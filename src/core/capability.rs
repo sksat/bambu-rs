@@ -1,67 +1,18 @@
 //! Firmware capability / quirk registry.
 //!
-//! API behaviour varies by `(model, firmware)`. This registry resolves a set of
-//! [`Capabilities`] from a model and firmware version, recording for each fact
-//! *how well we know it* ([`Knowledge`] + [`Source`]). That keeps the clean-room
-//! principle — **observed is truth, spec is reference, unobserved stays
-//! unobserved** — encoded in the type system rather than collapsed into bare
-//! `bool`s. The execution layer folds [`Knowledge`] to the safe side via
-//! [`Capabilities::control_allowed`].
+//! API behaviour varies by `(model, firmware)`. [`resolve`] looks a model and
+//! firmware version up in a [`CapabilityRegistry`] and returns the known
+//! [`Capabilities`]; unknown facts are simply `None`.
+//!
+//! The **clean-room** principle — observed is truth, we never claim to know what
+//! we haven't — lives in the *registration rules*, not in the value types: we
+//! only put a model in the registry once we understand it, only map a device
+//! code we've actually seen (see [`Model::from_device_code`](crate::core::model::Model::from_device_code)),
+//! and refuse control whenever the `(model, firmware)` falls outside what the
+//! registry covers (see [`Capabilities::control_permission`]).
 
 use crate::core::firmware::FirmwareVersion;
 use crate::core::model::Model;
-
-/// Where a capability fact comes from, ordered by trust:
-/// `Assumed < Spec < Observed`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Source {
-    /// A conservative default guess, backed by neither spec nor device.
-    Assumed,
-    /// Documented in the protocol spec (OpenBambuAPI), not yet device-verified.
-    Spec,
-    /// Confirmed by direct observation of real hardware.
-    Observed,
-}
-
-/// A capability fact together with how well we know it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Knowledge<T> {
-    Known { value: T, source: Source },
-    Unknown,
-}
-
-impl<T> Knowledge<T> {
-    pub fn known(value: T, source: Source) -> Self {
-        Knowledge::Known { value, source }
-    }
-
-    pub fn is_known(&self) -> bool {
-        matches!(self, Knowledge::Known { .. })
-    }
-
-    pub fn value(&self) -> Option<&T> {
-        match self {
-            Knowledge::Known { value, .. } => Some(value),
-            Knowledge::Unknown => None,
-        }
-    }
-
-    pub fn source(&self) -> Option<Source> {
-        match self {
-            Knowledge::Known { source, .. } => Some(*source),
-            Knowledge::Unknown => None,
-        }
-    }
-
-    /// The value, but only if known from a source at least as trusted as `min`.
-    /// This is how callers fold knowledge to the safe side.
-    pub fn trusted(&self, min: Source) -> Option<&T> {
-        match self {
-            Knowledge::Known { value, source } if *source >= min => Some(value),
-            _ => None,
-        }
-    }
-}
 
 /// Whether the printer pushes its full state each time (X1 class) or only deltas
 /// that the client must cache and merge (P1/A1 class).
@@ -101,63 +52,76 @@ pub enum AcsPolicy {
 /// How well the registry matched a `(model, firmware)` query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistryStatus {
-    /// Model and firmware fall within known territory.
-    Known,
+    /// Model and firmware fall within known, supported territory.
+    Supported,
     /// Model is known but firmware is newer than anything we have data for.
     FirmwareNewerThanKnown,
     /// Model is not in the registry.
     UnknownModel,
 }
 
-/// How much trust a caller requires before acting on a capability.
+/// Permission to send control commands (print start, heat, move, …).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CapabilityRequirement {
-    /// Act even on assumed defaults.
-    AllowAssumed,
-    /// Act on spec-documented or observed facts (the usual default).
-    RequireSpecOrObserved,
-    /// Act only on device-observed facts (for the riskiest operations).
-    RequireObserved,
+pub enum ControlPermit {
+    /// Control is not gated by ACS.
+    Allowed,
+    /// Allowed, but the printer must be in LAN-only + Developer Mode.
+    RequiresDeveloperMode,
 }
 
-impl CapabilityRequirement {
-    fn min_source(self) -> Source {
-        match self {
-            CapabilityRequirement::AllowAssumed => Source::Assumed,
-            CapabilityRequirement::RequireSpecOrObserved => Source::Spec,
-            CapabilityRequirement::RequireObserved => Source::Observed,
-        }
-    }
+/// Why control was refused — distinct reasons so the CLI can map them to exit
+/// codes and actionable messages, and so a caller can choose to override a
+/// specific one (e.g. allow an unknown firmware) at its own risk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlRefusal {
+    /// We don't recognise this model at all.
+    UnknownModel,
+    /// Firmware is newer than the registry knows; ACS behaviour may have
+    /// changed, so we refuse rather than risk an uncatalogued change.
+    FirmwareNewerThanKnown,
+    /// Developer Mode is required but not available on this firmware.
+    DeveloperModeUnavailable,
+    /// We don't know this model's control/ACS boundary.
+    UnknownControlBoundary,
 }
 
-/// Resolved capabilities for a `(model, firmware)`.
+/// Resolved capabilities for a `(model, firmware)`. Unknown facts are `None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capabilities {
     pub model: Model,
-    pub push_mode: Knowledge<PushMode>,
-    pub camera_transport: Knowledge<CameraTransport>,
-    pub developer_mode: Knowledge<DeveloperMode>,
-    pub acs_policy: Knowledge<AcsPolicy>,
+    pub push_mode: Option<PushMode>,
+    pub camera_transport: Option<CameraTransport>,
+    pub developer_mode: Option<DeveloperMode>,
+    pub acs_policy: Option<AcsPolicy>,
     pub registry_status: RegistryStatus,
 }
 
 impl Capabilities {
-    /// Whether control commands (print start, heat, move, …) may be sent, given
-    /// how much trust the caller requires.
+    /// Whether — and under what condition — control commands may be sent.
     ///
-    /// Folds [`Knowledge`] to the safe side: control is permitted only if we
-    /// positively know — from a sufficiently trusted source — either that ACS
-    /// does not gate control, or that Developer Mode is available. An unknown
-    /// model or unknown firmware therefore refuses control.
-    pub fn control_allowed(&self, req: CapabilityRequirement) -> bool {
-        let min = req.min_source();
-        if matches!(self.acs_policy.trusted(min), Some(AcsPolicy::NotRequired)) {
-            return true;
+    /// Safety is decided here, directly from registry-match quality and the
+    /// control boundary, rather than from per-fact provenance:
+    /// an unknown model or firmware-newer-than-known refuses control outright.
+    pub fn control_permission(&self) -> Result<ControlPermit, ControlRefusal> {
+        match self.registry_status {
+            RegistryStatus::UnknownModel => return Err(ControlRefusal::UnknownModel),
+            RegistryStatus::FirmwareNewerThanKnown => {
+                return Err(ControlRefusal::FirmwareNewerThanKnown);
+            }
+            RegistryStatus::Supported => {}
         }
-        matches!(
-            self.developer_mode.trusted(min),
-            Some(DeveloperMode::Available)
-        )
+        match (self.acs_policy, self.developer_mode) {
+            (Some(AcsPolicy::NotRequired), _) => Ok(ControlPermit::Allowed),
+            (_, Some(DeveloperMode::Available)) => Ok(ControlPermit::RequiresDeveloperMode),
+            (_, Some(DeveloperMode::Unavailable)) => Err(ControlRefusal::DeveloperModeUnavailable),
+            _ => Err(ControlRefusal::UnknownControlBoundary),
+        }
+    }
+
+    /// Convenience: whether control is permitted at all (see
+    /// [`Capabilities::control_permission`] for the reason).
+    pub fn control_allowed(&self) -> bool {
+        self.control_permission().is_ok()
     }
 }
 
@@ -169,8 +133,9 @@ struct ModelProfile {
     /// Firmware at/after which Developer Mode exists (and ACS gates control).
     /// `None` means we don't have a documented threshold for this model.
     developer_mode_since: Option<FirmwareVersion>,
-    /// Highest firmware we have data/assumptions for; newer firmware is resolved
-    /// best-effort but flagged [`RegistryStatus::FirmwareNewerThanKnown`].
+    /// Highest firmware we have data for; newer firmware resolves best-effort
+    /// but is flagged [`RegistryStatus::FirmwareNewerThanKnown`] and refused
+    /// control.
     max_known_firmware: FirmwareVersion,
 }
 
@@ -196,10 +161,10 @@ pub fn resolve(
     let Some(profile) = registry.profile(model) else {
         return Capabilities {
             model: model.clone(),
-            push_mode: Knowledge::Unknown,
-            camera_transport: Knowledge::Unknown,
-            developer_mode: Knowledge::Unknown,
-            acs_policy: Knowledge::Unknown,
+            push_mode: None,
+            camera_transport: None,
+            developer_mode: None,
+            acs_policy: None,
             registry_status: RegistryStatus::UnknownModel,
         };
     };
@@ -207,22 +172,8 @@ pub fn resolve(
     let registry_status = if firmware > &profile.max_known_firmware {
         RegistryStatus::FirmwareNewerThanKnown
     } else {
-        RegistryStatus::Known
+        RegistryStatus::Supported
     };
-
-    // Facts inferred for firmware *beyond* our known range are extrapolations,
-    // not spec — a firmware update can change ACS/control behaviour we have not
-    // catalogued yet. Downgrade firmware-derived facts to `Assumed` in that case
-    // so control is refused by default (and only an explicit opt-in to assumed
-    // facts re-enables it). Model-class properties below are firmware-independent
-    // and stay spec-level.
-    let fw_source = match registry_status {
-        RegistryStatus::FirmwareNewerThanKnown => Source::Assumed,
-        RegistryStatus::Known | RegistryStatus::UnknownModel => Source::Spec,
-    };
-
-    let push_mode = Knowledge::known(profile.push_mode, Source::Spec);
-    let camera_transport = Knowledge::known(profile.camera_transport, Source::Spec);
 
     let (developer_mode, acs_policy) = match &profile.developer_mode_since {
         Some(threshold) => {
@@ -231,18 +182,15 @@ pub fn resolve(
             } else {
                 DeveloperMode::Unavailable
             };
-            (
-                Knowledge::known(dev, fw_source),
-                Knowledge::known(AcsPolicy::Required, fw_source),
-            )
+            (Some(dev), Some(AcsPolicy::Required))
         }
-        None => (Knowledge::Unknown, Knowledge::Unknown),
+        None => (None, None),
     };
 
     Capabilities {
         model: model.clone(),
-        push_mode,
-        camera_transport,
+        push_mode: Some(profile.push_mode),
+        camera_transport: Some(profile.camera_transport),
         developer_mode,
         acs_policy,
         registry_status,
@@ -251,10 +199,8 @@ pub fn resolve(
 
 /// The built-in registry of known models.
 ///
-/// Values come from the OpenBambuAPI spec and prior research; every fact is
-/// marked [`Source::Spec`] until confirmed on real hardware, at which point its
-/// source should be upgraded to [`Source::Observed`]. Models are added as we
-/// gather data.
+/// Values come from the OpenBambuAPI spec and prior research; the A1 mini entry
+/// is the one we have actually observed. Models are added as we gather data.
 pub fn default_registry() -> CapabilityRegistry {
     let fw = |s: &str| FirmwareVersion::parse(s).expect("valid firmware literal");
     CapabilityRegistry {
@@ -277,70 +223,49 @@ mod tests {
     }
 
     #[test]
-    fn source_orders_by_trust() {
-        assert!(Source::Assumed < Source::Spec);
-        assert!(Source::Spec < Source::Observed);
-    }
-
-    #[test]
-    fn trusted_requires_minimum_source() {
-        let k = Knowledge::known(PushMode::DeltaOnly, Source::Spec);
-        assert_eq!(k.trusted(Source::Assumed), Some(&PushMode::DeltaOnly));
-        assert_eq!(k.trusted(Source::Spec), Some(&PushMode::DeltaOnly));
-        assert_eq!(k.trusted(Source::Observed), None); // spec is not observed
-        assert_eq!(
-            Knowledge::<PushMode>::Unknown.trusted(Source::Assumed),
-            None
-        );
-    }
-
-    #[test]
     fn a1mini_is_delta_push_and_tcp_camera() {
         let reg = default_registry();
         let caps = resolve(&reg, &Model::A1Mini, &fw("01.05.00"));
-        assert_eq!(caps.push_mode.value(), Some(&PushMode::DeltaOnly));
-        assert_eq!(
-            caps.camera_transport.value(),
-            Some(&CameraTransport::JpegTcp6000)
-        );
-        assert_eq!(caps.registry_status, RegistryStatus::Known);
+        assert_eq!(caps.push_mode, Some(PushMode::DeltaOnly));
+        assert_eq!(caps.camera_transport, Some(CameraTransport::JpegTcp6000));
+        assert_eq!(caps.registry_status, RegistryStatus::Supported);
     }
 
     #[test]
     fn developer_mode_threshold_boundary() {
         let reg = default_registry();
-        // Just before the threshold: unavailable.
         let before = resolve(&reg, &Model::A1Mini, &fw("01.04.99"));
-        assert_eq!(
-            before.developer_mode.value(),
-            Some(&DeveloperMode::Unavailable)
-        );
-        // Exactly at and after the threshold (incl. trailing-zero forms): available.
+        assert_eq!(before.developer_mode, Some(DeveloperMode::Unavailable));
         for v in ["01.05.00", "01.05", "01.05.00.00", "01.05.01"] {
             let caps = resolve(&reg, &Model::A1Mini, &fw(v));
             assert_eq!(
-                caps.developer_mode.value(),
-                Some(&DeveloperMode::Available),
+                caps.developer_mode,
+                Some(DeveloperMode::Available),
                 "firmware {v} should have Developer Mode"
             );
         }
     }
 
     #[test]
-    fn control_is_refused_below_developer_mode_threshold() {
+    fn control_refused_below_developer_mode_threshold() {
         let reg = default_registry();
         let caps = resolve(&reg, &Model::A1Mini, &fw("01.04.00"));
-        assert!(!caps.control_allowed(CapabilityRequirement::RequireSpecOrObserved));
+        assert_eq!(
+            caps.control_permission(),
+            Err(ControlRefusal::DeveloperModeUnavailable)
+        );
+        assert!(!caps.control_allowed());
     }
 
     #[test]
-    fn control_allowed_with_developer_mode_from_spec_but_not_observed() {
+    fn control_allowed_via_developer_mode_when_supported() {
         let reg = default_registry();
         let caps = resolve(&reg, &Model::A1Mini, &fw("01.05.00"));
-        // Spec-level knowledge is enough for the normal requirement...
-        assert!(caps.control_allowed(CapabilityRequirement::RequireSpecOrObserved));
-        // ...but the strictest requirement demands device-observed facts.
-        assert!(!caps.control_allowed(CapabilityRequirement::RequireObserved));
+        assert_eq!(
+            caps.control_permission(),
+            Ok(ControlPermit::RequiresDeveloperMode)
+        );
+        assert!(caps.control_allowed());
     }
 
     #[test]
@@ -348,12 +273,12 @@ mod tests {
         let reg = default_registry();
         let caps = resolve(&reg, &Model::Unknown("z9".into()), &fw("01.00.00"));
         assert_eq!(caps.registry_status, RegistryStatus::UnknownModel);
-        assert!(!caps.push_mode.is_known());
-        assert!(!caps.control_allowed(CapabilityRequirement::AllowAssumed));
+        assert_eq!(caps.push_mode, None);
+        assert_eq!(caps.control_permission(), Err(ControlRefusal::UnknownModel));
     }
 
     #[test]
-    fn known_model_in_registry_but_absent_profile_is_unknown() {
+    fn known_model_variant_without_a_profile_is_unknown() {
         // P1S is a known Model variant but has no profile yet.
         let reg = default_registry();
         let caps = resolve(&reg, &Model::P1S, &fw("01.00.00"));
@@ -361,25 +286,18 @@ mod tests {
     }
 
     #[test]
-    fn firmware_newer_than_known_downgrades_to_assumed_and_refuses_control() {
+    fn firmware_newer_than_known_refuses_control_directly() {
+        // The P1 safety boundary, expressed directly via registry_status rather
+        // than by downgrading per-fact provenance.
         let reg = default_registry();
         let caps = resolve(&reg, &Model::A1Mini, &fw("01.99.00"));
         assert_eq!(caps.registry_status, RegistryStatus::FirmwareNewerThanKnown);
-
-        // The value is still resolved best-effort (above threshold), but because
-        // we are extrapolating past known firmware its source is only `Assumed`,
-        // not `Spec` — a future firmware can change ACS behaviour we haven't
-        // catalogued.
-        assert_eq!(caps.developer_mode.value(), Some(&DeveloperMode::Available));
-        assert_eq!(caps.developer_mode.source(), Some(Source::Assumed));
-        assert_eq!(caps.acs_policy.source(), Some(Source::Assumed));
-
-        // Therefore the normal requirement refuses control on unknown-future
-        // firmware, and only an explicit opt-in to assumed facts allows it.
-        assert!(!caps.control_allowed(CapabilityRequirement::RequireSpecOrObserved));
-        assert!(caps.control_allowed(CapabilityRequirement::AllowAssumed));
-
-        // Model-class properties (firmware-independent) remain spec-level.
-        assert_eq!(caps.push_mode.source(), Some(Source::Spec));
+        assert_eq!(
+            caps.control_permission(),
+            Err(ControlRefusal::FirmwareNewerThanKnown)
+        );
+        // The descriptive facts are still resolved best-effort.
+        assert_eq!(caps.push_mode, Some(PushMode::DeltaOnly));
+        assert_eq!(caps.developer_mode, Some(DeveloperMode::Available));
     }
 }
