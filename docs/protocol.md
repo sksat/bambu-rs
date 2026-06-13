@@ -79,7 +79,14 @@ Field notes **[observed]**:
 
 - Fan speeds are **strings** (`cooling_fan_speed: "0"`); temperatures are floats.
 - `hms` is an array of `{attr, code}` (empty = no active alerts).
-- `lights_report` is an array (e.g. `[{node:"chamber_light", mode:"off"}]`).
+- `lights_report` is an array (e.g. `[{node:"chamber_light", mode:"off"}]`),
+  keyed by `node`. This A1 mini reports **only** `chamber_light` — no
+  `work_light` — so `system.ledctrl` with `led_node:"work_light"` ACKs but never
+  shows up in `lights_report` (→ verified as *unverified*). work_light is
+  **[spec]**, present on other models. **[observed]**
+- `spd_lvl` is the active print-speed level: 1 silent, 2 standard, 3 sport,
+  4 ludicrous. `print.print_speed` (param = the level) sets it; the change is
+  reflected in `spd_lvl` even while idle (verified: standard↔sport). **[observed]**
 - `chamber_temper` is reported (`5`) on the A1 but is **not a real sensor** —
   only X1/X1E/H2D have one. Surface it only for those models.
 - `home_flag` is a bitfield of per-axis homed state; it changes during a home,

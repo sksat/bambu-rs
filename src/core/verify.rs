@@ -43,7 +43,7 @@ pub fn has_observable_effect(cmd: &Command) -> bool {
             | Command::Pause
             | Command::Resume
             | Command::Stop
-            | Command::ChamberLight(_)
+            | Command::Led { .. }
             | Command::IpcamTimelapse(_)
             | Command::PrintSpeed(_)
     )
@@ -94,11 +94,11 @@ pub fn evaluate(
         Command::Pause => state == Some(GcodeState::Pause),
         Command::Resume => state == Some(GcodeState::Running),
         // The light is "set" only once `lights_report` actually shows the
-        // commanded mode — the `ledctrl` ACK alone is not enough (a faulty unit
-        // ACKs but `lights_report` stays unchanged).
-        Command::ChamberLight(on) => {
+        // commanded mode for that node — the `ledctrl` ACK alone is not enough
+        // (a faulty unit ACKs but `lights_report` stays unchanged).
+        Command::Led { node, on } => {
             let want = if *on { "on" } else { "off" };
-            status.chamber_light.as_deref() == Some(want)
+            status.light_mode(node.as_str()) == Some(want)
         }
         // The timelapse setting is "set" once `ipcam.timelapse` shows the
         // commanded mode — the `ipcam_timelapse` ACK alone isn't enough (same
@@ -146,7 +146,10 @@ mod tests {
             motor_noise: false
         }));
         // The light is effectful — verified via lights_report, not just the ACK.
-        assert!(has_observable_effect(&Command::ChamberLight(true)));
+        assert!(has_observable_effect(&Command::Led {
+            node: crate::core::command::LedNode::ChamberLight,
+            on: true
+        }));
         // ACK-only commands:
         assert!(!has_observable_effect(&Command::GcodeLine("G28".into())));
         assert!(!has_observable_effect(&Command::PushAll));
@@ -210,24 +213,35 @@ mod tests {
 
     #[test]
     fn chamber_light_effect_reads_lights_report_not_the_ack() {
+        use crate::core::command::LedNode;
+        use crate::core::status::LightReport;
+        let chamber = |node: LedNode, on: bool| Command::Led { node, on };
         let lit = |mode: &str| PrinterStatus {
-            chamber_light: Some(mode.to_string()),
+            lights: vec![LightReport {
+                node: "chamber_light".to_string(),
+                mode: mode.to_string(),
+            }],
             ..Default::default()
         };
         // light on: observed only when lights_report actually shows "on".
         assert_eq!(
-            evaluate(&Command::ChamberLight(true), &lit("on"), Some(0)),
+            evaluate(&chamber(LedNode::ChamberLight, true), &lit("on"), Some(0)),
             EffectStatus::Observed
         );
         // Faulty unit: ledctrl ACKed but lights_report stays "off" -> pending
         // (→ unverified on timeout), never a false "verified".
         assert_eq!(
-            evaluate(&Command::ChamberLight(true), &lit("off"), Some(0)),
+            evaluate(&chamber(LedNode::ChamberLight, true), &lit("off"), Some(0)),
             EffectStatus::Pending
         );
         assert_eq!(
-            evaluate(&Command::ChamberLight(false), &lit("off"), Some(0)),
+            evaluate(&chamber(LedNode::ChamberLight, false), &lit("off"), Some(0)),
             EffectStatus::Observed
+        );
+        // work_light has no entry in lights_report -> pending (never false-verified).
+        assert_eq!(
+            evaluate(&chamber(LedNode::WorkLight, true), &lit("on"), Some(0)),
+            EffectStatus::Pending
         );
     }
 

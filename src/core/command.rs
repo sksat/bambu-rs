@@ -30,6 +30,28 @@ impl SequenceIds {
     }
 }
 
+/// Which LED a `system.ledctrl` command targets. The node name is what the
+/// printer matches in `lights_report`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedNode {
+    /// The chamber/logo light — present on the A1 mini. **[observed]**
+    ChamberLight,
+    /// A separate work light. **[spec]** — not present on every model (this A1
+    /// mini's `lights_report` only carries `chamber_light`), so it may ACK
+    /// without effect.
+    WorkLight,
+}
+
+impl LedNode {
+    /// The `led_node` token (also the `lights_report` node name).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LedNode::ChamberLight => "chamber_light",
+            LedNode::WorkLight => "work_light",
+        }
+    }
+}
+
 /// Whether to enable or disable the printer's per-print timelapse recording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimelapseControl {
@@ -118,8 +140,9 @@ pub enum Command {
     PrintSpeed(SpeedLevel),
     /// Start a print of a sliced 3MF on the printer (`print.project_file`).
     ProjectFile(ProjectFile),
-    /// Turn the chamber light on/off (`system.ledctrl`).
-    ChamberLight(bool),
+    /// Turn an LED on/off (`system.ledctrl`). Effect is read back from
+    /// `lights_report` for the matching node, not the ACK alone.
+    Led { node: LedNode, on: bool },
     /// Enable/disable the printer's per-print timelapse recording
     /// (`camera.ipcam_timelapse`). Its effect is read back from the
     /// `ipcam.timelapse` report field. **[spec]** — shape is from OpenBambuAPI;
@@ -205,7 +228,7 @@ impl Command {
             | Command::PrintSpeed(_)
             | Command::ProjectFile(_)
             | Command::Calibration { .. } => "print",
-            Command::ChamberLight(_) | Command::Reboot => "system",
+            Command::Led { .. } | Command::Reboot => "system",
             Command::IpcamTimelapse(_) => "camera",
         }
     }
@@ -261,11 +284,11 @@ impl Command {
                     "print": { "sequence_id": sequence_id, "command": "calibration", "option": option }
                 })
             }
-            Command::ChamberLight(on) => json!({
+            Command::Led { node, on } => json!({
                 "system": {
                     "sequence_id": sequence_id,
                     "command": "ledctrl",
-                    "led_node": "chamber_light",
+                    "led_node": node.as_str(),
                     "led_mode": if *on { "on" } else { "off" },
                     "led_on_time": 500,
                     "led_off_time": 500,
@@ -317,7 +340,14 @@ mod tests {
             Command::ProjectFile(ProjectFile::new("u", 1, "n")).category(),
             "print"
         );
-        assert_eq!(Command::ChamberLight(true).category(), "system");
+        assert_eq!(
+            Command::Led {
+                node: LedNode::ChamberLight,
+                on: true
+            }
+            .category(),
+            "system"
+        );
     }
 
     #[test]
@@ -406,15 +436,31 @@ mod tests {
     }
 
     #[test]
-    fn chamber_light_on_and_off_payloads() {
-        let on = Command::ChamberLight(true).to_payload("8");
+    fn ledctrl_on_and_off_payloads_carry_the_node() {
+        let on = Command::Led {
+            node: LedNode::ChamberLight,
+            on: true,
+        }
+        .to_payload("8");
         assert_eq!(on["system"]["command"], "ledctrl");
         assert_eq!(on["system"]["led_node"], "chamber_light");
         assert_eq!(on["system"]["led_mode"], "on");
         assert_eq!(on["system"]["sequence_id"], "8");
 
-        let off = Command::ChamberLight(false).to_payload("9");
+        let off = Command::Led {
+            node: LedNode::ChamberLight,
+            on: false,
+        }
+        .to_payload("9");
         assert_eq!(off["system"]["led_mode"], "off");
+
+        // work_light targets a different node (same envelope).
+        let work = Command::Led {
+            node: LedNode::WorkLight,
+            on: true,
+        }
+        .to_payload("1");
+        assert_eq!(work["system"]["led_node"], "work_light");
     }
 
     #[test]

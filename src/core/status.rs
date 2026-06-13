@@ -61,14 +61,22 @@ pub struct PrinterStatus {
     /// `ams.tray_now` → the matching AMS tray or the external spool. `None` when
     /// nothing is loaded or the report doesn't carry AMS data.
     pub filament: Option<Filament>,
-    /// Reported chamber-light mode (`on`/`off`) from `lights_report`. This is the
-    /// printer's *actual* light state — distinct from a `ledctrl` ACK, which only
-    /// confirms the command was accepted (observed: a faulty unit ACKs `ledctrl`
-    /// but `lights_report` stays `off`).
-    pub chamber_light: Option<String>,
+    /// All `lights_report` entries (each `{node, mode}`), e.g.
+    /// `chamber_light=off`. This is the printer's *actual* light state — distinct
+    /// from a `ledctrl` ACK, which only confirms acceptance (observed: a faulty
+    /// unit ACKs `ledctrl` but `lights_report` stays `off`). Look a node up with
+    /// [`PrinterStatus::light_mode`].
+    pub lights: Vec<LightReport>,
     /// Camera/timelapse settings from the `ipcam` report node. `None` when the
     /// report carries no `ipcam` object.
     pub ipcam: Option<Ipcam>,
+}
+
+/// One `lights_report` entry: an LED node and its mode (`on`/`off`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct LightReport {
+    pub node: String,
+    pub mode: String,
 }
 
 /// Camera/timelapse settings from the `ipcam` report node (A1/P1: a JPEG-stream
@@ -128,13 +136,19 @@ impl PrinterStatus {
             spd_lvl: get("spd_lvl").and_then(as_i64_loose),
             subtask_name: get("subtask_name").and_then(as_string),
             filament: print.and_then(resolve_filament),
-            chamber_light: get("lights_report")
+            lights: get("lights_report")
                 .and_then(Value::as_array)
-                .and_then(|arr| {
+                .map(|arr| {
                     arr.iter()
-                        .find(|e| e.get("node").and_then(Value::as_str) == Some("chamber_light"))
+                        .filter_map(|e| {
+                            Some(LightReport {
+                                node: e.get("node").and_then(Value::as_str)?.to_string(),
+                                mode: e.get("mode").and_then(Value::as_str)?.to_string(),
+                            })
+                        })
+                        .collect()
                 })
-                .and_then(|e| e.get("mode").and_then(as_string)),
+                .unwrap_or_default(),
             ipcam: get("ipcam").map(|ic| Ipcam {
                 timelapse: ic.get("timelapse").and_then(as_string),
                 record: ic.get("ipcam_record").and_then(as_string),
@@ -148,6 +162,15 @@ impl PrinterStatus {
     /// command took effect.
     pub fn timelapse_mode(&self) -> Option<&str> {
         self.ipcam.as_ref()?.timelapse.as_deref()
+    }
+
+    /// The mode (`on`/`off`) of a `lights_report` node (e.g. `chamber_light`),
+    /// if reported. Used to verify a `ledctrl` command took effect.
+    pub fn light_mode(&self, node: &str) -> Option<&str> {
+        self.lights
+            .iter()
+            .find(|l| l.node == node)
+            .map(|l| l.mode.as_str())
     }
 
     /// The chamber temperature **only if** the model has a real chamber sensor.
@@ -404,6 +427,22 @@ mod tests {
         };
         assert_eq!(st.real_chamber_temperature(&a1), None); // synthetic -> hidden
         assert_eq!(st.real_chamber_temperature(&x1), Some(5.0)); // real sensor -> exposed
+    }
+
+    #[test]
+    fn lights_report_parses_and_is_looked_up_by_node() {
+        let st = PrinterStatus::from_state(&json!({ "print": { "lights_report": [
+            { "node": "chamber_light", "mode": "off" },
+            { "node": "work_light", "mode": "on" }
+        ]}}));
+        assert_eq!(st.light_mode("chamber_light"), Some("off"));
+        assert_eq!(st.light_mode("work_light"), Some("on"));
+        // Unknown node -> None.
+        assert_eq!(st.light_mode("logo_light"), None);
+        // No lights_report -> empty, no panic.
+        let bare = PrinterStatus::from_state(&json!({ "print": {} }));
+        assert!(bare.lights.is_empty());
+        assert_eq!(bare.light_mode("chamber_light"), None);
     }
 
     #[test]

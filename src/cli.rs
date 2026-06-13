@@ -18,7 +18,9 @@ use crate::client::{
 };
 use crate::config::{self, Config, ConfigError, Overrides, Profile, ResolvedTarget};
 use crate::core::capability::{self, ControlAssessment, ControlRefusal};
-use crate::core::command::{Command as ProtoCommand, ProjectFile, SpeedLevel, TimelapseControl};
+use crate::core::command::{
+    Command as ProtoCommand, LedNode, ProjectFile, SpeedLevel, TimelapseControl,
+};
 use crate::core::report::ReportState;
 use crate::core::stage::Stage;
 use crate::core::status::{GcodeState, PrinterStatus};
@@ -113,11 +115,15 @@ enum Command {
         #[command(subcommand)]
         action: TimelapseAction,
     },
-    /// Turn the chamber/work light on or off (control test; low-risk).
+    /// Turn a light on or off (control test; low-risk).
     Light {
         /// "on" or "off".
         #[arg(value_parser = ["on", "off"])]
         state: String,
+        /// Which light: chamber (default) or work. `work` is [spec] — not every
+        /// model has one (this A1 mini only reports `chamber_light`).
+        #[arg(long, default_value = "chamber", value_parser = ["chamber", "work"])]
+        node: String,
         /// Watch the report for this many seconds after sending.
         #[arg(long, default_value_t = 8)]
         timeout: u64,
@@ -420,7 +426,11 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
         Command::File { action } => run_file(cli, action),
         Command::Camera { action } => run_camera(cli, action),
         Command::Timelapse { action } => run_timelapse(cli, action),
-        Command::Light { state, timeout } => run_light(cli, state == "on", *timeout),
+        Command::Light {
+            state,
+            node,
+            timeout,
+        } => run_light(cli, state == "on", node, *timeout),
         Command::Speed { level, timeout } => run_speed(cli, level, *timeout),
         Command::Calibrate {
             bed_level,
@@ -934,10 +944,15 @@ fn watch_identity(cli: &Cli) -> Result<(String, Option<String>), CliError> {
     Ok((target.model.to_string(), profile_name))
 }
 
-fn run_light(cli: &Cli, on: bool, timeout_secs: u64) -> Result<(), CliError> {
+fn run_light(cli: &Cli, on: bool, node: &str, timeout_secs: u64) -> Result<(), CliError> {
+    let node = match node {
+        "chamber" => LedNode::ChamberLight,
+        "work" => LedNode::WorkLight,
+        other => return Err(CliError::new(exit::VALIDATION, format!("unknown light {other:?}"))),
+    };
     let client = connect_client(cli, timeout_secs)?;
-    eprintln!("setting chamber_light {} …", if on { "on" } else { "off" });
-    report_command_outcome(client.send_and_verify(&ProtoCommand::ChamberLight(on))?)
+    eprintln!("setting {} {} …", node.as_str(), if on { "on" } else { "off" });
+    report_command_outcome(client.send_and_verify(&ProtoCommand::Led { node, on })?)
 }
 
 fn run_speed(cli: &Cli, level: &str, timeout_secs: u64) -> Result<(), CliError> {
