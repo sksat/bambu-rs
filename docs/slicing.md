@@ -35,6 +35,19 @@ Key flags (from the Bambu Studio CLI reference):
 
 `OrcaSlicer` takes the same flags (substitute the `orca-slicer` binary).
 
+> **Gotcha — flatten inherited profiles for headless CLI use.** The *bundled
+> system* profiles (`<install>/resources/profiles/BBL/...`) use `"inherits"`
+> chains (e.g. a PETG filament → `…@base` → `fdm_filament_pet` → common). The
+> OrcaSlicer 2.3.2 CLI, given such a file by path, applies only the **leaf**'s
+> keys and does **not** resolve the chain — so you silently get wrong values
+> (observed: `nozzle_temperature` correct but `filament_type=PLA` and bed temp
+> 45 °C instead of PETG's 70 °C, which then fails validation as
+> "Cool Plate does not support filament"). Either export a *resolved* preset
+> from the GUI, or flatten the chain yourself (walk `inherits`, merge
+> parent→leaf) before passing it. Also set `curr_bed_type` explicitly (e.g.
+> `Textured PEI Plate`) — the CLI defaults it to `Cool Plate`, which PETG can't
+> use. Headless slicing also needs a display: run under `xvfb-run -a`.
+
 > The slicer embeds, in the `.gcode.3mf`, exactly what `bambu job start` needs:
 > `Metadata/plate_N.gcode`, its `.md5`, plate metadata, and the filament the
 > plate was sliced for (material + temps). Print PETG with a PETG slice — a
