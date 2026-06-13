@@ -46,8 +46,61 @@ pub enum Command {
     Stop,
     /// Send a single raw G-code line (`print.gcode_line`).
     GcodeLine(String),
+    /// Print a raw G-code file already on the printer (`print.gcode_file`,
+    /// single-material — no AMS mapping). The value is the on-printer path.
+    GcodeFile(String),
+    /// Start a print of a sliced 3MF on the printer (`print.project_file`).
+    ProjectFile(ProjectFile),
     /// Turn the chamber light on/off (`system.ledctrl`).
     ChamberLight(bool),
+}
+
+/// Parameters for `print.project_file` — start a sliced `.gcode.3mf` that is
+/// already on the printer's storage.
+///
+/// Field shapes are spec-derived (OpenBambuAPI) and must be confirmed on real
+/// hardware (the device is the source of truth — start the print and verify it
+/// reaches `RUNNING`). Calibration flags default to on, matching a normal slice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectFile {
+    /// URL of the file on the printer, e.g. `ftp:///cache/foo.gcode.3mf`.
+    pub url: String,
+    /// Plate number; the gcode is read from `Metadata/plate_{plate}.gcode`.
+    pub plate: u32,
+    /// Job name shown on the printer.
+    pub subtask_name: String,
+    /// Lowercase-hex md5 of the plate gcode (empty to skip the check).
+    pub md5: String,
+    /// Build-plate type (`auto`, or a specific plate name).
+    pub bed_type: String,
+    /// Use the AMS, with a per-filament tray mapping (`-1` = external spool).
+    pub use_ams: bool,
+    pub ams_mapping: Vec<i32>,
+    pub timelapse: bool,
+    pub flow_cali: bool,
+    pub bed_leveling: bool,
+    pub vibration_cali: bool,
+    pub layer_inspect: bool,
+}
+
+impl ProjectFile {
+    /// A minimal project print: no AMS, `auto` bed type, calibrations on.
+    pub fn new(url: impl Into<String>, plate: u32, subtask_name: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            plate,
+            subtask_name: subtask_name.into(),
+            md5: String::new(),
+            bed_type: "auto".to_string(),
+            use_ams: false,
+            ams_mapping: Vec::new(),
+            timelapse: false,
+            flow_cali: true,
+            bed_leveling: true,
+            vibration_cali: true,
+            layer_inspect: true,
+        }
+    }
 }
 
 impl Command {
@@ -57,7 +110,12 @@ impl Command {
     pub fn category(&self) -> &'static str {
         match self {
             Command::PushAll => "pushing",
-            Command::Pause | Command::Resume | Command::Stop | Command::GcodeLine(_) => "print",
+            Command::Pause
+            | Command::Resume
+            | Command::Stop
+            | Command::GcodeLine(_)
+            | Command::GcodeFile(_)
+            | Command::ProjectFile(_) => "print",
             Command::ChamberLight(_) => "system",
         }
     }
@@ -72,6 +130,29 @@ impl Command {
             Command::Resume => print_command(sequence_id, "resume", ""),
             Command::Stop => print_command(sequence_id, "stop", ""),
             Command::GcodeLine(line) => print_command(sequence_id, "gcode_line", line),
+            Command::GcodeFile(path) => print_command(sequence_id, "gcode_file", path),
+            Command::ProjectFile(p) => json!({
+                "print": {
+                    "sequence_id": sequence_id,
+                    "command": "project_file",
+                    "param": format!("Metadata/plate_{}.gcode", p.plate),
+                    "url": p.url,
+                    "subtask_name": p.subtask_name,
+                    "md5": p.md5,
+                    "bed_type": p.bed_type,
+                    "timelapse": p.timelapse,
+                    "flow_cali": p.flow_cali,
+                    "bed_leveling": p.bed_leveling,
+                    "vibration_cali": p.vibration_cali,
+                    "layer_inspect": p.layer_inspect,
+                    "use_ams": p.use_ams,
+                    "ams_mapping": p.ams_mapping,
+                    "project_id": "0",
+                    "profile_id": "0",
+                    "task_id": "0",
+                    "subtask_id": "0",
+                }
+            }),
             Command::ChamberLight(on) => json!({
                 "system": {
                     "sequence_id": sequence_id,
@@ -113,7 +194,35 @@ mod tests {
         assert_eq!(Command::PushAll.category(), "pushing");
         assert_eq!(Command::Pause.category(), "print");
         assert_eq!(Command::GcodeLine("G28".into()).category(), "print");
+        assert_eq!(Command::GcodeFile("/x".into()).category(), "print");
+        assert_eq!(
+            Command::ProjectFile(ProjectFile::new("u", 1, "n")).category(),
+            "print"
+        );
         assert_eq!(Command::ChamberLight(true).category(), "system");
+    }
+
+    #[test]
+    fn gcode_file_payload() {
+        assert_eq!(
+            Command::GcodeFile("/cache/foo.gcode".into()).to_payload("2"),
+            json!({ "print": { "sequence_id": "2", "command": "gcode_file", "param": "/cache/foo.gcode" } })
+        );
+    }
+
+    #[test]
+    fn project_file_payload_has_plate_and_lan_ids() {
+        let pf = ProjectFile::new("ftp:///cache/x.gcode.3mf", 2, "x job");
+        let v = Command::ProjectFile(pf).to_payload("3");
+        let p = &v["print"];
+        assert_eq!(p["command"], "project_file");
+        assert_eq!(p["sequence_id"], "3");
+        assert_eq!(p["param"], "Metadata/plate_2.gcode");
+        assert_eq!(p["url"], "ftp:///cache/x.gcode.3mf");
+        assert_eq!(p["subtask_name"], "x job");
+        assert_eq!(p["use_ams"], false);
+        assert_eq!(p["task_id"], "0"); // LAN SD print uses "0" ids
+        assert!(p["ams_mapping"].is_array());
     }
 
     #[test]

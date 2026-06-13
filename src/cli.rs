@@ -15,7 +15,7 @@ use serde::Serialize;
 use crate::camera::{CameraClient, CameraError};
 use crate::client::{ClientError, CommandOutcome, LanMqttClient, StatusSource, WatchStep};
 use crate::config::{self, Config, ConfigError, Overrides, Profile, ResolvedTarget};
-use crate::core::command::Command as ProtoCommand;
+use crate::core::command::{Command as ProtoCommand, ProjectFile};
 use crate::core::status::{GcodeState, PrinterStatus};
 use crate::ftp::{FtpError, FtpsClient};
 
@@ -24,6 +24,7 @@ mod exit {
     pub const GENERAL: u8 = 1;
     pub const VALIDATION: u8 = 3;
     pub const CONFIRM_REQUIRED: u8 = 4;
+    pub const PRINTER_BUSY: u8 = 5;
     pub const VERIFY_TIMEOUT: u8 = 6;
     pub const TRANSPORT: u8 = 7;
     pub const DEVICE_REJECTED: u8 = 8;
@@ -67,6 +68,11 @@ enum Command {
     },
     /// Fetch and print a status snapshot.
     Status,
+    /// Start, pause, resume or stop a print job.
+    Job {
+        #[command(subcommand)]
+        action: JobAction,
+    },
     /// Watch the current print to a terminal state (like `gh run watch`).
     Watch {
         /// Exit non-zero if the print ends in a FAILED state.
@@ -128,6 +134,46 @@ enum ConfigAction {
     List,
     /// Show a profile (access code redacted).
     Show,
+}
+
+#[derive(Subcommand)]
+enum JobAction {
+    /// Start a print of a file already on the printer (.gcode or .gcode.3mf).
+    Start {
+        /// On-printer path, e.g. /cache/foo.gcode or /cache/foo.gcode.3mf.
+        file: String,
+        /// Plate number (for .3mf project files).
+        #[arg(long, default_value_t = 1)]
+        plate: u32,
+        /// Use the AMS with this mapping: comma-separated tray indices per
+        /// filament, -1 = external spool (e.g. "0,-1").
+        #[arg(long)]
+        ams_map: Option<String>,
+        /// Build-plate type.
+        #[arg(long, default_value = "auto")]
+        bed_type: String,
+        /// Show the resolved command JSON without sending it (safe).
+        #[arg(long)]
+        dry_run: bool,
+        /// Required to actually start a print.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Pause the current print (needs --confirm).
+    Pause {
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Resume a paused print (needs --confirm).
+    Resume {
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Stop (cancel) the current print — irreversible (needs --confirm).
+    Stop {
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -227,6 +273,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             exit_status,
             timeout,
         } => run_watch(cli, *exit_status, *timeout),
+        Command::Job { action } => run_job(cli, action),
         Command::File { action } => run_file(cli, action),
         Command::Camera { action } => run_camera(cli, action),
         Command::Light { state, timeout } => run_light(cli, state == "on", *timeout),
@@ -435,6 +482,97 @@ fn run_file(cli: &Cli, action: &FileAction) -> Result<(), CliError> {
             Ok(())
         }
     }
+}
+
+fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
+    match action {
+        JobAction::Start {
+            file,
+            plate,
+            ams_map,
+            bed_type,
+            dry_run,
+            confirm,
+        } => {
+            let cmd = build_start_command(file, *plate, ams_map.as_deref(), bed_type)?;
+            if *dry_run {
+                // Show the resolved payload (the "plan") without sending anything.
+                print_json(&cmd.to_payload("1"));
+                return Ok(());
+            }
+            if !*confirm {
+                return Err(CliError::new(
+                    exit::CONFIRM_REQUIRED,
+                    "refusing to start a print without --confirm (try --dry-run first)",
+                ));
+            }
+            ensure_idle(cli)?;
+            let client = connect_client(cli, 20)?;
+            eprintln!("starting print: {file}");
+            report_command_outcome(client.send_and_verify(&cmd)?)
+        }
+        JobAction::Pause { confirm } => job_control(cli, ProtoCommand::Pause, *confirm),
+        JobAction::Resume { confirm } => job_control(cli, ProtoCommand::Resume, *confirm),
+        JobAction::Stop { confirm } => job_control(cli, ProtoCommand::Stop, *confirm),
+    }
+}
+
+/// Build the start command, choosing project_file (.3mf) or gcode_file (.gcode).
+fn build_start_command(
+    file: &str,
+    plate: u32,
+    ams_map: Option<&str>,
+    bed_type: &str,
+) -> Result<ProtoCommand, CliError> {
+    let name = std::path::Path::new(file)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(file)
+        .to_string();
+    if file.to_ascii_lowercase().ends_with(".3mf") {
+        // FTP-uploaded files live under a path like /cache/x.gcode.3mf -> ftp:///cache/...
+        let mut pf = ProjectFile::new(format!("ftp://{file}"), plate, name);
+        pf.bed_type = bed_type.to_string();
+        if let Some(map) = ams_map {
+            pf.use_ams = true;
+            pf.ams_mapping = parse_ams_map(map)?;
+        }
+        Ok(ProtoCommand::ProjectFile(pf))
+    } else {
+        Ok(ProtoCommand::GcodeFile(file.to_string()))
+    }
+}
+
+fn parse_ams_map(map: &str) -> Result<Vec<i32>, CliError> {
+    map.split(',')
+        .map(|s| s.trim().parse::<i32>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| CliError::new(exit::VALIDATION, format!("invalid --ams-map: {map:?}")))
+}
+
+/// Refuse to start a print unless the printer is idle (a key safety guard).
+fn ensure_idle(cli: &Cli) -> Result<(), CliError> {
+    let state = connect_client(cli, 10)?.fetch_snapshot()?;
+    match PrinterStatus::from_state(state.get()).state() {
+        None | Some(GcodeState::Idle) | Some(GcodeState::Finish) | Some(GcodeState::Failed) => {
+            Ok(())
+        }
+        Some(busy) => Err(CliError::new(
+            exit::PRINTER_BUSY,
+            format!("printer is busy ({busy:?}); refusing to start a print"),
+        )),
+    }
+}
+
+fn job_control(cli: &Cli, cmd: ProtoCommand, confirm: bool) -> Result<(), CliError> {
+    if !confirm {
+        return Err(CliError::new(
+            exit::CONFIRM_REQUIRED,
+            "this control command needs --confirm",
+        ));
+    }
+    let client = connect_client(cli, 15)?;
+    report_command_outcome(client.send_and_verify(&cmd)?)
 }
 
 fn run_camera(cli: &Cli, action: &CameraAction) -> Result<(), CliError> {

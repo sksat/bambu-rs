@@ -59,6 +59,35 @@ fn unknown_explicit_printer_errors_instead_of_falling_back_to_env() {
 }
 
 #[test]
+fn job_start_dry_run_shows_payload_without_a_target() {
+    let cfg = tmp_cfg("job-dry");
+    // dry-run builds the payload only — no config/connection needed.
+    bambu(&cfg)
+        .args(["job", "start", "/cache/x.gcode.3mf", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("project_file"))
+        .stdout(predicate::str::contains("Metadata/plate_1.gcode"));
+    bambu(&cfg)
+        .args(["job", "start", "/cache/x.gcode", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("gcode_file"));
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[test]
+fn job_start_and_pause_need_confirm() {
+    let cfg = tmp_cfg("job-confirm");
+    bambu(&cfg)
+        .args(["job", "start", "/cache/x.gcode"])
+        .assert()
+        .code(4);
+    bambu(&cfg).args(["job", "pause"]).assert().code(4);
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[test]
 fn gcode_without_confirm_is_refused() {
     let cfg = tmp_cfg("gcode-noconfirm");
     bambu(&cfg).args(["gcode", "G28"]).assert().code(4); // CONFIRM_REQUIRED
