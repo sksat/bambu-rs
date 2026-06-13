@@ -563,8 +563,12 @@ fn watch_to_terminal(
                 },
                 None => "-".to_string(),
             };
+            let eta = match st.remaining_time_min.filter(|m| *m > 0) {
+                Some(m) => format!("  ETA {}", fmt_eta(m)),
+                None => String::new(),
+            };
             eprintln!(
-                "{:<8} {:>3}%  layer {}/{}  N{} B{}{stage}{err}",
+                "{:<8} {:>3}%  layer {}/{}  N{} B{}{eta}{stage}{err}",
                 st.gcode_state.as_deref().unwrap_or("?"),
                 st.mc_percent.unwrap_or(0),
                 st.layer_num.unwrap_or(0),
@@ -980,7 +984,33 @@ fn print_status_human(o: &StatusOutput) {
     if let Some(p) = s.mc_percent {
         let layer = s.layer_num.unwrap_or(0);
         let total = s.total_layer_num.unwrap_or(0);
-        println!("progress: {p}% (layer {layer}/{total})");
+        let eta = match s.remaining_time_min.filter(|m| *m > 0) {
+            Some(m) => format!(", ETA {}", fmt_eta(m)),
+            None => String::new(),
+        };
+        println!("progress: {p}% (layer {layer}/{total}{eta})");
+    }
+}
+
+/// Format a remaining-time estimate in minutes as `15m` or `1h35m`.
+fn fmt_eta(min: i64) -> String {
+    if min >= 60 {
+        format!("{}h{:02}m", min / 60, min % 60)
+    } else {
+        format!("{min}m")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fmt_eta;
+
+    #[test]
+    fn eta_formats_minutes_and_hours() {
+        assert_eq!(fmt_eta(15), "15m");
+        assert_eq!(fmt_eta(59), "59m");
+        assert_eq!(fmt_eta(60), "1h00m");
+        assert_eq!(fmt_eta(95), "1h35m");
     }
 }
 
