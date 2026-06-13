@@ -928,8 +928,9 @@ fn report_command_outcome(outcome: CommandOutcome) -> Result<(), CliError> {
             stage: VerifyStage::Effect,
         } => Err(CliError::new(
             exit::VERIFY_TIMEOUT,
-            "command was acknowledged but its effect was never observed \
-             (e.g. the print did not start); unverified — check `bambu status`",
+            "command was acknowledged but its effect never showed in the report \
+             (the printer's state didn't change — e.g. a print that won't start \
+             or a light that won't switch); unverified — check `bambu status`",
         )),
     }
 }

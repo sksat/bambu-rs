@@ -43,6 +43,7 @@ pub fn has_observable_effect(cmd: &Command) -> bool {
             | Command::Pause
             | Command::Resume
             | Command::Stop
+            | Command::ChamberLight(_)
     )
 }
 
@@ -90,12 +91,17 @@ pub fn evaluate(
         }
         Command::Pause => state == Some(GcodeState::Pause),
         Command::Resume => state == Some(GcodeState::Running),
+        // The light is "set" only once `lights_report` actually shows the
+        // commanded mode — the `ledctrl` ACK alone is not enough (a faulty unit
+        // ACKs but `lights_report` stays unchanged).
+        Command::ChamberLight(on) => {
+            let want = if *on { "on" } else { "off" };
+            status.chamber_light.as_deref() == Some(want)
+        }
         // Stop is handled above (terminal-state check, error-tolerant).
         Command::Stop => unreachable!("Stop handled before the new-error check"),
         // No observable state effect — caller should not use evaluate() for these.
-        Command::PushAll | Command::GcodeLine(_) | Command::ChamberLight(_) | Command::Reboot => {
-            false
-        }
+        Command::PushAll | Command::GcodeLine(_) | Command::Reboot => false,
     };
 
     if observed {
@@ -131,10 +137,35 @@ mod tests {
             vibration: false,
             motor_noise: false
         }));
+        // The light is effectful — verified via lights_report, not just the ACK.
+        assert!(has_observable_effect(&Command::ChamberLight(true)));
         // ACK-only commands:
         assert!(!has_observable_effect(&Command::GcodeLine("G28".into())));
-        assert!(!has_observable_effect(&Command::ChamberLight(true)));
         assert!(!has_observable_effect(&Command::PushAll));
+        assert!(!has_observable_effect(&Command::Reboot));
+    }
+
+    #[test]
+    fn chamber_light_effect_reads_lights_report_not_the_ack() {
+        let lit = |mode: &str| PrinterStatus {
+            chamber_light: Some(mode.to_string()),
+            ..Default::default()
+        };
+        // light on: observed only when lights_report actually shows "on".
+        assert_eq!(
+            evaluate(&Command::ChamberLight(true), &lit("on"), Some(0)),
+            EffectStatus::Observed
+        );
+        // Faulty unit: ledctrl ACKed but lights_report stays "off" -> pending
+        // (→ unverified on timeout), never a false "verified".
+        assert_eq!(
+            evaluate(&Command::ChamberLight(true), &lit("off"), Some(0)),
+            EffectStatus::Pending
+        );
+        assert_eq!(
+            evaluate(&Command::ChamberLight(false), &lit("off"), Some(0)),
+            EffectStatus::Observed
+        );
     }
 
     #[test]

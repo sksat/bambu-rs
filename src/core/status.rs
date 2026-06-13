@@ -58,6 +58,11 @@ pub struct PrinterStatus {
     /// `ams.tray_now` → the matching AMS tray or the external spool. `None` when
     /// nothing is loaded or the report doesn't carry AMS data.
     pub filament: Option<Filament>,
+    /// Reported chamber-light mode (`on`/`off`) from `lights_report`. This is the
+    /// printer's *actual* light state — distinct from a `ledctrl` ACK, which only
+    /// confirms the command was accepted (observed: a faulty unit ACKs `ledctrl`
+    /// but `lights_report` stays `off`).
+    pub chamber_light: Option<String>,
 }
 
 /// The loaded filament a print draws from (resolved from `ams.tray_now`).
@@ -101,6 +106,13 @@ impl PrinterStatus {
             cooling_fan_speed: get("cooling_fan_speed").and_then(as_i64_loose),
             subtask_name: get("subtask_name").and_then(as_string),
             filament: print.and_then(resolve_filament),
+            chamber_light: get("lights_report")
+                .and_then(Value::as_array)
+                .and_then(|arr| {
+                    arr.iter()
+                        .find(|e| e.get("node").and_then(Value::as_str) == Some("chamber_light"))
+                })
+                .and_then(|e| e.get("mode").and_then(as_string)),
         }
     }
 
