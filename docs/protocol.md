@@ -150,6 +150,57 @@ A raw `gcode_line` (e.g. `G28`) executes but does **not** change
 `gcode_state`/`stg_cur` — those track print *jobs*. Verify it via the ACK
 (and, for a home, `home_flag`); raw coordinates are not in the report. **[observed]**
 
+**The ACK is necessary but not sufficient.** `result == "success"` only means the
+command was *accepted*. A real fault can still follow: observed on the A1 mini, a
+`project_file` ACKed `success` yet the print never started — `gcode_state` stayed
+`IDLE` and `print_error` became `0x0500C010` (a failing SD card). So for commands
+with an observable effect, also confirm the effect in the report and watch for a
+**new** `print_error` (capture the baseline before sending). `subtask_name` is
+**not** a reliable "started" signal — it updated to the new job even though the
+print never began. **[observed]** (see `src/core/verify.rs`)
+
+## Printing a job: on-printer file layout + `project_file`
+
+The printer's FTP root has, among others, two dirs that matter for printing
+**[observed]**:
+
+- `/cache` — Bambu Studio's upload area. Holds project `.3mf` *and* extracted
+  per-plate `*_plate_1.gcode` files.
+- `/model` — the user-visible model library: proper sliced `*.gcode.3mf`.
+
+A sliced `.gcode.3mf` is a zip containing `Metadata/plate_N.gcode`,
+`Metadata/plate_N.gcode.md5`, `Metadata/plate_N.json`, `3D/3dmodel.model`, plate
+PNGs, `project_settings.config`, etc. **[observed]**
+
+To start one: `print.project_file` with `url = ftp:///<dir>/<file>.gcode.3mf`,
+`param = Metadata/plate_N.gcode`, and the LAN ids set to `"0"`. A real print was
+started this way from `/model` with a **space-containing** url and `md5 = ""`
+(skip) — both accepted: `ftp:///model/Bed scraper by JernejP.gcode.3mf`.
+**[observed]**
+
+`print.gcode_file` (raw on-printer `.gcode`, e.g. a `*_plate_1.gcode`) was
+**rejected** on the A1 mini (`result: "fail", reason: "error string"`) across
+every param form tried (`/cache/…`, basename, short no-space name, `+url`).
+**But this test was confounded by the failing SD card** (all file reads were
+unreliable at the time), so whether `gcode_file` is genuinely unsupported on the
+A1 is **inconclusive** — retest on a healthy SD card before concluding. We do
+**not** register a "gcode_file unsupported" quirk. **[observed, inconclusive]**
+
+## Errors: `print_error` is a separate channel from HMS
+
+A device fault can surface via **`print_error`** (a single 32-bit code under
+`/print`) entirely independently of `hms[]`. A failing A1 mini SD card reported
+`print_error = 0x0500C010` (module `0x05` = mainboard/storage) while `hms` was
+`[]`. So a status view must surface `print_error` in its own right; rendered as
+`0x{:08X}`. `sdcard: true` means a card is *present*, not that it is healthy.
+We don't bundle a `print_error`→text table (same rationale as HMS). **[observed]**
+
+## FTP control/data both usable
+
+Beyond `LIST` + `STOR`, the A1 mini's implicit-FTPS server also supports
+`RNFR`/`RNTO` (rename, control-channel only) and `RETR` (download). Used during
+debugging to inspect on-printer files. **[observed]**
+
 ## HMS decode
 
 `hms[]` entries are `{attr, code}` 32-bit ints. Format
@@ -163,7 +214,10 @@ comes from Bambu's wiki, not a bundled table. **[spec]** (worked example
 
 ## Open questions
 
-- Exact `print.project_file` field encodings for a LAN SD print (RE-derived;
-  confirm by capturing a Bambu Studio → A1 mini session).
+- Is `print.gcode_file` genuinely unsupported on the A1 mini, or did the failing
+  SD card cause the rejection? Retest on a healthy SD card.
+- Does `project_file` require a matching `md5` on a healthy SD card, or is `""`
+  (skip) always accepted? (We only got to confirm the ACK; the SD fault stopped
+  the print before it ran.)
 - Camera TCP:6000 handshake details on the A1; per-AMS-variant codes.
 - `home_flag` bit layout (which bit = which axis).
