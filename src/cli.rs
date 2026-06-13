@@ -12,6 +12,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
+use crate::camera::{CameraClient, CameraError};
 use crate::client::{ClientError, CommandOutcome, LanMqttClient, StatusSource, WatchStep};
 use crate::config::{self, Config, ConfigError, Overrides, Profile, ResolvedTarget};
 use crate::core::command::Command as ProtoCommand;
@@ -80,6 +81,11 @@ enum Command {
         #[command(subcommand)]
         action: FileAction,
     },
+    /// Camera operations (A1/P1 chamber-image stream).
+    Camera {
+        #[command(subcommand)]
+        action: CameraAction,
+    },
     /// Turn the chamber/work light on or off (control test; low-risk).
     Light {
         /// "on" or "off".
@@ -122,6 +128,19 @@ enum ConfigAction {
     List,
     /// Show a profile (access code redacted).
     Show,
+}
+
+#[derive(Subcommand)]
+enum CameraAction {
+    /// Grab one JPEG frame and write it to a file.
+    Snapshot {
+        /// Output file path.
+        #[arg(long, default_value = "snapshot.jpg")]
+        out: std::path::PathBuf,
+        /// Give up after this many seconds.
+        #[arg(long, default_value_t = 10)]
+        timeout: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -182,6 +201,12 @@ impl From<FtpError> for CliError {
     }
 }
 
+impl From<CameraError> for CliError {
+    fn from(e: CameraError) -> Self {
+        CliError::new(exit::TRANSPORT, e.to_string())
+    }
+}
+
 /// Entry point. Parses args, dispatches, and maps errors to exit codes.
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
@@ -203,6 +228,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             timeout,
         } => run_watch(cli, *exit_status, *timeout),
         Command::File { action } => run_file(cli, action),
+        Command::Camera { action } => run_camera(cli, action),
         Command::Light { state, timeout } => run_light(cli, state == "on", *timeout),
         Command::Gcode {
             line,
@@ -406,6 +432,30 @@ fn run_file(cli: &Cli, action: &FileAction) -> Result<(), CliError> {
             let remote = format!("{}/{filename}", dest.trim_end_matches('/'));
             let n = ftps.upload(local, &remote)?;
             eprintln!("uploaded {n} bytes to {remote}");
+            Ok(())
+        }
+    }
+}
+
+fn run_camera(cli: &Cli, action: &CameraAction) -> Result<(), CliError> {
+    match action {
+        CameraAction::Snapshot { out, timeout } => {
+            let camera =
+                CameraClient::new(resolve_target(cli)?).with_timeout(Duration::from_secs(*timeout));
+            let jpeg = camera.snapshot()?;
+            std::fs::write(out, &jpeg).map_err(|e| {
+                CliError::new(exit::GENERAL, format!("write {}: {e}", out.display()))
+            })?;
+            eprintln!("wrote {} bytes", jpeg.len());
+            if want_json(cli) {
+                print_json(&serde_json::json!({
+                    "path": out.to_string_lossy(),
+                    "bytes": jpeg.len(),
+                }));
+            } else {
+                // The file path is the result (never inline image bytes).
+                println!("{}", out.display());
+            }
             Ok(())
         }
     }

@@ -16,6 +16,7 @@
 //! Mode** (since the Jan-2025 Authorization Control System); read-only
 //! telemetry is broadly available.
 
+pub mod camera;
 #[cfg(feature = "cli")]
 pub mod cli;
 pub mod client;
