@@ -9,6 +9,7 @@ pub mod firmware;
 pub mod hms;
 pub mod model;
 pub mod report;
+pub mod safety;
 pub mod stage;
 pub mod status;
 pub mod verify;

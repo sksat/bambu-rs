@@ -22,6 +22,7 @@ use crate::core::command::{
     Command as ProtoCommand, LedNode, ProjectFile, SpeedLevel, TimelapseControl,
 };
 use crate::core::report::ReportState;
+use crate::core::safety::{self, GcodeVerdict, TempLimits};
 use crate::core::stage::Stage;
 use crate::core::status::{GcodeState, PrinterStatus};
 use crate::core::version::Module;
@@ -162,6 +163,9 @@ enum Command {
         /// Required to actually send a control command.
         #[arg(long)]
         confirm: bool,
+        /// Override the static safety check (over-limit temps, cold extrusion).
+        #[arg(long)]
+        force: bool,
         /// Watch the report for this many seconds after sending.
         #[arg(long, default_value_t = 30)]
         timeout: u64,
@@ -449,8 +453,9 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
         Command::Gcode {
             line,
             confirm,
+            force,
             timeout,
-        } => run_gcode(cli, line, *confirm, *timeout),
+        } => run_gcode(cli, line, *confirm, *force, *timeout),
         Command::Reboot { confirm } => run_reboot(cli, *confirm),
     }
 }
@@ -986,11 +991,27 @@ fn run_reboot(cli: &Cli, confirm: bool) -> Result<(), CliError> {
     Ok(())
 }
 
-fn run_gcode(cli: &Cli, line: &str, confirm: bool, timeout_secs: u64) -> Result<(), CliError> {
+fn run_gcode(
+    cli: &Cli,
+    line: &str,
+    confirm: bool,
+    force: bool,
+    timeout_secs: u64,
+) -> Result<(), CliError> {
     if !confirm {
         return Err(CliError::new(
             exit::CONFIRM_REQUIRED,
             "refusing to send a control command without --confirm",
+        ));
+    }
+    // Static safety guard: block recognised-dangerous lines (over-limit temps,
+    // cold extrusion) unless explicitly overridden with --force.
+    if !force
+        && let GcodeVerdict::Block(reason) = safety::check_gcode(line, &TempLimits::default())
+    {
+        return Err(CliError::new(
+            exit::VALIDATION,
+            format!("refusing unsafe G-code: {reason}"),
         ));
     }
     let client = connect_client(cli, timeout_secs)?;
