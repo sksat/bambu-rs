@@ -289,13 +289,30 @@ Two caveats, both observed when we used it to recover a wedged SD mount:
   reboot is a *transient* clear, not a fix; a recurring `0x0500C010` means the
   SD card needs reseating/reformatting/replacing.
 
-## FTP control/data both usable
+## FTP capabilities (implicit-FTPS, port 990)
 
-Beyond `LIST` + `STOR`, the A1 mini's implicit-FTPS server also supports
-`RNFR`/`RNTO` (rename, control-channel only) and `RETR` (download). `RETR` backs
-`bambu file download` / `bambu timelapse get` — verified by downloading a real
-`*.gcode.3mf` byte-identical (valid zip, plate gcode intact). `DELE` backs
-`bambu file rm` (standard, not yet device-exercised here). **[observed]**
+Probed on the real A1 mini. `RETR` backs `bambu file download` / `bambu timelapse
+get` — verified byte-identical on a real `*.gcode.3mf`. **[observed]**
+
+| command | works? | notes |
+| --- | --- | --- |
+| `LIST` | ✓ | full `UNIX L8` listing (perms, size, `Mon DD HH:MM` date) |
+| `NLST` | ✓ | names only (`bambu file ls`) |
+| `SIZE` | ✓ | byte size (e.g. `92763`) |
+| `MDTM` | ✓ | mtime, e.g. `20260613181134` |
+| `RETR` | ✓ | **whole-file only** (see `REST`) |
+| `STOR` | ✓ | upload |
+| `DELE` | ✓ | delete |
+| `RNFR`/`RNTO` | ✓ | rename (control-channel only) |
+| `MKD` / `RMD` | ✓ | mkdir / rmdir |
+| `SYST` | ✓ | `215 UNIX Type: L8` |
+| `FEAT` | ✗ | `502 no-features` |
+| `REST` | ✗ | `502` — **no resume / no ranged reads**, so RETR can't seek |
+
+Implication for a would-be **FUSE** mount: directory + metadata ops are fully
+covered (`LIST`/`SIZE`/`MDTM`), as are create/delete/rename/mkdir. The one gap is
+`REST`: no random access, so `read`/`write` must be **whole-file** (cache on open,
+write on close) — fine for managing `.3mf`/timelapse files, not for partial I/O.
 
 ## HMS decode
 
