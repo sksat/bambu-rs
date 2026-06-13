@@ -1,0 +1,30 @@
+[package]
+name = "bambu-rs"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Clean-room, agent-friendly library and CLI for Bambu Lab 3D printers (LAN mode)"
+license = "MIT"
+repository = "https://github.com/sksat/bambu-rs"
+readme = "README.md"
+keywords = ["bambulab", "3d-printing", "mqtt", "cli", "printer"]
+categories = ["command-line-utilities", "api-bindings"]
+
+# Reusable library is the first-class artifact; the `bambu` CLI is its first consumer.
+[lib]
+name = "bambu_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bambu"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+# CLI-only dependencies (clap, etc.) are gated here so library-only consumers don't pull them.
+cli = []
+
+[dependencies]
+
+[dev-dependencies]

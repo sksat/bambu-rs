@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local secrets / captured real-device fixtures that may contain access codes
+/.bambu-local
+/captures
