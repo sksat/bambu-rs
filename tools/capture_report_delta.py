@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.9"
+# dependencies = []
+# ///
 """Capture the pushall snapshot AND every subsequent report delta over a window.
 
 Read-only — sends one `pushall`, then just records what the printer pushes. Use

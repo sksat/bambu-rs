@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.9"
+# dependencies = []
+# ///
+"""Clean-room capture of `info.get_version` (stdlib only, read-only)."""
 import socket, ssl, os, json, sys, time
 IP=os.environ["BAMBU_IP"]; SERIAL=os.environ["BAMBU_SERIAL"]; CODE=os.environ["BAMBU_CODE"]
 def elen(n):

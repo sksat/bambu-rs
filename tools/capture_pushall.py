@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.9"
+# dependencies = []
+# ///
 """Minimal clean-room MQTT-over-TLS client: connect, subscribe, send one
 `pushall`, capture the report snapshot. Read-only — no control commands.
 
