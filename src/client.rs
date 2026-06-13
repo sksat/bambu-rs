@@ -32,7 +32,7 @@ pub enum ClientError {
     Tls(String),
     #[error("MQTT error: {0}")]
     Mqtt(String),
-    #[error("timed out after {0:?} waiting for a status snapshot")]
+    #[error("timed out after {0:?} (no snapshot, ACK, or terminal state in time)")]
     Timeout(Duration),
     #[error("async runtime error: {0}")]
     Runtime(String),
