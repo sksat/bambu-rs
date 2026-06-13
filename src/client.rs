@@ -163,18 +163,30 @@ impl LanMqttClient {
         &self,
         interval: Option<Duration>,
         reconnect: bool,
+        stall: Option<Duration>,
         mut on_update: F,
     ) -> Result<ReportState, ClientError> {
         // Merged state persists across reconnects so a continuous monitor keeps
         // a coherent picture through a printer reboot / Wi-Fi blip.
         let mut state = ReportState::new();
+        // Stall deadline (continuous monitor only): give up if no report arrives
+        // within `stall`, but reset it on every report — so a responsive printer
+        // is watched indefinitely while a truly-gone one is dropped after the
+        // window (reconnect attempts do NOT reset it).
+        let mut deadline = stall.map(|d| tokio::time::Instant::now() + d);
+        let stalled =
+            |dl: Option<tokio::time::Instant>| dl.is_some_and(|d| tokio::time::Instant::now() >= d);
+
         'reconnect: loop {
             let (client, mut eventloop) = match self.connect().await {
                 Ok(c) => c,
                 Err(e) => {
-                    if reconnect {
+                    if reconnect && !stalled(deadline) {
                         tokio::time::sleep(RECONNECT_DELAY).await;
                         continue 'reconnect;
+                    }
+                    if reconnect {
+                        return Ok(state); // stalled out while reconnecting
                     }
                     return Err(e);
                 }
@@ -195,31 +207,44 @@ impl LanMqttClient {
             }
 
             loop {
-                let polled = match ticker.as_mut() {
-                    Some(t) => tokio::select! {
-                        ev = poll(&mut eventloop) => ev,
-                        _ = t.tick() => {
-                            let _ = client
-                                .publish(
-                                    request_topic(&self.target.serial),
-                                    QoS::AtMostOnce,
-                                    false,
-                                    Command::PushAll.to_payload("0").to_string(),
-                                )
-                                .await;
-                            continue;
-                        }
+                // One step: a report (Some(Ok)), a connection error (Some(Err)),
+                // or a ticker fire that sent a pushall and yielded no data (None).
+                let step = async {
+                    match ticker.as_mut() {
+                        Some(t) => tokio::select! {
+                            ev = poll(&mut eventloop) => Some(ev),
+                            _ = t.tick() => {
+                                let _ = client
+                                    .publish(
+                                        request_topic(&self.target.serial),
+                                        QoS::AtMostOnce,
+                                        false,
+                                        Command::PushAll.to_payload("0").to_string(),
+                                    )
+                                    .await;
+                                None
+                            }
+                        },
+                        None => Some(poll(&mut eventloop).await),
+                    }
+                };
+                let polled = match deadline {
+                    Some(dl) => match tokio::time::timeout_at(dl, step).await {
+                        Ok(v) => v,
+                        Err(_) => return Ok(state), // no report within the stall window
                     },
-                    None => poll(&mut eventloop).await,
+                    None => step.await,
                 };
                 let ev = match polled {
-                    Ok(ev) => ev,
-                    // Connection dropped: a continuous monitor reconnects and
-                    // carries on; a to-terminal watch surfaces the error.
-                    Err(e) => {
-                        if reconnect {
+                    None => continue, // ticker fired (sent pushall), not data
+                    Some(Ok(ev)) => ev,
+                    Some(Err(e)) => {
+                        if reconnect && !stalled(deadline) {
                             tokio::time::sleep(RECONNECT_DELAY).await;
                             continue 'reconnect;
+                        }
+                        if reconnect {
+                            return Ok(state);
                         }
                         return Err(e);
                     }
@@ -228,6 +253,7 @@ impl LanMqttClient {
                     && let Ok(json) = serde_json::from_slice::<Value>(&p.payload)
                 {
                     state.apply(json);
+                    deadline = stall.map(|d| tokio::time::Instant::now() + d); // responsive: reset
                     if state.pointer("/print").is_some()
                         && matches!(on_update(&state), WatchStep::Stop)
                     {
@@ -238,20 +264,33 @@ impl LanMqttClient {
         }
     }
 
-    /// Watch the printer, invoking `on_update` on every merged report until it
-    /// returns [`WatchStep::Stop`], or the (total) timeout elapses. With
-    /// `interval` set, also send a periodic `pushall` to raise the data rate
-    /// (`None` listens passively). With `reconnect`, a dropped connection is
-    /// retried (re-subscribe + re-pushall) instead of erroring — for a
-    /// continuous monitor that should survive a printer reboot / Wi-Fi blip;
-    /// pass `false` to fail fast when watching a job to completion.
+    /// Watch a job **to completion**: invoke `on_update` on every merged report
+    /// until it returns [`WatchStep::Stop`], or the total `timeout` elapses
+    /// (fail-fast — a dropped connection errors). With `interval` set, also send
+    /// a periodic `pushall` to raise the data rate. For `job start --watch`.
     pub fn watch<F: FnMut(&ReportState) -> WatchStep>(
         &self,
         interval: Option<Duration>,
-        reconnect: bool,
         on_update: F,
     ) -> Result<ReportState, ClientError> {
-        self.run_with_timeout(self.watch_async(interval, reconnect, on_update))
+        self.run_with_timeout(self.watch_async(interval, false, None, on_update))
+    }
+
+    /// Continuously monitor: like [`watch`](Self::watch) but **never stops on
+    /// its own** and **auto-reconnects** through drops. `timeout` is a *stall*
+    /// window — it ends only after no report arrives for that long (reset on
+    /// every report), so a responsive printer is watched indefinitely while a
+    /// truly-gone one is dropped after the window. For `status --watch`.
+    pub fn monitor<F: FnMut(&ReportState) -> WatchStep>(
+        &self,
+        interval: Option<Duration>,
+        on_update: F,
+    ) -> Result<ReportState, ClientError> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| ClientError::Runtime(e.to_string()))?;
+        rt.block_on(self.watch_async(interval, true, Some(self.timeout), on_update))
     }
 
     async fn send_and_watch_async<F: FnMut(&ReportState) -> WatchStep>(

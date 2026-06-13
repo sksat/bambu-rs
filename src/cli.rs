@@ -18,6 +18,7 @@ use crate::client::{
 };
 use crate::config::{self, Config, ConfigError, Overrides, Profile, ResolvedTarget};
 use crate::core::command::{Command as ProtoCommand, ProjectFile};
+use crate::core::report::ReportState;
 use crate::core::stage::Stage;
 use crate::core::status::{GcodeState, PrinterStatus};
 use crate::ftp::{FtpError, FtpsClient};
@@ -80,9 +81,9 @@ enum Command {
         /// data rate, like Bambu Studio. Default: passive (printer's ~2s push).
         #[arg(long)]
         interval: Option<u64>,
-        /// With --watch, stop after this many seconds (default 1h; or Ctrl-C).
-        /// Drops are auto-reconnected within this budget.
-        #[arg(long, default_value_t = 3600)]
+        /// With --watch, give up only after NO report for this many seconds
+        /// (resets while the printer responds; drops auto-reconnect). Default 2m.
+        #[arg(long, default_value_t = 120)]
         timeout: u64,
     },
     /// Decode the active HMS (Health Management System) alerts.
@@ -527,8 +528,7 @@ fn watch_to_terminal(
     continuous: bool,
 ) -> Result<(), CliError> {
     let mut last: Option<WatchKey> = None;
-    // A continuous monitor reconnects through drops; a to-terminal watch fails fast.
-    let result = client.watch(interval, continuous, |state| {
+    let mut on_update = |state: &ReportState| -> WatchStep {
         let st = PrinterStatus::from_state(state.get());
         let key = WatchKey {
             gcode_state: st.gcode_state.clone(),
@@ -597,14 +597,21 @@ fn watch_to_terminal(
             Some(s) if is_watch_terminal(s) => WatchStep::Stop,
             _ => WatchStep::Continue,
         }
-    });
-
-    let final_state = match result {
-        Ok(fs) => fs,
-        // The continuous monitor ends only via its timeout (or Ctrl-C): not a failure.
-        Err(ClientError::Timeout(_)) if continuous => return Ok(()),
-        Err(e) => return Err(e.into()),
     };
+
+    // status --watch monitors (reconnects, stall timeout); job start --watch
+    // watches a job to completion (fail-fast).
+    let result = if continuous {
+        client.monitor(interval, &mut on_update)
+    } else {
+        client.watch(interval, &mut on_update)
+    };
+    let final_state = result?;
+    // The monitor's per-change lines were the output; it ends only via its
+    // stall window (or Ctrl-C) — nothing more to print, no exit codes.
+    if continuous {
+        return Ok(());
+    }
 
     let status = PrinterStatus::from_state(final_state.get());
     let error = status.error.clone();
