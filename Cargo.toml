@@ -2,7 +2,10 @@
 name = "bambu-rs"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.85.1"
+# MSRV: 1.88.0 — the code uses `let` chains (`if let … && let …`), stabilised in
+# 1.88. Enforced by the `msrv` CI job. (Bumping this may free newer deps, e.g.
+# zip 8.x needs 1.88.)
+rust-version = "1.88.0"
 description = "Clean-room, agent-friendly library and CLI for Bambu Lab 3D printers (LAN mode)"
 license = "MIT"
 repository = "https://github.com/sksat/bambu-rs"

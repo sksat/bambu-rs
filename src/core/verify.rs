@@ -218,7 +218,9 @@ mod tests {
             evaluate(&Command::PrintSpeed(SpeedLevel::Sport), &at(2), Some(0)),
             EffectStatus::Pending
         );
-        assert!(has_observable_effect(&Command::PrintSpeed(SpeedLevel::Silent)));
+        assert!(has_observable_effect(&Command::PrintSpeed(
+            SpeedLevel::Silent
+        )));
     }
 
     #[test]

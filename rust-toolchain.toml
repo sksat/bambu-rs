@@ -1,0 +1,8 @@
+# Pin everyone (local dev + CI) to an exact stable toolchain for reproducible
+# builds and a consistent rustfmt/clippy. An explicit version (not the moving
+# `stable` channel) is the point — bump it deliberately. The MSRV (Cargo.toml
+# `rust-version`) is enforced separately by the `msrv` CI job, which overrides
+# this via RUSTUP_TOOLCHAIN to build on the supported floor.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]

@@ -456,8 +456,14 @@ mod tests {
         assert_eq!(ic.resolution.as_deref(), Some("1080p"));
         assert_eq!(st.timelapse_mode(), Some("disable"));
         // No ipcam node -> None.
-        assert_eq!(PrinterStatus::from_state(&json!({ "print": {} })).ipcam, None);
-        assert_eq!(PrinterStatus::from_state(&json!({ "print": {} })).timelapse_mode(), None);
+        assert_eq!(
+            PrinterStatus::from_state(&json!({ "print": {} })).ipcam,
+            None
+        );
+        assert_eq!(
+            PrinterStatus::from_state(&json!({ "print": {} })).timelapse_mode(),
+            None
+        );
     }
 
     #[test]

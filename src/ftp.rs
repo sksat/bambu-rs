@@ -117,7 +117,9 @@ impl FtpsClient {
     /// Delete `remote_path` on the printer (FTP `DELE`).
     pub fn delete(&self, remote_path: &str) -> Result<(), FtpError> {
         let mut ftp = self.connect()?;
-        let result = ftp.rm(remote_path).map_err(|e| FtpError::Ftp(e.to_string()));
+        let result = ftp
+            .rm(remote_path)
+            .map_err(|e| FtpError::Ftp(e.to_string()));
         let _ = ftp.quit();
         result
     }
@@ -129,7 +131,10 @@ mod tests {
 
     #[test]
     fn part_path_is_a_sibling_with_a_part_suffix() {
-        assert_eq!(part_path(Path::new("/tmp/v.mp4")), Path::new("/tmp/v.mp4.part"));
+        assert_eq!(
+            part_path(Path::new("/tmp/v.mp4")),
+            Path::new("/tmp/v.mp4.part")
+        );
         assert_eq!(part_path(Path::new("out.jpg")), Path::new("out.jpg.part"));
     }
 }

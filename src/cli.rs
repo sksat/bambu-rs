@@ -1042,10 +1042,19 @@ fn run_light(cli: &Cli, on: bool, node: &str, timeout_secs: u64) -> Result<(), C
     let node = match node {
         "chamber" => LedNode::ChamberLight,
         "work" => LedNode::WorkLight,
-        other => return Err(CliError::new(exit::VALIDATION, format!("unknown light {other:?}"))),
+        other => {
+            return Err(CliError::new(
+                exit::VALIDATION,
+                format!("unknown light {other:?}"),
+            ));
+        }
     };
     let client = connect_client(cli, timeout_secs)?;
-    eprintln!("setting {} {} …", node.as_str(), if on { "on" } else { "off" });
+    eprintln!(
+        "setting {} {} …",
+        node.as_str(),
+        if on { "on" } else { "off" }
+    );
     report_command_outcome(client.send_and_verify(&ProtoCommand::Led { node, on })?)
 }
 
@@ -1055,10 +1064,19 @@ fn run_speed(cli: &Cli, level: &str, timeout_secs: u64) -> Result<(), CliError> 
         "standard" => SpeedLevel::Standard,
         "sport" => SpeedLevel::Sport,
         "ludicrous" => SpeedLevel::Ludicrous,
-        other => return Err(CliError::new(exit::VALIDATION, format!("unknown speed {other:?}"))),
+        other => {
+            return Err(CliError::new(
+                exit::VALIDATION,
+                format!("unknown speed {other:?}"),
+            ));
+        }
     };
     let client = connect_client(cli, timeout_secs)?;
-    eprintln!("setting print speed to {} (level {}) …", level.as_str(), level.level());
+    eprintln!(
+        "setting print speed to {} (level {}) …",
+        level.as_str(),
+        level.level()
+    );
     report_command_outcome(client.send_and_verify(&ProtoCommand::PrintSpeed(level))?)
 }
 
@@ -1095,8 +1113,7 @@ fn run_gcode(
     }
     // Static safety guard: block recognised-dangerous lines (over-limit temps,
     // cold extrusion) unless explicitly overridden with --force.
-    if !force
-        && let GcodeVerdict::Block(reason) = safety::check_gcode(line, &TempLimits::default())
+    if !force && let GcodeVerdict::Block(reason) = safety::check_gcode(line, &TempLimits::default())
     {
         return Err(CliError::new(
             exit::VALIDATION,
@@ -1402,27 +1419,37 @@ fn ensure_idle(cli: &Cli) -> Result<(), CliError> {
 
 fn run_ams(cli: &Cli, action: &AmsAction) -> Result<(), CliError> {
     // Helper: a plain control command gated on --confirm (ACK-verified).
-    let control = |cli: &Cli, cmd: ProtoCommand, confirm: bool, what: &str| -> Result<(), CliError> {
-        if !confirm {
-            return Err(CliError::new(
-                exit::CONFIRM_REQUIRED,
-                format!("{what} needs --confirm"),
-            ));
-        }
-        let client = connect_client(cli, 15)?;
-        eprintln!("{what} … (AMS commands are [spec]; the ACK confirms acceptance)");
-        report_command_outcome(client.send_and_verify(&cmd)?)
-    };
+    let control =
+        |cli: &Cli, cmd: ProtoCommand, confirm: bool, what: &str| -> Result<(), CliError> {
+            if !confirm {
+                return Err(CliError::new(
+                    exit::CONFIRM_REQUIRED,
+                    format!("{what} needs --confirm"),
+                ));
+            }
+            let client = connect_client(cli, 15)?;
+            eprintln!("{what} … (AMS commands are [spec]; the ACK confirms acceptance)");
+            report_command_outcome(client.send_and_verify(&cmd)?)
+        };
     match action {
-        AmsAction::Resume { confirm } => {
-            control(cli, ProtoCommand::AmsControl(AmsControl::Resume), *confirm, "ams resume")
-        }
-        AmsAction::Reset { confirm } => {
-            control(cli, ProtoCommand::AmsControl(AmsControl::Reset), *confirm, "ams reset")
-        }
-        AmsAction::Pause { confirm } => {
-            control(cli, ProtoCommand::AmsControl(AmsControl::Pause), *confirm, "ams pause")
-        }
+        AmsAction::Resume { confirm } => control(
+            cli,
+            ProtoCommand::AmsControl(AmsControl::Resume),
+            *confirm,
+            "ams resume",
+        ),
+        AmsAction::Reset { confirm } => control(
+            cli,
+            ProtoCommand::AmsControl(AmsControl::Reset),
+            *confirm,
+            "ams reset",
+        ),
+        AmsAction::Pause { confirm } => control(
+            cli,
+            ProtoCommand::AmsControl(AmsControl::Pause),
+            *confirm,
+            "ams pause",
+        ),
         AmsAction::Change {
             tray,
             tar_temp,
@@ -1760,10 +1787,9 @@ fn run_timelapse_capture(
             {
                 last_layer = Some(layer);
                 // Capture on every Nth layer (layer 0 = the first reported layer).
-                if layer >= 0 && (layer as u64) % every == 0 {
+                if layer >= 0 && (layer as u64).is_multiple_of(every) {
                     frame_no += 1;
-                    let frame =
-                        out_dir.join(format!("frame_{frame_no:06}_layer_{layer:05}.{ext}"));
+                    let frame = out_dir.join(format!("frame_{frame_no:06}_layer_{layer:05}.{ext}"));
                     // Enqueue; the worker captures. send fails only if the worker
                     // died, which we surface via the join below.
                     let _ = tx.send((frame, layer));
@@ -2004,10 +2030,10 @@ fn print_status_human(o: &StatusOutput) {
     }
     // Show the current activity only when it's a real special stage; the
     // no-stage markers (0 / 255) just echo idle-or-printing.
-    if let (Some(stage), Some(id)) = (s.stage, s.stg_cur) {
-        if !Stage(id).is_no_stage() {
-            println!("stage:   {stage} ({id})");
-        }
+    if let (Some(stage), Some(id)) = (s.stage, s.stg_cur)
+        && !Stage(id).is_no_stage()
+    {
+        println!("stage:   {stage} ({id})");
     }
     if let Some(f) = &s.filament {
         let name = f.name.as_deref().or(f.material.as_deref()).unwrap_or("?");
@@ -2068,7 +2094,10 @@ mod tests {
             subst_capture_tokens("{outdir}/f_{layer}.jpg", "/t/frame.jpg", 42, "/t"),
             "/t/f_42.jpg"
         );
-        assert_eq!(subst_capture_tokens("{frame}", "/t/frame.jpg", 7, "/t"), "/t/frame.jpg");
+        assert_eq!(
+            subst_capture_tokens("{frame}", "/t/frame.jpg", 7, "/t"),
+            "/t/frame.jpg"
+        );
         // No tokens -> unchanged.
         assert_eq!(subst_capture_tokens("-r", "/f.jpg", 1, "/t"), "-r");
     }

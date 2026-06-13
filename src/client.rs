@@ -585,8 +585,10 @@ async fn poll(eventloop: &mut EventLoop) -> Result<Event, ClientError> {
 /// Missing `msg` falls back to the command check (older firmware may omit it).
 fn is_full_message(message: &Value) -> bool {
     let print = message.get("print");
-    let is_push_status =
-        print.and_then(|p| p.get("command")).and_then(|v| v.as_str()) == Some("push_status");
+    let is_push_status = print
+        .and_then(|p| p.get("command"))
+        .and_then(|v| v.as_str())
+        == Some("push_status");
     let msg = print.and_then(|p| p.get("msg")).and_then(|v| v.as_i64());
     is_push_status && msg.is_none_or(|m| m == 0)
 }

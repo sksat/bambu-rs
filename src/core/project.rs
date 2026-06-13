@@ -75,23 +75,27 @@ pub fn gcode_md5_hex(bytes: &[u8]) -> String {
     let mut hasher = Md5::new();
     hasher.update(bytes);
     // RustCrypto's digest output doesn't impl LowerHex, so hex-encode by hand.
-    hasher.finalize().iter().fold(String::with_capacity(32), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    hasher
+        .finalize()
+        .iter()
+        .fold(String::with_capacity(32), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// Inspect one plate of a `.gcode.3mf` given its raw ZIP bytes.
 pub fn inspect_plate(zip_bytes: &[u8], plate: u32) -> Result<PlateInspection, ProjectError> {
-    let mut archive =
-        zip::ZipArchive::new(Cursor::new(zip_bytes)).map_err(|e| ProjectError::InvalidZip(e.to_string()))?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes))
+        .map_err(|e| ProjectError::InvalidZip(e.to_string()))?;
 
     let gcode = read_entry(&mut archive, &format!("Metadata/plate_{plate}.gcode"))?
         .ok_or(ProjectError::PlateMissing(plate))?;
     let gcode_md5 = gcode_md5_hex(&gcode);
 
     // Optional sidecar checksum (cross-check only).
-    let sidecar_md5 = match read_entry(&mut archive, &format!("Metadata/plate_{plate}.gcode.md5"))? {
+    let sidecar_md5 = match read_entry(&mut archive, &format!("Metadata/plate_{plate}.gcode.md5"))?
+    {
         Some(raw) => {
             let token = String::from_utf8_lossy(&raw)
                 .split_whitespace()
@@ -222,7 +226,8 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut zip = zip::ZipWriter::new(Cursor::new(&mut buf));
-            let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            let opts =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
             for (name, bytes) in entries {
                 zip.start_file(*name, opts).unwrap();
                 zip.write_all(bytes).unwrap();
@@ -283,7 +288,10 @@ mod tests {
     fn mismatched_sidecar_is_flagged_not_fatal_and_computed_value_wins() {
         let zip = make_3mf(&[
             ("Metadata/plate_1.gcode", b"G28"),
-            ("Metadata/plate_1.gcode.md5", b"00000000000000000000000000000000"),
+            (
+                "Metadata/plate_1.gcode.md5",
+                b"00000000000000000000000000000000",
+            ),
         ]);
         let got = inspect_plate(&zip, 1).unwrap();
         assert!(!got.sidecar_matches);
@@ -321,7 +329,15 @@ mod tests {
             filament_colors: vec![],
         };
         // Uppercase + whitespace asserted value still matches.
-        assert!(verify_expectations(&inspection, 1, Some("  F4DC55FD36F79D26ACA4003E36B48D4F "), None).is_ok());
+        assert!(
+            verify_expectations(
+                &inspection,
+                1,
+                Some("  F4DC55FD36F79D26ACA4003E36B48D4F "),
+                None
+            )
+            .is_ok()
+        );
         // Wrong md5.
         assert!(matches!(
             verify_expectations(&inspection, 1, Some("deadbeef"), None),

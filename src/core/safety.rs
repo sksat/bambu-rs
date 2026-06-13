@@ -206,7 +206,10 @@ mod tests {
         // Trailing comment doesn't hide the setpoint.
         assert!(check_gcode("M104 S999 ; warmup", &limits()).is_blocked());
         // A comment that merely mentions a high number is not a setpoint.
-        assert_eq!(check_gcode("M104 S210 ; was S999", &limits()), GcodeVerdict::Allow);
+        assert_eq!(
+            check_gcode("M104 S210 ; was S999", &limits()),
+            GcodeVerdict::Allow
+        );
     }
 
     #[test]
