@@ -159,12 +159,45 @@ impl LanMqttClient {
 
     async fn watch_async<F: FnMut(&ReportState) -> WatchStep>(
         &self,
+        interval: Option<Duration>,
         mut on_update: F,
     ) -> Result<ReportState, ClientError> {
-        let (_client, mut eventloop) = self.connect().await?;
+        let (client, mut eventloop) = self.connect().await?;
         let mut state = ReportState::new();
+
+        // The printer's autonomous push is slow (~2s, small deltas). With an
+        // interval set, poll it like Bambu Studio does — send a periodic
+        // `pushall` to pull full snapshots (~1/s; the printer caps pushall there)
+        // for a higher data-acquisition rate.
+        let mut ticker = interval.map(|d| {
+            let mut t = tokio::time::interval(d);
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            t
+        });
+        // connect() already sent the first pushall; drop the immediate first tick.
+        if let Some(t) = ticker.as_mut() {
+            t.tick().await;
+        }
+
         loop {
-            if let Event::Incoming(Packet::Publish(p)) = poll(&mut eventloop).await?
+            let ev = match ticker.as_mut() {
+                Some(t) => tokio::select! {
+                    ev = poll(&mut eventloop) => ev?,
+                    _ = t.tick() => {
+                        let _ = client
+                            .publish(
+                                request_topic(&self.target.serial),
+                                QoS::AtMostOnce,
+                                false,
+                                Command::PushAll.to_payload("0").to_string(),
+                            )
+                            .await;
+                        continue;
+                    }
+                },
+                None => poll(&mut eventloop).await?,
+            };
+            if let Event::Incoming(Packet::Publish(p)) = ev
                 && let Ok(json) = serde_json::from_slice::<Value>(&p.payload)
             {
                 state.apply(json);
@@ -177,12 +210,15 @@ impl LanMqttClient {
     }
 
     /// Watch the printer, invoking `on_update` on every merged report until it
-    /// returns [`WatchStep::Stop`], or the timeout elapses.
+    /// returns [`WatchStep::Stop`], or the timeout elapses. With `interval` set,
+    /// also send a periodic `pushall` to raise the data rate (see the
+    /// [Studio-cadence finding](crate)); `None` listens passively.
     pub fn watch<F: FnMut(&ReportState) -> WatchStep>(
         &self,
+        interval: Option<Duration>,
         on_update: F,
     ) -> Result<ReportState, ClientError> {
-        self.run_with_timeout(self.watch_async(on_update))
+        self.run_with_timeout(self.watch_async(interval, on_update))
     }
 
     async fn send_and_watch_async<F: FnMut(&ReportState) -> WatchStep>(

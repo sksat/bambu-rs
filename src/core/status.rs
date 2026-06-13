@@ -132,6 +132,10 @@ pub struct DeviceError {
     pub code: i64,
     /// Conventional hex rendering, e.g. `0x0500C010`.
     pub hex: String,
+    /// Link to Bambu's official error-code resolver for this code (we don't
+    /// bundle a code→text table — sources conflict — so we point at the
+    /// authority instead, the same way [`crate::core::hms`] links to the wiki).
+    pub lookup_url: String,
 }
 
 impl DeviceError {
@@ -140,6 +144,10 @@ impl DeviceError {
         (code != 0).then(|| DeviceError {
             code,
             hex: format!("0x{:08X}", code as u32),
+            lookup_url: format!(
+                "https://e.bambulab.com/query.php?lang=en&e={:08X}",
+                code as u32
+            ),
         })
     }
 }
@@ -291,6 +299,10 @@ mod tests {
         let e = DeviceError::from_code(0x0500C010).unwrap();
         assert_eq!(e.code, 0x0500C010);
         assert_eq!(e.hex, "0x0500C010");
+        assert_eq!(
+            e.lookup_url,
+            "https://e.bambulab.com/query.php?lang=en&e=0500C010"
+        );
         // Zero is "no error".
         assert_eq!(DeviceError::from_code(0), None);
     }

@@ -54,7 +54,24 @@ pub fn evaluate(
     status: &PrinterStatus,
     baseline_print_error: Option<i64>,
 ) -> EffectStatus {
-    // A new, non-zero print_error overrides everything: the command did not
+    let state = status.state();
+
+    // Stop/abort is special: success == reaching a terminal state. Aborting a
+    // paused or already-errored job can transiently raise a `print_error` before
+    // it settles to FAILED, so a "new" error here must NOT mask the stop
+    // succeeding (observed: stop -> 0x0300400C -> then FAILED, print_error 0).
+    if matches!(cmd, Command::Stop) {
+        return if matches!(
+            state,
+            Some(GcodeState::Idle | GcodeState::Finish | GcodeState::Failed)
+        ) {
+            EffectStatus::Observed
+        } else {
+            EffectStatus::Pending
+        };
+    }
+
+    // For every other command, a new non-zero print_error means it did not
     // cleanly take effect.
     let current = status.print_error.unwrap_or(0);
     let baseline = baseline_print_error.unwrap_or(0);
@@ -62,7 +79,6 @@ pub fn evaluate(
         return EffectStatus::NewError(current);
     }
 
-    let state = status.state();
     let observed = match cmd {
         // A print start has "taken effect" once the job is being prepared or
         // run. (subtask_name is not trusted — see module docs.)
@@ -74,10 +90,8 @@ pub fn evaluate(
         }
         Command::Pause => state == Some(GcodeState::Pause),
         Command::Resume => state == Some(GcodeState::Running),
-        Command::Stop => matches!(
-            state,
-            Some(GcodeState::Idle | GcodeState::Finish | GcodeState::Failed)
-        ),
+        // Stop is handled above (terminal-state check, error-tolerant).
+        Command::Stop => unreachable!("Stop handled before the new-error check"),
         // No observable state effect — caller should not use evaluate() for these.
         Command::PushAll | Command::GcodeLine(_) | Command::ChamberLight(_) | Command::Reboot => {
             false
@@ -181,6 +195,22 @@ mod tests {
         // Wrong state -> still pending.
         assert_eq!(
             evaluate(&Command::Pause, &status("RUNNING", 0), Some(0)),
+            EffectStatus::Pending
+        );
+    }
+
+    #[test]
+    fn stop_tolerates_a_transient_abort_error() {
+        // Aborting a paused/errored job transiently raises a new print_error
+        // (0x0300400C) before it settles to FAILED. Reaching a terminal state is
+        // success — the transient error must NOT be reported as a failure.
+        assert_eq!(
+            evaluate(&Command::Stop, &status("FAILED", 0x0300400C), Some(0)),
+            EffectStatus::Observed
+        );
+        // Not terminal yet -> pending (keep waiting), still not NewError.
+        assert_eq!(
+            evaluate(&Command::Stop, &status("PAUSE", 0x0300400C), Some(0)),
             EffectStatus::Pending
         );
     }

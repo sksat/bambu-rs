@@ -86,6 +86,10 @@ enum Command {
         /// Give up after this many seconds (default 6h).
         #[arg(long, default_value_t = 21600)]
         timeout: u64,
+        /// Poll the printer every N seconds (sends `pushall`) for a higher data
+        /// rate, like Bambu Studio. Default: passive (printer's own ~2s push).
+        #[arg(long)]
+        interval: Option<u64>,
     },
     /// Transfer files to/from the printer over FTPS.
     File {
@@ -313,7 +317,8 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
         Command::Watch {
             exit_status,
             timeout,
-        } => run_watch(cli, *exit_status, *timeout),
+            interval,
+        } => run_watch(cli, *exit_status, *timeout, *interval),
         Command::Job { action } => run_job(cli, action),
         Command::File { action } => run_file(cli, action),
         Command::Camera { action } => run_camera(cli, action),
@@ -493,7 +498,12 @@ struct WatchKey {
     error: Option<i64>,
 }
 
-fn run_watch(cli: &Cli, exit_status: bool, timeout_secs: u64) -> Result<(), CliError> {
+fn run_watch(
+    cli: &Cli,
+    exit_status: bool,
+    timeout_secs: u64,
+    interval_secs: Option<u64>,
+) -> Result<(), CliError> {
     let cfg = Config::load_or_default(&config_path()?)?;
     let profile_name = selected_profile_name(cli, &cfg)?;
     let profile = profile_name.as_deref().and_then(|n| cfg.profile(n));
@@ -502,7 +512,8 @@ fn run_watch(cli: &Cli, exit_status: bool, timeout_secs: u64) -> Result<(), CliE
     let model = target.model.to_string();
 
     let client = LanMqttClient::new(target).with_timeout(Duration::from_secs(timeout_secs));
-    watch_to_terminal(&client, cli, model, profile_name, exit_status)
+    let interval = interval_secs.map(Duration::from_secs);
+    watch_to_terminal(&client, cli, model, profile_name, exit_status, interval)
 }
 
 /// Watch the printer to a terminal state, **or until a device error appears**,
@@ -516,9 +527,10 @@ fn watch_to_terminal(
     model: String,
     profile_name: Option<String>,
     exit_status: bool,
+    interval: Option<Duration>,
 ) -> Result<(), CliError> {
     let mut last: Option<WatchKey> = None;
-    let final_state = client.watch(|state| {
+    let final_state = client.watch(interval, |state| {
         let st = PrinterStatus::from_state(state.get());
         let key = WatchKey {
             gcode_state: st.gcode_state.clone(),
@@ -706,7 +718,7 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
                 eprintln!("print started; watching for completion / anomalies …");
                 let (model, profile_name) = watch_identity(cli)?;
                 let watcher = connect_client(cli, *watch_timeout)?;
-                watch_to_terminal(&watcher, cli, model, profile_name, true)
+                watch_to_terminal(&watcher, cli, model, profile_name, true, None)
             } else {
                 report_command_outcome(outcome)
             }
@@ -935,6 +947,7 @@ fn print_status_human(o: &StatusOutput) {
     // A device-level fault (print_error) is the most important thing to see.
     if let Some(err) = &s.error {
         println!("error:   ⚠ {} (print_error {})", err.hex, err.code);
+        println!("         {}", err.lookup_url);
     }
     // Show the current activity only when it's a real special stage; the
     // no-stage markers (0 / 255) just echo idle-or-printing.
