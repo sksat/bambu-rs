@@ -13,9 +13,10 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 
 use crate::client::{ClientError, CommandOutcome, LanMqttClient, StatusSource, WatchStep};
-use crate::config::{self, Config, ConfigError, Overrides, Profile};
+use crate::config::{self, Config, ConfigError, Overrides, Profile, ResolvedTarget};
 use crate::core::command::Command as ProtoCommand;
 use crate::core::status::{GcodeState, PrinterStatus};
+use crate::ftp::{FtpError, FtpsClient};
 
 /// Exit codes (a subset of the documented scheme).
 mod exit {
@@ -74,6 +75,11 @@ enum Command {
         #[arg(long, default_value_t = 21600)]
         timeout: u64,
     },
+    /// Transfer files to/from the printer over FTPS.
+    File {
+        #[command(subcommand)]
+        action: FileAction,
+    },
     /// Turn the chamber/work light on or off (control test; low-risk).
     Light {
         /// "on" or "off".
@@ -118,6 +124,23 @@ enum ConfigAction {
     Show,
 }
 
+#[derive(Subcommand)]
+enum FileAction {
+    /// List file names in a directory on the printer.
+    Ls {
+        #[arg(default_value = "/")]
+        dir: String,
+    },
+    /// Upload a local file to the printer.
+    Upload {
+        /// Local file to upload.
+        local: std::path::PathBuf,
+        /// Destination directory on the printer.
+        #[arg(long, default_value = "/cache")]
+        dest: String,
+    },
+}
+
 /// A CLI error carrying the exit code to return.
 struct CliError {
     code: u8,
@@ -153,6 +176,12 @@ impl From<ClientError> for CliError {
     }
 }
 
+impl From<FtpError> for CliError {
+    fn from(e: FtpError) -> Self {
+        CliError::new(exit::TRANSPORT, e.to_string())
+    }
+}
+
 /// Entry point. Parses args, dispatches, and maps errors to exit codes.
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
@@ -173,6 +202,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             exit_status,
             timeout,
         } => run_watch(cli, *exit_status, *timeout),
+        Command::File { action } => run_file(cli, action),
         Command::Light { state, timeout } => run_light(cli, state == "on", *timeout),
         Command::Gcode {
             line,
@@ -349,16 +379,47 @@ fn run_gcode(cli: &Cli, line: &str, confirm: bool, timeout_secs: u64) -> Result<
     report_command_outcome(client.send_and_verify(&ProtoCommand::GcodeLine(line.to_string()))?)
 }
 
-/// Resolve the target and build a client with the given timeout (shared setup
-/// for control commands, which don't need the profile name for output).
-fn connect_client(cli: &Cli, timeout_secs: u64) -> Result<LanMqttClient, CliError> {
+fn run_file(cli: &Cli, action: &FileAction) -> Result<(), CliError> {
+    let ftps = FtpsClient::new(resolve_target(cli)?);
+    match action {
+        FileAction::Ls { dir } => {
+            let names = ftps.list(dir)?;
+            if cli.json {
+                print_json(&names);
+            } else {
+                for name in &names {
+                    println!("{name}");
+                }
+            }
+            Ok(())
+        }
+        FileAction::Upload { local, dest } => {
+            let filename = local
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| CliError::new(exit::VALIDATION, "invalid local file name"))?;
+            let remote = format!("{}/{filename}", dest.trim_end_matches('/'));
+            let n = ftps.upload(local, &remote)?;
+            eprintln!("uploaded {n} bytes to {remote}");
+            Ok(())
+        }
+    }
+}
+
+/// Resolve a connection target from the selected profile + overrides.
+fn resolve_target(cli: &Cli) -> Result<ResolvedTarget, CliError> {
     let cfg = Config::load_or_default(&config_path()?)?;
     let profile = selected_profile_name(cli, &cfg)
         .ok()
         .and_then(|n| cfg.profile(&n).cloned());
     let overrides = flag_overrides(cli).over(Overrides::from_env());
-    let target = config::resolve(profile.as_ref(), &overrides)?;
-    Ok(LanMqttClient::new(target).with_timeout(Duration::from_secs(timeout_secs)))
+    Ok(config::resolve(profile.as_ref(), &overrides)?)
+}
+
+/// Resolve the target and build a client with the given timeout (shared setup
+/// for control commands).
+fn connect_client(cli: &Cli, timeout_secs: u64) -> Result<LanMqttClient, CliError> {
+    Ok(LanMqttClient::new(resolve_target(cli)?).with_timeout(Duration::from_secs(timeout_secs)))
 }
 
 /// Map a control command's verification outcome to output + an exit code.

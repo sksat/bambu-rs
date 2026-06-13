@@ -49,6 +49,13 @@ fn gcode_without_confirm_is_refused() {
 }
 
 #[test]
+fn file_ls_without_config_is_validation_error() {
+    let cfg = tmp_cfg("file-noconf");
+    bambu(&cfg).args(["file", "ls"]).assert().code(3); // VALIDATION (no target)
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[test]
 fn config_add_requires_a_printer_name() {
     let cfg = tmp_cfg("add-noname");
     bambu(&cfg)
