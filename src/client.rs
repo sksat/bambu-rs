@@ -22,6 +22,7 @@ use crate::core::command::{Command, SequenceIds};
 use crate::core::report::ReportState;
 use crate::core::status::PrinterStatus;
 use crate::core::verify::{self, EffectStatus};
+use crate::core::version::DeviceVersion;
 
 const MQTT_PORT: u16 = 8883;
 const MQTT_USER: &str = "bblp";
@@ -157,6 +158,42 @@ impl LanMqttClient {
                 }
             }
         }
+    }
+
+    async fn fetch_version_async(&self) -> Result<DeviceVersion, ClientError> {
+        // Hold `_client` so the event loop stays connected.
+        let (client, mut eventloop) = self.connect().await?;
+        // connect() used sequence id "0" for the pushall; get_version gets "1".
+        client
+            .publish(
+                request_topic(&self.target.serial),
+                QoS::AtLeastOnce,
+                false,
+                Command::GetVersion.to_payload("1").to_string(),
+            )
+            .await
+            .map_err(|e| ClientError::Mqtt(e.to_string()))?;
+
+        let mut state = ReportState::new();
+        loop {
+            if let Event::Incoming(Packet::Publish(p)) = poll(&mut eventloop).await?
+                && let Ok(json) = serde_json::from_slice::<Value>(&p.payload)
+            {
+                state.apply(json);
+                // The get_version response arrives under `/info` on the same
+                // report topic; wait for it (not the pushall that connect sent).
+                if let Some(info) = state.pointer("/info")
+                    && info.get("command").and_then(Value::as_str) == Some("get_version")
+                {
+                    return Ok(DeviceVersion::from_info(info));
+                }
+            }
+        }
+    }
+
+    /// Fetch the printer's module/firmware inventory (`info.get_version`).
+    pub fn fetch_version(&self) -> Result<DeviceVersion, ClientError> {
+        self.run_with_timeout(self.fetch_version_async())
     }
 
     async fn watch_async<F: FnMut(&ReportState) -> WatchStep>(

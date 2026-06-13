@@ -175,6 +175,49 @@ impl Capabilities {
     pub fn control_allowed(&self) -> bool {
         self.control_permission().is_ok()
     }
+
+    /// A **soft, agent-facing** assessment of whether control is expected to
+    /// work — the *degrade-not-wall* counterpart to [`control_permission`].
+    ///
+    /// The one difference: a firmware merely **newer than the registry knows**
+    /// degrades to [`ControlAssessment::NewerFirmwareUntested`] (a warning) here
+    /// instead of a hard refusal, so a routine firmware update doesn't wall off
+    /// an otherwise-working CLI — the LAN command set is very stable across
+    /// point releases. Genuinely unknown models, a missing control boundary, and
+    /// Developer Mode being unavailable still refuse, exactly as in
+    /// [`control_permission`].
+    pub fn control_assessment(&self) -> ControlAssessment {
+        match self.registry_status {
+            RegistryStatus::FirmwareNewerThanKnown => ControlAssessment::NewerFirmwareUntested,
+            RegistryStatus::UnknownModel => {
+                ControlAssessment::Refused(ControlRefusal::UnknownModel)
+            }
+            RegistryStatus::Supported => match self.control_permission() {
+                Ok(ControlPermit::Allowed) => ControlAssessment::Allowed,
+                Ok(ControlPermit::RequiresDeveloperMode) => {
+                    ControlAssessment::RequiresDeveloperMode
+                }
+                Err(refusal) => ControlAssessment::Refused(refusal),
+            },
+        }
+    }
+}
+
+/// A soft, agent-facing verdict on whether control is expected to work. Unlike
+/// [`Capabilities::control_permission`], firmware newer than known is a warning,
+/// not a refusal (see [`Capabilities::control_assessment`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlAssessment {
+    /// Control is permitted (ACS not enforced).
+    Allowed,
+    /// Permitted, provided the printer is in LAN-only + Developer Mode.
+    RequiresDeveloperMode,
+    /// Firmware is newer than the registry knows; control is very likely fine —
+    /// proceed, but warn that it's untested against this firmware.
+    NewerFirmwareUntested,
+    /// Control is refused for a hard reason (unknown model, no control boundary,
+    /// or Developer Mode unavailable).
+    Refused(ControlRefusal),
 }
 
 /// The confirmed control gating for a model. Present only for models we are
@@ -457,6 +500,43 @@ mod tests {
         );
         // Descriptive facts still resolve.
         assert_eq!(caps.push_mode, Some(PushMode::DeltaOnly));
+    }
+
+    #[test]
+    fn control_assessment_degrades_newer_firmware_to_a_warning_not_a_wall() {
+        let reg = default_registry();
+        // Newer-than-known firmware: strict permission walls, but the soft
+        // assessment only warns (degrade-not-wall) so an update doesn't break us.
+        let newer = resolve(&reg, &Model::A1Mini, &fw("01.99.00"));
+        assert_eq!(
+            newer.control_permission(),
+            Err(ControlRefusal::FirmwareNewerThanKnown)
+        );
+        assert_eq!(
+            newer.control_assessment(),
+            ControlAssessment::NewerFirmwareUntested
+        );
+
+        // A supported A1 mini still requires Developer Mode in both views.
+        let ok = resolve(&reg, &Model::A1Mini, &fw("01.07.02"));
+        assert_eq!(
+            ok.control_assessment(),
+            ControlAssessment::RequiresDeveloperMode
+        );
+
+        // An unknown model is refused in both views (no degrade for that).
+        let unknown = resolve(&reg, &Model::Unknown("z9".into()), &fw("01.00.00"));
+        assert_eq!(
+            unknown.control_assessment(),
+            ControlAssessment::Refused(ControlRefusal::UnknownModel)
+        );
+
+        // Developer Mode unavailable is a hard refusal even in the soft view.
+        let below = resolve(&reg, &Model::A1Mini, &fw("01.04.99"));
+        assert_eq!(
+            below.control_assessment(),
+            ControlAssessment::Refused(ControlRefusal::DeveloperModeUnavailable)
+        );
     }
 
     #[test]

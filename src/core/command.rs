@@ -38,6 +38,9 @@ impl SequenceIds {
 pub enum Command {
     /// Request a full state snapshot (`pushing.pushall`).
     PushAll,
+    /// Request the module/firmware inventory (`info.get_version`). A read; the
+    /// response comes back under `/info` with a `module[]` array.
+    GetVersion,
     /// Pause the current print.
     Pause,
     /// Resume a paused print.
@@ -124,6 +127,7 @@ impl Command {
     pub fn category(&self) -> &'static str {
         match self {
             Command::PushAll => "pushing",
+            Command::GetVersion => "info",
             Command::Pause
             | Command::Resume
             | Command::Stop
@@ -140,6 +144,9 @@ impl Command {
         match self {
             Command::PushAll => json!({
                 "pushing": { "sequence_id": sequence_id, "command": "pushall" }
+            }),
+            Command::GetVersion => json!({
+                "info": { "sequence_id": sequence_id, "command": "get_version" }
             }),
             Command::Pause => print_command(sequence_id, "pause", ""),
             Command::Resume => print_command(sequence_id, "resume", ""),
@@ -274,6 +281,15 @@ mod tests {
         assert_eq!(p["use_ams"], false);
         assert_eq!(p["task_id"], "0"); // LAN SD print uses "0" ids
         assert!(p["ams_mapping"].is_array());
+    }
+
+    #[test]
+    fn get_version_is_an_info_read() {
+        assert_eq!(Command::GetVersion.category(), "info");
+        assert_eq!(
+            Command::GetVersion.to_payload("1"),
+            json!({ "info": { "sequence_id": "1", "command": "get_version" } })
+        );
     }
 
     #[test]

@@ -12,3 +12,4 @@ pub mod report;
 pub mod stage;
 pub mod status;
 pub mod verify;
+pub mod version;

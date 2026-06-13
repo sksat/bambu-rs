@@ -101,7 +101,7 @@ pub fn evaluate(
         // Stop is handled above (terminal-state check, error-tolerant).
         Command::Stop => unreachable!("Stop handled before the new-error check"),
         // No observable state effect — caller should not use evaluate() for these.
-        Command::PushAll | Command::GcodeLine(_) | Command::Reboot => false,
+        Command::PushAll | Command::GetVersion | Command::GcodeLine(_) | Command::Reboot => false,
     };
 
     if observed {

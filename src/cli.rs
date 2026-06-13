@@ -17,10 +17,12 @@ use crate::client::{
     ClientError, CommandOutcome, LanMqttClient, StatusSource, VerifyStage, WatchStep,
 };
 use crate::config::{self, Config, ConfigError, Overrides, Profile, ResolvedTarget};
+use crate::core::capability::{self, ControlAssessment, ControlRefusal};
 use crate::core::command::{Command as ProtoCommand, ProjectFile};
 use crate::core::report::ReportState;
 use crate::core::stage::Stage;
 use crate::core::status::{GcodeState, PrinterStatus};
+use crate::core::version::Module;
 use crate::ftp::{FtpError, FtpsClient};
 
 /// Exit codes (a subset of the documented scheme).
@@ -86,6 +88,8 @@ enum Command {
         #[arg(long, default_value_t = 120)]
         timeout: u64,
     },
+    /// Show the printer's firmware/module inventory and resolved capabilities.
+    Info,
     /// Decode the active HMS (Health Management System) alerts.
     Hms,
     /// Start, pause, resume or stop a print job.
@@ -323,6 +327,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             interval,
             timeout,
         } => run_status(cli, *watch, *interval, *timeout),
+        Command::Info => run_info(cli),
         Command::Hms => run_hms(cli),
         Command::Job { action } => run_job(cli, action),
         Command::File { action } => run_file(cli, action),
@@ -497,6 +502,191 @@ fn run_hms(cli: &Cli) -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+/// Agent-facing view of the control assessment (degrade-not-wall).
+#[derive(Serialize)]
+struct ControlView {
+    /// `allowed` | `requires_developer_mode` | `newer_firmware_untested` | `refused`.
+    status: &'static str,
+    /// Whether control is *expected* to work (true for the first three).
+    expected_ok: bool,
+    /// Human-readable reason, present for warnings/refusals.
+    reason: Option<String>,
+}
+
+impl ControlView {
+    fn from(assessment: ControlAssessment) -> Self {
+        let refusal = |r: ControlRefusal| match r {
+            ControlRefusal::UnknownModel => "model not in the capability registry",
+            ControlRefusal::FirmwareNewerThanKnown => "firmware newer than the registry knows",
+            ControlRefusal::DeveloperModeUnavailable => {
+                "Developer Mode unavailable on this firmware"
+            }
+            ControlRefusal::UnknownControlBoundary => {
+                "no confirmed control boundary for this model"
+            }
+        };
+        match assessment {
+            ControlAssessment::Allowed => ControlView {
+                status: "allowed",
+                expected_ok: true,
+                reason: None,
+            },
+            ControlAssessment::RequiresDeveloperMode => ControlView {
+                status: "requires_developer_mode",
+                expected_ok: true,
+                reason: Some("control needs LAN-only + Developer Mode enabled".into()),
+            },
+            ControlAssessment::NewerFirmwareUntested => ControlView {
+                status: "newer_firmware_untested",
+                expected_ok: true,
+                reason: Some(
+                    "firmware is newer than the tested range; control is very likely fine but \
+                     unverified against this version"
+                        .into(),
+                ),
+            },
+            ControlAssessment::Refused(r) => ControlView {
+                status: "refused",
+                expected_ok: false,
+                reason: Some(refusal(r).into()),
+            },
+        }
+    }
+}
+
+/// Output of `bambu info`: identity + firmware + resolved capabilities.
+#[derive(Serialize)]
+struct InfoOutput {
+    printer: Option<String>,
+    model: String,
+    firmware: Option<String>,
+    registry_status: &'static str,
+    push_mode: Option<&'static str>,
+    camera_transport: Option<&'static str>,
+    developer_mode: Option<&'static str>,
+    control: ControlView,
+    modules: Vec<Module>,
+}
+
+fn run_info(cli: &Cli) -> Result<(), CliError> {
+    let cfg = Config::load_or_default(&config_path()?)?;
+    let profile_name = selected_profile_name(cli, &cfg)?;
+    let profile = profile_name.as_deref().and_then(|n| cfg.profile(n));
+    let overrides = flag_overrides(cli).over(Overrides::from_env());
+    let target = config::resolve(profile, &overrides)?;
+    let model = target.model.clone();
+
+    let version = connect_client(cli, 10)?.fetch_version()?;
+
+    // Resolve capabilities only when the firmware is known; without it we can
+    // still report descriptive facts via a model-only lookup is not possible
+    // (resolve needs a firmware), so we fall back to reporting "unknown firmware".
+    let registry = capability::default_registry();
+    let output = match &version.firmware {
+        Some(fw) => {
+            let caps = capability::resolve(&registry, &model, fw);
+            InfoOutput {
+                printer: profile_name,
+                model: model.to_string(),
+                firmware: Some(fw.to_string()),
+                registry_status: registry_status_str(caps.registry_status),
+                push_mode: caps.push_mode.map(push_mode_str),
+                camera_transport: caps.camera_transport.map(camera_transport_str),
+                developer_mode: caps.developer_mode.map(developer_mode_str),
+                control: ControlView::from(caps.control_assessment()),
+                modules: version.modules.clone(),
+            }
+        }
+        None => InfoOutput {
+            printer: profile_name,
+            model: model.to_string(),
+            firmware: None,
+            registry_status: "unknown_firmware",
+            push_mode: None,
+            camera_transport: None,
+            developer_mode: None,
+            control: ControlView {
+                status: "unknown",
+                expected_ok: false,
+                reason: Some("could not read the firmware version (no `ota` module)".into()),
+            },
+            modules: version.modules.clone(),
+        },
+    };
+
+    if want_json(cli) {
+        print_json(&output);
+    } else {
+        print_info_human(&output);
+    }
+    Ok(())
+}
+
+fn registry_status_str(s: capability::RegistryStatus) -> &'static str {
+    use capability::RegistryStatus::*;
+    match s {
+        Supported => "supported",
+        FirmwareNewerThanKnown => "firmware_newer_than_known",
+        UnknownModel => "unknown_model",
+    }
+}
+
+fn push_mode_str(m: capability::PushMode) -> &'static str {
+    match m {
+        capability::PushMode::Full => "full",
+        capability::PushMode::DeltaOnly => "delta_only",
+    }
+}
+
+fn camera_transport_str(t: capability::CameraTransport) -> &'static str {
+    use capability::CameraTransport::*;
+    match t {
+        Rtsp322 => "rtsp_322",
+        JpegTcp6000 => "jpeg_tcp_6000",
+        None => "none",
+    }
+}
+
+fn developer_mode_str(d: capability::DeveloperMode) -> &'static str {
+    match d {
+        capability::DeveloperMode::Available => "available",
+        capability::DeveloperMode::Unavailable => "unavailable",
+    }
+}
+
+fn print_info_human(o: &InfoOutput) {
+    println!(
+        "printer: {} ({})",
+        o.printer.as_deref().unwrap_or("-"),
+        o.model
+    );
+    println!("firmware: {}", o.firmware.as_deref().unwrap_or("?"));
+    println!("registry: {}", o.registry_status);
+    if let Some(p) = o.push_mode {
+        println!("push:     {p}");
+    }
+    if let Some(c) = o.camera_transport {
+        println!("camera:   {c}");
+    }
+    match &o.control.reason {
+        Some(r) => println!("control:  {} — {r}", o.control.status),
+        None => println!("control:  {}", o.control.status),
+    }
+    if !o.modules.is_empty() {
+        println!("modules:");
+        for m in &o.modules {
+            let hw = m.hw_ver.as_deref().unwrap_or("-");
+            let sw = m.sw_ver.as_deref().unwrap_or("-");
+            let prod = m
+                .product_name
+                .as_deref()
+                .map(|p| format!("  {p}"))
+                .unwrap_or_default();
+            println!("  {:<10} hw {:<9} sw {}{prod}", m.name, hw, sw);
+        }
+    }
 }
 
 /// The report fields whose change triggers a new `watch` progress line.

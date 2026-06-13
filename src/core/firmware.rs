@@ -96,6 +96,14 @@ impl std::hash::Hash for FirmwareVersion {
     }
 }
 
+impl serde::Serialize for FirmwareVersion {
+    /// Serialise as the original version string (e.g. `"01.07.02.00"`), so JSON
+    /// output round-trips what the device reported.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.raw)
+    }
+}
+
 impl fmt::Display for FirmwareVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.raw)
