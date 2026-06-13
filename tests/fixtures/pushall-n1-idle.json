@@ -2,7 +2,7 @@
   "_meta": {
     "captured_at": "2026-06-13",
     "firmware": null,
-    "marketing_model": "a1-or-a1mini (UNCONFIRMED - device reports code N1)",
+    "marketing_model": "a1mini (confirmed by owner 2026-06-13; device reports model code N1)",
     "mode": "lan",
     "model_code": "N1",
     "note": "Real pushall response. command=push_status; sequence_id is the printer's own counter, not an echo. Fan speeds are strings.",

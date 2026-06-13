@@ -59,6 +59,29 @@ impl Model {
     pub fn is_known(&self) -> bool {
         !matches!(self, Model::Unknown(_))
     }
+
+    /// Resolve a device-reported model code (e.g. the SSDP `DevModel.bambu.com`
+    /// header) to a [`Model`].
+    ///
+    /// Only the A1 mini ↔ `"N1"` mapping is encoded so far, and it is **observed
+    /// from a real A1 mini** (2026-06-13): the unit reports model code `"N1"`.
+    /// Other codes return [`Model::Unknown`] until observed on hardware — we do
+    /// not guess from memory (an earlier guess of `"N2S"` for the A1 mini was
+    /// wrong, which is exactly why the device is the source of truth).
+    pub fn from_device_code(code: &str) -> Self {
+        match code.trim() {
+            "N1" => Model::A1Mini,
+            other => Model::Unknown(other.to_string()),
+        }
+    }
+
+    /// The device-reported model code for this model, if we have observed one.
+    pub fn device_code(&self) -> Option<&'static str> {
+        match self {
+            Model::A1Mini => Some("N1"),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for Model {
@@ -93,6 +116,22 @@ mod tests {
         let m = Model::from_config_str("z9 ultra");
         assert_eq!(m, Model::Unknown("z9 ultra".to_string()));
         assert!(!m.is_known());
+    }
+
+    #[test]
+    fn a1_mini_device_code_is_n1_observed() {
+        // Observed on a real A1 mini (2026-06-13): it reports model code "N1".
+        assert_eq!(Model::from_device_code("N1"), Model::A1Mini);
+        assert_eq!(Model::A1Mini.device_code(), Some("N1"));
+    }
+
+    #[test]
+    fn unobserved_device_codes_are_unknown() {
+        assert_eq!(
+            Model::from_device_code("C11"),
+            Model::Unknown("C11".to_string())
+        );
+        assert_eq!(Model::P1S.device_code(), None);
     }
 
     #[test]
