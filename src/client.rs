@@ -288,7 +288,11 @@ impl LanMqttClient {
             // Capture the baseline print_error the first time we see the full
             // pushall snapshot.
             if baseline_error.is_none() && is_full_snapshot(&state) {
-                baseline_error = Some(PrinterStatus::from_state(state.get()).print_error.unwrap_or(0));
+                baseline_error = Some(
+                    PrinterStatus::from_state(state.get())
+                        .print_error
+                        .unwrap_or(0),
+                );
             }
 
             // Phase 1 — the ACK echoes our sequence_id and carries result/reason.

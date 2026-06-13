@@ -13,7 +13,9 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 
 use crate::camera::{CameraClient, CameraError};
-use crate::client::{ClientError, CommandOutcome, LanMqttClient, StatusSource, VerifyStage, WatchStep};
+use crate::client::{
+    ClientError, CommandOutcome, LanMqttClient, StatusSource, VerifyStage, WatchStep,
+};
 use crate::config::{self, Config, ConfigError, Overrides, Profile, ResolvedTarget};
 use crate::core::command::{Command as ProtoCommand, ProjectFile};
 use crate::core::stage::Stage;
@@ -785,6 +787,10 @@ fn print_status_human(o: &StatusOutput) {
         o.model
     );
     println!("state:   {}", s.gcode_state.as_deref().unwrap_or("?"));
+    // A device-level fault (print_error) is the most important thing to see.
+    if let Some(err) = &s.error {
+        println!("error:   ⚠ {} (print_error {})", err.hex, err.code);
+    }
     // Show the current activity only when it's a real special stage; the
     // no-stage markers (0 / 255) just echo idle-or-printing.
     if let (Some(stage), Some(id)) = (s.stage, s.stg_cur) {

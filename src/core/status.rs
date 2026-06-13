@@ -21,6 +21,10 @@ pub struct PrinterStatus {
     pub gcode_state: Option<String>,
     /// `print_error` code (0 = none).
     pub print_error: Option<i64>,
+    /// Typed view of a non-zero `print_error` (a device-level fault, distinct
+    /// from HMS — observed: a failing SD card surfaced `0x0500C010` here while
+    /// `hms` was empty). `None` when there is no active error.
+    pub error: Option<DeviceError>,
     /// Progress percentage (`mc_percent`).
     pub mc_percent: Option<i64>,
     /// Current layer / total layers.
@@ -59,10 +63,12 @@ impl PrinterStatus {
         let print = state.get("print");
         let get = |key: &str| print.and_then(|p| p.get(key));
         let stg_cur = get("stg_cur").and_then(as_i64_loose);
+        let print_error = get("print_error").and_then(as_i64_loose);
 
         PrinterStatus {
             gcode_state: get("gcode_state").and_then(as_string),
-            print_error: get("print_error").and_then(as_i64_loose),
+            print_error,
+            error: print_error.and_then(DeviceError::from_code),
             mc_percent: get("mc_percent").and_then(as_i64_loose),
             layer_num: get("layer_num").and_then(as_i64_loose),
             total_layer_num: get("total_layer_num").and_then(as_i64_loose),
@@ -92,6 +98,31 @@ impl PrinterStatus {
     /// The parsed coarse job state, if a `gcode_state` was reported.
     pub fn state(&self) -> Option<GcodeState> {
         self.gcode_state.as_deref().map(GcodeState::parse)
+    }
+}
+
+/// A device-level fault decoded from `print_error` (0 = no error). This is a
+/// **separate channel from HMS** — on the A1 mini a failing SD card reported
+/// `print_error = 0x0500C010` while `hms` stayed empty, so a status view must
+/// surface `print_error` in its own right.
+///
+/// We deliberately don't bundle a code→text table (sources conflict; same
+/// rationale as [`crate::core::hms`]); the hex code is emitted for lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceError {
+    /// Raw `print_error` value.
+    pub code: i64,
+    /// Conventional hex rendering, e.g. `0x0500C010`.
+    pub hex: String,
+}
+
+impl DeviceError {
+    /// Build from a raw `print_error`; `None` when the code is 0 (no error).
+    pub fn from_code(code: i64) -> Option<Self> {
+        (code != 0).then(|| DeviceError {
+            code,
+            hex: format!("0x{:08X}", code as u32),
+        })
     }
 }
 
@@ -153,6 +184,24 @@ mod tests {
     use super::*;
     use crate::core::report::ReportState;
     use serde_json::json;
+
+    #[test]
+    fn device_error_decodes_nonzero_print_error_to_hex() {
+        // The real SD-card fault value.
+        let e = DeviceError::from_code(0x0500C010).unwrap();
+        assert_eq!(e.code, 0x0500C010);
+        assert_eq!(e.hex, "0x0500C010");
+        // Zero is "no error".
+        assert_eq!(DeviceError::from_code(0), None);
+    }
+
+    #[test]
+    fn status_surfaces_a_nonzero_print_error_as_a_typed_error() {
+        let state = json!({ "print": { "print_error": 83935248, "gcode_state": "IDLE" } });
+        let st = PrinterStatus::from_state(&state);
+        assert_eq!(st.print_error, Some(83935248));
+        assert_eq!(st.error.as_ref().unwrap().hex, "0x0500C010");
+    }
 
     #[test]
     fn parses_the_real_a1mini_idle_pushall_fixture() {
