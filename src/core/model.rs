@@ -1,8 +1,9 @@
-//! Printer models.
+//! Printer models and their canonical device codes.
 //!
-//! For the MVP the model is supplied by the user in their profile
-//! (`--model a1mini`); device-side detection from a `pushall` report is added
-//! once we have real captures to derive the mapping from.
+//! The model can be supplied by the user (`--model a1mini`) or resolved from a
+//! device-reported code (SSDP `DevModel.bambu.com`, the cloud `dev_model_name`,
+//! or the MQTT module `project_name` — for most models these share one code
+//! namespace).
 
 use std::fmt;
 
@@ -13,10 +14,11 @@ pub enum Model {
     A1,
     P1P,
     P1S,
+    X1,
     X1Carbon,
     X1E,
     H2D,
-    /// A model name we don't recognise, kept verbatim.
+    /// A model name/code we don't recognise, kept verbatim.
     Unknown(String),
 }
 
@@ -34,6 +36,7 @@ impl Model {
             "a1" => Model::A1,
             "p1p" => Model::P1P,
             "p1s" => Model::P1S,
+            "x1" => Model::X1,
             "x1c" | "x1carbon" => Model::X1Carbon,
             "x1e" => Model::X1E,
             "h2d" => Model::H2D,
@@ -48,6 +51,7 @@ impl Model {
             Model::A1 => "a1",
             Model::P1P => "p1p",
             Model::P1S => "p1s",
+            Model::X1 => "x1",
             Model::X1Carbon => "x1c",
             Model::X1E => "x1e",
             Model::H2D => "h2d",
@@ -60,27 +64,46 @@ impl Model {
         !matches!(self, Model::Unknown(_))
     }
 
-    /// Resolve a device-reported model code (e.g. the SSDP `DevModel.bambu.com`
-    /// header) to a [`Model`].
+    /// Resolve a device-reported model **code** to a [`Model`].
     ///
-    /// Only the A1 mini ↔ `"N1"` mapping is encoded so far, and it is **observed
-    /// from a real A1 mini** (2026-06-13): the unit reports model code `"N1"`.
-    /// Other codes return [`Model::Unknown`] until observed on hardware — we do
-    /// not guess from memory (an earlier guess of `"N2S"` for the A1 mini was
-    /// wrong, which is exactly why the device is the source of truth).
+    /// These are the **vendor-canonical** codes from Bambu's own slicer machine
+    /// list (`BambuStudio/resources/printers/<code>.json` `model_id`), which for
+    /// the A1 family also match what the printer broadcasts over SSDP. We treat
+    /// the *mapping* as fact (vendor source); we do not copy the profile
+    /// contents. The A1 mini ↔ `"N1"` mapping is additionally **hardware-observed**
+    /// on a real unit (2026-06-13) — note that the once-"common" `N2S = A1 mini`
+    /// belief is inverted; `N1` is the A1 mini and `N2S` is the full-size A1.
+    ///
+    /// The legacy SSDP strings `"3DPrinter-X1-Carbon"` / `"3DPrinter-X1"` are
+    /// accepted and normalised to the modern `BL-P001` / `BL-P002` models.
     pub fn from_device_code(code: &str) -> Self {
         match code.trim() {
             "N1" => Model::A1Mini,
+            "N2S" => Model::A1,
+            "C11" => Model::P1P,
+            "C12" => Model::P1S,
+            "C13" => Model::X1E,
+            "BL-P001" | "3DPrinter-X1-Carbon" => Model::X1Carbon,
+            "BL-P002" | "3DPrinter-X1" => Model::X1,
+            "O1D" => Model::H2D,
             other => Model::Unknown(other.to_string()),
         }
     }
 
-    /// The device-reported model code for this model, if we have observed one.
+    /// The canonical device code for this model (round-trips through
+    /// [`Model::from_device_code`]); `None` for [`Model::Unknown`].
     pub fn device_code(&self) -> Option<&'static str> {
-        match self {
-            Model::A1Mini => Some("N1"),
-            _ => None,
-        }
+        Some(match self {
+            Model::A1Mini => "N1",
+            Model::A1 => "N2S",
+            Model::P1P => "C11",
+            Model::P1S => "C12",
+            Model::X1 => "BL-P002",
+            Model::X1Carbon => "BL-P001",
+            Model::X1E => "C13",
+            Model::H2D => "O1D",
+            Model::Unknown(_) => return None,
+        })
     }
 }
 
@@ -94,17 +117,29 @@ impl fmt::Display for Model {
 mod tests {
     use super::*;
 
+    const KNOWN: [Model; 8] = [
+        Model::A1Mini,
+        Model::A1,
+        Model::P1P,
+        Model::P1S,
+        Model::X1,
+        Model::X1Carbon,
+        Model::X1E,
+        Model::H2D,
+    ];
+
     #[test]
-    fn parses_canonical_names() {
+    fn parses_canonical_config_names() {
         assert_eq!(Model::from_config_str("a1mini"), Model::A1Mini);
         assert_eq!(Model::from_config_str("a1"), Model::A1);
         assert_eq!(Model::from_config_str("p1s"), Model::P1S);
+        assert_eq!(Model::from_config_str("x1"), Model::X1);
         assert_eq!(Model::from_config_str("x1c"), Model::X1Carbon);
         assert_eq!(Model::from_config_str("h2d"), Model::H2D);
     }
 
     #[test]
-    fn parsing_is_lenient_about_case_and_separators() {
+    fn config_parsing_is_lenient_about_case_and_separators() {
         assert_eq!(Model::from_config_str("A1 mini"), Model::A1Mini);
         assert_eq!(Model::from_config_str("A1-Mini"), Model::A1Mini);
         assert_eq!(Model::from_config_str("a1_mini"), Model::A1Mini);
@@ -119,32 +154,53 @@ mod tests {
     }
 
     #[test]
-    fn a1_mini_device_code_is_n1_observed() {
-        // Observed on a real A1 mini (2026-06-13): it reports model code "N1".
-        assert_eq!(Model::from_device_code("N1"), Model::A1Mini);
-        assert_eq!(Model::A1Mini.device_code(), Some("N1"));
+    fn resolves_vendor_canonical_device_codes() {
+        assert_eq!(Model::from_device_code("N1"), Model::A1Mini); // hardware-observed
+        assert_eq!(Model::from_device_code("N2S"), Model::A1); // NOT the A1 mini
+        assert_eq!(Model::from_device_code("C11"), Model::P1P);
+        assert_eq!(Model::from_device_code("C12"), Model::P1S);
+        assert_eq!(Model::from_device_code("C13"), Model::X1E);
+        assert_eq!(Model::from_device_code("BL-P001"), Model::X1Carbon);
+        assert_eq!(Model::from_device_code("BL-P002"), Model::X1);
+        assert_eq!(Model::from_device_code("O1D"), Model::H2D);
     }
 
     #[test]
-    fn unobserved_device_codes_are_unknown() {
+    fn x1_and_x1_carbon_are_distinct_codes() {
+        assert_ne!(Model::X1, Model::X1Carbon);
+        assert_eq!(Model::X1.device_code(), Some("BL-P002"));
+        assert_eq!(Model::X1Carbon.device_code(), Some("BL-P001"));
+    }
+
+    #[test]
+    fn legacy_ssdp_strings_normalise_to_modern_models() {
         assert_eq!(
-            Model::from_device_code("C11"),
-            Model::Unknown("C11".to_string())
+            Model::from_device_code("3DPrinter-X1-Carbon"),
+            Model::X1Carbon
         );
-        assert_eq!(Model::P1S.device_code(), None);
+        assert_eq!(Model::from_device_code("3DPrinter-X1"), Model::X1);
     }
 
     #[test]
-    fn known_models_round_trip_through_canonical_name() {
-        for m in [
-            Model::A1Mini,
-            Model::A1,
-            Model::P1P,
-            Model::P1S,
-            Model::X1Carbon,
-            Model::X1E,
-            Model::H2D,
-        ] {
+    fn unrecognised_device_code_is_unknown() {
+        assert_eq!(
+            Model::from_device_code("ZZ9"),
+            Model::Unknown("ZZ9".to_string())
+        );
+        assert_eq!(Model::Unknown("ZZ9".into()).device_code(), None);
+    }
+
+    #[test]
+    fn device_codes_round_trip_for_all_known_models() {
+        for m in KNOWN {
+            let code = m.device_code().expect("known model has a device code");
+            assert_eq!(Model::from_device_code(code), m, "round-trip for {m}");
+        }
+    }
+
+    #[test]
+    fn config_names_round_trip_for_all_known_models() {
+        for m in KNOWN {
             assert!(m.is_known());
             assert_eq!(Model::from_config_str(m.as_str()), m);
         }
