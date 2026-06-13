@@ -7,3 +7,4 @@ pub mod capability;
 pub mod command;
 pub mod firmware;
 pub mod model;
+pub mod report;
