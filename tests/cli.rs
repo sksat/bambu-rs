@@ -9,13 +9,17 @@ use std::path::{Path, PathBuf};
 fn tmp_cfg(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("bambu-cli-it-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
     dir
 }
 
 /// A `bambu` command with an isolated config dir and no `BAMBU_*` env leaking in.
+/// Runs in the (empty) config dir as CWD so a developer's `.env` in the repo
+/// root can't bleed into these hermetic tests.
 fn bambu(cfg: &Path) -> Command {
     let mut c = Command::cargo_bin("bambu").unwrap();
-    c.env("XDG_CONFIG_HOME", cfg)
+    c.current_dir(cfg)
+        .env("XDG_CONFIG_HOME", cfg)
         .env_remove("BAMBU_IP")
         .env_remove("BAMBU_SERIAL")
         .env_remove("BAMBU_ACCESS_CODE")
@@ -47,6 +51,7 @@ fn unknown_explicit_printer_errors_instead_of_falling_back_to_env() {
     let cfg = tmp_cfg("bad-printer");
     Command::cargo_bin("bambu")
         .unwrap()
+        .current_dir(&cfg)
         .env("XDG_CONFIG_HOME", &cfg)
         .env("BAMBU_IP", "203.0.113.4")
         .env("BAMBU_SERIAL", "S")
