@@ -16,6 +16,7 @@ use crate::camera::{CameraClient, CameraError};
 use crate::client::{ClientError, CommandOutcome, LanMqttClient, StatusSource, WatchStep};
 use crate::config::{self, Config, ConfigError, Overrides, Profile, ResolvedTarget};
 use crate::core::command::{Command as ProtoCommand, ProjectFile};
+use crate::core::stage::Stage;
 use crate::core::status::{GcodeState, PrinterStatus};
 use crate::ftp::{FtpError, FtpsClient};
 
@@ -453,7 +454,7 @@ fn run_watch(cli: &Cli, exit_status: bool, timeout_secs: u64) -> Result<(), CliE
         if last.as_ref() != Some(&key) {
             last = Some(key);
             let stage = match (st.stg_cur, st.stage) {
-                (Some(id), Some(name)) if id != 0 => format!("  [{name}]"),
+                (Some(id), Some(name)) if !Stage(id).is_no_stage() => format!("  [{name}]"),
                 _ => String::new(),
             };
             eprintln!(
@@ -775,11 +776,11 @@ fn print_status_human(o: &StatusOutput) {
         o.model
     );
     println!("state:   {}", s.gcode_state.as_deref().unwrap_or("?"));
-    // Show the current activity only when it's a real special stage; stage 0 is
-    // the no-op default that also shows while idle.
-    if let Some(stage) = s.stage {
-        if s.stg_cur != Some(0) {
-            println!("stage:   {stage} ({})", s.stg_cur.unwrap_or(0));
+    // Show the current activity only when it's a real special stage; the
+    // no-stage markers (0 / 255) just echo idle-or-printing.
+    if let (Some(stage), Some(id)) = (s.stage, s.stg_cur) {
+        if !Stage(id).is_no_stage() {
+            println!("stage:   {stage} ({id})");
         }
     }
     if let (Some(n), Some(b)) = (s.nozzle_temper, s.bed_temper) {

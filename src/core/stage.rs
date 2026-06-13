@@ -5,12 +5,13 @@
 //! calibration sweeps, filament changes — independently of the coarse
 //! [`GcodeState`](crate::core::status::GcodeState).
 //!
-//! **Read it together with `gcode_state`, not alone.** Stage `0` ("printing")
-//! is the *no-special-stage* default: a real A1 mini reports `stg_cur = 0` both
-//! while laying down filament **and** while idle (confirmed by the idle
-//! `pushall` fixture, where `gcode_state = IDLE` but `stg_cur = 0`). So `0`
-//! means "nothing special is happening" — what's actually happening is told by
-//! `gcode_state`.
+//! **Read it together with `gcode_state`, not alone.** Two values mean "no
+//! special activity": stage `0` ("printing") and the `255` (`0xFF`) sentinel.
+//! A real A1 mini reports `stg_cur = 0` both while laying down filament **and**
+//! while idle (the idle `pushall` fixture has `gcode_state = IDLE`,
+//! `stg_cur = 0`), and reports `stg_cur = 255` after a job ends
+//! (`gcode_state = FINISH`, `stg_cur = 255` — both observed). So neither value
+//! tells you whether the printer is busy; `gcode_state` does.
 //!
 //! Provenance: the id→name table is transcribed from the OpenBambuAPI spec
 //! (a *spec*, not an implementation). Stages annotated `[observed]` were seen
@@ -68,8 +69,17 @@ impl Stage {
             33 => "paused_cutter_error",
             34 => "paused_first_layer_error",
             35 => "paused_nozzle_clog",
+            255 => "no_stage", // [observed] 0xFF sentinel, seen at FINISH
             _ => return None,
         })
+    }
+
+    /// Whether this is a "no special activity" marker — stage `0` (the
+    /// printing-default, also seen at fresh idle) or the `255`/`0xFF` cleared
+    /// sentinel (seen at FINISH) — rather than a real in-progress stage. Use
+    /// `gcode_state` to distinguish idle from a running print.
+    pub fn is_no_stage(self) -> bool {
+        matches!(self.0, 0 | 255)
     }
 }
 
@@ -98,6 +108,23 @@ mod tests {
         assert_eq!(Stage(7).name(), Some("heating_hotend"));
         assert_eq!(Stage(13).name(), Some("homing_toolhead"));
         assert_eq!(Stage(25).name(), Some("calibrating_motor_noise"));
+    }
+
+    #[test]
+    fn no_stage_markers_are_recognised() {
+        // 0 (printing-default / fresh idle) and 255 (cleared sentinel) are not
+        // real in-progress activity.
+        assert!(Stage(0).is_no_stage());
+        assert!(Stage(255).is_no_stage());
+        assert!(!Stage(1).is_no_stage()); // auto_bed_leveling is real activity
+        assert!(!Stage(14).is_no_stage());
+    }
+
+    #[test]
+    fn the_0xff_sentinel_is_the_cleared_no_stage_value() {
+        // Observed on a real A1 mini at FINISH (gcode_state=FINISH, stg_cur=255):
+        // 0xFF is the "no active stage" sentinel left after a job ends.
+        assert_eq!(Stage(255).name(), Some("no_stage"));
     }
 
     #[test]

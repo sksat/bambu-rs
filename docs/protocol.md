@@ -95,11 +95,13 @@ report field that tracks ad-hoc motion (homing, bed leveling, calibration
 sweeps, filament changes) independently of `gcode_state`. The id→name table is
 spec-derived (OpenBambuAPI); names map to `src/core/stage.rs`.
 
-**`stg_cur = 0` is the no-special-stage default.** A real A1 mini reports `0`
-both while laying down filament *and while idle* (the idle `pushall` fixture has
-`gcode_state=IDLE`, `stg_cur=0`). So read it **together with `gcode_state`**:
-`0` means "nothing special", and `gcode_state` says whether that's idle or a
-normal print. **[observed]**
+**Two values mean "no special activity": `0` and `255` (`0xFF`).** A real A1
+mini reports `stg_cur=0` both while laying down filament *and while idle* (the
+idle `pushall` fixture has `gcode_state=IDLE`, `stg_cur=0`), and reports
+`stg_cur=255` after a job ends (`gcode_state=FINISH`, `stg_cur=255` — the
+calibration above finished at exactly this). So read `stg_cur` **together with
+`gcode_state`**: neither sentinel tells you whether the printer is busy;
+`gcode_state` does. **[observed]**
 
 Stages confirmed on the A1 mini during a `bed_level + vibration` calibration
 (`bambu calibrate --bed-level --vibration --confirm`), in order: **[observed]**
