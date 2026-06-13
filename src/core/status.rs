@@ -76,6 +76,50 @@ impl PrinterStatus {
             ChamberTemperature::ReportedSynthetic | ChamberTemperature::Unsupported => None,
         }
     }
+
+    /// The parsed coarse job state, if a `gcode_state` was reported.
+    pub fn state(&self) -> Option<GcodeState> {
+        self.gcode_state.as_deref().map(GcodeState::parse)
+    }
+}
+
+/// The coarse job state (`gcode_state`). The device sends uppercase tokens; an
+/// unrecognised token maps to [`GcodeState::Unknown`] for forward compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcodeState {
+    Idle,
+    Prepare,
+    Running,
+    Pause,
+    Finish,
+    Failed,
+    Slicing,
+    Init,
+    Offline,
+    Unknown,
+}
+
+impl GcodeState {
+    /// Parse a `gcode_state` token (case-insensitive).
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_uppercase().as_str() {
+            "IDLE" => GcodeState::Idle,
+            "PREPARE" => GcodeState::Prepare,
+            "RUNNING" => GcodeState::Running,
+            "PAUSE" => GcodeState::Pause,
+            "FINISH" => GcodeState::Finish,
+            "FAILED" => GcodeState::Failed,
+            "SLICING" => GcodeState::Slicing,
+            "INIT" => GcodeState::Init,
+            "OFFLINE" => GcodeState::Offline,
+            _ => GcodeState::Unknown,
+        }
+    }
+
+    /// Whether the print has reached a terminal state (finished or failed).
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, GcodeState::Finish | GcodeState::Failed)
+    }
 }
 
 fn as_string(v: &Value) -> Option<String> {
@@ -164,6 +208,23 @@ mod tests {
         }));
         assert_eq!(st.cooling_fan_speed, Some(85)); // from string
         assert_eq!(st.mc_percent, Some(42)); // from number
+    }
+
+    #[test]
+    fn gcode_state_parses_and_classifies_terminality() {
+        assert_eq!(GcodeState::parse("IDLE"), GcodeState::Idle);
+        assert_eq!(GcodeState::parse("running"), GcodeState::Running);
+        assert_eq!(GcodeState::parse("WAT"), GcodeState::Unknown);
+        assert!(GcodeState::parse("FINISH").is_terminal());
+        assert!(GcodeState::parse("FAILED").is_terminal());
+        assert!(!GcodeState::parse("RUNNING").is_terminal());
+    }
+
+    #[test]
+    fn printer_status_exposes_typed_state() {
+        let st = PrinterStatus::from_state(&json!({ "print": { "gcode_state": "RUNNING" } }));
+        assert_eq!(st.state(), Some(GcodeState::Running));
+        assert_eq!(PrinterStatus::from_state(&json!({})).state(), None);
     }
 
     #[test]
