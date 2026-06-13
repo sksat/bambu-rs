@@ -566,10 +566,21 @@ async fn poll(eventloop: &mut EventLoop) -> Result<Event, ClientError> {
         .map_err(|e| ClientError::Mqtt(e.to_string()))
 }
 
-/// Whether the merged state holds the full `pushall` response, which the printer
-/// marks with `command == "push_status"` (as opposed to a partial delta).
+/// Whether the merged state holds the full `pushall` response.
+///
+/// Observed on the A1 mini (`tools/capture_report_delta.py`): the full snapshot
+/// carries `print.msg == 0` with all ~64 fields, while periodic **deltas** carry
+/// `print.msg == 1` with only the changed fields — and **both** set
+/// `command == "push_status"`. So the command alone is not a reliable
+/// full-vs-delta signal; `msg == 0` is. We treat it as full when it's a
+/// `push_status` and `msg` is either absent (older firmware that may not send it)
+/// or zero, so a delta (`msg == 1`) arriving first is not mistaken for the snapshot.
 fn is_full_snapshot(state: &ReportState) -> bool {
-    state.pointer("/print/command").and_then(|v| v.as_str()) == Some("push_status")
+    let print = state.pointer("/print");
+    let is_push_status =
+        print.and_then(|p| p.get("command")).and_then(|v| v.as_str()) == Some("push_status");
+    let msg = print.and_then(|p| p.get("msg")).and_then(|v| v.as_i64());
+    is_push_status && msg.is_none_or(|m| m == 0)
 }
 
 /// Build a rustls config that accepts the printer's self-signed certificate.
@@ -649,5 +660,23 @@ mod tests {
     #[test]
     fn tls_config_builds() {
         assert!(tls_config().is_ok());
+    }
+
+    #[test]
+    fn full_snapshot_is_msg_zero_not_just_push_status() {
+        use serde_json::json;
+        let with = |v| {
+            let mut rs = ReportState::new();
+            rs.apply(v);
+            is_full_snapshot(&rs)
+        };
+        // Full pushall response: push_status + msg 0.
+        assert!(with(json!({ "print": { "command": "push_status", "msg": 0 } })));
+        // A delta also says push_status but msg == 1 -> NOT the full snapshot.
+        assert!(!with(json!({ "print": { "command": "push_status", "msg": 1 } })));
+        // Older firmware without msg: fall back to the command check.
+        assert!(with(json!({ "print": { "command": "push_status" } })));
+        // Not a push_status at all.
+        assert!(!with(json!({ "print": { "command": "gcode_line" } })));
     }
 }

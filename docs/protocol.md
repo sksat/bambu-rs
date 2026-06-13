@@ -13,7 +13,9 @@ Each fact is tagged:
 - **[spec]** — from OpenBambuAPI / Bambu's vendor data; not (yet) device-verified.
 
 Reproduce captures with `tools/capture_pushall.py` / `tools/capture_get_version.py`
-(stdlib only, read-only). Scrubbed fixtures live in `tests/fixtures/`.
+/ `tools/capture_report_delta.py` (records the pushall + every subsequent delta
+over a window — run it, then trigger a change to observe its wire format). All
+stdlib only, read-only. Scrubbed fixtures live in `tests/fixtures/`.
 
 ## Transport
 
@@ -74,6 +76,13 @@ A `pushall` request (`{"pushing":{"sequence_id":"0","command":"pushall"}}`) is
 answered by a message whose `print.command == "push_status"` with ~64 fields.
 The A1/P1 class then pushes **deltas** (only the changed fields); the client must
 cache and merge. **[observed]**
+
+**`print.msg` is the full-vs-delta flag, not `command`.** The full snapshot has
+`msg == 0` (~64 fields); the periodic deltas have `msg == 1` (a handful of
+changed fields) — **but both carry `command == "push_status"`**. So "is this the
+full snapshot?" must check `msg == 0`, not the command (a delta would otherwise
+look full). Captured with `tools/capture_report_delta.py` (4 idle deltas were all
+`msg == 1`, so `msg` is a type flag, not an incrementing sequence). **[observed]**
 
 Field notes **[observed]**:
 
