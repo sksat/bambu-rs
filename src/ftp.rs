@@ -74,4 +74,29 @@ impl FtpsClient {
         let _ = ftp.quit();
         result
     }
+
+    /// Download `remote_path` from the printer to `local`; returns bytes written.
+    /// Streams (FTP `RETR`) so large files (e.g. timelapse videos) aren't held
+    /// in memory.
+    pub fn download(&self, remote_path: &str, local: &Path) -> Result<u64, FtpError> {
+        let mut file = std::fs::File::create(local)?;
+        let mut ftp = self.connect()?;
+        let result = ftp
+            .retr(remote_path, |reader| {
+                // The closure must return suppaftp's FtpResult; wrap any local
+                // write error as a connection error so RETR is finalised cleanly.
+                std::io::copy(reader, &mut file).map_err(suppaftp::FtpError::ConnectionError)
+            })
+            .map_err(|e| FtpError::Ftp(e.to_string()));
+        let _ = ftp.quit();
+        result
+    }
+
+    /// Delete `remote_path` on the printer (FTP `DELE`).
+    pub fn delete(&self, remote_path: &str) -> Result<(), FtpError> {
+        let mut ftp = self.connect()?;
+        let result = ftp.rm(remote_path).map_err(|e| FtpError::Ftp(e.to_string()));
+        let _ = ftp.quit();
+        result
+    }
 }

@@ -255,6 +255,21 @@ enum FileAction {
         #[arg(long, default_value = "/cache")]
         dest: String,
     },
+    /// Download a file from the printer (e.g. a timelapse video).
+    Download {
+        /// On-printer path, e.g. /timelapse/video.mp4.
+        remote: String,
+        /// Local output path (default: the remote file's basename in the CWD).
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Delete a file on the printer — irreversible (needs --confirm).
+    Rm {
+        /// On-printer path to delete.
+        remote: String,
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 /// A CLI error carrying the exit code to return.
@@ -903,6 +918,43 @@ fn run_file(cli: &Cli, action: &FileAction) -> Result<(), CliError> {
             let remote = format!("{}/{filename}", dest.trim_end_matches('/'));
             let n = ftps.upload(local, &remote)?;
             eprintln!("uploaded {n} bytes to {remote}");
+            Ok(())
+        }
+        FileAction::Download { remote, out } => {
+            let local = match out {
+                Some(p) => p.clone(),
+                None => std::path::Path::new(remote)
+                    .file_name()
+                    .map(std::path::PathBuf::from)
+                    .ok_or_else(|| {
+                        CliError::new(
+                            exit::VALIDATION,
+                            format!("cannot derive an output name from {remote:?}; pass --out"),
+                        )
+                    })?,
+            };
+            let n = ftps.download(remote, &local)?;
+            eprintln!("downloaded {n} bytes to {}", local.display());
+            if want_json(cli) {
+                print_json(&serde_json::json!({
+                    "path": local.to_string_lossy(),
+                    "bytes": n,
+                }));
+            } else {
+                // The file path is the result (never the file's bytes).
+                println!("{}", local.display());
+            }
+            Ok(())
+        }
+        FileAction::Rm { remote, confirm } => {
+            if !*confirm {
+                return Err(CliError::new(
+                    exit::CONFIRM_REQUIRED,
+                    "refusing to delete a file without --confirm",
+                ));
+            }
+            ftps.delete(remote)?;
+            eprintln!("deleted {remote}");
             Ok(())
         }
     }
