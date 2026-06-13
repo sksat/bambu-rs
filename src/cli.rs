@@ -1019,6 +1019,9 @@ fn run_file(cli: &Cli, action: &FileAction) -> Result<(), CliError> {
             }
             ftps.delete(remote)?;
             eprintln!("deleted {remote}");
+            if want_json(cli) {
+                print_json(&serde_json::json!({ "deleted": true, "remote": remote }));
+            }
             Ok(())
         }
     }
@@ -1297,20 +1300,47 @@ fn run_timelapse_capture(
     if every == 0 {
         return Err(CliError::new(exit::VALIDATION, "--every must be >= 1"));
     }
+    if ext.is_empty() || ext.len() > 12 || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(CliError::new(
+            exit::VALIDATION,
+            "--ext must be 1-12 alphanumeric characters (e.g. jpg, png)",
+        ));
+    }
     std::fs::create_dir_all(out_dir)
         .map_err(|e| CliError::new(exit::GENERAL, format!("create {}: {e}", out_dir.display())))?;
     let client = connect_client(cli, timeout_secs)?;
-
-    let mut last_layer: Option<i64> = None;
-    let mut frame_no: u64 = 0;
-    let mut captured: u64 = 0;
-    let mut failures: u64 = 0;
 
     eprintln!(
         "watching the active print; capturing every {} layer(s) to {} …",
         every,
         out_dir.display()
     );
+
+    // Run captures on a dedicated worker thread fed by a channel, so a slow
+    // capture command never blocks the MQTT event loop (which would miss layer
+    // updates and risk tripping the keepalive). The watch callback only enqueues.
+    let (tx, rx) = std::sync::mpsc::channel::<(std::path::PathBuf, i64)>();
+    let worker = {
+        let argv = on_layer_cmd.to_vec();
+        let dir = out_dir.to_path_buf();
+        std::thread::spawn(move || {
+            let (mut captured, mut failures) = (0u64, 0u64);
+            for (frame, layer) in rx {
+                match run_capture_cmd(&argv, &frame, layer, &dir) {
+                    Ok(()) => {
+                        captured += 1;
+                        eprintln!("captured frame (layer {layer}) -> {}", frame.display());
+                    }
+                    Err(e) => {
+                        failures += 1;
+                        eprintln!("capture failed at layer {layer}: {e} (continuing)");
+                    }
+                }
+            }
+            (captured, failures)
+        })
+    };
+
     // Only capture while a print is actually progressing — otherwise an idle
     // printer's stale `layer_num` (often 0) would trigger a spurious frame.
     let is_active = |s: Option<GcodeState>| {
@@ -1319,50 +1349,66 @@ fn run_timelapse_capture(
             Some(GcodeState::Running | GcodeState::Prepare | GcodeState::Pause)
         )
     };
-    let mut on_update = |state: &ReportState| -> WatchStep {
-        let st = PrinterStatus::from_state(state.get());
-        if is_active(st.state())
-            && let Some(layer) = st.layer_num
-            && last_layer != Some(layer)
-        {
-            last_layer = Some(layer);
-            // Capture on every Nth layer (layer 0 = the first reported layer).
-            if layer >= 0 && (layer as u64) % every == 0 {
-                frame_no += 1;
-                let frame = out_dir.join(format!("frame_{frame_no:06}_layer_{layer:05}.{ext}"));
-                match run_capture_cmd(on_layer_cmd, &frame, layer, out_dir) {
-                    Ok(()) => {
-                        captured += 1;
-                        eprintln!("captured frame {frame_no} (layer {layer})");
-                    }
-                    Err(e) => {
-                        failures += 1;
-                        eprintln!("capture failed at layer {layer}: {e} (continuing)");
-                    }
+    // Scope the callback so its borrow of `tx` ends before we drop `tx` (which
+    // signals the worker to finish and lets us join it for the final counts).
+    let watch_result = {
+        let mut last_layer: Option<i64> = None;
+        let mut frame_no: u64 = 0;
+        let mut on_update = |state: &ReportState| -> WatchStep {
+            let st = PrinterStatus::from_state(state.get());
+            if is_active(st.state())
+                && let Some(layer) = st.layer_num
+                && last_layer != Some(layer)
+            {
+                last_layer = Some(layer);
+                // Capture on every Nth layer (layer 0 = the first reported layer).
+                if layer >= 0 && (layer as u64) % every == 0 {
+                    frame_no += 1;
+                    let frame =
+                        out_dir.join(format!("frame_{frame_no:06}_layer_{layer:05}.{ext}"));
+                    // Enqueue; the worker captures. send fails only if the worker
+                    // died, which we surface via the join below.
+                    let _ = tx.send((frame, layer));
                 }
             }
-        }
-        // A device fault or terminal state ends the capture session.
-        if st.error.is_some() {
-            return WatchStep::Stop;
-        }
-        match st.state() {
-            Some(s) if is_watch_terminal(s) => WatchStep::Stop,
-            _ => WatchStep::Continue,
-        }
+            if st.error.is_some() {
+                return WatchStep::Stop;
+            }
+            match st.state() {
+                Some(s) if is_watch_terminal(s) => WatchStep::Stop,
+                _ => WatchStep::Continue,
+            }
+        };
+        client.watch(interval, &mut on_update)
     };
+    // Close the channel and drain the worker (runs any queued captures), then
+    // read the tallies it accumulated.
+    drop(tx);
+    let (captured, failures) = worker.join().unwrap_or((0, 0));
 
-    match client.watch(interval, &mut on_update) {
-        Ok(_) => {}
-        // A stall/timeout just ends the session — the frames so far are kept.
-        Err(ClientError::Timeout(_)) => eprintln!("watch timed out; ending capture session"),
-        Err(e) => return Err(e.into()),
+    let ended_by = match &watch_result {
+        Ok(_) => "terminal",
+        Err(ClientError::Timeout(_)) => "timeout",
+        Err(_) => "error",
+    };
+    // A hard transport error (not a stall) is still a failure to report.
+    if let Err(e) = watch_result
+        && !matches!(e, ClientError::Timeout(_))
+    {
+        return Err(e.into());
     }
 
-    eprintln!(
-        "done: {captured} frame(s) captured, {failures} failure(s), in {}",
-        out_dir.display()
-    );
+    eprintln!("done: {captured} frame(s) captured, {failures} failure(s) ({ended_by})");
+    let suggested = ffmpeg_suggestion(out_dir, ext);
+    if want_json(cli) {
+        print_json(&serde_json::json!({
+            "captured": captured,
+            "failures": failures,
+            "out_dir": out_dir.to_string_lossy(),
+            "ended_by": ended_by,
+            "suggested_assemble": (captured > 0 && assemble_cmd.is_none()).then_some(suggested.clone()),
+        }));
+    }
     if captured == 0 {
         eprintln!(
             "no frames captured — start this during an active print \
@@ -1370,7 +1416,17 @@ fn run_timelapse_capture(
         );
         return Ok(());
     }
-    finish_timelapse(out_dir, ext, assemble_cmd)
+    finish_timelapse(out_dir, &suggested, assemble_cmd, want_json(cli))
+}
+
+/// A suggested `ffmpeg` line to stitch the frames (glob handles the layer suffix
+/// in frame names; sequential `frame_NNNNNN` keeps them ordered).
+fn ffmpeg_suggestion(out_dir: &std::path::Path, ext: &str) -> String {
+    let dir = out_dir.display();
+    format!(
+        "ffmpeg -framerate 12 -pattern_type glob -i '{dir}/frame_*.{ext}' \
+         -c:v libx264 -pix_fmt yuv420p {dir}/timelapse.mp4"
+    )
 }
 
 /// Substitute the capture-command tokens in one argv element. Pure so the
@@ -1405,19 +1461,22 @@ fn run_capture_cmd(
     }
 }
 
-/// Assemble the captured frames into a video, or print a suggested ffmpeg line.
+/// Assemble the captured frames into a video, or print the suggested ffmpeg line.
 fn finish_timelapse(
     out_dir: &std::path::Path,
-    ext: &str,
+    suggested: &str,
     assemble_cmd: Option<&[String]>,
+    json: bool,
 ) -> Result<(), CliError> {
-    let dir = out_dir.display();
     match assemble_cmd {
         Some(argv) if !argv.is_empty() => {
             let subst = |s: &str| s.replace("{outdir}", &out_dir.to_string_lossy());
             let prog = subst(&argv[0]);
             let args: Vec<String> = argv[1..].iter().map(|a| subst(a)).collect();
-            eprintln!("assembling: {prog} {}", args.join(" "));
+            // Log only the program, not its args: a user's assemble command may
+            // carry credentials/tokens, and the OS process table already exposes
+            // them — don't additionally print them to our own log.
+            eprintln!("assembling with {prog} ({} arg(s)) …", args.len());
             let status = std::process::Command::new(&prog)
                 .args(&args)
                 .status()
@@ -1430,14 +1489,12 @@ fn finish_timelapse(
             }
             Ok(())
         }
+        // No assemble step requested: suggest one (already echoed in the JSON
+        // summary, so only print it in human mode).
         _ => {
-            // No assemble step requested: suggest one (glob handles the layer
-            // suffix in frame names; sequential frame_NNNNNN keeps them ordered).
-            println!(
-                "frames are in {dir}. To build a video:\n  \
-                 ffmpeg -framerate 12 -pattern_type glob -i '{dir}/frame_*.{ext}' \
-                 -c:v libx264 -pix_fmt yuv420p {dir}/timelapse.mp4"
-            );
+            if !json {
+                println!("to build a video:\n  {suggested}");
+            }
             Ok(())
         }
     }
