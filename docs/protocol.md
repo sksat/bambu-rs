@@ -195,6 +195,24 @@ A device fault can surface via **`print_error`** (a single 32-bit code under
 `0x{:08X}`. `sdcard: true` means a card is *present*, not that it is healthy.
 We don't bundle a `print_error`→text table (same rationale as HMS). **[observed]**
 
+## Reboot (undocumented but accepted)
+
+`{"system":{"command":"reboot","sequence_id":"N"}}` is **not** in the
+OpenBambuAPI spec, but the A1 mini **accepts and acts on it**: after sending,
+MQTT:8883 (and every other port) dropped and the printer restarted, returning
+~1–2 min later. No ACK is observed — the connection just drops — so verify by
+reconnection, not by an ACK. **[observed]**
+
+Two caveats, both observed when we used it to recover a wedged SD mount:
+
+- The printer may rejoin via DHCP on a **different IP** than before. A static
+  lease / DHCP reservation avoids this.
+- A reboot **clears the stale `print_error`** (`0x0500C010`) and idle reads work
+  again — but on a genuinely failing SD card the fault **recurs on the next
+  large read**: a print attempt set `0x0500C010` again and never started. So
+  reboot is a *transient* clear, not a fix; a recurring `0x0500C010` means the
+  SD card needs reseating/reformatting/replacing.
+
 ## FTP control/data both usable
 
 Beyond `LIST` + `STOR`, the A1 mini's implicit-FTPS server also supports
