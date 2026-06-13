@@ -179,6 +179,13 @@ enum JobAction {
         /// Required to actually start a print.
         #[arg(long)]
         confirm: bool,
+        /// After starting, watch the job to completion and detect anomalies
+        /// (a device error or a FAILED state exits non-zero).
+        #[arg(long)]
+        watch: bool,
+        /// With --watch, give up watching after this many seconds (default 6h).
+        #[arg(long, default_value_t = 21600)]
+        watch_timeout: u64,
     },
     /// Pause the current print (needs --confirm).
     Pause {
@@ -429,6 +436,7 @@ struct WatchKey {
     stg_cur: Option<i64>,
     mc_percent: Option<i64>,
     layer_num: Option<i64>,
+    error: Option<i64>,
 }
 
 fn run_watch(cli: &Cli, exit_status: bool, timeout_secs: u64) -> Result<(), CliError> {
@@ -437,13 +445,24 @@ fn run_watch(cli: &Cli, exit_status: bool, timeout_secs: u64) -> Result<(), CliE
     let profile = profile_name.as_deref().and_then(|n| cfg.profile(n));
     let overrides = flag_overrides(cli).over(Overrides::from_env());
     let target = config::resolve(profile, &overrides)?;
-    let model = target.model.clone();
+    let model = target.model.to_string();
 
     let client = LanMqttClient::new(target).with_timeout(Duration::from_secs(timeout_secs));
+    watch_to_terminal(&client, cli, model, profile_name, exit_status)
+}
 
-    // Print a progress line (to stderr) whenever state / stage / percent / layer
-    // changes. Stage is included so ad-hoc motion (homing, leveling, calibration
-    // sweeps) is visible even while gcode_state stays RUNNING.
+/// Watch the printer to a terminal state, **or until a device error appears**,
+/// printing a progress line (to stderr) on every change. Used by `watch` and by
+/// `job start --watch`. A `print_error` mid-job is treated as an anomaly: stop,
+/// surface it, and exit non-zero regardless of `exit_status`. `exit_status`
+/// additionally makes a FAILED end-state exit non-zero (gh-run-watch style).
+fn watch_to_terminal(
+    client: &LanMqttClient,
+    cli: &Cli,
+    model: String,
+    profile_name: Option<String>,
+    exit_status: bool,
+) -> Result<(), CliError> {
     let mut last: Option<WatchKey> = None;
     let final_state = client.watch(|state| {
         let st = PrinterStatus::from_state(state.get());
@@ -452,6 +471,7 @@ fn run_watch(cli: &Cli, exit_status: bool, timeout_secs: u64) -> Result<(), CliE
             stg_cur: st.stg_cur,
             mc_percent: st.mc_percent,
             layer_num: st.layer_num,
+            error: st.error.as_ref().map(|e| e.code),
         };
         if last.as_ref() != Some(&key) {
             last = Some(key);
@@ -459,13 +479,21 @@ fn run_watch(cli: &Cli, exit_status: bool, timeout_secs: u64) -> Result<(), CliE
                 (Some(id), Some(name)) if !Stage(id).is_no_stage() => format!("  [{name}]"),
                 _ => String::new(),
             };
+            let err = match &st.error {
+                Some(e) => format!("  ⚠ {}", e.hex),
+                None => String::new(),
+            };
             eprintln!(
-                "{:<8} {:>3}%  layer {}/{}{stage}",
+                "{:<8} {:>3}%  layer {}/{}{stage}{err}",
                 st.gcode_state.as_deref().unwrap_or("?"),
                 st.mc_percent.unwrap_or(0),
                 st.layer_num.unwrap_or(0),
                 st.total_layer_num.unwrap_or(0),
             );
+        }
+        // A device fault is an anomaly worth stopping for, even mid-RUNNING.
+        if st.error.is_some() {
+            return WatchStep::Stop;
         }
         match st.state() {
             Some(s) if is_watch_terminal(s) => WatchStep::Stop,
@@ -474,10 +502,11 @@ fn run_watch(cli: &Cli, exit_status: bool, timeout_secs: u64) -> Result<(), CliE
     })?;
 
     let status = PrinterStatus::from_state(final_state.get());
-    let failed = exit_status && status.state() == Some(GcodeState::Failed);
+    let error = status.error.clone();
+    let failed = status.state() == Some(GcodeState::Failed);
     let output = StatusOutput {
         printer: profile_name,
-        model: model.to_string(),
+        model,
         status,
     };
     if want_json(cli) {
@@ -485,13 +514,33 @@ fn run_watch(cli: &Cli, exit_status: bool, timeout_secs: u64) -> Result<(), CliE
     } else {
         print_status_human(&output);
     }
-    if failed {
+    if let Some(e) = error {
+        return Err(CliError::new(
+            exit::DEVICE_REJECTED,
+            format!(
+                "a device error appeared during the job: {} ({})",
+                e.hex, e.code
+            ),
+        ));
+    }
+    if exit_status && failed {
         return Err(CliError::new(
             exit::GENERAL,
             "print ended in a FAILED state",
         ));
     }
     Ok(())
+}
+
+/// Resolve `(model string, profile name)` for status/watch output headers,
+/// using the same precedence as a connection.
+fn watch_identity(cli: &Cli) -> Result<(String, Option<String>), CliError> {
+    let cfg = Config::load_or_default(&config_path()?)?;
+    let profile_name = selected_profile_name(cli, &cfg)?;
+    let profile = profile_name.as_deref().and_then(|n| cfg.profile(n));
+    let overrides = flag_overrides(cli).over(Overrides::from_env());
+    let target = config::resolve(profile, &overrides)?;
+    Ok((target.model.to_string(), profile_name))
 }
 
 fn run_light(cli: &Cli, on: bool, timeout_secs: u64) -> Result<(), CliError> {
@@ -548,6 +597,8 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
             bed_type,
             dry_run,
             confirm,
+            watch,
+            watch_timeout,
         } => {
             let cmd = build_start_command(file, *plate, ams_map.as_deref(), bed_type)?;
             if *dry_run {
@@ -562,9 +613,19 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
                 ));
             }
             ensure_idle(cli)?;
-            let client = connect_client(cli, 20)?;
+            let client = connect_client(cli, 30)?;
             eprintln!("starting print: {file}");
-            report_command_outcome(client.send_and_verify(&cmd)?)
+            let outcome = client.send_and_verify(&cmd)?;
+            // Only keep watching if the print actually started; otherwise the
+            // verdict (rejected/unverified) is the result.
+            if *watch && outcome == CommandOutcome::Verified {
+                eprintln!("print started; watching for completion / anomalies …");
+                let (model, profile_name) = watch_identity(cli)?;
+                let watcher = connect_client(cli, *watch_timeout)?;
+                watch_to_terminal(&watcher, cli, model, profile_name, true)
+            } else {
+                report_command_outcome(outcome)
+            }
         }
         JobAction::Pause { confirm } => job_control(cli, ProtoCommand::Pause, *confirm),
         JobAction::Resume { confirm } => job_control(cli, ProtoCommand::Resume, *confirm),
