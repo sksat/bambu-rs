@@ -4,12 +4,8 @@
 //! exit codes, confirmation flags and the local exclusive lock live here; all
 //! protocol behaviour lives in the reusable [`bambu_rs`] library.
 //!
-//! The real CLI is built incrementally (see the plan, phases P0–P3). For now
-//! this is a placeholder so the `bambu` binary target compiles.
+//! All behaviour lives in [`bambu_rs::cli`]; this just returns its exit code.
 
-fn main() {
-    eprintln!(
-        "bambu {} — work in progress (see plan P0–P3)",
-        env!("CARGO_PKG_VERSION")
-    );
+fn main() -> std::process::ExitCode {
+    bambu_rs::cli::run()
 }

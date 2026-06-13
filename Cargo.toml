@@ -23,10 +23,11 @@ required-features = ["cli"]
 [features]
 default = ["cli"]
 # CLI-only dependencies (clap, etc.) are gated here so library-only consumers don't pull them.
-cli = []
+cli = ["dep:clap"]
 
 [dependencies]
 anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"], optional = true }
 rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls"] }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-pki-types = "1.14.1"
@@ -37,4 +38,6 @@ tokio = { version = "1.52.3", default-features = false, features = ["rt", "time"
 toml = "1.1.2"
 
 [dev-dependencies]
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
 proptest = "1.11.0"

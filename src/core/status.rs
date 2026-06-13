@@ -10,10 +10,11 @@
 //! speeds arrive as strings and are parsed here.
 
 use crate::core::capability::{ChamberTemperature, HardwareFeatures};
+use serde::Serialize;
 use serde_json::Value;
 
 /// The fields of a printer `print` report that matter for monitoring.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct PrinterStatus {
     /// Coarse job state, e.g. `IDLE`, `RUNNING`, `PAUSE`, `FINISH`, `FAILED`.
     pub gcode_state: Option<String>,
