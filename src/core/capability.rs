@@ -210,7 +210,17 @@ pub fn resolve(
         RegistryStatus::Known
     };
 
-    // Model-class properties are documented (Spec) until device-observed.
+    // Facts inferred for firmware *beyond* our known range are extrapolations,
+    // not spec — a firmware update can change ACS/control behaviour we have not
+    // catalogued yet. Downgrade firmware-derived facts to `Assumed` in that case
+    // so control is refused by default (and only an explicit opt-in to assumed
+    // facts re-enables it). Model-class properties below are firmware-independent
+    // and stay spec-level.
+    let fw_source = match registry_status {
+        RegistryStatus::FirmwareNewerThanKnown => Source::Assumed,
+        RegistryStatus::Known | RegistryStatus::UnknownModel => Source::Spec,
+    };
+
     let push_mode = Knowledge::known(profile.push_mode, Source::Spec);
     let camera_transport = Knowledge::known(profile.camera_transport, Source::Spec);
 
@@ -222,8 +232,8 @@ pub fn resolve(
                 DeveloperMode::Unavailable
             };
             (
-                Knowledge::known(dev, Source::Spec),
-                Knowledge::known(AcsPolicy::Required, Source::Spec),
+                Knowledge::known(dev, fw_source),
+                Knowledge::known(AcsPolicy::Required, fw_source),
             )
         }
         None => (Knowledge::Unknown, Knowledge::Unknown),
@@ -351,11 +361,25 @@ mod tests {
     }
 
     #[test]
-    fn firmware_newer_than_known_is_flagged_but_still_resolves() {
+    fn firmware_newer_than_known_downgrades_to_assumed_and_refuses_control() {
         let reg = default_registry();
         let caps = resolve(&reg, &Model::A1Mini, &fw("01.99.00"));
         assert_eq!(caps.registry_status, RegistryStatus::FirmwareNewerThanKnown);
-        // Still resolved best-effort: above threshold => Developer Mode available.
+
+        // The value is still resolved best-effort (above threshold), but because
+        // we are extrapolating past known firmware its source is only `Assumed`,
+        // not `Spec` — a future firmware can change ACS behaviour we haven't
+        // catalogued.
         assert_eq!(caps.developer_mode.value(), Some(&DeveloperMode::Available));
+        assert_eq!(caps.developer_mode.source(), Some(Source::Assumed));
+        assert_eq!(caps.acs_policy.source(), Some(Source::Assumed));
+
+        // Therefore the normal requirement refuses control on unknown-future
+        // firmware, and only an explicit opt-in to assumed facts allows it.
+        assert!(!caps.control_allowed(CapabilityRequirement::RequireSpecOrObserved));
+        assert!(caps.control_allowed(CapabilityRequirement::AllowAssumed));
+
+        // Model-class properties (firmware-independent) remain spec-level.
+        assert_eq!(caps.push_mode.source(), Some(Source::Spec));
     }
 }
