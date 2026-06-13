@@ -108,8 +108,18 @@ pub fn evaluate(
         Command::PrintSpeed(level) => status.spd_lvl == Some(level.level()),
         // Stop is handled above (terminal-state check, error-tolerant).
         Command::Stop => unreachable!("Stop handled before the new-error check"),
-        // No observable state effect — caller should not use evaluate() for these.
-        Command::PushAll | Command::GetVersion | Command::GcodeLine(_) | Command::Reboot => false,
+        // No observable state effect — caller should not use evaluate() for
+        // these (ACK is the final verdict). The AMS commands are [spec] and
+        // ACK-verified: their physical effect is slow/unobserved, so we stand
+        // behind "the printer accepted it", not "it completed".
+        Command::PushAll
+        | Command::GetVersion
+        | Command::GcodeLine(_)
+        | Command::Reboot
+        | Command::AmsControl(_)
+        | Command::AmsChangeFilament { .. }
+        | Command::AmsUserSetting { .. }
+        | Command::AmsFilamentSetting(_) => false,
     };
 
     if observed {

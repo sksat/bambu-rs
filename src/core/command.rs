@@ -30,6 +30,46 @@ impl SequenceIds {
     }
 }
 
+/// Basic AMS control action (`print.ams_control` `param`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmsControl {
+    /// Resume after an AMS pause/error.
+    Resume,
+    /// Reset the AMS state.
+    Reset,
+    /// Pause the AMS.
+    Pause,
+}
+
+impl AmsControl {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AmsControl::Resume => "resume",
+            AmsControl::Reset => "reset",
+            AmsControl::Pause => "pause",
+        }
+    }
+}
+
+/// Parameters for `print.ams_filament_setting` — set a tray's filament profile.
+/// Shapes are from the OpenBambuAPI spec. **[spec]**
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmsFilamentSetting {
+    /// Index of the AMS unit.
+    pub ams_id: u32,
+    /// Index of the tray within the unit.
+    pub tray_id: u32,
+    /// Filament profile id (e.g. `GFA00`); empty if unknown.
+    pub tray_info_idx: String,
+    /// Colour as hex `RRGGBBAA` (alpha usually `FF`).
+    pub tray_color: String,
+    /// Minimum/maximum nozzle temperature for the filament (°C).
+    pub nozzle_temp_min: i64,
+    pub nozzle_temp_max: i64,
+    /// Material, e.g. `PLA`, `PETG`.
+    pub tray_type: String,
+}
+
 /// Which LED a `system.ledctrl` command targets. The node name is what the
 /// printer matches in `lights_report`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +192,26 @@ pub enum Command {
     /// **accepted by the A1 mini** (observed). The connection drops and the
     /// printer restarts, so there is no ACK — send it fire-and-forget.
     Reboot,
+    /// Basic AMS control (`print.ams_control`): resume/reset/pause. **[spec]**
+    AmsControl(AmsControl),
+    /// Change the loaded filament via the AMS (`print.ams_change_filament`):
+    /// `target` tray, with the old (`curr_temp`) and new (`tar_temp`) nozzle
+    /// temps. Physically moves filament. **[spec]** — not device-confirmed.
+    AmsChangeFilament {
+        target: u32,
+        curr_temp: i64,
+        tar_temp: i64,
+    },
+    /// AMS RFID-read settings (`print.ams_user_setting`). **[spec]**
+    AmsUserSetting {
+        ams_id: u32,
+        /// Read RFID on startup.
+        startup_read: bool,
+        /// Read RFID on tray insertion.
+        tray_read: bool,
+    },
+    /// Set a tray's filament profile (`print.ams_filament_setting`). **[spec]**
+    AmsFilamentSetting(Box<AmsFilamentSetting>),
     /// Run printer calibration (`print.calibration`, an `option` bitmask).
     /// (Lidar — bit 0 — is X1-only and intentionally not exposed here.)
     Calibration {
@@ -227,6 +287,10 @@ impl Command {
             | Command::GcodeFile(_)
             | Command::PrintSpeed(_)
             | Command::ProjectFile(_)
+            | Command::AmsControl(_)
+            | Command::AmsChangeFilament { .. }
+            | Command::AmsUserSetting { .. }
+            | Command::AmsFilamentSetting(_)
             | Command::Calibration { .. } => "print",
             Command::Led { .. } | Command::Reboot => "system",
             Command::IpcamTimelapse(_) => "camera",
@@ -250,6 +314,52 @@ impl Command {
             Command::PrintSpeed(level) => {
                 print_command(sequence_id, "print_speed", &level.level().to_string())
             }
+            Command::AmsControl(action) => json!({
+                "print": {
+                    "sequence_id": sequence_id,
+                    "command": "ams_control",
+                    "param": action.as_str(),
+                }
+            }),
+            Command::AmsChangeFilament {
+                target,
+                curr_temp,
+                tar_temp,
+            } => json!({
+                "print": {
+                    "sequence_id": sequence_id,
+                    "command": "ams_change_filament",
+                    "target": target,
+                    "curr_temp": curr_temp,
+                    "tar_temp": tar_temp,
+                }
+            }),
+            Command::AmsUserSetting {
+                ams_id,
+                startup_read,
+                tray_read,
+            } => json!({
+                "print": {
+                    "sequence_id": sequence_id,
+                    "command": "ams_user_setting",
+                    "ams_id": ams_id,
+                    "startup_read_option": startup_read,
+                    "tray_read_option": tray_read,
+                }
+            }),
+            Command::AmsFilamentSetting(s) => json!({
+                "print": {
+                    "sequence_id": sequence_id,
+                    "command": "ams_filament_setting",
+                    "ams_id": s.ams_id,
+                    "tray_id": s.tray_id,
+                    "tray_info_idx": s.tray_info_idx,
+                    "tray_color": s.tray_color,
+                    "nozzle_temp_min": s.nozzle_temp_min,
+                    "nozzle_temp_max": s.nozzle_temp_max,
+                    "tray_type": s.tray_type,
+                }
+            }),
             Command::ProjectFile(p) => json!({
                 "print": {
                     "sequence_id": sequence_id,
@@ -500,6 +610,73 @@ mod tests {
         assert_eq!(on["camera"]["sequence_id"], "4");
         let off = Command::IpcamTimelapse(TimelapseControl::Disable).to_payload("5");
         assert_eq!(off["camera"]["control"], "disable");
+    }
+
+    #[test]
+    fn ams_control_payload_matches_spec() {
+        let v = Command::AmsControl(AmsControl::Resume).to_payload("1");
+        assert_eq!(
+            v,
+            json!({ "print": { "sequence_id": "1", "command": "ams_control", "param": "resume" } })
+        );
+        assert_eq!(
+            Command::AmsControl(AmsControl::Reset).to_payload("1")["print"]["param"],
+            "reset"
+        );
+        assert_eq!(Command::AmsControl(AmsControl::Pause).category(), "print");
+    }
+
+    #[test]
+    fn ams_change_filament_payload_matches_spec() {
+        let v = Command::AmsChangeFilament {
+            target: 2,
+            curr_temp: 220,
+            tar_temp: 240,
+        }
+        .to_payload("1");
+        let p = &v["print"];
+        assert_eq!(p["command"], "ams_change_filament");
+        assert_eq!(p["target"], 2);
+        assert_eq!(p["curr_temp"], 220);
+        assert_eq!(p["tar_temp"], 240);
+    }
+
+    #[test]
+    fn ams_user_setting_payload_matches_spec() {
+        let v = Command::AmsUserSetting {
+            ams_id: 0,
+            startup_read: true,
+            tray_read: false,
+        }
+        .to_payload("1");
+        let p = &v["print"];
+        assert_eq!(p["command"], "ams_user_setting");
+        assert_eq!(p["ams_id"], 0);
+        assert_eq!(p["startup_read_option"], true);
+        assert_eq!(p["tray_read_option"], false);
+    }
+
+    #[test]
+    fn ams_filament_setting_payload_matches_spec() {
+        let v = Command::AmsFilamentSetting(Box::new(AmsFilamentSetting {
+            ams_id: 0,
+            tray_id: 1,
+            tray_info_idx: "GFA00".to_string(),
+            tray_color: "00112233".to_string(),
+            nozzle_temp_min: 190,
+            nozzle_temp_max: 230,
+            tray_type: "PLA".to_string(),
+        }))
+        .to_payload("1");
+        let p = &v["print"];
+        assert_eq!(p["command"], "ams_filament_setting");
+        assert_eq!(p["ams_id"], 0);
+        assert_eq!(p["tray_id"], 1);
+        assert_eq!(p["tray_info_idx"], "GFA00");
+        assert_eq!(p["tray_color"], "00112233");
+        assert_eq!(p["nozzle_temp_min"], 190);
+        assert_eq!(p["nozzle_temp_max"], 230);
+        assert_eq!(p["tray_type"], "PLA");
     }
 
     #[test]

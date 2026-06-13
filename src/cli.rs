@@ -19,7 +19,8 @@ use crate::client::{
 use crate::config::{self, Config, ConfigError, Overrides, Profile, ResolvedTarget};
 use crate::core::capability::{self, ControlAssessment, ControlRefusal};
 use crate::core::command::{
-    Command as ProtoCommand, LedNode, ProjectFile, SpeedLevel, TimelapseControl,
+    AmsControl, AmsFilamentSetting, Command as ProtoCommand, LedNode, ProjectFile, SpeedLevel,
+    TimelapseControl,
 };
 use crate::core::report::ReportState;
 use crate::core::safety::{self, GcodeVerdict, TempLimits};
@@ -137,6 +138,12 @@ enum Command {
         /// Watch the report for this many seconds to confirm spd_lvl changed.
         #[arg(long, default_value_t = 8)]
         timeout: u64,
+    },
+    /// AMS operations (control, filament change, tray settings). [spec] —
+    /// derived from OpenBambuAPI, not yet confirmed on this unit's AMS Lite.
+    Ams {
+        #[command(subcommand)]
+        action: AmsAction,
     },
     /// Run printer calibration (bed leveling / vibration / motor noise).
     Calibrate {
@@ -310,6 +317,79 @@ enum TimelapseAction {
 }
 
 #[derive(Subcommand)]
+enum AmsAction {
+    /// Resume the AMS after a pause/error (ams_control resume).
+    Resume {
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Reset the AMS state (ams_control reset).
+    Reset {
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Pause the AMS (ams_control pause).
+    Pause {
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Change the loaded filament via the AMS — physically moves filament.
+    Change {
+        /// Target tray id.
+        #[arg(long)]
+        tray: u32,
+        /// New nozzle temperature (°C) for the target filament.
+        #[arg(long)]
+        tar_temp: i64,
+        /// Current nozzle temperature (°C); defaults to the new temp.
+        #[arg(long)]
+        curr_temp: Option<i64>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Set a tray's filament profile (material/colour/temps).
+    SetFilament {
+        #[arg(long, default_value_t = 0)]
+        ams: u32,
+        #[arg(long)]
+        tray: u32,
+        /// Material, e.g. PLA, PETG.
+        #[arg(long = "type")]
+        material: String,
+        /// Colour as hex RRGGBBAA (alpha usually FF).
+        #[arg(long, default_value = "000000FF")]
+        color: String,
+        /// Min/max nozzle temperature (°C).
+        #[arg(long)]
+        min: i64,
+        #[arg(long)]
+        max: i64,
+        /// Filament profile id (e.g. GFA00); optional.
+        #[arg(long, default_value = "")]
+        info_idx: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Set AMS RFID-read options (ams_user_setting).
+    Settings {
+        #[arg(long, default_value_t = 0)]
+        ams: u32,
+        /// Read RFID on startup.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        startup_read: bool,
+        /// Read RFID on tray insertion.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        tray_read: bool,
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum CameraAction {
     /// Grab one JPEG frame and write it to a file.
     Snapshot {
@@ -430,6 +510,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
         Command::File { action } => run_file(cli, action),
         Command::Camera { action } => run_camera(cli, action),
         Command::Timelapse { action } => run_timelapse(cli, action),
+        Command::Ams { action } => run_ams(cli, action),
         Command::Light {
             state,
             node,
@@ -1188,6 +1269,104 @@ fn ensure_idle(cli: &Cli) -> Result<(), CliError> {
             exit::PRINTER_BUSY,
             format!("printer is busy ({busy:?}); refusing to start a print"),
         )),
+    }
+}
+
+fn run_ams(cli: &Cli, action: &AmsAction) -> Result<(), CliError> {
+    // Helper: a plain control command gated on --confirm (ACK-verified).
+    let control = |cli: &Cli, cmd: ProtoCommand, confirm: bool, what: &str| -> Result<(), CliError> {
+        if !confirm {
+            return Err(CliError::new(
+                exit::CONFIRM_REQUIRED,
+                format!("{what} needs --confirm"),
+            ));
+        }
+        let client = connect_client(cli, 15)?;
+        eprintln!("{what} … (AMS commands are [spec]; the ACK confirms acceptance)");
+        report_command_outcome(client.send_and_verify(&cmd)?)
+    };
+    match action {
+        AmsAction::Resume { confirm } => {
+            control(cli, ProtoCommand::AmsControl(AmsControl::Resume), *confirm, "ams resume")
+        }
+        AmsAction::Reset { confirm } => {
+            control(cli, ProtoCommand::AmsControl(AmsControl::Reset), *confirm, "ams reset")
+        }
+        AmsAction::Pause { confirm } => {
+            control(cli, ProtoCommand::AmsControl(AmsControl::Pause), *confirm, "ams pause")
+        }
+        AmsAction::Change {
+            tray,
+            tar_temp,
+            curr_temp,
+            dry_run,
+            confirm,
+        } => {
+            let cmd = ProtoCommand::AmsChangeFilament {
+                target: *tray,
+                curr_temp: curr_temp.unwrap_or(*tar_temp),
+                tar_temp: *tar_temp,
+            };
+            if *dry_run {
+                print_json(&cmd.to_payload("1"));
+                return Ok(());
+            }
+            if !*confirm {
+                return Err(CliError::new(
+                    exit::CONFIRM_REQUIRED,
+                    "ams change physically moves filament; needs --confirm (try --dry-run first)",
+                ));
+            }
+            // A filament change is a physical operation — only when idle.
+            ensure_idle(cli)?;
+            let client = connect_client(cli, 30)?;
+            eprintln!(
+                "changing filament to tray {tray} … [spec, untested on this unit] — \
+                 the ACK confirms acceptance; watch `bambu status` for the physical change"
+            );
+            report_command_outcome(client.send_and_verify(&cmd)?)
+        }
+        AmsAction::SetFilament {
+            ams,
+            tray,
+            material,
+            color,
+            min,
+            max,
+            info_idx,
+            dry_run,
+            confirm,
+        } => {
+            let cmd = ProtoCommand::AmsFilamentSetting(Box::new(AmsFilamentSetting {
+                ams_id: *ams,
+                tray_id: *tray,
+                tray_info_idx: info_idx.clone(),
+                tray_color: color.clone(),
+                nozzle_temp_min: *min,
+                nozzle_temp_max: *max,
+                tray_type: material.clone(),
+            }));
+            if *dry_run {
+                print_json(&cmd.to_payload("1"));
+                return Ok(());
+            }
+            control(cli, cmd, *confirm, "ams set-filament")
+        }
+        AmsAction::Settings {
+            ams,
+            startup_read,
+            tray_read,
+            confirm,
+        } => control(
+            cli,
+            ProtoCommand::AmsUserSetting {
+                ams_id: *ams,
+                startup_read: *startup_read,
+                tray_read: *tray_read,
+            },
+            *confirm,
+            "ams settings",
+        ),
     }
 }
 

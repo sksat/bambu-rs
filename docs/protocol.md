@@ -235,6 +235,25 @@ produced by the **slicer's** timelapse gcode, not by a printer command.
 > user-supplied capture command (argv, no shell) on each new `layer_num`. Pure
 > orchestration — the printer's own layer events are the trigger.
 
+## AMS commands (`print.ams_*`)
+
+Derived from the OpenBambuAPI spec; **[spec]** — not yet confirmed on this unit's
+AMS Lite (we don't issue physical AMS ops unattended). All are `print` category:
+
+- `ams_control` `{param: "resume"|"reset"|"pause"}` — basic AMS control.
+- `ams_change_filament` `{target, curr_temp, tar_temp}` — change the loaded
+  filament (target tray; old/new nozzle temps). **Physically moves filament.**
+- `ams_user_setting` `{ams_id, startup_read_option, tray_read_option}` — RFID
+  read options.
+- `ams_filament_setting` `{ams_id, tray_id, tray_info_idx, tray_color (hex
+  RRGGBBAA), nozzle_temp_min, nozzle_temp_max, tray_type}` — set a tray's
+  filament profile. Its effect should appear in `ams.ams[].tray[]`.
+
+The CLI gates `ams change` behind `--confirm` + idle + `--dry-run`, and treats
+all of these as **ACK-verified** (the ACK confirms acceptance; the physical
+effect is slow/unobserved). Use `tools/capture_report_delta.py` during a real AMS
+op to observe the report changes and upgrade these from [spec] to [observed].
+
 ## Errors: `print_error` is a separate channel from HMS
 
 A device fault can surface via **`print_error`** (a single 32-bit code under
