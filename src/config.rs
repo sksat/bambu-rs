@@ -144,6 +144,52 @@ impl Overrides {
     }
 }
 
+/// Parse the `BAMBU_*` assignments from `.env`-style content. Only `BAMBU_`-
+/// prefixed keys are returned (so an unrelated `.env` can't inject surprising
+/// config); an optional `export ` prefix and matching surrounding quotes are
+/// stripped. Pure (no I/O) so it is unit-testable.
+pub fn parse_dotenv(content: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let k = k.trim();
+        if !k.starts_with("BAMBU_") {
+            continue;
+        }
+        let v = v.trim();
+        let v = v
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .or_else(|| v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+            .unwrap_or(v);
+        out.push((k.to_string(), v.to_string()));
+    }
+    out
+}
+
+/// Best-effort: load `BAMBU_*` keys from `./.env` into the process environment,
+/// **without** overriding variables already set (so the precedence stays
+/// flags > real env > `.env` > config). A missing/unreadable file is ignored.
+/// The access code is never logged.
+pub fn load_dotenv() {
+    let Ok(content) = std::fs::read_to_string(".env") else {
+        return;
+    };
+    for (k, v) in parse_dotenv(&content) {
+        if std::env::var_os(&k).is_none() {
+            // Safe: called once at startup, before any threads are spawned.
+            unsafe { std::env::set_var(&k, v) };
+        }
+    }
+}
+
 /// A fully-resolved connection target. Holds the access-code secret (redacted
 /// from `Debug`).
 #[derive(Clone, PartialEq, Eq)]
@@ -193,6 +239,31 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_dotenv_reads_bambu_keys_only_with_quotes_and_export() {
+        let content = "\
+# a comment
+BAMBU_IP=192.0.2.10
+export BAMBU_SERIAL=0309ABC
+BAMBU_ACCESS_CODE=\"12345678\"
+BAMBU_MODEL='a1mini'
+
+PATH=/should/not/leak
+NOT_BAMBU=ignored
+malformed line without equals
+";
+        let got = parse_dotenv(content);
+        assert_eq!(
+            got,
+            vec![
+                ("BAMBU_IP".to_string(), "192.0.2.10".to_string()),
+                ("BAMBU_SERIAL".to_string(), "0309ABC".to_string()),
+                ("BAMBU_ACCESS_CODE".to_string(), "12345678".to_string()),
+                ("BAMBU_MODEL".to_string(), "a1mini".to_string()),
+            ]
+        );
+    }
 
     fn sample_profile() -> Profile {
         Profile {

@@ -5,3 +5,5 @@
 # Local secrets / captured real-device fixtures that may contain access codes
 /.bambu-local
 /captures
+# .env holds BAMBU_ACCESS_CODE and friends — never commit it
+.env

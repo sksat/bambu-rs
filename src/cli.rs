@@ -285,6 +285,9 @@ impl From<CameraError> for CliError {
 
 /// Entry point. Parses args, dispatches, and maps errors to exit codes.
 pub fn run() -> ExitCode {
+    // Pull BAMBU_* from a local .env (without overriding real env vars) so an
+    // interactive user need not export them every time.
+    config::load_dotenv();
     let cli = Cli::parse();
     match dispatch(&cli) {
         Ok(()) => ExitCode::SUCCESS,
