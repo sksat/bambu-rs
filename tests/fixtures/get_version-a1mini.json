@@ -1,0 +1,71 @@
+{
+  "_meta": {
+    "captured_at": "2026-06-13",
+    "marketing_model": "a1mini",
+    "mode": "lan",
+    "model_code": "N1",
+    "note": "info.get_version response. OTA(firmware)=01.07.02.00; esp32 hw_ver=AP05 (A1-FAMILY incl. A1 mini, NOT A1-only); AMS_F102 = AMS Lite class.",
+    "scrubbed": [
+      "module[].sn"
+    ],
+    "source": "observed-real-device"
+  },
+  "message": {
+    "info": {
+      "command": "get_version",
+      "module": [
+        {
+          "flag": 3,
+          "hw_ver": "OTA",
+          "loader_ver": "00.00.00.00",
+          "name": "ota",
+          "product_name": "Bambu Lab A1 mini",
+          "sn": "<redacted>",
+          "sw_ver": "01.07.02.00",
+          "visible": true
+        },
+        {
+          "flag": 0,
+          "hw_ver": "AP05",
+          "loader_ver": "00.00.00.00",
+          "name": "esp32",
+          "product_name": "",
+          "sn": "<redacted>",
+          "sw_ver": "01.16.39.58",
+          "visible": false
+        },
+        {
+          "flag": 0,
+          "hw_ver": "MC02",
+          "loader_ver": "00.00.00.32",
+          "name": "mc",
+          "product_name": "",
+          "sn": "<redacted>",
+          "sw_ver": "00.01.30.10",
+          "visible": false
+        },
+        {
+          "flag": 0,
+          "hw_ver": "TH03",
+          "loader_ver": "00.00.00.26",
+          "name": "th",
+          "product_name": "",
+          "sn": "<redacted>",
+          "sw_ver": "00.00.07.72",
+          "visible": false
+        },
+        {
+          "flag": 0,
+          "hw_ver": "AMS_F102",
+          "loader_ver": "00.00.00.00",
+          "name": "ams_f1/0",
+          "product_name": "AMS Lite",
+          "sn": "<redacted>",
+          "sw_ver": "00.00.08.15",
+          "visible": true
+        }
+      ],
+      "sequence_id": "0"
+    }
+  }
+}

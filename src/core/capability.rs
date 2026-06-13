@@ -1,15 +1,24 @@
 //! Firmware capability / quirk registry.
 //!
-//! API behaviour varies by `(model, firmware)`. [`resolve`] looks a model and
-//! firmware version up in a [`CapabilityRegistry`] and returns the known
+//! API and hardware behaviour vary by `(model, firmware)`. [`resolve`] looks a
+//! model and firmware up in a [`CapabilityRegistry`] and returns the known
 //! [`Capabilities`]; unknown facts are simply `None`.
 //!
-//! The **clean-room** principle — observed is truth, we never claim to know what
-//! we haven't — lives in the *registration rules*, not in the value types: we
-//! only put a model in the registry once we understand it, only map a device
-//! code we've actually seen (see [`Model::from_device_code`](crate::core::model::Model::from_device_code)),
-//! and refuse control whenever the `(model, firmware)` falls outside what the
-//! registry covers (see [`Capabilities::control_permission`]).
+//! ## Two separated concerns
+//!
+//! - **Descriptive** capabilities (push mode, camera transport, hardware
+//!   features) describe how to *talk to and interpret* a printer. We register
+//!   these even for models we've only documented, so discovery/status work.
+//! - The **control boundary** (may we send control commands, and under what
+//!   firmware gating) is a *safety* decision. It is granted only for models we
+//!   are confident enough about; an unknown model, a firmware newer than we
+//!   know, or a model without a confirmed control boundary all refuse control
+//!   (see [`Capabilities::control_permission`]).
+//!
+//! Provenance ([`EvidenceGrade`]) travels per *model profile* as audit
+//! metadata; it is deliberately **not** consulted by `control_permission`
+//! (per-fact provenance was rejected as over-engineering — safety lives in the
+//! control boundary, not in a confidence tag).
 
 use crate::core::firmware::FirmwareVersion;
 use crate::core::model::Model;
@@ -33,7 +42,31 @@ pub enum CameraTransport {
     None,
 }
 
-/// Whether the printer's "Developer Mode" (LAN-only control) is available.
+/// How a model's `chamber_temper` report field should be interpreted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChamberTemperature {
+    /// A real chamber sensor (enclosed X1 / X1E / H2D).
+    RealSensor,
+    /// The field is emitted but is **not** a real sensor (A1 / P1) — a typed
+    /// status must not surface it as a temperature.
+    ReportedSynthetic,
+    /// Not present at all.
+    Unsupported,
+}
+
+/// Hardware features that change how reports are interpreted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HardwareFeatures {
+    /// Micro-LiDAR (X1 / X1C / X1E) — gates `0x0C` (XCAM) HMS codes and the
+    /// lidar calibration bit.
+    pub lidar: bool,
+    pub chamber_temperature: ChamberTemperature,
+    pub aux_fan: bool,
+    pub chamber_fan: bool,
+}
+
+/// Whether the printer's "Developer Mode" (LAN-only control) is available at the
+/// queried firmware.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeveloperMode {
     Available,
@@ -47,6 +80,20 @@ pub enum AcsPolicy {
     Required,
     /// Control is not gated.
     NotRequired,
+}
+
+/// How well-evidenced a model profile is. Audit metadata only — **never** used
+/// to decide control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceGrade {
+    /// Confirmed on our own hardware.
+    Observed,
+    /// Bambu's own slicer machine list (vendor-canonical).
+    VendorSpec,
+    /// OpenBambuAPI protocol documentation.
+    DocSpec,
+    /// Extrapolated; never observed on the wire.
+    Inferred,
 }
 
 /// How well the registry matched a `(model, firmware)` query.
@@ -69,9 +116,8 @@ pub enum ControlPermit {
     RequiresDeveloperMode,
 }
 
-/// Why control was refused — distinct reasons so the CLI can map them to exit
-/// codes and actionable messages, and so a caller can choose to override a
-/// specific one (e.g. allow an unknown firmware) at its own risk.
+/// Why control was refused — distinct reasons so a caller (CLI) can map them to
+/// exit codes and actionable messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlRefusal {
     /// We don't recognise this model at all.
@@ -81,7 +127,7 @@ pub enum ControlRefusal {
     FirmwareNewerThanKnown,
     /// Developer Mode is required but not available on this firmware.
     DeveloperModeUnavailable,
-    /// We don't know this model's control/ACS boundary.
+    /// We don't have a confirmed control boundary for this model.
     UnknownControlBoundary,
 }
 
@@ -91,17 +137,19 @@ pub struct Capabilities {
     pub model: Model,
     pub push_mode: Option<PushMode>,
     pub camera_transport: Option<CameraTransport>,
+    pub hardware: Option<HardwareFeatures>,
     pub developer_mode: Option<DeveloperMode>,
     pub acs_policy: Option<AcsPolicy>,
+    pub evidence: Option<EvidenceGrade>,
     pub registry_status: RegistryStatus,
 }
 
 impl Capabilities {
     /// Whether — and under what condition — control commands may be sent.
     ///
-    /// Safety is decided here, directly from registry-match quality and the
-    /// control boundary, rather than from per-fact provenance:
-    /// an unknown model or firmware-newer-than-known refuses control outright.
+    /// Safety is decided from registry-match quality and the control boundary,
+    /// never from [`EvidenceGrade`]: an unknown model, firmware newer than
+    /// known, or a model without a confirmed control boundary all refuse.
     pub fn control_permission(&self) -> Result<ControlPermit, ControlRefusal> {
         match self.registry_status {
             RegistryStatus::UnknownModel => return Err(ControlRefusal::UnknownModel),
@@ -112,31 +160,45 @@ impl Capabilities {
         }
         match (self.acs_policy, self.developer_mode) {
             (Some(AcsPolicy::NotRequired), _) => Ok(ControlPermit::Allowed),
-            (_, Some(DeveloperMode::Available)) => Ok(ControlPermit::RequiresDeveloperMode),
-            (_, Some(DeveloperMode::Unavailable)) => Err(ControlRefusal::DeveloperModeUnavailable),
+            (Some(AcsPolicy::Required), Some(DeveloperMode::Available)) => {
+                Ok(ControlPermit::RequiresDeveloperMode)
+            }
+            (Some(AcsPolicy::Required), Some(DeveloperMode::Unavailable)) => {
+                Err(ControlRefusal::DeveloperModeUnavailable)
+            }
+            // No confirmed control boundary (developer_mode/acs are None).
             _ => Err(ControlRefusal::UnknownControlBoundary),
         }
     }
 
-    /// Convenience: whether control is permitted at all (see
-    /// [`Capabilities::control_permission`] for the reason).
+    /// Convenience: whether control is permitted at all.
     pub fn control_allowed(&self) -> bool {
         self.control_permission().is_ok()
     }
 }
 
+/// The confirmed control gating for a model. Present only for models we are
+/// confident enough about to permit control.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ControlBoundary {
+    /// Firmware at/after which Developer Mode exists (and ACS gates control).
+    developer_mode_since: FirmwareVersion,
+    acs_policy: AcsPolicy,
+}
+
 /// Per-model data the registry holds.
 struct ModelProfile {
     model: Model,
+    // Descriptive (registered even for less-certain models):
     push_mode: PushMode,
     camera_transport: CameraTransport,
-    /// Firmware at/after which Developer Mode exists (and ACS gates control).
-    /// `None` means we don't have a documented threshold for this model.
-    developer_mode_since: Option<FirmwareVersion>,
-    /// Highest firmware we have data for; newer firmware resolves best-effort
-    /// but is flagged [`RegistryStatus::FirmwareNewerThanKnown`] and refused
-    /// control.
+    hardware: HardwareFeatures,
+    evidence: EvidenceGrade,
+    /// Highest firmware we understand; newer firmware refuses control.
     max_known_firmware: FirmwareVersion,
+    // Safety:
+    /// `None` => no confirmed control boundary => control is refused.
+    control_boundary: Option<ControlBoundary>,
 }
 
 /// A set of known model profiles. Construct via [`default_registry`] or build a
@@ -163,8 +225,10 @@ pub fn resolve(
             model: model.clone(),
             push_mode: None,
             camera_transport: None,
+            hardware: None,
             developer_mode: None,
             acs_policy: None,
+            evidence: None,
             registry_status: RegistryStatus::UnknownModel,
         };
     };
@@ -175,14 +239,14 @@ pub fn resolve(
         RegistryStatus::Supported
     };
 
-    let (developer_mode, acs_policy) = match &profile.developer_mode_since {
-        Some(threshold) => {
-            let dev = if firmware >= threshold {
+    let (developer_mode, acs_policy) = match &profile.control_boundary {
+        Some(cb) => {
+            let dev = if firmware >= &cb.developer_mode_since {
                 DeveloperMode::Available
             } else {
                 DeveloperMode::Unavailable
             };
-            (Some(dev), Some(AcsPolicy::Required))
+            (Some(dev), Some(cb.acs_policy))
         }
         None => (None, None),
     };
@@ -191,26 +255,136 @@ pub fn resolve(
         model: model.clone(),
         push_mode: Some(profile.push_mode),
         camera_transport: Some(profile.camera_transport),
+        hardware: Some(profile.hardware),
         developer_mode,
         acs_policy,
+        evidence: Some(profile.evidence),
         registry_status,
     }
 }
 
 /// The built-in registry of known models.
 ///
-/// Values come from the OpenBambuAPI spec and prior research; the A1 mini entry
-/// is the one we have actually observed. Models are added as we gather data.
+/// The A1 mini entry is **hardware-observed** (model code, firmware
+/// `01.07.02.00` and AMS-Lite confirmed on a real unit). Other entries are
+/// vendor-canonical (`EvidenceGrade::VendorSpec`) or, for the newest gear,
+/// inferred — and the inferred ones deliberately carry **no control boundary**.
 pub fn default_registry() -> CapabilityRegistry {
     let fw = |s: &str| FirmwareVersion::parse(s).expect("valid firmware literal");
+
+    let a1_family_hw = HardwareFeatures {
+        lidar: false,
+        chamber_temperature: ChamberTemperature::ReportedSynthetic, // emitted but inert
+        aux_fan: false,
+        chamber_fan: false,
+    };
+    let p1_hw = HardwareFeatures {
+        lidar: false,
+        chamber_temperature: ChamberTemperature::ReportedSynthetic,
+        aux_fan: true,
+        chamber_fan: true,
+    };
+    let x1_hw = HardwareFeatures {
+        lidar: true,
+        chamber_temperature: ChamberTemperature::RealSensor,
+        aux_fan: true,
+        chamber_fan: true,
+    };
+
+    let a1_boundary = || {
+        Some(ControlBoundary {
+            developer_mode_since: fw("01.05.00"),
+            acs_policy: AcsPolicy::Required,
+        })
+    };
+    let p1_boundary = || {
+        Some(ControlBoundary {
+            developer_mode_since: fw("01.08.02"),
+            acs_policy: AcsPolicy::Required,
+        })
+    };
+    let x1_boundary = || {
+        Some(ControlBoundary {
+            developer_mode_since: fw("01.08.03"),
+            acs_policy: AcsPolicy::Required,
+        })
+    };
+
     CapabilityRegistry {
-        profiles: vec![ModelProfile {
-            model: Model::A1Mini,
-            push_mode: PushMode::DeltaOnly,
-            camera_transport: CameraTransport::JpegTcp6000,
-            developer_mode_since: Some(fw("01.05.00")),
-            max_known_firmware: fw("01.06.00"),
-        }],
+        profiles: vec![
+            // OBSERVED: our real A1 mini (firmware 01.07.02.00, hw_ver AP05, AMS Lite).
+            ModelProfile {
+                model: Model::A1Mini,
+                push_mode: PushMode::DeltaOnly,
+                camera_transport: CameraTransport::JpegTcp6000,
+                hardware: a1_family_hw,
+                evidence: EvidenceGrade::Observed,
+                max_known_firmware: fw("01.07.02"),
+                control_boundary: a1_boundary(),
+            },
+            // VendorSpec: A1 (full) — same family as the observed A1 mini.
+            ModelProfile {
+                model: Model::A1,
+                push_mode: PushMode::DeltaOnly,
+                camera_transport: CameraTransport::JpegTcp6000,
+                hardware: a1_family_hw,
+                evidence: EvidenceGrade::VendorSpec,
+                max_known_firmware: fw("01.07.02"),
+                control_boundary: a1_boundary(),
+            },
+            ModelProfile {
+                model: Model::P1P,
+                push_mode: PushMode::DeltaOnly,
+                camera_transport: CameraTransport::JpegTcp6000,
+                hardware: p1_hw,
+                evidence: EvidenceGrade::VendorSpec,
+                max_known_firmware: fw("01.08.04"),
+                control_boundary: p1_boundary(),
+            },
+            ModelProfile {
+                model: Model::P1S,
+                push_mode: PushMode::DeltaOnly,
+                camera_transport: CameraTransport::JpegTcp6000,
+                hardware: p1_hw,
+                evidence: EvidenceGrade::VendorSpec,
+                max_known_firmware: fw("01.08.04"),
+                control_boundary: p1_boundary(),
+            },
+            ModelProfile {
+                model: Model::X1Carbon,
+                push_mode: PushMode::Full,
+                camera_transport: CameraTransport::Rtsp322,
+                hardware: x1_hw,
+                evidence: EvidenceGrade::VendorSpec,
+                max_known_firmware: fw("01.08.05"),
+                control_boundary: x1_boundary(),
+            },
+            ModelProfile {
+                model: Model::X1E,
+                push_mode: PushMode::Full,
+                camera_transport: CameraTransport::Rtsp322,
+                hardware: x1_hw,
+                evidence: EvidenceGrade::VendorSpec,
+                max_known_firmware: fw("01.08.05"),
+                control_boundary: x1_boundary(),
+            },
+            // INFERRED: H2D SSDP code never observed, push mode inferred — keep
+            // descriptive info but grant NO control boundary (control refused).
+            ModelProfile {
+                model: Model::H2D,
+                push_mode: PushMode::Full,
+                camera_transport: CameraTransport::Rtsp322,
+                hardware: HardwareFeatures {
+                    lidar: false,
+                    chamber_temperature: ChamberTemperature::RealSensor,
+                    aux_fan: true,
+                    chamber_fan: true,
+                },
+                evidence: EvidenceGrade::Inferred,
+                max_known_firmware: fw("01.02.00"),
+                control_boundary: None,
+            },
+        ],
     }
 }
 
@@ -223,53 +397,48 @@ mod tests {
     }
 
     #[test]
-    fn a1mini_is_delta_push_and_tcp_camera() {
+    fn observed_a1mini_descriptive_facts() {
         let reg = default_registry();
-        let caps = resolve(&reg, &Model::A1Mini, &fw("01.05.00"));
+        let caps = resolve(&reg, &Model::A1Mini, &fw("01.07.02"));
         assert_eq!(caps.push_mode, Some(PushMode::DeltaOnly));
         assert_eq!(caps.camera_transport, Some(CameraTransport::JpegTcp6000));
+        assert_eq!(caps.evidence, Some(EvidenceGrade::Observed));
         assert_eq!(caps.registry_status, RegistryStatus::Supported);
-    }
-
-    #[test]
-    fn developer_mode_threshold_boundary() {
-        let reg = default_registry();
-        let before = resolve(&reg, &Model::A1Mini, &fw("01.04.99"));
-        assert_eq!(before.developer_mode, Some(DeveloperMode::Unavailable));
-        for v in ["01.05.00", "01.05", "01.05.00.00", "01.05.01"] {
-            let caps = resolve(&reg, &Model::A1Mini, &fw(v));
-            assert_eq!(
-                caps.developer_mode,
-                Some(DeveloperMode::Available),
-                "firmware {v} should have Developer Mode"
-            );
-        }
-    }
-
-    #[test]
-    fn control_refused_below_developer_mode_threshold() {
-        let reg = default_registry();
-        let caps = resolve(&reg, &Model::A1Mini, &fw("01.04.00"));
+        let hw = caps.hardware.unwrap();
+        assert!(!hw.lidar);
         assert_eq!(
-            caps.control_permission(),
-            Err(ControlRefusal::DeveloperModeUnavailable)
+            hw.chamber_temperature,
+            ChamberTemperature::ReportedSynthetic
         );
-        assert!(!caps.control_allowed());
+        assert!(!hw.aux_fan && !hw.chamber_fan);
     }
 
     #[test]
-    fn control_allowed_via_developer_mode_when_supported() {
+    fn a1mini_real_firmware_is_supported_not_newer_than_known() {
+        // Regression: max_known_firmware must cover the real device (01.07.02.00),
+        // otherwise control would be wrongly refused as FirmwareNewerThanKnown.
         let reg = default_registry();
-        let caps = resolve(&reg, &Model::A1Mini, &fw("01.05.00"));
+        let caps = resolve(&reg, &Model::A1Mini, &fw("01.07.02.00"));
+        assert_eq!(caps.registry_status, RegistryStatus::Supported);
         assert_eq!(
             caps.control_permission(),
             Ok(ControlPermit::RequiresDeveloperMode)
         );
-        assert!(caps.control_allowed());
     }
 
     #[test]
-    fn unknown_model_resolves_to_unknown_and_refuses_control() {
+    fn developer_mode_threshold_and_control_below_it() {
+        let reg = default_registry();
+        let below = resolve(&reg, &Model::A1Mini, &fw("01.04.99"));
+        assert_eq!(below.developer_mode, Some(DeveloperMode::Unavailable));
+        assert_eq!(
+            below.control_permission(),
+            Err(ControlRefusal::DeveloperModeUnavailable)
+        );
+    }
+
+    #[test]
+    fn unknown_model_refuses_control() {
         let reg = default_registry();
         let caps = resolve(&reg, &Model::Unknown("z9".into()), &fw("01.00.00"));
         assert_eq!(caps.registry_status, RegistryStatus::UnknownModel);
@@ -278,17 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn known_model_variant_without_a_profile_is_unknown() {
-        // P1S is a known Model variant but has no profile yet.
-        let reg = default_registry();
-        let caps = resolve(&reg, &Model::P1S, &fw("01.00.00"));
-        assert_eq!(caps.registry_status, RegistryStatus::UnknownModel);
-    }
-
-    #[test]
-    fn firmware_newer_than_known_refuses_control_directly() {
-        // The P1 safety boundary, expressed directly via registry_status rather
-        // than by downgrading per-fact provenance.
+    fn firmware_newer_than_known_refuses_control() {
         let reg = default_registry();
         let caps = resolve(&reg, &Model::A1Mini, &fw("01.99.00"));
         assert_eq!(caps.registry_status, RegistryStatus::FirmwareNewerThanKnown);
@@ -296,8 +455,39 @@ mod tests {
             caps.control_permission(),
             Err(ControlRefusal::FirmwareNewerThanKnown)
         );
-        // The descriptive facts are still resolved best-effort.
+        // Descriptive facts still resolve.
         assert_eq!(caps.push_mode, Some(PushMode::DeltaOnly));
-        assert_eq!(caps.developer_mode, Some(DeveloperMode::Available));
+    }
+
+    #[test]
+    fn x1_carbon_is_full_push_rtsp_and_has_lidar() {
+        let reg = default_registry();
+        let caps = resolve(&reg, &Model::X1Carbon, &fw("01.08.03"));
+        assert_eq!(caps.push_mode, Some(PushMode::Full));
+        assert_eq!(caps.camera_transport, Some(CameraTransport::Rtsp322));
+        let hw = caps.hardware.unwrap();
+        assert!(hw.lidar);
+        assert_eq!(hw.chamber_temperature, ChamberTemperature::RealSensor);
+        assert_eq!(
+            caps.control_permission(),
+            Ok(ControlPermit::RequiresDeveloperMode)
+        );
+    }
+
+    #[test]
+    fn inferred_h2d_keeps_descriptive_info_but_refuses_control() {
+        // The crux of descriptive-vs-control separation: H2D facts are present
+        // for discovery, but with no confirmed control boundary control is
+        // refused even though the model and firmware are "in range".
+        let reg = default_registry();
+        let caps = resolve(&reg, &Model::H2D, &fw("01.01.05"));
+        assert_eq!(caps.registry_status, RegistryStatus::Supported);
+        assert_eq!(caps.push_mode, Some(PushMode::Full)); // descriptive present
+        assert_eq!(caps.evidence, Some(EvidenceGrade::Inferred));
+        assert_eq!(caps.developer_mode, None);
+        assert_eq!(
+            caps.control_permission(),
+            Err(ControlRefusal::UnknownControlBoundary)
+        );
     }
 }

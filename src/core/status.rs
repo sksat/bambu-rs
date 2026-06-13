@@ -9,6 +9,7 @@
 //! `tests/fixtures/pushall-n1-idle.json`), not from spec guesses — e.g. fan
 //! speeds arrive as strings and are parsed here.
 
+use crate::core::capability::{ChamberTemperature, HardwareFeatures};
 use serde_json::Value;
 
 /// The fields of a printer `print` report that matter for monitoring.
@@ -27,12 +28,15 @@ pub struct PrinterStatus {
     pub remaining_time_min: Option<i64>,
     /// Current stage id (`stg_cur`); decoded to a name elsewhere.
     pub stg_cur: Option<i64>,
-    /// Nozzle / bed / chamber temperatures and their targets (°C).
+    /// Nozzle / bed temperatures and their targets (°C).
     pub nozzle_temper: Option<f64>,
     pub nozzle_target: Option<f64>,
     pub bed_temper: Option<f64>,
     pub bed_target: Option<f64>,
-    pub chamber_temper: Option<f64>,
+    /// **Raw** `chamber_temper` value as reported. On A1/P1 this is emitted but
+    /// is not a real sensor — call [`PrinterStatus::real_chamber_temperature`]
+    /// for a value only when the model actually has a chamber sensor.
+    pub chamber_temper_raw: Option<f64>,
     /// Part-cooling fan speed (`cooling_fan_speed`; arrives as a string).
     pub cooling_fan_speed: Option<i64>,
     /// Name of the running subtask/job (empty when idle).
@@ -58,9 +62,18 @@ impl PrinterStatus {
             nozzle_target: get("nozzle_target_temper").and_then(Value::as_f64),
             bed_temper: get("bed_temper").and_then(Value::as_f64),
             bed_target: get("bed_target_temper").and_then(Value::as_f64),
-            chamber_temper: get("chamber_temper").and_then(Value::as_f64),
+            chamber_temper_raw: get("chamber_temper").and_then(Value::as_f64),
             cooling_fan_speed: get("cooling_fan_speed").and_then(as_i64_loose),
             subtask_name: get("subtask_name").and_then(as_string),
+        }
+    }
+
+    /// The chamber temperature **only if** the model has a real chamber sensor.
+    /// Models that merely echo a synthetic `chamber_temper` (A1 / P1) get `None`.
+    pub fn real_chamber_temperature(&self, hardware: &HardwareFeatures) -> Option<f64> {
+        match hardware.chamber_temperature {
+            ChamberTemperature::RealSensor => self.chamber_temper_raw,
+            ChamberTemperature::ReportedSynthetic | ChamberTemperature::Unsupported => None,
         }
     }
 }
@@ -106,7 +119,28 @@ mod tests {
         assert!((st.bed_temper.unwrap() - 26.53125).abs() < 1e-9);
         assert!((st.nozzle_temper.unwrap() - 27.21875).abs() < 1e-9);
         assert_eq!(st.bed_target, Some(0.0));
-        assert_eq!(st.chamber_temper, Some(5.0));
+        // Raw chamber value is present (5.0) but the A1 mini has no real sensor.
+        assert_eq!(st.chamber_temper_raw, Some(5.0));
+    }
+
+    #[test]
+    fn real_chamber_temperature_respects_hardware() {
+        use crate::core::capability::{ChamberTemperature, HardwareFeatures};
+        let st = PrinterStatus::from_state(&json!({ "print": { "chamber_temper": 5.0 } }));
+        let a1 = HardwareFeatures {
+            lidar: false,
+            chamber_temperature: ChamberTemperature::ReportedSynthetic,
+            aux_fan: false,
+            chamber_fan: false,
+        };
+        let x1 = HardwareFeatures {
+            lidar: true,
+            chamber_temperature: ChamberTemperature::RealSensor,
+            aux_fan: true,
+            chamber_fan: true,
+        };
+        assert_eq!(st.real_chamber_temperature(&a1), None); // synthetic -> hidden
+        assert_eq!(st.real_chamber_temperature(&x1), Some(5.0)); // real sensor -> exposed
     }
 
     #[test]
