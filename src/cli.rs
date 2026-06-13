@@ -101,6 +101,24 @@ enum Command {
         #[arg(long, default_value_t = 8)]
         timeout: u64,
     },
+    /// Run printer calibration (bed leveling / vibration / motor noise).
+    Calibrate {
+        /// Bed leveling.
+        #[arg(long)]
+        bed_level: bool,
+        /// Vibration compensation.
+        #[arg(long)]
+        vibration: bool,
+        /// Motor-noise calibration.
+        #[arg(long)]
+        motor_noise: bool,
+        /// Show the resolved command JSON without sending it (safe).
+        #[arg(long)]
+        dry_run: bool,
+        /// Required to actually run calibration (it moves the hardware).
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Send a raw G-code line and watch the report (control; needs --confirm).
     Gcode {
         /// The G-code line, e.g. "G28" (home all axes).
@@ -277,6 +295,20 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
         Command::File { action } => run_file(cli, action),
         Command::Camera { action } => run_camera(cli, action),
         Command::Light { state, timeout } => run_light(cli, state == "on", *timeout),
+        Command::Calibrate {
+            bed_level,
+            vibration,
+            motor_noise,
+            dry_run,
+            confirm,
+        } => run_calibrate(
+            cli,
+            *bed_level,
+            *vibration,
+            *motor_noise,
+            *dry_run,
+            *confirm,
+        ),
         Command::Gcode {
             line,
             confirm,
@@ -562,6 +594,44 @@ fn ensure_idle(cli: &Cli) -> Result<(), CliError> {
             format!("printer is busy ({busy:?}); refusing to start a print"),
         )),
     }
+}
+
+fn run_calibrate(
+    cli: &Cli,
+    bed_level: bool,
+    vibration: bool,
+    motor_noise: bool,
+    dry_run: bool,
+    confirm: bool,
+) -> Result<(), CliError> {
+    // Default to the common A1 calibration (bed leveling + vibration) when no
+    // step is requested.
+    let (bed_level, vibration) = if !bed_level && !vibration && !motor_noise {
+        (true, true)
+    } else {
+        (bed_level, vibration)
+    };
+    let cmd = ProtoCommand::Calibration {
+        bed_level,
+        vibration,
+        motor_noise,
+    };
+    if dry_run {
+        print_json(&cmd.to_payload("1"));
+        return Ok(());
+    }
+    if !confirm {
+        return Err(CliError::new(
+            exit::CONFIRM_REQUIRED,
+            "calibration moves the hardware; needs --confirm (try --dry-run first)",
+        ));
+    }
+    ensure_idle(cli)?;
+    let client = connect_client(cli, 20)?;
+    eprintln!(
+        "starting calibration (bed_level={bed_level} vibration={vibration} motor_noise={motor_noise}) …"
+    );
+    report_command_outcome(client.send_and_verify(&cmd)?)
 }
 
 fn job_control(cli: &Cli, cmd: ProtoCommand, confirm: bool) -> Result<(), CliError> {

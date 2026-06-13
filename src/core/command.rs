@@ -53,6 +53,16 @@ pub enum Command {
     ProjectFile(ProjectFile),
     /// Turn the chamber light on/off (`system.ledctrl`).
     ChamberLight(bool),
+    /// Run printer calibration (`print.calibration`, an `option` bitmask).
+    /// (Lidar — bit 0 — is X1-only and intentionally not exposed here.)
+    Calibration {
+        /// Bed leveling (bit 1 = 2).
+        bed_level: bool,
+        /// Vibration compensation (bit 2 = 4).
+        vibration: bool,
+        /// Motor-noise calibration (bit 3 = 8).
+        motor_noise: bool,
+    },
 }
 
 /// Parameters for `print.project_file` — start a sliced `.gcode.3mf` that is
@@ -115,7 +125,8 @@ impl Command {
             | Command::Stop
             | Command::GcodeLine(_)
             | Command::GcodeFile(_)
-            | Command::ProjectFile(_) => "print",
+            | Command::ProjectFile(_)
+            | Command::Calibration { .. } => "print",
             Command::ChamberLight(_) => "system",
         }
     }
@@ -153,6 +164,18 @@ impl Command {
                     "subtask_id": "0",
                 }
             }),
+            Command::Calibration {
+                bed_level,
+                vibration,
+                motor_noise,
+            } => {
+                let option = i64::from(*bed_level) * 2
+                    + i64::from(*vibration) * 4
+                    + i64::from(*motor_noise) * 8;
+                json!({
+                    "print": { "sequence_id": sequence_id, "command": "calibration", "option": option }
+                })
+            }
             Command::ChamberLight(on) => json!({
                 "system": {
                     "sequence_id": sequence_id,
@@ -200,6 +223,27 @@ mod tests {
             "print"
         );
         assert_eq!(Command::ChamberLight(true).category(), "system");
+    }
+
+    #[test]
+    fn calibration_option_is_a_bitmask() {
+        let v = Command::Calibration {
+            bed_level: true,
+            vibration: true,
+            motor_noise: false,
+        }
+        .to_payload("1");
+        assert_eq!(v["print"]["command"], "calibration");
+        assert_eq!(v["print"]["option"], 6); // 2 (bed) | 4 (vibration)
+        assert_eq!(
+            Command::Calibration {
+                bed_level: false,
+                vibration: false,
+                motor_noise: true,
+            }
+            .to_payload("1")["print"]["option"],
+            8
+        );
     }
 
     #[test]
