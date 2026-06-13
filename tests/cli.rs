@@ -42,6 +42,23 @@ fn status_without_config_or_env_is_validation_error() {
 }
 
 #[test]
+fn unknown_explicit_printer_errors_instead_of_falling_back_to_env() {
+    // A --printer typo must NOT silently run against a BAMBU_*-supplied target.
+    let cfg = tmp_cfg("bad-printer");
+    Command::cargo_bin("bambu")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", &cfg)
+        .env("BAMBU_IP", "203.0.113.4")
+        .env("BAMBU_SERIAL", "S")
+        .env("BAMBU_ACCESS_CODE", "C")
+        .env("BAMBU_MODEL", "a1mini")
+        .args(["--printer", "nope", "status"])
+        .assert()
+        .code(3); // UnknownProfile, before any connection attempt
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[test]
 fn gcode_without_confirm_is_refused() {
     let cfg = tmp_cfg("gcode-noconfirm");
     bambu(&cfg).args(["gcode", "G28"]).assert().code(4); // CONFIRM_REQUIRED
@@ -99,10 +116,11 @@ fn config_add_list_show_roundtrip_redacts_access_code() {
         .success();
 
     bambu(&cfg)
-        .args(["config", "list"])
+        .args(["config", "list", "--json"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("a1 (default)"));
+        .stdout(predicate::str::contains("\"default\""))
+        .stdout(predicate::str::contains("a1"));
 
     bambu(&cfg)
         .args(["config", "show", "--json"])

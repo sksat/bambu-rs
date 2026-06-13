@@ -247,7 +247,7 @@ fn run_config(cli: &Cli, action: &ConfigAction) -> Result<(), CliError> {
             Ok(())
         }
         ConfigAction::List => {
-            if cli.json {
+            if want_json(cli) {
                 let names: Vec<&String> = cfg.printers.keys().collect();
                 print_json(&serde_json::json!({
                     "default": cfg.default_printer,
@@ -268,12 +268,17 @@ fn run_config(cli: &Cli, action: &ConfigAction) -> Result<(), CliError> {
             Ok(())
         }
         ConfigAction::Show => {
-            let name = selected_profile_name(cli, &cfg)?;
+            let name = selected_profile_name(cli, &cfg)?.ok_or_else(|| {
+                CliError::new(
+                    exit::VALIDATION,
+                    "no printer selected: pass --printer or set a default",
+                )
+            })?;
             let profile = cfg
                 .profile(&name)
                 .ok_or_else(|| CliError::from(ConfigError::UnknownProfile(name.clone())))?;
             let view = RedactedProfile::from(&name, profile);
-            if cli.json {
+            if want_json(cli) {
                 print_json(&view);
             } else {
                 println!("{view}");
@@ -285,7 +290,7 @@ fn run_config(cli: &Cli, action: &ConfigAction) -> Result<(), CliError> {
 
 fn run_status(cli: &Cli) -> Result<(), CliError> {
     let cfg = Config::load_or_default(&config_path()?)?;
-    let profile_name = selected_profile_name(cli, &cfg).ok();
+    let profile_name = selected_profile_name(cli, &cfg)?;
     let profile = profile_name.as_deref().and_then(|n| cfg.profile(n));
 
     let overrides = flag_overrides(cli).over(Overrides::from_env());
@@ -301,7 +306,7 @@ fn run_status(cli: &Cli) -> Result<(), CliError> {
         status,
     };
 
-    if cli.json || !std::io::stdout().is_terminal() {
+    if want_json(cli) {
         print_json(&output);
     } else {
         print_status_human(&output);
@@ -311,7 +316,7 @@ fn run_status(cli: &Cli) -> Result<(), CliError> {
 
 fn run_watch(cli: &Cli, exit_status: bool, timeout_secs: u64) -> Result<(), CliError> {
     let cfg = Config::load_or_default(&config_path()?)?;
-    let profile_name = selected_profile_name(cli, &cfg).ok();
+    let profile_name = selected_profile_name(cli, &cfg)?;
     let profile = profile_name.as_deref().and_then(|n| cfg.profile(n));
     let overrides = flag_overrides(cli).over(Overrides::from_env());
     let target = config::resolve(profile, &overrides)?;
@@ -347,7 +352,7 @@ fn run_watch(cli: &Cli, exit_status: bool, timeout_secs: u64) -> Result<(), CliE
         model: model.to_string(),
         status,
     };
-    if cli.json || !std::io::stdout().is_terminal() {
+    if want_json(cli) {
         print_json(&output);
     } else {
         print_status_human(&output);
@@ -384,7 +389,7 @@ fn run_file(cli: &Cli, action: &FileAction) -> Result<(), CliError> {
     match action {
         FileAction::Ls { dir } => {
             let names = ftps.list(dir)?;
-            if cli.json {
+            if want_json(cli) {
                 print_json(&names);
             } else {
                 for name in &names {
@@ -409,9 +414,7 @@ fn run_file(cli: &Cli, action: &FileAction) -> Result<(), CliError> {
 /// Resolve a connection target from the selected profile + overrides.
 fn resolve_target(cli: &Cli) -> Result<ResolvedTarget, CliError> {
     let cfg = Config::load_or_default(&config_path()?)?;
-    let profile = selected_profile_name(cli, &cfg)
-        .ok()
-        .and_then(|n| cfg.profile(&n).cloned());
+    let profile = selected_profile_name(cli, &cfg)?.and_then(|n| cfg.profile(&n).cloned());
     let overrides = flag_overrides(cli).over(Overrides::from_env());
     Ok(config::resolve(profile.as_ref(), &overrides)?)
 }
@@ -448,17 +451,26 @@ fn is_watch_terminal(state: GcodeState) -> bool {
     )
 }
 
-/// Resolve which profile name to use: explicit `--printer`, else the default.
-fn selected_profile_name(cli: &Cli, cfg: &Config) -> Result<String, CliError> {
-    cli.printer
-        .clone()
-        .or_else(|| cfg.default_printer.clone())
-        .ok_or_else(|| {
-            CliError::new(
-                exit::VALIDATION,
-                "no printer selected: pass --printer or set a default",
-            )
-        })
+/// Resolve which profile to use: explicit `--printer`, else the configured
+/// default. Returns `None` when neither is set (the caller then relies on
+/// flag/env overrides). A name that IS set but is not in the config is an error
+/// — we never silently fall back to a different target (e.g. on a `--printer`
+/// typo with `BAMBU_*` in the environment).
+fn selected_profile_name(cli: &Cli, cfg: &Config) -> Result<Option<String>, CliError> {
+    let name = match cli.printer.clone().or_else(|| cfg.default_printer.clone()) {
+        Some(n) => n,
+        None => return Ok(None),
+    };
+    if cfg.printers.contains_key(&name) {
+        Ok(Some(name))
+    } else {
+        Err(CliError::from(ConfigError::UnknownProfile(name)))
+    }
+}
+
+/// JSON output is the default when stdout is not a TTY, or when `--json` is set.
+fn want_json(cli: &Cli) -> bool {
+    cli.json || !std::io::stdout().is_terminal()
 }
 
 fn flag_overrides(cli: &Cli) -> Overrides {
