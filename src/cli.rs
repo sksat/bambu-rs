@@ -1,11 +1,11 @@
 //! The `bambu` command-line interface (behind the `cli` feature).
 //!
 //! Thin layer over the library: parse args, resolve a connection target, call
-//! the client, format output. Agent contract: JSON to stdout (default when
-//! stdout is not a TTY, or with `--json`), human text otherwise; a semantic
-//! exit-code scheme; the access code is never printed.
+//! the client, format output. Agent contract: human-readable output by default,
+//! machine-readable JSON to stdout with `--json` (no TTY auto-detection — output
+//! format depends only on the flag); a semantic exit-code scheme; the access
+//! code is never printed.
 
-use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -55,13 +55,9 @@ struct Cli {
     /// Override the model (e.g. a1mini).
     #[arg(long, global = true)]
     model: Option<String>,
-    /// Emit JSON (the default when stdout is not a TTY).
+    /// Emit machine-readable JSON (default output is human-readable).
     #[arg(long, global = true)]
     json: bool,
-    /// Force human-readable output even when stdout is piped (overrides the
-    /// auto-JSON-when-not-a-TTY default; e.g. `watch bambu status --human`).
-    #[arg(long, global = true, conflicts_with = "json")]
-    human: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -927,16 +923,10 @@ fn selected_profile_name(cli: &Cli, cfg: &Config) -> Result<Option<String>, CliE
 
 /// JSON output is the default when stdout is not a TTY, or when `--json` is set.
 fn want_json(cli: &Cli) -> bool {
-    // Explicit flags win; otherwise default to JSON when stdout isn't a TTY
-    // (the agent contract). `--human` forces human output even through a pipe
-    // (e.g. `watch bambu status`), where the auto-switch is otherwise surprising.
-    if cli.json {
-        return true;
-    }
-    if cli.human {
-        return false;
-    }
-    !std::io::stdout().is_terminal()
+    // Output is human-readable by default and JSON only with an explicit
+    // `--json` — no TTY auto-detection (that magic surprised users piping into
+    // e.g. `watch`). Agents/scripts pass `--json`; matches `gh`'s convention.
+    cli.json
 }
 
 fn flag_overrides(cli: &Cli) -> Overrides {

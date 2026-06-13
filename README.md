@@ -19,7 +19,8 @@ can run prints safely.
   Bambu library implementations. The observed protocol facts (transport, access
   modes, model codes, report shape, command verification, HMS) are written up in
   [docs/protocol.md](docs/protocol.md).
-- **Agent-friendly & safe.** JSON on stdout, a semantic exit-code scheme,
+- **Agent-friendly & safe.** Machine-readable JSON with `--json` (human-readable
+  by default), a semantic exit-code scheme,
   `--confirm`/`--dry-run` gates on every physical action, and *verify-by-reread*
   (success is confirmed from the printer's own report, never from publish
   success).
