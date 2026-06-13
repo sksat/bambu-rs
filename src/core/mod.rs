@@ -8,6 +8,7 @@ pub mod command;
 pub mod firmware;
 pub mod hms;
 pub mod model;
+pub mod project;
 pub mod report;
 pub mod safety;
 pub mod stage;

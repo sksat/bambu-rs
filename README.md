@@ -43,8 +43,12 @@ bambu-studio --slice 1 \
 # 2. Upload it to the printer (FTPS)
 bambu file upload out.gcode.3mf --dest /cache
 
-# 3. Start the print (plate 1, AMS tray 0) and watch to completion
-bambu job start /cache/out.gcode.3mf --plate 1 --ams-map 0 --confirm --watch
+# 3. Preview the real plan (downloads + inspects the on-printer file) …
+bambu job start /cache/out.gcode.3mf --plate 1 --dry-run   # → inspection.gcode_md5
+
+# … then start, asserting it's exactly the file you inspected, and watch:
+bambu job start /cache/out.gcode.3mf --plate 1 --ams-map 0 \
+  --expect-md5 <that-md5> --expect-plate 1 --confirm --watch
 ```
 
 Full details (flags, AMS mapping, external spool, `--dry-run`) in

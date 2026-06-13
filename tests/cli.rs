@@ -82,6 +82,22 @@ fn job_start_dry_run_shows_payload_without_a_target() {
 }
 
 #[test]
+fn expect_guards_reject_raw_gcode_offline() {
+    // --expect-md5/--expect-plate are .3mf-only; on a raw .gcode they fail fast
+    // (exit 3) before any network I/O, so this needs no printer.
+    let cfg = tmp_cfg("expect-gcode");
+    bambu(&cfg)
+        .args(["job", "start", "/cache/x.gcode", "--expect-plate", "1"])
+        .assert()
+        .code(3);
+    bambu(&cfg)
+        .args(["job", "start", "/cache/x.gcode", "--expect-md5", "deadbeef"])
+        .assert()
+        .code(3);
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[test]
 fn job_start_and_pause_need_confirm() {
     let cfg = tmp_cfg("job-confirm");
     bambu(&cfg)

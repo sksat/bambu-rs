@@ -28,6 +28,7 @@ cli = ["dep:clap"]
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"], optional = true }
+md-5 = "0.11.0"
 native-tls = "0.2.18"
 rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls"] }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "logging", "tls12"] }
@@ -40,6 +41,7 @@ suppaftp = { version = "8.0.4", features = ["native-tls", "deprecated"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", default-features = false, features = ["rt", "time", "macros"] }
 toml = "1.1.2"
+zip = { version = "7.2.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"

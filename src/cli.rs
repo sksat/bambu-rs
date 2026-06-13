@@ -22,6 +22,7 @@ use crate::core::command::{
     AmsControl, AmsFilamentSetting, Command as ProtoCommand, LedNode, ProjectFile, SpeedLevel,
     TimelapseControl,
 };
+use crate::core::project::{self, PlateInspection};
 use crate::core::report::ReportState;
 use crate::core::safety::{self, GcodeVerdict, TempLimits};
 use crate::core::stage::Stage;
@@ -234,6 +235,13 @@ enum JobAction {
         /// Required to actually start a print.
         #[arg(long)]
         confirm: bool,
+        /// Guard: refuse unless the on-printer file's plate-gcode md5 matches
+        /// this (case-insensitive). Get it from `--dry-run`. (.3mf only.)
+        #[arg(long)]
+        expect_md5: Option<String>,
+        /// Guard: refuse unless --plate equals this. (.3mf only.)
+        #[arg(long)]
+        expect_plate: Option<u32>,
         /// After starting, watch the job to completion and detect anomalies
         /// (a device error or a FAILED state exits non-zero).
         #[arg(long)]
@@ -1177,14 +1185,53 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
             timelapse,
             dry_run,
             confirm,
+            expect_md5,
+            expect_plate,
             watch,
             watch_timeout,
             interval,
         } => {
+            let is_3mf = file.to_ascii_lowercase().ends_with(".3mf");
+            // The expect-guards are 3mf-only (raw .gcode has no plate/md5 metadata):
+            // reject them on a .gcode rather than silently ignore.
+            if !is_3mf && (expect_md5.is_some() || expect_plate.is_some()) {
+                return Err(CliError::new(
+                    exit::VALIDATION,
+                    "--expect-md5 / --expect-plate only apply to .3mf files",
+                ));
+            }
             let cmd = build_start_command(file, *plate, ams_map.as_deref(), bed_type, *timelapse)?;
+
+            // When an expect-guard is given, inspecting the on-printer file is
+            // MANDATORY (the caller asked us to verify) and a mismatch is fatal.
+            // A bare --dry-run inspects BEST-EFFORT (enrich the plan if the
+            // printer is reachable, else show the payload alone). A plain start
+            // doesn't inspect at all — that path stays fast and unchanged.
+            let has_expect = expect_md5.is_some() || expect_plate.is_some();
+            let inspection: Option<PlateInspection> = if is_3mf && has_expect {
+                let insp = inspect_remote_plate(cli, file, *plate)?;
+                project::verify_expectations(&insp, *plate, expect_md5.as_deref(), *expect_plate)
+                    .map_err(|e| CliError::new(exit::VALIDATION, e.to_string()))?;
+                Some(insp)
+            } else if is_3mf && *dry_run {
+                match inspect_remote_plate(cli, file, *plate) {
+                    Ok(insp) => Some(insp),
+                    Err(e) => {
+                        eprintln!(
+                            "note: could not inspect the on-printer file ({}); \
+                             showing the payload only",
+                            e.message
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             if *dry_run {
-                // Show the resolved payload (the "plan") without sending anything.
-                print_json(&cmd.to_payload("1"));
+                // Real plan: the resolved payload + what the on-printer file holds.
+                print_json(&start_plan_json(&cmd, file, inspection.as_ref()));
                 return Ok(());
             }
             if !*confirm {
@@ -1256,6 +1303,69 @@ fn parse_ams_map(map: &str) -> Result<Vec<i32>, CliError> {
         .map(|s| s.trim().parse::<i32>())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| CliError::new(exit::VALIDATION, format!("invalid --ams-map: {map:?}")))
+}
+
+/// Download the on-printer `.3mf` to a temp file and inspect the given plate.
+/// The temp file is always removed (success or error). A download failure maps
+/// to exit 7 (transport), a parse/missing-plate to exit 3 (validation).
+fn inspect_remote_plate(
+    cli: &Cli,
+    on_printer_path: &str,
+    plate: u32,
+) -> Result<PlateInspection, CliError> {
+    let ftps = FtpsClient::new(resolve_target(cli)?);
+    // A unique temp path so concurrent dry-runs don't collide.
+    let tmp = std::env::temp_dir().join(format!(
+        "bambu-inspect-{}-{plate}.3mf",
+        std::process::id()
+    ));
+    let result = (|| {
+        ftps.download(on_printer_path, &tmp)?; // FtpError -> exit 7
+        let bytes = std::fs::read(&tmp)
+            .map_err(|e| CliError::new(exit::GENERAL, format!("reading downloaded 3mf: {e}")))?;
+        project::inspect_plate(&bytes, plate)
+            .map_err(|e| CliError::new(exit::VALIDATION, format!("3mf inspection: {e}")))
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
+
+/// Build the `--dry-run` plan: the exact command payload plus what the
+/// on-printer file actually contains (so an agent can read the md5/plate and
+/// pass them back as `--expect-md5`/`--expect-plate`).
+fn start_plan_json(
+    cmd: &ProtoCommand,
+    file: &str,
+    inspection: Option<&PlateInspection>,
+) -> serde_json::Value {
+    let mut warnings: Vec<String> = Vec::new();
+    let inspection_json = match inspection {
+        Some(i) => {
+            if !i.sidecar_matches {
+                warnings.push(
+                    "the file's own .gcode.md5 sidecar disagrees with the computed md5; \
+                     using the computed value"
+                        .to_string(),
+                );
+            }
+            serde_json::json!({
+                "file": file,
+                "plate": i.plate,
+                "gcode_md5": i.gcode_md5,
+                "sidecar_md5": i.sidecar_md5,
+                "sidecar_matches": i.sidecar_matches,
+                "bed_type": i.bed_type,
+                "filament_colors": i.filament_colors,
+                "source": "on-printer file (downloaded for inspection)",
+                "warnings": warnings,
+            })
+        }
+        None => serde_json::Value::Null,
+    };
+    serde_json::json!({
+        "command": cmd.to_payload("1"),
+        "inspection": inspection_json,
+    })
 }
 
 /// Refuse to start a print unless the printer is idle (a key safety guard).

@@ -187,7 +187,15 @@ The printer's FTP root has, among others, two dirs that matter for printing
 
 A sliced `.gcode.3mf` is a zip containing `Metadata/plate_N.gcode`,
 `Metadata/plate_N.gcode.md5`, `Metadata/plate_N.json`, `3D/3dmodel.model`, plate
-PNGs, `project_settings.config`, etc. **[observed]**
+PNGs, `project_settings.config`, etc. **[observed]** `plate_N.gcode.md5` holds the
+md5 of `plate_N.gcode` as **UPPERCASE** hex (matches `md5(plate_N.gcode)`
+case-insensitively — confirmed on a real petg-cube). `plate_N.json` carries
+`bed_type` and `filament_colors` (`#RRGGBB`). `bambu job start --dry-run` and the
+`--expect-md5`/`--expect-plate` guards download the on-printer file over FTPS and
+inspect it (we compute the md5 from the gcode bytes — authoritative — and treat
+the sidecar as a cross-check). The `project_file` `md5` field is still sent **`""`**
+(the observed-good value; sending a computed md5 is untested on a healthy SD card
+— see open questions). **[observed]**
 
 To start one: `print.project_file` with `url = ftp:///<dir>/<file>.gcode.3mf`,
 `param = Metadata/plate_N.gcode`, and the LAN ids set to `"0"`. A real print was
