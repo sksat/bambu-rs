@@ -943,6 +943,15 @@ fn print_status_human(o: &StatusOutput) {
             println!("stage:   {stage} ({id})");
         }
     }
+    if let Some(f) = &s.filament {
+        let name = f.name.as_deref().or(f.material.as_deref()).unwrap_or("?");
+        let color = f
+            .color
+            .as_deref()
+            .map(|c| format!(" #{c}"))
+            .unwrap_or_default();
+        println!("filament: {name} @ {}{color}", f.location);
+    }
     if let (Some(n), Some(b)) = (s.nozzle_temper, s.bed_temper) {
         println!("temps:   nozzle {n:.1}°C / bed {b:.1}°C");
     }

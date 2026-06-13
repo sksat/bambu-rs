@@ -54,6 +54,23 @@ pub struct PrinterStatus {
     pub cooling_fan_speed: Option<i64>,
     /// Name of the running subtask/job (empty when idle).
     pub subtask_name: Option<String>,
+    /// The currently-loaded filament (the one the print uses), resolved from
+    /// `ams.tray_now` → the matching AMS tray or the external spool. `None` when
+    /// nothing is loaded or the report doesn't carry AMS data.
+    pub filament: Option<Filament>,
+}
+
+/// The loaded filament a print draws from (resolved from `ams.tray_now`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Filament {
+    /// `ams0`..`amsN` for an AMS tray, or `external` for the external spool.
+    pub location: String,
+    /// Material, e.g. `PLA` (`tray_type`).
+    pub material: Option<String>,
+    /// Display name, e.g. `PLA Matte` (`tray_sub_brands`).
+    pub name: Option<String>,
+    /// Colour as reported (`tray_color`), e.g. `000000FF` (RGBA hex).
+    pub color: Option<String>,
 }
 
 impl PrinterStatus {
@@ -83,6 +100,7 @@ impl PrinterStatus {
             chamber_temper_raw: get("chamber_temper").and_then(Value::as_f64),
             cooling_fan_speed: get("cooling_fan_speed").and_then(as_i64_loose),
             subtask_name: get("subtask_name").and_then(as_string),
+            filament: print.and_then(resolve_filament),
         }
     }
 
@@ -169,6 +187,47 @@ fn as_string(v: &Value) -> Option<String> {
     v.as_str().map(str::to_owned)
 }
 
+/// A string field, but `None` for empty (the device uses `""` for "unset").
+fn as_nonempty_string(v: &Value) -> Option<String> {
+    v.as_str().filter(|s| !s.is_empty()).map(str::to_owned)
+}
+
+/// Resolve the loaded filament from the `print` object: `ams.tray_now` names the
+/// active tray — `254` is the external spool (`vt_tray`), otherwise it matches a
+/// tray `id` inside `ams.ams[].tray[]`. Returns `None` when nothing is loaded
+/// (`tray_now == 255`) or the report carries no AMS data.
+fn resolve_filament(print: &Value) -> Option<Filament> {
+    let ams = print.get("ams")?;
+    let tray_now = ams.get("tray_now").and_then(Value::as_str)?;
+
+    if tray_now == "254" {
+        let vt = print.get("vt_tray")?;
+        return Some(Filament {
+            location: "external".to_string(),
+            material: vt.get("tray_type").and_then(as_nonempty_string),
+            name: vt.get("tray_sub_brands").and_then(as_nonempty_string),
+            color: vt.get("tray_color").and_then(as_nonempty_string),
+        });
+    }
+
+    for unit in ams.get("ams").and_then(Value::as_array)?.iter() {
+        let Some(trays) = unit.get("tray").and_then(Value::as_array) else {
+            continue;
+        };
+        for tray in trays {
+            if tray.get("id").and_then(Value::as_str) == Some(tray_now) {
+                return Some(Filament {
+                    location: format!("ams{tray_now}"),
+                    material: tray.get("tray_type").and_then(as_nonempty_string),
+                    name: tray.get("tray_sub_brands").and_then(as_nonempty_string),
+                    color: tray.get("tray_color").and_then(as_nonempty_string),
+                });
+            }
+        }
+    }
+    None
+}
+
 /// Accept either a JSON number or a numeric string (the device sends some
 /// integer-valued fields, e.g. fan speeds, as strings).
 fn as_i64_loose(v: &Value) -> Option<i64> {
@@ -184,6 +243,47 @@ mod tests {
     use super::*;
     use crate::core::report::ReportState;
     use serde_json::json;
+
+    #[test]
+    fn filament_resolves_from_ams_tray_now() {
+        // tray_now points at AMS tray 3 (PLA Matte black).
+        let state = json!({ "print": {
+            "ams": {
+                "tray_now": "3",
+                "ams": [{ "id": "0", "tray": [
+                    { "id": "0", "tray_type": "PLA", "tray_sub_brands": "PLA Matte", "tray_color": "DE4343FF" },
+                    { "id": "3", "tray_type": "PLA", "tray_sub_brands": "PLA Matte", "tray_color": "000000FF" }
+                ]}]
+            }
+        }});
+        let f = PrinterStatus::from_state(&state).filament.unwrap();
+        assert_eq!(f.location, "ams3");
+        assert_eq!(f.material.as_deref(), Some("PLA"));
+        assert_eq!(f.name.as_deref(), Some("PLA Matte"));
+        assert_eq!(f.color.as_deref(), Some("000000FF"));
+    }
+
+    #[test]
+    fn filament_resolves_external_spool() {
+        let state = json!({ "print": {
+            "ams": { "tray_now": "254", "ams": [] },
+            "vt_tray": { "tray_type": "PLA", "tray_sub_brands": "", "tray_color": "161616FF" }
+        }});
+        let f = PrinterStatus::from_state(&state).filament.unwrap();
+        assert_eq!(f.location, "external");
+        assert_eq!(f.material.as_deref(), Some("PLA"));
+        assert_eq!(f.name, None); // empty sub_brands -> None
+        assert_eq!(f.color.as_deref(), Some("161616FF"));
+    }
+
+    #[test]
+    fn filament_none_when_nothing_loaded() {
+        let state = json!({ "print": { "ams": { "tray_now": "255", "ams": [] } } });
+        assert_eq!(PrinterStatus::from_state(&state).filament, None);
+        // No AMS data at all.
+        let bare = json!({ "print": { "gcode_state": "IDLE" } });
+        assert_eq!(PrinterStatus::from_state(&bare).filament, None);
+    }
 
     #[test]
     fn device_error_decodes_nonzero_print_error_to_hex() {
