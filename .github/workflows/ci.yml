@@ -29,19 +29,40 @@ jobs:
       - name: Test
         run: cargo test --all-features
 
-  # Enforce the declared MSRV (Cargo.toml `rust-version`). RUSTUP_TOOLCHAIN
-  # overrides rust-toolchain.toml (which pins 1.96.0) so this builds on the floor.
+  # Enforce the declared MSRV (Cargo.toml `rust-version`) — and prove this job is
+  # actually exercising it. The MSRV is read FROM Cargo.toml (single source of
+  # truth, no drift), and a guard asserts the active rustc really is that version
+  # before building, so a misconfiguration (e.g. rust-toolchain.toml's 1.96.0 pin
+  # leaking past RUSTUP_TOOLCHAIN) fails loudly instead of silently passing on
+  # the wrong toolchain.
   msrv:
     runs-on: ubuntu-latest
-    env:
-      RUSTUP_TOOLCHAIN: "1.88.0"
     steps:
       - uses: actions/checkout@v6.0.3
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          v="$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*"([0-9.]+)".*/\1/')"
+          [ -n "$v" ] || { echo "::error::could not read rust-version from Cargo.toml"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "MSRV from Cargo.toml: $v"
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable, 2026-03-27
         with:
-          toolchain: "1.88.0"
+          toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@v2.9.1
+      # RUSTUP_TOOLCHAIN overrides rust-toolchain.toml (which pins 1.96.0) so cargo
+      # uses the MSRV; the guard then proves it actually did.
+      - name: Guard — active rustc must be the declared MSRV
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
+        run: |
+          want="${{ steps.msrv.outputs.version }}"
+          got="$(rustc --version | awk '{print $2}')"
+          echo "declared MSRV=$want  active rustc=$got"
+          [ "$got" = "$want" ] || { echo "::error::msrv job is NOT on the MSRV ($got != $want)"; exit 1; }
       # Compiles lib + bins + tests + examples on the MSRV and runs the tests —
-      # catches any accidental use of a feature newer than 1.85.1.
+      # catches any accidental use of a feature newer than the declared floor.
       - name: Build + test on MSRV
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
         run: cargo test --all-features
