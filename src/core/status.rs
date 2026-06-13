@@ -52,6 +52,9 @@ pub struct PrinterStatus {
     pub chamber_temper_raw: Option<f64>,
     /// Part-cooling fan speed (`cooling_fan_speed`; arrives as a string).
     pub cooling_fan_speed: Option<i64>,
+    /// Active print-speed level (`spd_lvl`): 1 silent, 2 standard, 3 sport,
+    /// 4 ludicrous. How a `print_speed` command is verified.
+    pub spd_lvl: Option<i64>,
     /// Name of the running subtask/job (empty when idle).
     pub subtask_name: Option<String>,
     /// The currently-loaded filament (the one the print uses), resolved from
@@ -122,6 +125,7 @@ impl PrinterStatus {
             bed_target: get("bed_target_temper").and_then(Value::as_f64),
             chamber_temper_raw: get("chamber_temper").and_then(Value::as_f64),
             cooling_fan_speed: get("cooling_fan_speed").and_then(as_i64_loose),
+            spd_lvl: get("spd_lvl").and_then(as_i64_loose),
             subtask_name: get("subtask_name").and_then(as_string),
             filament: print.and_then(resolve_filament),
             chamber_light: get("lights_report")

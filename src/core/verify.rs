@@ -45,6 +45,7 @@ pub fn has_observable_effect(cmd: &Command) -> bool {
             | Command::Stop
             | Command::ChamberLight(_)
             | Command::IpcamTimelapse(_)
+            | Command::PrintSpeed(_)
     )
 }
 
@@ -103,6 +104,8 @@ pub fn evaluate(
         // commanded mode — the `ipcam_timelapse` ACK alone isn't enough (same
         // caveat as the light; relevant since this unit's camera is faulty).
         Command::IpcamTimelapse(control) => status.timelapse_mode() == Some(control.as_str()),
+        // The speed profile is applied once `spd_lvl` shows the commanded level.
+        Command::PrintSpeed(level) => status.spd_lvl == Some(level.level()),
         // Stop is handled above (terminal-state check, error-tolerant).
         Command::Stop => unreachable!("Stop handled before the new-error check"),
         // No observable state effect — caller should not use evaluate() for these.
@@ -183,6 +186,26 @@ mod tests {
         assert!(has_observable_effect(&Command::IpcamTimelapse(
             TimelapseControl::Disable
         )));
+    }
+
+    #[test]
+    fn print_speed_effect_reads_spd_lvl() {
+        use crate::core::command::SpeedLevel;
+        let at = |lvl: i64| PrinterStatus {
+            spd_lvl: Some(lvl),
+            ..Default::default()
+        };
+        // Observed once spd_lvl shows the commanded level.
+        assert_eq!(
+            evaluate(&Command::PrintSpeed(SpeedLevel::Sport), &at(3), Some(0)),
+            EffectStatus::Observed
+        );
+        // Still the old level -> pending (→ unverified on timeout).
+        assert_eq!(
+            evaluate(&Command::PrintSpeed(SpeedLevel::Sport), &at(2), Some(0)),
+            EffectStatus::Pending
+        );
+        assert!(has_observable_effect(&Command::PrintSpeed(SpeedLevel::Silent)));
     }
 
     #[test]

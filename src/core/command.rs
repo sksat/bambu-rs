@@ -48,6 +48,49 @@ impl TimelapseControl {
     }
 }
 
+/// Print-speed profile. A1/P1 use four levels; the printer echoes the active
+/// one back as `spd_lvl` in its report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeedLevel {
+    Silent,
+    Standard,
+    Sport,
+    Ludicrous,
+}
+
+impl SpeedLevel {
+    /// The numeric level the printer expects (and reports as `spd_lvl`).
+    pub fn level(self) -> i64 {
+        match self {
+            SpeedLevel::Silent => 1,
+            SpeedLevel::Standard => 2,
+            SpeedLevel::Sport => 3,
+            SpeedLevel::Ludicrous => 4,
+        }
+    }
+
+    /// Map a numeric `spd_lvl` back to a level (`None` for an unknown value).
+    pub fn from_level(n: i64) -> Option<Self> {
+        match n {
+            1 => Some(SpeedLevel::Silent),
+            2 => Some(SpeedLevel::Standard),
+            3 => Some(SpeedLevel::Sport),
+            4 => Some(SpeedLevel::Ludicrous),
+            _ => None,
+        }
+    }
+
+    /// The lowercase name (`silent`/`standard`/`sport`/`ludicrous`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SpeedLevel::Silent => "silent",
+            SpeedLevel::Standard => "standard",
+            SpeedLevel::Sport => "sport",
+            SpeedLevel::Ludicrous => "ludicrous",
+        }
+    }
+}
+
 /// A control/query command sent to the printer.
 ///
 /// Pure and data-only: rendering to JSON ([`Command::to_payload`]) takes the
@@ -70,6 +113,9 @@ pub enum Command {
     /// Print a raw G-code file already on the printer (`print.gcode_file`,
     /// single-material — no AMS mapping). The value is the on-printer path.
     GcodeFile(String),
+    /// Set the print-speed profile (`print.print_speed`). Effect is read back
+    /// from `spd_lvl`; can be sent mid-print.
+    PrintSpeed(SpeedLevel),
     /// Start a print of a sliced 3MF on the printer (`print.project_file`).
     ProjectFile(ProjectFile),
     /// Turn the chamber light on/off (`system.ledctrl`).
@@ -156,6 +202,7 @@ impl Command {
             | Command::Stop
             | Command::GcodeLine(_)
             | Command::GcodeFile(_)
+            | Command::PrintSpeed(_)
             | Command::ProjectFile(_)
             | Command::Calibration { .. } => "print",
             Command::ChamberLight(_) | Command::Reboot => "system",
@@ -177,6 +224,9 @@ impl Command {
             Command::Stop => print_command(sequence_id, "stop", ""),
             Command::GcodeLine(line) => print_command(sequence_id, "gcode_line", line),
             Command::GcodeFile(path) => print_command(sequence_id, "gcode_file", path),
+            Command::PrintSpeed(level) => {
+                print_command(sequence_id, "print_speed", &level.level().to_string())
+            }
             Command::ProjectFile(p) => json!({
                 "print": {
                     "sequence_id": sequence_id,
@@ -365,6 +415,31 @@ mod tests {
 
         let off = Command::ChamberLight(false).to_payload("9");
         assert_eq!(off["system"]["led_mode"], "off");
+    }
+
+    #[test]
+    fn print_speed_renders_the_level_as_a_print_param() {
+        let v = Command::PrintSpeed(SpeedLevel::Sport).to_payload("6");
+        assert_eq!(
+            v,
+            json!({ "print": { "sequence_id": "6", "command": "print_speed", "param": "3" } })
+        );
+        assert_eq!(Command::PrintSpeed(SpeedLevel::Silent).category(), "print");
+    }
+
+    #[test]
+    fn speed_level_maps_to_and_from_its_number() {
+        for (lvl, n) in [
+            (SpeedLevel::Silent, 1),
+            (SpeedLevel::Standard, 2),
+            (SpeedLevel::Sport, 3),
+            (SpeedLevel::Ludicrous, 4),
+        ] {
+            assert_eq!(lvl.level(), n);
+            assert_eq!(SpeedLevel::from_level(n), Some(lvl));
+        }
+        assert_eq!(SpeedLevel::from_level(0), None);
+        assert_eq!(SpeedLevel::from_level(5), None);
     }
 
     #[test]

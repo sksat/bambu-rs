@@ -18,7 +18,7 @@ use crate::client::{
 };
 use crate::config::{self, Config, ConfigError, Overrides, Profile, ResolvedTarget};
 use crate::core::capability::{self, ControlAssessment, ControlRefusal};
-use crate::core::command::{Command as ProtoCommand, ProjectFile, TimelapseControl};
+use crate::core::command::{Command as ProtoCommand, ProjectFile, SpeedLevel, TimelapseControl};
 use crate::core::report::ReportState;
 use crate::core::stage::Stage;
 use crate::core::status::{GcodeState, PrinterStatus};
@@ -119,6 +119,15 @@ enum Command {
         #[arg(value_parser = ["on", "off"])]
         state: String,
         /// Watch the report for this many seconds after sending.
+        #[arg(long, default_value_t = 8)]
+        timeout: u64,
+    },
+    /// Set the print-speed profile (can be sent mid-print; reversible).
+    Speed {
+        /// Speed level.
+        #[arg(value_parser = ["silent", "standard", "sport", "ludicrous"])]
+        level: String,
+        /// Watch the report for this many seconds to confirm spd_lvl changed.
         #[arg(long, default_value_t = 8)]
         timeout: u64,
     },
@@ -412,6 +421,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
         Command::Camera { action } => run_camera(cli, action),
         Command::Timelapse { action } => run_timelapse(cli, action),
         Command::Light { state, timeout } => run_light(cli, state == "on", *timeout),
+        Command::Speed { level, timeout } => run_speed(cli, level, *timeout),
         Command::Calibrate {
             bed_level,
             vibration,
@@ -928,6 +938,19 @@ fn run_light(cli: &Cli, on: bool, timeout_secs: u64) -> Result<(), CliError> {
     let client = connect_client(cli, timeout_secs)?;
     eprintln!("setting chamber_light {} …", if on { "on" } else { "off" });
     report_command_outcome(client.send_and_verify(&ProtoCommand::ChamberLight(on))?)
+}
+
+fn run_speed(cli: &Cli, level: &str, timeout_secs: u64) -> Result<(), CliError> {
+    let level = match level {
+        "silent" => SpeedLevel::Silent,
+        "standard" => SpeedLevel::Standard,
+        "sport" => SpeedLevel::Sport,
+        "ludicrous" => SpeedLevel::Ludicrous,
+        other => return Err(CliError::new(exit::VALIDATION, format!("unknown speed {other:?}"))),
+    };
+    let client = connect_client(cli, timeout_secs)?;
+    eprintln!("setting print speed to {} (level {}) …", level.as_str(), level.level());
+    report_command_outcome(client.send_and_verify(&ProtoCommand::PrintSpeed(level))?)
 }
 
 fn run_reboot(cli: &Cli, confirm: bool) -> Result<(), CliError> {
@@ -1625,6 +1648,12 @@ fn print_status_human(o: &StatusOutput) {
     }
     if let Some(tl) = s.timelapse_mode() {
         println!("timelapse: {tl}");
+    }
+    if let Some(lvl) = s.spd_lvl {
+        let name = SpeedLevel::from_level(lvl)
+            .map(|l| l.as_str())
+            .unwrap_or("?");
+        println!("speed:   {name} ({lvl})");
     }
     if let Some(p) = s.mc_percent {
         let layer = s.layer_num.unwrap_or(0);
