@@ -58,6 +58,10 @@ struct Cli {
     /// Emit JSON (the default when stdout is not a TTY).
     #[arg(long, global = true)]
     json: bool,
+    /// Force human-readable output even when stdout is piped (overrides the
+    /// auto-JSON-when-not-a-TTY default; e.g. `watch bambu status --human`).
+    #[arg(long, global = true, conflicts_with = "json")]
+    human: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -199,6 +203,10 @@ enum JobAction {
         /// With --watch, give up watching after this many seconds (default 6h).
         #[arg(long, default_value_t = 21600)]
         watch_timeout: u64,
+        /// With --watch, poll every N seconds (sends `pushall`) for a higher
+        /// data rate, like Bambu Studio. Default: passive.
+        #[arg(long)]
+        interval: Option<u64>,
     },
     /// Pause the current print (needs --confirm).
     Pause {
@@ -695,6 +703,7 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
             confirm,
             watch,
             watch_timeout,
+            interval,
         } => {
             let cmd = build_start_command(file, *plate, ams_map.as_deref(), bed_type)?;
             if *dry_run {
@@ -718,7 +727,8 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
                 eprintln!("print started; watching for completion / anomalies …");
                 let (model, profile_name) = watch_identity(cli)?;
                 let watcher = connect_client(cli, *watch_timeout)?;
-                watch_to_terminal(&watcher, cli, model, profile_name, true, None)
+                let watch_interval = interval.map(Duration::from_secs);
+                watch_to_terminal(&watcher, cli, model, profile_name, true, watch_interval)
             } else {
                 report_command_outcome(outcome)
             }
@@ -917,7 +927,16 @@ fn selected_profile_name(cli: &Cli, cfg: &Config) -> Result<Option<String>, CliE
 
 /// JSON output is the default when stdout is not a TTY, or when `--json` is set.
 fn want_json(cli: &Cli) -> bool {
-    cli.json || !std::io::stdout().is_terminal()
+    // Explicit flags win; otherwise default to JSON when stdout isn't a TTY
+    // (the agent contract). `--human` forces human output even through a pipe
+    // (e.g. `watch bambu status`), where the auto-switch is otherwise surprising.
+    if cli.json {
+        return true;
+    }
+    if cli.human {
+        return false;
+    }
+    !std::io::stdout().is_terminal()
 }
 
 fn flag_overrides(cli: &Cli) -> Overrides {
