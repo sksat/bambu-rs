@@ -73,6 +73,15 @@ enum Command {
         #[arg(long, default_value_t = 21600)]
         timeout: u64,
     },
+    /// Turn the chamber/work light on or off (control test; low-risk).
+    Light {
+        /// "on" or "off".
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+        /// Watch the report for this many seconds after sending.
+        #[arg(long, default_value_t = 8)]
+        timeout: u64,
+    },
     /// Send a raw G-code line and watch the report (control; needs --confirm).
     Gcode {
         /// The G-code line, e.g. "G28" (home all axes).
@@ -163,6 +172,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             exit_status,
             timeout,
         } => run_watch(cli, *exit_status, *timeout),
+        Command::Light { state, timeout } => run_light(cli, state == "on", *timeout),
         Command::Gcode {
             line,
             confirm,
@@ -318,6 +328,40 @@ fn run_watch(cli: &Cli, exit_status: bool, timeout_secs: u64) -> Result<(), CliE
         ));
     }
     Ok(())
+}
+
+fn run_light(cli: &Cli, on: bool, timeout_secs: u64) -> Result<(), CliError> {
+    let cfg = Config::load_or_default(&config_path()?)?;
+    let profile_name = selected_profile_name(cli, &cfg).ok();
+    let profile = profile_name.as_deref().and_then(|n| cfg.profile(n));
+    let overrides = flag_overrides(cli).over(Overrides::from_env());
+    let target = config::resolve(profile, &overrides)?;
+
+    let client = LanMqttClient::new(target).with_timeout(Duration::from_secs(timeout_secs));
+    eprintln!(
+        "setting chamber_light {}; watching lights_report for {timeout_secs}s …",
+        if on { "on" } else { "off" }
+    );
+
+    let mut last: Option<String> = None;
+    let result = client.send_and_watch(&[ProtoCommand::ChamberLight(on)], |state| {
+        let lights = state
+            .pointer("/print/lights_report")
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        if last.as_deref() != Some(lights.as_str()) {
+            eprintln!("lights_report={lights}");
+            last = Some(lights);
+        }
+        WatchStep::Continue
+    });
+    match result {
+        Ok(_) | Err(ClientError::Timeout(_)) => {
+            eprintln!("done (watch window elapsed)");
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn run_gcode(cli: &Cli, line: &str, confirm: bool, timeout_secs: u64) -> Result<(), CliError> {
