@@ -51,6 +51,21 @@ pub enum WatchStep {
     Stop,
 }
 
+/// The result of verifying a control command against the printer's ACK.
+///
+/// The printer echoes a command's `sequence_id` back with `result`/`reason`
+/// (observed on the A1 mini), so we can distinguish a confirmed command from one
+/// that was merely published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandOutcome {
+    /// The printer ACKed with `result == "success"`.
+    Verified,
+    /// The printer ACKed with a non-success result.
+    Rejected { reason: String },
+    /// Published, but no ACK arrived before the timeout — do NOT assume success.
+    SentUnverified,
+}
+
 /// The report topic for a serial: `device/{serial}/report`.
 pub fn report_topic(serial: &str) -> String {
     format!("device/{serial}/report")
@@ -197,9 +212,66 @@ impl LanMqttClient {
         self.run_with_timeout(self.send_and_watch_async(commands, on_update))
     }
 
-    fn run_with_timeout<Fut>(&self, fut: Fut) -> Result<ReportState, ClientError>
+    async fn send_and_verify_async(&self, cmd: &Command) -> Result<CommandOutcome, ClientError> {
+        let (client, mut eventloop) = self.connect().await?;
+        // connect() used sequence id "0" for the pushall; this command gets "1".
+        let seq = "1";
+        client
+            .publish(
+                request_topic(&self.target.serial),
+                QoS::AtLeastOnce,
+                false,
+                cmd.to_payload(seq).to_string(),
+            )
+            .await
+            .map_err(|e| ClientError::Mqtt(e.to_string()))?;
+
+        // The ACK comes back under the command's own category (print/system/…).
+        let cat = cmd.category();
+        let seq_ptr = format!("/{cat}/sequence_id");
+        let result_ptr = format!("/{cat}/result");
+        let reason_ptr = format!("/{cat}/reason");
+
+        let mut state = ReportState::new();
+        loop {
+            if let Event::Incoming(Packet::Publish(p)) = poll(&mut eventloop).await?
+                && let Ok(json) = serde_json::from_slice::<Value>(&p.payload)
+            {
+                state.apply(json);
+                // The ACK echoes our sequence_id and carries result/reason.
+                let echoed = state.pointer(&seq_ptr).and_then(|v| v.as_str()) == Some(seq);
+                if let (true, Some(result)) =
+                    (echoed, state.pointer(&result_ptr).and_then(|v| v.as_str()))
+                {
+                    return Ok(if result.eq_ignore_ascii_case("success") {
+                        CommandOutcome::Verified
+                    } else {
+                        let reason = state
+                            .pointer(&reason_ptr)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(result)
+                            .to_string();
+                        CommandOutcome::Rejected { reason }
+                    });
+                }
+            }
+        }
+    }
+
+    /// Send a control command and verify it against the printer's ACK (matched
+    /// by echoed `sequence_id` + `result`). A timeout means **`SentUnverified`**
+    /// — published but not confirmed — never assume success.
+    pub fn send_and_verify(&self, cmd: &Command) -> Result<CommandOutcome, ClientError> {
+        match self.run_with_timeout(self.send_and_verify_async(cmd)) {
+            Ok(outcome) => Ok(outcome),
+            Err(ClientError::Timeout(_)) => Ok(CommandOutcome::SentUnverified),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn run_with_timeout<T, Fut>(&self, fut: Fut) -> Result<T, ClientError>
     where
-        Fut: std::future::Future<Output = Result<ReportState, ClientError>>,
+        Fut: std::future::Future<Output = Result<T, ClientError>>,
     {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

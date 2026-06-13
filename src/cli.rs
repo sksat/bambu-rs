@@ -12,7 +12,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
-use crate::client::{ClientError, LanMqttClient, StatusSource, WatchStep};
+use crate::client::{ClientError, CommandOutcome, LanMqttClient, StatusSource, WatchStep};
 use crate::config::{self, Config, ConfigError, Overrides, Profile};
 use crate::core::command::Command as ProtoCommand;
 use crate::core::status::{GcodeState, PrinterStatus};
@@ -24,6 +24,7 @@ mod exit {
     pub const CONFIRM_REQUIRED: u8 = 4;
     pub const VERIFY_TIMEOUT: u8 = 6;
     pub const TRANSPORT: u8 = 7;
+    pub const DEVICE_REJECTED: u8 = 8;
 }
 
 #[derive(Parser)]
@@ -331,37 +332,9 @@ fn run_watch(cli: &Cli, exit_status: bool, timeout_secs: u64) -> Result<(), CliE
 }
 
 fn run_light(cli: &Cli, on: bool, timeout_secs: u64) -> Result<(), CliError> {
-    let cfg = Config::load_or_default(&config_path()?)?;
-    let profile_name = selected_profile_name(cli, &cfg).ok();
-    let profile = profile_name.as_deref().and_then(|n| cfg.profile(n));
-    let overrides = flag_overrides(cli).over(Overrides::from_env());
-    let target = config::resolve(profile, &overrides)?;
-
-    let client = LanMqttClient::new(target).with_timeout(Duration::from_secs(timeout_secs));
-    eprintln!(
-        "setting chamber_light {}; watching lights_report for {timeout_secs}s …",
-        if on { "on" } else { "off" }
-    );
-
-    let mut last: Option<String> = None;
-    let result = client.send_and_watch(&[ProtoCommand::ChamberLight(on)], |state| {
-        let lights = state
-            .pointer("/print/lights_report")
-            .map(|v| v.to_string())
-            .unwrap_or_default();
-        if last.as_deref() != Some(lights.as_str()) {
-            eprintln!("lights_report={lights}");
-            last = Some(lights);
-        }
-        WatchStep::Continue
-    });
-    match result {
-        Ok(_) | Err(ClientError::Timeout(_)) => {
-            eprintln!("done (watch window elapsed)");
-            Ok(())
-        }
-        Err(e) => Err(e.into()),
-    }
+    let client = connect_client(cli, timeout_secs)?;
+    eprintln!("setting chamber_light {} …", if on { "on" } else { "off" });
+    report_command_outcome(client.send_and_verify(&ProtoCommand::ChamberLight(on))?)
 }
 
 fn run_gcode(cli: &Cli, line: &str, confirm: bool, timeout_secs: u64) -> Result<(), CliError> {
@@ -371,46 +344,38 @@ fn run_gcode(cli: &Cli, line: &str, confirm: bool, timeout_secs: u64) -> Result<
             "refusing to send a control command without --confirm",
         ));
     }
+    let client = connect_client(cli, timeout_secs)?;
+    eprintln!("sending gcode_line {line:?} …");
+    report_command_outcome(client.send_and_verify(&ProtoCommand::GcodeLine(line.to_string()))?)
+}
+
+/// Resolve the target and build a client with the given timeout (shared setup
+/// for control commands, which don't need the profile name for output).
+fn connect_client(cli: &Cli, timeout_secs: u64) -> Result<LanMqttClient, CliError> {
     let cfg = Config::load_or_default(&config_path()?)?;
-    let profile_name = selected_profile_name(cli, &cfg).ok();
-    let profile = profile_name.as_deref().and_then(|n| cfg.profile(n));
+    let profile = selected_profile_name(cli, &cfg)
+        .ok()
+        .and_then(|n| cfg.profile(&n).cloned());
     let overrides = flag_overrides(cli).over(Overrides::from_env());
-    let target = config::resolve(profile, &overrides)?;
+    let target = config::resolve(profile.as_ref(), &overrides)?;
+    Ok(LanMqttClient::new(target).with_timeout(Duration::from_secs(timeout_secs)))
+}
 
-    let client = LanMqttClient::new(target).with_timeout(Duration::from_secs(timeout_secs));
-    eprintln!("sending gcode_line {line:?}; watching the report for {timeout_secs}s …");
-
-    // Print a line whenever any of the motion-relevant fields change.
-    let mut last: Option<String> = None;
-    let result = client.send_and_watch(&[ProtoCommand::GcodeLine(line.to_string())], |state| {
-        let st = PrinterStatus::from_state(state.get());
-        let mc_stage = state.pointer("/print/mc_print_stage").and_then(|v| {
-            v.as_str()
-                .map(String::from)
-                .or_else(|| v.as_i64().map(|n| n.to_string()))
-        });
-        let summary = format!(
-            "gcode_state={} stg_cur={:?} mc_print_stage={:?} print_error={:?} nozzle={:?} bed={:?}",
-            st.gcode_state.as_deref().unwrap_or("?"),
-            st.stg_cur,
-            mc_stage,
-            st.print_error,
-            st.nozzle_temper,
-            st.bed_temper,
-        );
-        if last.as_deref() != Some(summary.as_str()) {
-            eprintln!("{summary}");
-            last = Some(summary);
-        }
-        WatchStep::Continue // observe for the whole window
-    });
-
-    match result {
-        Ok(_) | Err(ClientError::Timeout(_)) => {
-            eprintln!("done (watch window elapsed)");
+/// Map a control command's verification outcome to output + an exit code.
+fn report_command_outcome(outcome: CommandOutcome) -> Result<(), CliError> {
+    match outcome {
+        CommandOutcome::Verified => {
+            eprintln!("verified: the printer ACKed success");
             Ok(())
         }
-        Err(e) => Err(e.into()),
+        CommandOutcome::Rejected { reason } => Err(CliError::new(
+            exit::DEVICE_REJECTED,
+            format!("the printer rejected the command: {reason}"),
+        )),
+        CommandOutcome::SentUnverified => Err(CliError::new(
+            exit::VERIFY_TIMEOUT,
+            "command published but not acknowledged within the timeout (unverified)",
+        )),
     }
 }
 

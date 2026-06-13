@@ -51,6 +51,17 @@ pub enum Command {
 }
 
 impl Command {
+    /// The top-level message category — the single JSON key this command nests
+    /// under, and the key its ACK comes back under (`print` commands are ACKed
+    /// at `/print/...`, `system` commands at `/system/...`).
+    pub fn category(&self) -> &'static str {
+        match self {
+            Command::PushAll => "pushing",
+            Command::Pause | Command::Resume | Command::Stop | Command::GcodeLine(_) => "print",
+            Command::ChamberLight(_) => "system",
+        }
+    }
+
     /// Render this command to its request-payload JSON, stamping `sequence_id`.
     pub fn to_payload(&self, sequence_id: &str) -> Value {
         match self {
@@ -95,6 +106,14 @@ mod tests {
         assert_eq!(ids.next_id(), "0");
         assert_eq!(ids.next_id(), "1");
         assert_eq!(ids.next_id(), "2");
+    }
+
+    #[test]
+    fn categories_match_the_envelope_key() {
+        assert_eq!(Command::PushAll.category(), "pushing");
+        assert_eq!(Command::Pause.category(), "print");
+        assert_eq!(Command::GcodeLine("G28".into()).category(), "print");
+        assert_eq!(Command::ChamberLight(true).category(), "system");
     }
 
     #[test]

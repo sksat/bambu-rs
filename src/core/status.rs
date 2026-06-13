@@ -29,6 +29,9 @@ pub struct PrinterStatus {
     pub remaining_time_min: Option<i64>,
     /// Current stage id (`stg_cur`); decoded to a name elsewhere.
     pub stg_cur: Option<i64>,
+    /// `home_flag` bitfield (per-axis homed state); it changes during a home/move,
+    /// so it's one of the few report signals that reflect ad-hoc motion.
+    pub home_flag: Option<i64>,
     /// Nozzle / bed temperatures and their targets (°C).
     pub nozzle_temper: Option<f64>,
     pub nozzle_target: Option<f64>,
@@ -59,6 +62,7 @@ impl PrinterStatus {
             total_layer_num: get("total_layer_num").and_then(as_i64_loose),
             remaining_time_min: get("mc_remaining_time").and_then(as_i64_loose),
             stg_cur: get("stg_cur").and_then(as_i64_loose),
+            home_flag: get("home_flag").and_then(as_i64_loose),
             nozzle_temper: get("nozzle_temper").and_then(Value::as_f64),
             nozzle_target: get("nozzle_target_temper").and_then(Value::as_f64),
             bed_temper: get("bed_temper").and_then(Value::as_f64),
