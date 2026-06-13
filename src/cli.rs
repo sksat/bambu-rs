@@ -71,6 +71,8 @@ enum Command {
     },
     /// Fetch and print a status snapshot.
     Status,
+    /// Decode the active HMS (Health Management System) alerts.
+    Hms,
     /// Start, pause, resume or stop a print job.
     Job {
         #[command(subcommand)]
@@ -297,6 +299,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
     match &cli.command {
         Command::Config { action } => run_config(cli, action),
         Command::Status => run_status(cli),
+        Command::Hms => run_hms(cli),
         Command::Watch {
             exit_status,
             timeout,
@@ -425,6 +428,42 @@ fn run_status(cli: &Cli) -> Result<(), CliError> {
         print_json(&output);
     } else {
         print_status_human(&output);
+    }
+    Ok(())
+}
+
+/// One decoded HMS alert, for output.
+#[derive(Serialize)]
+struct HmsView {
+    code: String,
+    code_hyphen: String,
+    severity: u16,
+    is_lidar: bool,
+    wiki: String,
+}
+
+fn run_hms(cli: &Cli) -> Result<(), CliError> {
+    let state = connect_client(cli, 10)?.fetch_snapshot()?;
+    let entries = crate::core::hms::decode_report_hms(state.get());
+    let views: Vec<HmsView> = entries
+        .iter()
+        .map(|e| HmsView {
+            code: e.code_string(),
+            code_hyphen: e.code_hyphen(),
+            severity: e.severity_raw(),
+            is_lidar: e.is_lidar(),
+            wiki: e.wiki_url(),
+        })
+        .collect();
+
+    if want_json(cli) {
+        print_json(&views);
+    } else if views.is_empty() {
+        println!("no active HMS alerts");
+    } else {
+        for v in &views {
+            println!("{}  (severity {})  {}", v.code, v.severity, v.wiki);
+        }
     }
     Ok(())
 }
