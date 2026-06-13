@@ -80,8 +80,9 @@ enum Command {
         /// data rate, like Bambu Studio. Default: passive (printer's ~2s push).
         #[arg(long)]
         interval: Option<u64>,
-        /// With --watch, stop after this many seconds (default 6h; or Ctrl-C).
-        #[arg(long, default_value_t = 21600)]
+        /// With --watch, stop after this many seconds (default 1h; or Ctrl-C).
+        /// Drops are auto-reconnected within this budget.
+        #[arg(long, default_value_t = 3600)]
         timeout: u64,
     },
     /// Decode the active HMS (Health Management System) alerts.
@@ -526,7 +527,8 @@ fn watch_to_terminal(
     continuous: bool,
 ) -> Result<(), CliError> {
     let mut last: Option<WatchKey> = None;
-    let result = client.watch(interval, |state| {
+    // A continuous monitor reconnects through drops; a to-terminal watch fails fast.
+    let result = client.watch(interval, continuous, |state| {
         let st = PrinterStatus::from_state(state.get());
         let key = WatchKey {
             gcode_state: st.gcode_state.clone(),

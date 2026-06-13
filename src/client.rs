@@ -26,6 +26,8 @@ use crate::core::verify::{self, EffectStatus};
 const MQTT_PORT: u16 = 8883;
 const MQTT_USER: &str = "bblp";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Backoff between reconnect attempts for a continuous (`reconnect`) watch.
+const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
 /// Errors from the I/O client. Messages never include the access code.
 #[derive(Debug, thiserror::Error)]
@@ -160,65 +162,96 @@ impl LanMqttClient {
     async fn watch_async<F: FnMut(&ReportState) -> WatchStep>(
         &self,
         interval: Option<Duration>,
+        reconnect: bool,
         mut on_update: F,
     ) -> Result<ReportState, ClientError> {
-        let (client, mut eventloop) = self.connect().await?;
+        // Merged state persists across reconnects so a continuous monitor keeps
+        // a coherent picture through a printer reboot / Wi-Fi blip.
         let mut state = ReportState::new();
-
-        // The printer's autonomous push is slow (~2s, small deltas). With an
-        // interval set, poll it like Bambu Studio does — send a periodic
-        // `pushall` to pull full snapshots (~1/s; the printer caps pushall there)
-        // for a higher data-acquisition rate.
-        let mut ticker = interval.map(|d| {
-            let mut t = tokio::time::interval(d);
-            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            t
-        });
-        // connect() already sent the first pushall; drop the immediate first tick.
-        if let Some(t) = ticker.as_mut() {
-            t.tick().await;
-        }
-
-        loop {
-            let ev = match ticker.as_mut() {
-                Some(t) => tokio::select! {
-                    ev = poll(&mut eventloop) => ev?,
-                    _ = t.tick() => {
-                        let _ = client
-                            .publish(
-                                request_topic(&self.target.serial),
-                                QoS::AtMostOnce,
-                                false,
-                                Command::PushAll.to_payload("0").to_string(),
-                            )
-                            .await;
-                        continue;
+        'reconnect: loop {
+            let (client, mut eventloop) = match self.connect().await {
+                Ok(c) => c,
+                Err(e) => {
+                    if reconnect {
+                        tokio::time::sleep(RECONNECT_DELAY).await;
+                        continue 'reconnect;
                     }
-                },
-                None => poll(&mut eventloop).await?,
+                    return Err(e);
+                }
             };
-            if let Event::Incoming(Packet::Publish(p)) = ev
-                && let Ok(json) = serde_json::from_slice::<Value>(&p.payload)
-            {
-                state.apply(json);
-                if state.pointer("/print").is_some() && matches!(on_update(&state), WatchStep::Stop)
+
+            // The printer's autonomous push is slow (~2s, small deltas). With an
+            // interval set, poll it like Bambu Studio does — send a periodic
+            // `pushall` to pull full snapshots (~1/s; the printer caps pushall
+            // there) for a higher data-acquisition rate.
+            let mut ticker = interval.map(|d| {
+                let mut t = tokio::time::interval(d);
+                t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                t
+            });
+            // connect() already sent the first pushall; drop the immediate tick.
+            if let Some(t) = ticker.as_mut() {
+                t.tick().await;
+            }
+
+            loop {
+                let polled = match ticker.as_mut() {
+                    Some(t) => tokio::select! {
+                        ev = poll(&mut eventloop) => ev,
+                        _ = t.tick() => {
+                            let _ = client
+                                .publish(
+                                    request_topic(&self.target.serial),
+                                    QoS::AtMostOnce,
+                                    false,
+                                    Command::PushAll.to_payload("0").to_string(),
+                                )
+                                .await;
+                            continue;
+                        }
+                    },
+                    None => poll(&mut eventloop).await,
+                };
+                let ev = match polled {
+                    Ok(ev) => ev,
+                    // Connection dropped: a continuous monitor reconnects and
+                    // carries on; a to-terminal watch surfaces the error.
+                    Err(e) => {
+                        if reconnect {
+                            tokio::time::sleep(RECONNECT_DELAY).await;
+                            continue 'reconnect;
+                        }
+                        return Err(e);
+                    }
+                };
+                if let Event::Incoming(Packet::Publish(p)) = ev
+                    && let Ok(json) = serde_json::from_slice::<Value>(&p.payload)
                 {
-                    return Ok(state);
+                    state.apply(json);
+                    if state.pointer("/print").is_some()
+                        && matches!(on_update(&state), WatchStep::Stop)
+                    {
+                        return Ok(state);
+                    }
                 }
             }
         }
     }
 
     /// Watch the printer, invoking `on_update` on every merged report until it
-    /// returns [`WatchStep::Stop`], or the timeout elapses. With `interval` set,
-    /// also send a periodic `pushall` to raise the data rate (see the
-    /// [Studio-cadence finding](crate)); `None` listens passively.
+    /// returns [`WatchStep::Stop`], or the (total) timeout elapses. With
+    /// `interval` set, also send a periodic `pushall` to raise the data rate
+    /// (`None` listens passively). With `reconnect`, a dropped connection is
+    /// retried (re-subscribe + re-pushall) instead of erroring — for a
+    /// continuous monitor that should survive a printer reboot / Wi-Fi blip;
+    /// pass `false` to fail fast when watching a job to completion.
     pub fn watch<F: FnMut(&ReportState) -> WatchStep>(
         &self,
         interval: Option<Duration>,
+        reconnect: bool,
         on_update: F,
     ) -> Result<ReportState, ClientError> {
-        self.run_with_timeout(self.watch_async(interval, on_update))
+        self.run_with_timeout(self.watch_async(interval, reconnect, on_update))
     }
 
     async fn send_and_watch_async<F: FnMut(&ReportState) -> WatchStep>(
