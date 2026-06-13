@@ -20,6 +20,8 @@ use serde_json::Value;
 use crate::config::ResolvedTarget;
 use crate::core::command::{Command, SequenceIds};
 use crate::core::report::ReportState;
+use crate::core::status::PrinterStatus;
+use crate::core::verify::{self, EffectStatus};
 
 const MQTT_PORT: u16 = 8883;
 const MQTT_USER: &str = "bblp";
@@ -51,19 +53,36 @@ pub enum WatchStep {
     Stop,
 }
 
-/// The result of verifying a control command against the printer's ACK.
+/// Which stage of verification failed to confirm a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyStage {
+    /// No usable ACK arrived (the printer never echoed our `sequence_id`).
+    Ack,
+    /// The ACK was `success`, but the command's *effect* was never observed in
+    /// the report before the timeout (e.g. a print that never started).
+    Effect,
+}
+
+/// The result of verifying a control command.
 ///
 /// The printer echoes a command's `sequence_id` back with `result`/`reason`
-/// (observed on the A1 mini), so we can distinguish a confirmed command from one
-/// that was merely published.
+/// (observed on the A1 mini); the ACK is necessary but **not sufficient**. For
+/// commands with an observable effect (a print start, pause/resume/stop) we also
+/// read the report back and confirm the effect — and watch for a new
+/// `print_error` — because an ACK of `success` can still be followed by nothing
+/// happening (observed: a failing SD card ACKed `project_file` then never
+/// printed). See [`crate::core::verify`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandOutcome {
-    /// The printer ACKed with `result == "success"`.
+    /// ACKed `success` **and**, for effectful commands, the effect was observed.
     Verified,
-    /// The printer ACKed with a non-success result.
+    /// The printer rejected the command (ACK `result != success`) or a new
+    /// device error appeared right after it. `reason` is human-readable.
     Rejected { reason: String },
-    /// Published, but no ACK arrived before the timeout — do NOT assume success.
-    SentUnverified,
+    /// Sent but not confirmed — never assume success. `stage` says whether we
+    /// never saw an ACK ([`VerifyStage::Ack`]) or saw the ACK but never the
+    /// effect ([`VerifyStage::Effect`]).
+    Unverified { stage: VerifyStage },
 }
 
 /// The report topic for a serial: `device/{serial}/report`.
@@ -232,41 +251,107 @@ impl LanMqttClient {
         let result_ptr = format!("/{cat}/result");
         let reason_ptr = format!("/{cat}/reason");
 
+        // Per-phase budget starts after connect, so verification gets the full
+        // configured timeout regardless of how long connecting took. The outer
+        // net in send_and_verify guards a connect/network hang.
+        let deadline = tokio::time::Instant::now() + self.timeout;
+
         let mut state = ReportState::new();
+        let mut acked = false;
+        // print_error as it stood before the command took effect, so we react
+        // only to a NEW fault (the pushall snapshot supplies it).
+        let mut baseline_error: Option<i64> = None;
+
         loop {
-            if let Event::Incoming(Packet::Publish(p)) = poll(&mut eventloop).await?
-                && let Ok(json) = serde_json::from_slice::<Value>(&p.payload)
-            {
-                state.apply(json);
-                // The ACK echoes our sequence_id and carries result/reason.
+            let ev = match tokio::time::timeout_at(deadline, poll(&mut eventloop)).await {
+                Err(_) => {
+                    // Verify timeout: distinguish "never ACKed" from "ACKed but
+                    // the effect never showed".
+                    let stage = if acked {
+                        VerifyStage::Effect
+                    } else {
+                        VerifyStage::Ack
+                    };
+                    return Ok(CommandOutcome::Unverified { stage });
+                }
+                Ok(ev) => ev?,
+            };
+
+            let Event::Incoming(Packet::Publish(p)) = ev else {
+                continue;
+            };
+            let Ok(json) = serde_json::from_slice::<Value>(&p.payload) else {
+                continue;
+            };
+            state.apply(json);
+
+            // Capture the baseline print_error the first time we see the full
+            // pushall snapshot.
+            if baseline_error.is_none() && is_full_snapshot(&state) {
+                baseline_error = Some(PrinterStatus::from_state(state.get()).print_error.unwrap_or(0));
+            }
+
+            // Phase 1 — the ACK echoes our sequence_id and carries result/reason.
+            if !acked {
                 let echoed = state.pointer(&seq_ptr).and_then(|v| v.as_str()) == Some(seq);
                 if let (true, Some(result)) =
                     (echoed, state.pointer(&result_ptr).and_then(|v| v.as_str()))
                 {
-                    return Ok(if result.eq_ignore_ascii_case("success") {
-                        CommandOutcome::Verified
-                    } else {
+                    if !result.eq_ignore_ascii_case("success") {
                         let reason = state
                             .pointer(&reason_ptr)
                             .and_then(|v| v.as_str())
                             .unwrap_or(result)
                             .to_string();
-                        CommandOutcome::Rejected { reason }
-                    });
+                        return Ok(CommandOutcome::Rejected { reason });
+                    }
+                    acked = true;
+                    // For commands with no readable effect, the ACK is final.
+                    if !verify::has_observable_effect(cmd) {
+                        return Ok(CommandOutcome::Verified);
+                    }
+                }
+            }
+
+            // Phase 2 — confirm the effect actually happened (and no new fault).
+            if acked {
+                let status = PrinterStatus::from_state(state.get());
+                match verify::evaluate(cmd, &status, baseline_error) {
+                    EffectStatus::Observed => return Ok(CommandOutcome::Verified),
+                    EffectStatus::NewError(code) => {
+                        return Ok(CommandOutcome::Rejected {
+                            reason: format!(
+                                "device reported error 0x{code:08X} after the command; \
+                                 the effect was not observed (state unchanged)"
+                            ),
+                        });
+                    }
+                    EffectStatus::Pending => {}
                 }
             }
         }
     }
 
-    /// Send a control command and verify it against the printer's ACK (matched
-    /// by echoed `sequence_id` + `result`). A timeout means **`SentUnverified`**
-    /// — published but not confirmed — never assume success.
+    /// Send a control command and verify it. The ACK (echoed `sequence_id` +
+    /// `result`) is necessary but not sufficient: for commands with an
+    /// observable effect we also confirm the effect in the report and watch for
+    /// a new `print_error` (see [`CommandOutcome`]). A verify timeout yields
+    /// [`CommandOutcome::Unverified`] — published but not confirmed — never
+    /// assume success.
     pub fn send_and_verify(&self, cmd: &Command) -> Result<CommandOutcome, ClientError> {
-        match self.run_with_timeout(self.send_and_verify_async(cmd)) {
-            Ok(outcome) => Ok(outcome),
-            Err(ClientError::Timeout(_)) => Ok(CommandOutcome::SentUnverified),
-            Err(e) => Err(e),
-        }
+        // send_and_verify_async manages its own per-phase deadline and returns
+        // Unverified on a verify timeout; this outer net only guards a
+        // connect/network hang.
+        let net = self.timeout + Duration::from_secs(5);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| ClientError::Runtime(e.to_string()))?;
+        rt.block_on(async {
+            tokio::time::timeout(net, self.send_and_verify_async(cmd))
+                .await
+                .unwrap_or(Err(ClientError::Timeout(net)))
+        })
     }
 
     fn run_with_timeout<T, Fut>(&self, fut: Fut) -> Result<T, ClientError>

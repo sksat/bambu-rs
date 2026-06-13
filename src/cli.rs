@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 
 use crate::camera::{CameraClient, CameraError};
-use crate::client::{ClientError, CommandOutcome, LanMqttClient, StatusSource, WatchStep};
+use crate::client::{ClientError, CommandOutcome, LanMqttClient, StatusSource, VerifyStage, WatchStep};
 use crate::config::{self, Config, ConfigError, Overrides, Profile, ResolvedTarget};
 use crate::core::command::{Command as ProtoCommand, ProjectFile};
 use crate::core::stage::Stage;
@@ -708,16 +708,25 @@ fn connect_client(cli: &Cli, timeout_secs: u64) -> Result<LanMqttClient, CliErro
 fn report_command_outcome(outcome: CommandOutcome) -> Result<(), CliError> {
     match outcome {
         CommandOutcome::Verified => {
-            eprintln!("verified: the printer ACKed success");
+            eprintln!("verified: the printer confirmed the command took effect");
             Ok(())
         }
         CommandOutcome::Rejected { reason } => Err(CliError::new(
             exit::DEVICE_REJECTED,
             format!("the printer rejected the command: {reason}"),
         )),
-        CommandOutcome::SentUnverified => Err(CliError::new(
+        CommandOutcome::Unverified {
+            stage: VerifyStage::Ack,
+        } => Err(CliError::new(
             exit::VERIFY_TIMEOUT,
             "command published but not acknowledged within the timeout (unverified)",
+        )),
+        CommandOutcome::Unverified {
+            stage: VerifyStage::Effect,
+        } => Err(CliError::new(
+            exit::VERIFY_TIMEOUT,
+            "command was acknowledged but its effect was never observed \
+             (e.g. the print did not start); unverified — check `bambu status`",
         )),
     }
 }
