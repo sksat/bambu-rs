@@ -132,8 +132,9 @@ Request payloads are a single-key envelope keyed by **category**:
 { "print": { "sequence_id": "1", "command": "gcode_line", "param": "G28" } }
 ```
 
-Categories: `pushing` (pushall), `print` (pause/resume/stop/gcode_line/
-project_file/…), `system` (ledctrl/…). `sequence_id` is a stringified counter.
+Categories: `pushing` (pushall), `info` (get_version), `print` (pause/resume/
+stop/gcode_line/project_file/…), `system` (ledctrl/reboot/…), `camera`
+(ipcam_timelapse/…). `sequence_id` is a stringified counter.
 
 **Verify-by-reread via the ACK** (the primary verify signal): after sending a
 command with `sequence_id = N`, watch for a report under the **same category**
@@ -186,6 +187,38 @@ unreliable at the time), so whether `gcode_file` is genuinely unsupported on the
 A1 is **inconclusive** — retest on a healthy SD card before concluding. We do
 **not** register a "gcode_file unsupported" quirk. **[observed, inconclusive]**
 
+## Version inventory (`info.get_version`)
+
+`{"info":{"sequence_id":"N","command":"get_version"}}` is answered (under
+`/info`) with a `module[]` array — one entry per hardware/software component,
+each `{name, hw_ver, sw_ver, product_name, …}`. The **`ota`** module's `sw_ver`
+is the printer's user-facing **firmware** version (what the capability registry
+keys on). On our A1 mini: `ota` sw_ver `01.07.02.00` (product_name `Bambu Lab A1
+mini`), `esp32` hw `AP05`, and `ams_f1/0` hw `AMS_F102` product_name `AMS Lite`.
+`bambu info` reads this and resolves `(model, firmware)` capabilities.
+**[observed]** (fixture `tests/fixtures/get_version-a1mini.json`).
+
+## Camera / timelapse settings (`ipcam` node, `camera.ipcam_timelapse`)
+
+The report's `print.ipcam` object carries the camera/timelapse settings, e.g.
+`{"timelapse":"disable","ipcam_record":"enable","resolution":"1080p",
+"tutk_server":"disable","mode_bits":3}`. The `timelapse` field is the printer's
+**actual** timelapse setting. **[observed]**
+
+`camera.ipcam_timelapse` toggles it:
+`{"camera":{"command":"ipcam_timelapse","control":"enable","sequence_id":"N"}}`
+(`control` = `enable`/`disable`). Verify like the chamber light — read back
+`ipcam.timelapse`, not just the ACK (a faulty/absent camera may ACK but not take
+effect). **[spec]** — shape is OpenBambuAPI-derived; **not device-confirmed**,
+because this unit's built-in camera is hardware-dead (front-cover FPC). Recorded
+videos land in FTPS `/timelapse`. The "smooth/cinematic" per-layer-park look is
+produced by the **slicer's** timelapse gcode, not by a printer command.
+
+> Because the built-in camera can't capture here, `bambu timelapse capture`
+> drives an **external** camera instead: it watches the LAN report and runs a
+> user-supplied capture command (argv, no shell) on each new `layer_num`. Pure
+> orchestration — the printer's own layer events are the trigger.
+
 ## Errors: `print_error` is a separate channel from HMS
 
 A device fault can surface via **`print_error`** (a single 32-bit code under
@@ -216,8 +249,10 @@ Two caveats, both observed when we used it to recover a wedged SD mount:
 ## FTP control/data both usable
 
 Beyond `LIST` + `STOR`, the A1 mini's implicit-FTPS server also supports
-`RNFR`/`RNTO` (rename, control-channel only) and `RETR` (download). Used during
-debugging to inspect on-printer files. **[observed]**
+`RNFR`/`RNTO` (rename, control-channel only) and `RETR` (download). `RETR` backs
+`bambu file download` / `bambu timelapse get` — verified by downloading a real
+`*.gcode.3mf` byte-identical (valid zip, plate gcode intact). `DELE` backs
+`bambu file rm` (standard, not yet device-exercised here). **[observed]**
 
 ## HMS decode
 

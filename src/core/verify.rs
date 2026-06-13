@@ -44,6 +44,7 @@ pub fn has_observable_effect(cmd: &Command) -> bool {
             | Command::Resume
             | Command::Stop
             | Command::ChamberLight(_)
+            | Command::IpcamTimelapse(_)
     )
 }
 
@@ -98,6 +99,10 @@ pub fn evaluate(
             let want = if *on { "on" } else { "off" };
             status.chamber_light.as_deref() == Some(want)
         }
+        // The timelapse setting is "set" once `ipcam.timelapse` shows the
+        // commanded mode — the `ipcam_timelapse` ACK alone isn't enough (same
+        // caveat as the light; relevant since this unit's camera is faulty).
+        Command::IpcamTimelapse(control) => status.timelapse_mode() == Some(control.as_str()),
         // Stop is handled above (terminal-state check, error-tolerant).
         Command::Stop => unreachable!("Stop handled before the new-error check"),
         // No observable state effect — caller should not use evaluate() for these.
@@ -143,6 +148,41 @@ mod tests {
         assert!(!has_observable_effect(&Command::GcodeLine("G28".into())));
         assert!(!has_observable_effect(&Command::PushAll));
         assert!(!has_observable_effect(&Command::Reboot));
+    }
+
+    #[test]
+    fn ipcam_timelapse_effect_reads_the_ipcam_node_not_the_ack() {
+        use crate::core::command::TimelapseControl;
+        use crate::core::status::Ipcam;
+        let with_timelapse = |mode: &str| PrinterStatus {
+            ipcam: Some(Ipcam {
+                timelapse: Some(mode.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // Enable observed only once ipcam.timelapse actually reads "enable".
+        assert_eq!(
+            evaluate(
+                &Command::IpcamTimelapse(TimelapseControl::Enable),
+                &with_timelapse("enable"),
+                Some(0)
+            ),
+            EffectStatus::Observed
+        );
+        // ACKed but ipcam.timelapse still "disable" -> pending (→ unverified on
+        // timeout), never a false "verified" (this unit's camera is faulty).
+        assert_eq!(
+            evaluate(
+                &Command::IpcamTimelapse(TimelapseControl::Enable),
+                &with_timelapse("disable"),
+                Some(0)
+            ),
+            EffectStatus::Pending
+        );
+        assert!(has_observable_effect(&Command::IpcamTimelapse(
+            TimelapseControl::Disable
+        )));
     }
 
     #[test]

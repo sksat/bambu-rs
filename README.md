@@ -52,9 +52,25 @@ Full details (flags, AMS mapping, external spool, `--dry-run`) in
 
 ## Status / roadmap
 
-LAN MVP: `status` (one-shot or `--watch` to monitor) / `hms`, file upload, and printing a pre-sliced
-`.gcode.3mf` (FTPS upload → MQTT `project_file`) with safety guards. Camera, AMS
-ops, deeper slicer integration and the MCP server come later.
+LAN MVP: `status` (one-shot or `--watch` to monitor) / `info` (firmware +
+resolved capabilities) / `hms`, file transfer (`file upload`/`download`/`ls`/`rm`
+over FTPS), and printing a pre-sliced `.gcode.3mf` (FTPS upload → MQTT
+`project_file`) with safety guards.
+
+**Timelapse** is supported three ways: a printer-side toggle
+(`bambu timelapse enable/disable`, and `job start --timelapse`), fetching
+recorded videos (`bambu timelapse get`), and — for printers whose built-in
+camera is missing or broken — driving an **external** camera from the print's
+own layer events:
+
+```bash
+# Watch the active print; grab one frame per layer with any capture tool
+bambu timelapse capture --out-dir ./tl --on-layer-cmd 'fswebcam -r 1280x720 {frame}'
+```
+
+`capture` runs the command as argv (no shell; `{frame}`/`{layer}`/`{outdir}` are
+substituted), skips a failed grab and continues, and suggests an `ffmpeg` line at
+the end. AMS ops, deeper slicer integration and the MCP server come later.
 
 Control requires the printer to be in **LAN-only + Developer Mode** (since the
 Jan-2025 Authorization Control System).

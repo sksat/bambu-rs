@@ -30,6 +30,24 @@ impl SequenceIds {
     }
 }
 
+/// Whether to enable or disable the printer's per-print timelapse recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimelapseControl {
+    Enable,
+    Disable,
+}
+
+impl TimelapseControl {
+    /// The wire token the printer expects (`"enable"` / `"disable"`), which is
+    /// also exactly what the `ipcam.timelapse` report field reads back.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TimelapseControl::Enable => "enable",
+            TimelapseControl::Disable => "disable",
+        }
+    }
+}
+
 /// A control/query command sent to the printer.
 ///
 /// Pure and data-only: rendering to JSON ([`Command::to_payload`]) takes the
@@ -56,6 +74,11 @@ pub enum Command {
     ProjectFile(ProjectFile),
     /// Turn the chamber light on/off (`system.ledctrl`).
     ChamberLight(bool),
+    /// Enable/disable the printer's per-print timelapse recording
+    /// (`camera.ipcam_timelapse`). Its effect is read back from the
+    /// `ipcam.timelapse` report field. **[spec]** — shape is from OpenBambuAPI;
+    /// not device-confirmed (this unit's camera is hardware-dead).
+    IpcamTimelapse(TimelapseControl),
     /// Reboot the printer (`system.reboot`). Undocumented in the spec but
     /// **accepted by the A1 mini** (observed). The connection drops and the
     /// printer restarts, so there is no ACK — send it fire-and-forget.
@@ -136,6 +159,7 @@ impl Command {
             | Command::ProjectFile(_)
             | Command::Calibration { .. } => "print",
             Command::ChamberLight(_) | Command::Reboot => "system",
+            Command::IpcamTimelapse(_) => "camera",
         }
     }
 
@@ -201,6 +225,13 @@ impl Command {
             }),
             Command::Reboot => json!({
                 "system": { "sequence_id": sequence_id, "command": "reboot" }
+            }),
+            Command::IpcamTimelapse(control) => json!({
+                "camera": {
+                    "sequence_id": sequence_id,
+                    "command": "ipcam_timelapse",
+                    "control": control.as_str(),
+                }
             }),
         }
     }
@@ -334,6 +365,20 @@ mod tests {
 
         let off = Command::ChamberLight(false).to_payload("9");
         assert_eq!(off["system"]["led_mode"], "off");
+    }
+
+    #[test]
+    fn ipcam_timelapse_is_a_camera_command() {
+        assert_eq!(
+            Command::IpcamTimelapse(TimelapseControl::Enable).category(),
+            "camera"
+        );
+        let on = Command::IpcamTimelapse(TimelapseControl::Enable).to_payload("4");
+        assert_eq!(on["camera"]["command"], "ipcam_timelapse");
+        assert_eq!(on["camera"]["control"], "enable");
+        assert_eq!(on["camera"]["sequence_id"], "4");
+        let off = Command::IpcamTimelapse(TimelapseControl::Disable).to_payload("5");
+        assert_eq!(off["camera"]["control"], "disable");
     }
 
     #[test]

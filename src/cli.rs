@@ -18,7 +18,7 @@ use crate::client::{
 };
 use crate::config::{self, Config, ConfigError, Overrides, Profile, ResolvedTarget};
 use crate::core::capability::{self, ControlAssessment, ControlRefusal};
-use crate::core::command::{Command as ProtoCommand, ProjectFile};
+use crate::core::command::{Command as ProtoCommand, ProjectFile, TimelapseControl};
 use crate::core::report::ReportState;
 use crate::core::stage::Stage;
 use crate::core::status::{GcodeState, PrinterStatus};
@@ -107,6 +107,12 @@ enum Command {
         #[command(subcommand)]
         action: CameraAction,
     },
+    /// Timelapse: toggle printer-side recording, fetch videos, or drive an
+    /// external camera from the print's own layer events.
+    Timelapse {
+        #[command(subcommand)]
+        action: TimelapseAction,
+    },
     /// Turn the chamber/work light on or off (control test; low-risk).
     Light {
         /// "on" or "off".
@@ -192,6 +198,10 @@ enum JobAction {
         /// Build-plate type.
         #[arg(long, default_value = "auto")]
         bed_type: String,
+        /// Record a printer-side timelapse for this print (sets the
+        /// project_file `timelapse` flag). Needs a working built-in camera.
+        #[arg(long)]
+        timelapse: bool,
         /// Show the resolved command JSON without sending it (safe).
         #[arg(long)]
         dry_run: bool,
@@ -224,6 +234,59 @@ enum JobAction {
     Stop {
         #[arg(long)]
         confirm: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum TimelapseAction {
+    /// Enable printer-side timelapse recording (camera.ipcam_timelapse).
+    Enable {
+        /// Watch the report for this many seconds to confirm the setting.
+        #[arg(long, default_value_t = 8)]
+        timeout: u64,
+    },
+    /// Disable printer-side timelapse recording (camera.ipcam_timelapse).
+    Disable {
+        #[arg(long, default_value_t = 8)]
+        timeout: u64,
+    },
+    /// List recorded timelapse files on the printer (FTPS /timelapse).
+    List,
+    /// Download a recorded timelapse file from the printer.
+    Get {
+        /// File name under /timelapse (or a full on-printer path).
+        name: String,
+        /// Local output path (default: the file's basename in the CWD).
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Drive an EXTERNAL camera: watch the active print and run a capture
+    /// command on each new layer (works even with no/!broken built-in camera).
+    Capture {
+        /// Capture command run per layer, as argv (no shell). Tokens {frame},
+        /// {layer}, {outdir} are substituted. E.g. `fswebcam -r 1280x720 {frame}`.
+        #[arg(long = "on-layer-cmd", required = true, num_args = 1.., value_name = "CMD")]
+        on_layer_cmd: Vec<String>,
+        /// Directory for captured frames (created if missing).
+        #[arg(long, default_value = "./timelapse")]
+        out_dir: std::path::PathBuf,
+        /// Capture every Nth layer (1 = every layer).
+        #[arg(long, default_value_t = 1)]
+        every: u64,
+        /// Frame file extension used for {frame} paths.
+        #[arg(long, default_value = "jpg")]
+        ext: String,
+        /// Optional assemble command (argv, no shell) run once at the end;
+        /// {outdir} is substituted. If omitted, a suggested ffmpeg line is shown.
+        #[arg(long = "assemble-cmd", num_args = 1.., value_name = "CMD")]
+        assemble_cmd: Option<Vec<String>>,
+        /// Poll the printer every N seconds (sends `pushall`) for a higher layer
+        /// detection rate. Default: passive (printer's ~2s push).
+        #[arg(long)]
+        interval: Option<u64>,
+        /// Give up watching after this many seconds (default 6h).
+        #[arg(long, default_value_t = 21600)]
+        timeout: u64,
     },
 }
 
@@ -347,6 +410,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
         Command::Job { action } => run_job(cli, action),
         Command::File { action } => run_file(cli, action),
         Command::Camera { action } => run_camera(cli, action),
+        Command::Timelapse { action } => run_timelapse(cli, action),
         Command::Light { state, timeout } => run_light(cli, state == "on", *timeout),
         Command::Calibrate {
             bed_level,
@@ -967,13 +1031,14 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
             plate,
             ams_map,
             bed_type,
+            timelapse,
             dry_run,
             confirm,
             watch,
             watch_timeout,
             interval,
         } => {
-            let cmd = build_start_command(file, *plate, ams_map.as_deref(), bed_type)?;
+            let cmd = build_start_command(file, *plate, ams_map.as_deref(), bed_type, *timelapse)?;
             if *dry_run {
                 // Show the resolved payload (the "plan") without sending anything.
                 print_json(&cmd.to_payload("1"));
@@ -1021,6 +1086,7 @@ fn build_start_command(
     plate: u32,
     ams_map: Option<&str>,
     bed_type: &str,
+    timelapse: bool,
 ) -> Result<ProtoCommand, CliError> {
     let name = std::path::Path::new(file)
         .file_name()
@@ -1031,6 +1097,7 @@ fn build_start_command(
         // FTP-uploaded files live under a path like /cache/x.gcode.3mf -> ftp:///cache/...
         let mut pf = ProjectFile::new(format!("ftp://{file}"), plate, name);
         pf.bed_type = bed_type.to_string();
+        pf.timelapse = timelapse;
         if let Some(map) = ams_map {
             pf.use_ams = true;
             pf.ams_mapping = parse_ams_map(map)?;
@@ -1130,6 +1197,247 @@ fn run_camera(cli: &Cli, action: &CameraAction) -> Result<(), CliError> {
                 // The file path is the result (never inline image bytes).
                 println!("{}", out.display());
             }
+            Ok(())
+        }
+    }
+}
+
+fn run_timelapse(cli: &Cli, action: &TimelapseAction) -> Result<(), CliError> {
+    match action {
+        TimelapseAction::Enable { timeout } => {
+            timelapse_set(cli, TimelapseControl::Enable, *timeout)
+        }
+        TimelapseAction::Disable { timeout } => {
+            timelapse_set(cli, TimelapseControl::Disable, *timeout)
+        }
+        TimelapseAction::List => {
+            let names = FtpsClient::new(resolve_target(cli)?).list("/timelapse")?;
+            if want_json(cli) {
+                print_json(&names);
+            } else if names.is_empty() {
+                println!("no timelapse files on the printer");
+            } else {
+                for n in &names {
+                    println!("{n}");
+                }
+            }
+            Ok(())
+        }
+        TimelapseAction::Get { name, out } => {
+            // Accept either a bare file name or a full on-printer path.
+            let remote = if name.starts_with('/') {
+                name.clone()
+            } else {
+                format!("/timelapse/{name}")
+            };
+            let local = match out {
+                Some(p) => p.clone(),
+                None => std::path::Path::new(&remote)
+                    .file_name()
+                    .map(std::path::PathBuf::from)
+                    .ok_or_else(|| {
+                        CliError::new(exit::VALIDATION, "cannot derive an output name; pass --out")
+                    })?,
+            };
+            let n = FtpsClient::new(resolve_target(cli)?).download(&remote, &local)?;
+            eprintln!("downloaded {n} bytes to {}", local.display());
+            if want_json(cli) {
+                print_json(&serde_json::json!({
+                    "path": local.to_string_lossy(),
+                    "bytes": n,
+                }));
+            } else {
+                println!("{}", local.display());
+            }
+            Ok(())
+        }
+        TimelapseAction::Capture {
+            on_layer_cmd,
+            out_dir,
+            every,
+            ext,
+            assemble_cmd,
+            interval,
+            timeout,
+        } => run_timelapse_capture(
+            cli,
+            on_layer_cmd,
+            out_dir,
+            *every,
+            ext,
+            assemble_cmd.as_deref(),
+            interval.map(Duration::from_secs),
+            *timeout,
+        ),
+    }
+}
+
+fn timelapse_set(cli: &Cli, control: TimelapseControl, timeout_secs: u64) -> Result<(), CliError> {
+    let client = connect_client(cli, timeout_secs)?;
+    eprintln!("setting timelapse {} …", control.as_str());
+    report_command_outcome(client.send_and_verify(&ProtoCommand::IpcamTimelapse(control))?)
+}
+
+/// Drive an external camera: watch the active print and run a capture command on
+/// each new layer. This is the workaround for a missing/broken built-in camera —
+/// the printer's own `layer_num` is the trigger; the user supplies any capture
+/// tool. Capture runs as argv (no shell) with `{frame}`/`{layer}`/`{outdir}`
+/// substituted; a failed grab is logged and skipped so it never aborts the watch.
+#[allow(clippy::too_many_arguments)]
+fn run_timelapse_capture(
+    cli: &Cli,
+    on_layer_cmd: &[String],
+    out_dir: &std::path::Path,
+    every: u64,
+    ext: &str,
+    assemble_cmd: Option<&[String]>,
+    interval: Option<Duration>,
+    timeout_secs: u64,
+) -> Result<(), CliError> {
+    if every == 0 {
+        return Err(CliError::new(exit::VALIDATION, "--every must be >= 1"));
+    }
+    std::fs::create_dir_all(out_dir)
+        .map_err(|e| CliError::new(exit::GENERAL, format!("create {}: {e}", out_dir.display())))?;
+    let client = connect_client(cli, timeout_secs)?;
+
+    let mut last_layer: Option<i64> = None;
+    let mut frame_no: u64 = 0;
+    let mut captured: u64 = 0;
+    let mut failures: u64 = 0;
+
+    eprintln!(
+        "watching the active print; capturing every {} layer(s) to {} …",
+        every,
+        out_dir.display()
+    );
+    // Only capture while a print is actually progressing — otherwise an idle
+    // printer's stale `layer_num` (often 0) would trigger a spurious frame.
+    let is_active = |s: Option<GcodeState>| {
+        matches!(
+            s,
+            Some(GcodeState::Running | GcodeState::Prepare | GcodeState::Pause)
+        )
+    };
+    let mut on_update = |state: &ReportState| -> WatchStep {
+        let st = PrinterStatus::from_state(state.get());
+        if is_active(st.state())
+            && let Some(layer) = st.layer_num
+            && last_layer != Some(layer)
+        {
+            last_layer = Some(layer);
+            // Capture on every Nth layer (layer 0 = the first reported layer).
+            if layer >= 0 && (layer as u64) % every == 0 {
+                frame_no += 1;
+                let frame = out_dir.join(format!("frame_{frame_no:06}_layer_{layer:05}.{ext}"));
+                match run_capture_cmd(on_layer_cmd, &frame, layer, out_dir) {
+                    Ok(()) => {
+                        captured += 1;
+                        eprintln!("captured frame {frame_no} (layer {layer})");
+                    }
+                    Err(e) => {
+                        failures += 1;
+                        eprintln!("capture failed at layer {layer}: {e} (continuing)");
+                    }
+                }
+            }
+        }
+        // A device fault or terminal state ends the capture session.
+        if st.error.is_some() {
+            return WatchStep::Stop;
+        }
+        match st.state() {
+            Some(s) if is_watch_terminal(s) => WatchStep::Stop,
+            _ => WatchStep::Continue,
+        }
+    };
+
+    match client.watch(interval, &mut on_update) {
+        Ok(_) => {}
+        // A stall/timeout just ends the session — the frames so far are kept.
+        Err(ClientError::Timeout(_)) => eprintln!("watch timed out; ending capture session"),
+        Err(e) => return Err(e.into()),
+    }
+
+    eprintln!(
+        "done: {captured} frame(s) captured, {failures} failure(s), in {}",
+        out_dir.display()
+    );
+    if captured == 0 {
+        eprintln!(
+            "no frames captured — start this during an active print \
+             (the printer must be RUNNING and advancing layers)."
+        );
+        return Ok(());
+    }
+    finish_timelapse(out_dir, ext, assemble_cmd)
+}
+
+/// Substitute the capture-command tokens in one argv element. Pure so the
+/// (security-relevant) substitution is unit-testable; values land in distinct
+/// argv elements and are never re-parsed by a shell.
+fn subst_capture_tokens(s: &str, frame: &str, layer: i64, out_dir: &str) -> String {
+    s.replace("{frame}", frame)
+        .replace("{layer}", &layer.to_string())
+        .replace("{outdir}", out_dir)
+}
+
+/// Run one capture command (argv, no shell), substituting frame/layer/outdir.
+fn run_capture_cmd(
+    argv: &[String],
+    frame: &std::path::Path,
+    layer: i64,
+    out_dir: &std::path::Path,
+) -> Result<(), String> {
+    let frame = frame.to_string_lossy();
+    let dir = out_dir.to_string_lossy();
+    let subst = |s: &str| subst_capture_tokens(s, &frame, layer, &dir);
+    let prog = subst(&argv[0]);
+    let args: Vec<String> = argv[1..].iter().map(|a| subst(a)).collect();
+    let status = std::process::Command::new(&prog)
+        .args(&args)
+        .status()
+        .map_err(|e| format!("spawn {prog:?}: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{prog:?} exited with {status}"))
+    }
+}
+
+/// Assemble the captured frames into a video, or print a suggested ffmpeg line.
+fn finish_timelapse(
+    out_dir: &std::path::Path,
+    ext: &str,
+    assemble_cmd: Option<&[String]>,
+) -> Result<(), CliError> {
+    let dir = out_dir.display();
+    match assemble_cmd {
+        Some(argv) if !argv.is_empty() => {
+            let subst = |s: &str| s.replace("{outdir}", &out_dir.to_string_lossy());
+            let prog = subst(&argv[0]);
+            let args: Vec<String> = argv[1..].iter().map(|a| subst(a)).collect();
+            eprintln!("assembling: {prog} {}", args.join(" "));
+            let status = std::process::Command::new(&prog)
+                .args(&args)
+                .status()
+                .map_err(|e| CliError::new(exit::GENERAL, format!("spawn {prog:?}: {e}")))?;
+            if !status.success() {
+                return Err(CliError::new(
+                    exit::GENERAL,
+                    format!("assemble command exited with {status}"),
+                ));
+            }
+            Ok(())
+        }
+        _ => {
+            // No assemble step requested: suggest one (glob handles the layer
+            // suffix in frame names; sequential frame_NNNNNN keeps them ordered).
+            println!(
+                "frames are in {dir}. To build a video:\n  \
+                 ffmpeg -framerate 12 -pattern_type glob -i '{dir}/frame_*.{ext}' \
+                 -c:v libx264 -pix_fmt yuv420p {dir}/timelapse.mp4"
+            );
             Ok(())
         }
     }
@@ -1258,6 +1566,9 @@ fn print_status_human(o: &StatusOutput) {
     if let (Some(n), Some(b)) = (s.nozzle_temper, s.bed_temper) {
         println!("temps:   nozzle {n:.1}°C / bed {b:.1}°C");
     }
+    if let Some(tl) = s.timelapse_mode() {
+        println!("timelapse: {tl}");
+    }
     if let Some(p) = s.mc_percent {
         let layer = s.layer_num.unwrap_or(0);
         let total = s.total_layer_num.unwrap_or(0);
@@ -1280,7 +1591,7 @@ fn fmt_eta(min: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::fmt_eta;
+    use super::{fmt_eta, subst_capture_tokens};
 
     #[test]
     fn eta_formats_minutes_and_hours() {
@@ -1288,6 +1599,26 @@ mod tests {
         assert_eq!(fmt_eta(59), "59m");
         assert_eq!(fmt_eta(60), "1h00m");
         assert_eq!(fmt_eta(95), "1h35m");
+    }
+
+    #[test]
+    fn capture_tokens_substitute_per_argv_element() {
+        assert_eq!(
+            subst_capture_tokens("{outdir}/f_{layer}.jpg", "/t/frame.jpg", 42, "/t"),
+            "/t/f_42.jpg"
+        );
+        assert_eq!(subst_capture_tokens("{frame}", "/t/frame.jpg", 7, "/t"), "/t/frame.jpg");
+        // No tokens -> unchanged.
+        assert_eq!(subst_capture_tokens("-r", "/f.jpg", 1, "/t"), "-r");
+    }
+
+    #[test]
+    fn capture_tokens_do_not_interpret_shell_metacharacters() {
+        // The substituted value lands verbatim in a single argv element (no
+        // shell parses it), so metacharacters are inert — documents that
+        // `bambu timelapse capture` runs argv directly, not via a shell.
+        let layer_with_meta = subst_capture_tokens("{frame}", "/t/a b;rm -rf $HOME.jpg", 1, "/t");
+        assert_eq!(layer_with_meta, "/t/a b;rm -rf $HOME.jpg");
     }
 }
 

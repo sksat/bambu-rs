@@ -63,6 +63,24 @@ pub struct PrinterStatus {
     /// confirms the command was accepted (observed: a faulty unit ACKs `ledctrl`
     /// but `lights_report` stays `off`).
     pub chamber_light: Option<String>,
+    /// Camera/timelapse settings from the `ipcam` report node. `None` when the
+    /// report carries no `ipcam` object.
+    pub ipcam: Option<Ipcam>,
+}
+
+/// Camera/timelapse settings from the `ipcam` report node (A1/P1: a JPEG-stream
+/// camera). The `timelapse` field is the printer's *actual* timelapse setting,
+/// which is how an `ipcam_timelapse` command is verified (the ACK alone only
+/// says it was accepted — same caveat as the chamber light).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Ipcam {
+    /// `timelapse` mode (`enable`/`disable`) — whether a timelapse is recorded
+    /// during prints.
+    pub timelapse: Option<String>,
+    /// `ipcam_record` mode (`enable`/`disable`).
+    pub record: Option<String>,
+    /// Stream resolution, e.g. `1080p`.
+    pub resolution: Option<String>,
 }
 
 /// The loaded filament a print draws from (resolved from `ams.tray_now`).
@@ -113,7 +131,19 @@ impl PrinterStatus {
                         .find(|e| e.get("node").and_then(Value::as_str) == Some("chamber_light"))
                 })
                 .and_then(|e| e.get("mode").and_then(as_string)),
+            ipcam: get("ipcam").map(|ic| Ipcam {
+                timelapse: ic.get("timelapse").and_then(as_string),
+                record: ic.get("ipcam_record").and_then(as_string),
+                resolution: ic.get("resolution").and_then(as_string),
+            }),
         }
+    }
+
+    /// The printer's current timelapse setting (`enable`/`disable`) from the
+    /// `ipcam` report node, if present. Used to verify an `ipcam_timelapse`
+    /// command took effect.
+    pub fn timelapse_mode(&self) -> Option<&str> {
+        self.ipcam.as_ref()?.timelapse.as_deref()
     }
 
     /// The chamber temperature **only if** the model has a real chamber sensor.
@@ -370,6 +400,21 @@ mod tests {
         };
         assert_eq!(st.real_chamber_temperature(&a1), None); // synthetic -> hidden
         assert_eq!(st.real_chamber_temperature(&x1), Some(5.0)); // real sensor -> exposed
+    }
+
+    #[test]
+    fn ipcam_node_parses_timelapse_and_record() {
+        let st = PrinterStatus::from_state(&json!({ "print": { "ipcam": {
+            "timelapse": "disable", "ipcam_record": "enable", "resolution": "1080p"
+        }}}));
+        let ic = st.ipcam.as_ref().unwrap();
+        assert_eq!(ic.timelapse.as_deref(), Some("disable"));
+        assert_eq!(ic.record.as_deref(), Some("enable"));
+        assert_eq!(ic.resolution.as_deref(), Some("1080p"));
+        assert_eq!(st.timelapse_mode(), Some("disable"));
+        // No ipcam node -> None.
+        assert_eq!(PrinterStatus::from_state(&json!({ "print": {} })).ipcam, None);
+        assert_eq!(PrinterStatus::from_state(&json!({ "print": {} })).timelapse_mode(), None);
     }
 
     #[test]
