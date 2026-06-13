@@ -2,6 +2,9 @@
 **/*.rs.bk
 *.pdb
 
+# Claude Code runtime state (lock files, scheduled tasks)
+/.claude
+
 # Slicer (OrcaSlicer / BambuStudio CLI) output artifacts
 /result.json
 /*.gcode.3mf
