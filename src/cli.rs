@@ -419,6 +419,15 @@ fn run_status(cli: &Cli) -> Result<(), CliError> {
     Ok(())
 }
 
+/// The report fields whose change triggers a new `watch` progress line.
+#[derive(PartialEq)]
+struct WatchKey {
+    gcode_state: Option<String>,
+    stg_cur: Option<i64>,
+    mc_percent: Option<i64>,
+    layer_num: Option<i64>,
+}
+
 fn run_watch(cli: &Cli, exit_status: bool, timeout_secs: u64) -> Result<(), CliError> {
     let cfg = Config::load_or_default(&config_path()?)?;
     let profile_name = selected_profile_name(cli, &cfg)?;
@@ -429,15 +438,26 @@ fn run_watch(cli: &Cli, exit_status: bool, timeout_secs: u64) -> Result<(), CliE
 
     let client = LanMqttClient::new(target).with_timeout(Duration::from_secs(timeout_secs));
 
-    // Print a progress line (to stderr) whenever state / percent / layer changes.
-    let mut last: Option<(Option<String>, Option<i64>, Option<i64>)> = None;
+    // Print a progress line (to stderr) whenever state / stage / percent / layer
+    // changes. Stage is included so ad-hoc motion (homing, leveling, calibration
+    // sweeps) is visible even while gcode_state stays RUNNING.
+    let mut last: Option<WatchKey> = None;
     let final_state = client.watch(|state| {
         let st = PrinterStatus::from_state(state.get());
-        let key = (st.gcode_state.clone(), st.mc_percent, st.layer_num);
+        let key = WatchKey {
+            gcode_state: st.gcode_state.clone(),
+            stg_cur: st.stg_cur,
+            mc_percent: st.mc_percent,
+            layer_num: st.layer_num,
+        };
         if last.as_ref() != Some(&key) {
             last = Some(key);
+            let stage = match (st.stg_cur, st.stage) {
+                (Some(id), Some(name)) if id != 0 => format!("  [{name}]"),
+                _ => String::new(),
+            };
             eprintln!(
-                "{:<8} {:>3}%  layer {}/{}",
+                "{:<8} {:>3}%  layer {}/{}{stage}",
                 st.gcode_state.as_deref().unwrap_or("?"),
                 st.mc_percent.unwrap_or(0),
                 st.layer_num.unwrap_or(0),
@@ -755,6 +775,13 @@ fn print_status_human(o: &StatusOutput) {
         o.model
     );
     println!("state:   {}", s.gcode_state.as_deref().unwrap_or("?"));
+    // Show the current activity only when it's a real special stage; stage 0 is
+    // the no-op default that also shows while idle.
+    if let Some(stage) = s.stage {
+        if s.stg_cur != Some(0) {
+            println!("stage:   {stage} ({})", s.stg_cur.unwrap_or(0));
+        }
+    }
     if let (Some(n), Some(b)) = (s.nozzle_temper, s.bed_temper) {
         println!("temps:   nozzle {n:.1}°C / bed {b:.1}°C");
     }

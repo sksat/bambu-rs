@@ -88,6 +88,33 @@ Field notes **[observed]**:
 - `gcode_state` tokens: `IDLE`, `PREPARE`, `RUNNING`, `PAUSE`, `FINISH`,
   `FAILED`, `SLICING`, `INIT`, `OFFLINE`.
 
+### Print stages (`stg_cur`)
+
+`stg_cur` is a small integer naming the printer's **current activity** — the one
+report field that tracks ad-hoc motion (homing, bed leveling, calibration
+sweeps, filament changes) independently of `gcode_state`. The id→name table is
+spec-derived (OpenBambuAPI); names map to `src/core/stage.rs`.
+
+**`stg_cur = 0` is the no-special-stage default.** A real A1 mini reports `0`
+both while laying down filament *and while idle* (the idle `pushall` fixture has
+`gcode_state=IDLE`, `stg_cur=0`). So read it **together with `gcode_state`**:
+`0` means "nothing special", and `gcode_state` says whether that's idle or a
+normal print. **[observed]**
+
+Stages confirmed on the A1 mini during a `bed_level + vibration` calibration
+(`bambu calibrate --bed-level --vibration --confirm`), in order: **[observed]**
+
+| `stg_cur` | name | seen during |
+|---|---|---|
+| 14 | `cleaning_nozzle_tip` | nozzle heated to ~168°C, then cooled |
+| 3  | `sweeping_xy_mech_mode` | vibration-compensation XY sweep |
+| 1  | `auto_bed_leveling` | bed-level probing (~minutes), nozzle held ~140°C |
+
+This is concrete evidence that **motion/activity *is* observable** in the LAN
+report: `stg_cur` transitions through these stages while `gcode_state` stays
+`RUNNING` and `mc_percent` advances. The remaining names in the table are the
+spec's claim, not yet device-verified.
+
 ### Two kinds of `sequence_id`
 
 - The periodic `push_status` report carries the **printer's own** counter (not

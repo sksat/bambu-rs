@@ -10,6 +10,7 @@
 //! speeds arrive as strings and are parsed here.
 
 use crate::core::capability::{ChamberTemperature, HardwareFeatures};
+use crate::core::stage::Stage;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -27,8 +28,12 @@ pub struct PrinterStatus {
     pub total_layer_num: Option<i64>,
     /// Remaining time in minutes (`mc_remaining_time`).
     pub remaining_time_min: Option<i64>,
-    /// Current stage id (`stg_cur`); decoded to a name elsewhere.
+    /// Current stage id (`stg_cur`). Read together with `gcode_state`: stage 0
+    /// is the no-special-stage default and appears while idle too.
     pub stg_cur: Option<i64>,
+    /// Decoded name of `stg_cur` (e.g. `auto_bed_leveling`), or `None` for an
+    /// unknown/future stage id. See [`crate::core::stage`].
+    pub stage: Option<&'static str>,
     /// `home_flag` bitfield (per-axis homed state); it changes during a home/move,
     /// so it's one of the few report signals that reflect ad-hoc motion.
     pub home_flag: Option<i64>,
@@ -53,6 +58,7 @@ impl PrinterStatus {
     pub fn from_state(state: &Value) -> Self {
         let print = state.get("print");
         let get = |key: &str| print.and_then(|p| p.get(key));
+        let stg_cur = get("stg_cur").and_then(as_i64_loose);
 
         PrinterStatus {
             gcode_state: get("gcode_state").and_then(as_string),
@@ -61,7 +67,8 @@ impl PrinterStatus {
             layer_num: get("layer_num").and_then(as_i64_loose),
             total_layer_num: get("total_layer_num").and_then(as_i64_loose),
             remaining_time_min: get("mc_remaining_time").and_then(as_i64_loose),
-            stg_cur: get("stg_cur").and_then(as_i64_loose),
+            stg_cur,
+            stage: stg_cur.and_then(|id| Stage(id).name()),
             home_flag: get("home_flag").and_then(as_i64_loose),
             nozzle_temper: get("nozzle_temper").and_then(Value::as_f64),
             nozzle_target: get("nozzle_target_temper").and_then(Value::as_f64),
