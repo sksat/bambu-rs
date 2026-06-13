@@ -16,11 +16,16 @@
 //!   *not* delete the key (this differs from RFC 7386 JSON Merge Patch).
 //! - **Arrays are replaced wholesale**, not merged element-by-element.
 //!
-//! The array rule is the least certain: Bambu is known to sometimes send partial
-//! AMS-tray updates indexed by slot. If the A1 mini turns out to do that, we will
-//! add an opt-in per-path array-merge policy — but only once observed on real
-//! hardware. The engine applies messages in **arrival order** (last-writer-wins);
-//! reordering / dropping stale deltas is the transport layer's responsibility.
+//! The wholesale-array rule was the least certain (some Bambu docs hint at partial
+//! AMS-tray updates), so we **observed it**: over a 180 s capture during which an
+//! AMS-Lite slot was physically pulled and reinserted, the A1 mini emitted **zero**
+//! autonomous `ams` deltas — `ams` (the complete `ams.ams[].tray[]` structure)
+//! appeared only in the full `pushall`. So on the A1 mini there are no partial
+//! tray-array deltas and wholesale replacement is correct; a per-path array-merge
+//! policy would only add a stale-entry risk for an unobserved case. (Behaviour
+//! during an active multi-colour print, or on other models, is not yet verified.)
+//! The engine applies messages in **arrival order** (last-writer-wins); reordering
+//! / dropping stale deltas is the transport layer's responsibility.
 
 use serde_json::{Map, Value};
 

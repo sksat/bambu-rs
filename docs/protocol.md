@@ -262,6 +262,18 @@ all of these as **ACK-verified** (the ACK confirms acceptance; the physical
 effect is slow/unobserved). Use `tools/capture_report_delta.py` during a real AMS
 op to observe the report changes and upgrade these from [spec] to [observed].
 
+### AMS only arrives in the full pushall, never as a partial delta **[observed]**
+
+Captured over 180 s while an AMS-Lite slot was physically pulled and reinserted:
+**0 of 65 autonomous deltas carried `ams`** (they only changed `wifi_signal` /
+`nozzle_temper` / `bed_temper`). The `ams` object — the full `ams.ams[].tray[]`
+array, 4 trays with all fields — appeared only in the `pushall` snapshot (a quick
+reseat also left the tray fields unchanged). So the A1 mini does **not** send
+partial tray-array deltas: the report engine's wholesale array replacement is
+correct here, and `status`/`watch` (which re-pushall) always get the full AMS.
+This settled the deferred "merge AMS tray arrays by index" question — not needed
+on the A1 mini. (Behaviour during an active multi-colour print is not yet tested.)
+
 ## Errors: `print_error` is a separate channel from HMS
 
 A device fault can surface via **`print_error`** (a single 32-bit code under
