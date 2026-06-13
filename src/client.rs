@@ -358,6 +358,39 @@ impl LanMqttClient {
         })
     }
 
+    async fn send_fire_async(&self, cmd: &Command) -> Result<(), ClientError> {
+        let (client, mut eventloop) = self.connect().await?;
+        // connect() used sequence id "0" for the pushall; this command gets "1".
+        client
+            .publish(
+                request_topic(&self.target.serial),
+                QoS::AtLeastOnce,
+                false,
+                cmd.to_payload("1").to_string(),
+            )
+            .await
+            .map_err(|e| ClientError::Mqtt(e.to_string()))?;
+        // Pump the event loop briefly so the QoS-1 PUBLISH is actually written to
+        // the wire before we drop the connection. A reboot then tears the
+        // connection down (an error here is expected, not a failure).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            match tokio::time::timeout_at(deadline, poll(&mut eventloop)).await {
+                Err(_) => break,     // pump window elapsed — publish has been flushed
+                Ok(Ok(_)) => {}      // PUBACK or other events — keep pumping
+                Ok(Err(_)) => break, // connection dropped (expected for reboot)
+            }
+        }
+        Ok(())
+    }
+
+    /// Publish a command **fire-and-forget** — no ACK or effect is awaited. For
+    /// commands whose effect can't be read back because they tear down the
+    /// connection (e.g. [`Command::Reboot`]). Returns once the publish is flushed.
+    pub fn send_fire(&self, cmd: &Command) -> Result<(), ClientError> {
+        self.run_with_timeout(self.send_fire_async(cmd))
+    }
+
     fn run_with_timeout<T, Fut>(&self, fut: Fut) -> Result<T, ClientError>
     where
         Fut: std::future::Future<Output = Result<T, ClientError>>,

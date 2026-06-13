@@ -53,6 +53,10 @@ pub enum Command {
     ProjectFile(ProjectFile),
     /// Turn the chamber light on/off (`system.ledctrl`).
     ChamberLight(bool),
+    /// Reboot the printer (`system.reboot`). Undocumented in the spec but
+    /// **accepted by the A1 mini** (observed). The connection drops and the
+    /// printer restarts, so there is no ACK — send it fire-and-forget.
+    Reboot,
     /// Run printer calibration (`print.calibration`, an `option` bitmask).
     /// (Lidar — bit 0 — is X1-only and intentionally not exposed here.)
     Calibration {
@@ -127,7 +131,7 @@ impl Command {
             | Command::GcodeFile(_)
             | Command::ProjectFile(_)
             | Command::Calibration { .. } => "print",
-            Command::ChamberLight(_) => "system",
+            Command::ChamberLight(_) | Command::Reboot => "system",
         }
     }
 
@@ -187,6 +191,9 @@ impl Command {
                     "loop_times": 0,
                     "interval_time": 0,
                 }
+            }),
+            Command::Reboot => json!({
+                "system": { "sequence_id": sequence_id, "command": "reboot" }
             }),
         }
     }
@@ -311,6 +318,15 @@ mod tests {
 
         let off = Command::ChamberLight(false).to_payload("9");
         assert_eq!(off["system"]["led_mode"], "off");
+    }
+
+    #[test]
+    fn reboot_is_a_system_command() {
+        assert_eq!(Command::Reboot.category(), "system");
+        assert_eq!(
+            Command::Reboot.to_payload("3"),
+            json!({ "system": { "sequence_id": "3", "command": "reboot" } })
+        );
     }
 
     #[test]

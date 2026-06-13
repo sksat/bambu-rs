@@ -79,7 +79,9 @@ pub fn evaluate(
             Some(GcodeState::Idle | GcodeState::Finish | GcodeState::Failed)
         ),
         // No observable state effect — caller should not use evaluate() for these.
-        Command::PushAll | Command::GcodeLine(_) | Command::ChamberLight(_) => false,
+        Command::PushAll | Command::GcodeLine(_) | Command::ChamberLight(_) | Command::Reboot => {
+            false
+        }
     };
 
     if observed {

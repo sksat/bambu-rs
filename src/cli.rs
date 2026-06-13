@@ -135,6 +135,13 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         timeout: u64,
     },
+    /// Reboot the printer (disruptive; needs --confirm). The printer drops the
+    /// connection and restarts (~1–2 min) and may rejoin DHCP on a new IP.
+    Reboot {
+        /// Required — the printer will disconnect and restart.
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -330,6 +337,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             confirm,
             timeout,
         } => run_gcode(cli, line, *confirm, *timeout),
+        Command::Reboot { confirm } => run_reboot(cli, *confirm),
     }
 }
 
@@ -589,6 +597,24 @@ fn run_light(cli: &Cli, on: bool, timeout_secs: u64) -> Result<(), CliError> {
     let client = connect_client(cli, timeout_secs)?;
     eprintln!("setting chamber_light {} …", if on { "on" } else { "off" });
     report_command_outcome(client.send_and_verify(&ProtoCommand::ChamberLight(on))?)
+}
+
+fn run_reboot(cli: &Cli, confirm: bool) -> Result<(), CliError> {
+    if !confirm {
+        return Err(CliError::new(
+            exit::CONFIRM_REQUIRED,
+            "refusing to reboot without --confirm (the printer will disconnect and restart)",
+        ));
+    }
+    let client = connect_client(cli, 10)?;
+    eprintln!("sending reboot …");
+    // Reboot tears down the connection, so there is no ACK — fire-and-forget.
+    client.send_fire(&ProtoCommand::Reboot)?;
+    eprintln!(
+        "reboot sent — the printer will disconnect and restart (~1–2 min). \
+         No ACK is expected; it may rejoin DHCP on a different IP."
+    );
+    Ok(())
 }
 
 fn run_gcode(cli: &Cli, line: &str, confirm: bool, timeout_secs: u64) -> Result<(), CliError> {
