@@ -24,6 +24,24 @@
 
 use serde_json::{Map, Value};
 
+/// Whether a **single raw report message** is the full `pushall` response.
+///
+/// Observed on the A1 mini: the full snapshot carries `print.msg == 0` (~64
+/// fields), while periodic deltas carry `print.msg == 1` (a few fields) — and
+/// **both** set `command == "push_status"`, so the command alone isn't a reliable
+/// full-vs-delta signal. Inspect the **raw incoming message** (not merged state):
+/// `msg` is per-message, so a merged delta would overwrite a snapshot's `msg == 0`.
+/// Missing `msg` falls back to the command check (older firmware may omit it).
+pub fn is_full_snapshot_message(message: &Value) -> bool {
+    let print = message.get("print");
+    let is_push_status = print
+        .and_then(|p| p.get("command"))
+        .and_then(|v| v.as_str())
+        == Some("push_status");
+    let msg = print.and_then(|p| p.get("msg")).and_then(|v| v.as_i64());
+    is_push_status && msg.is_none_or(|m| m == 0)
+}
+
 /// Recursively merge `delta` into `target` (see the module docs for semantics).
 pub fn merge_into(target: &mut Value, delta: &Value) {
     if let (Value::Object(t), Value::Object(d)) = (&mut *target, delta) {
@@ -146,6 +164,26 @@ mod tests {
         rs.apply(json!({ "print": { "layer_num": 2 } })); // delta
         assert_eq!(rs.pointer("/print/gcode_state"), Some(&json!("RUNNING")));
         assert_eq!(rs.pointer("/print/layer_num"), Some(&json!(2)));
+    }
+
+    #[test]
+    fn full_snapshot_is_msg_zero_not_just_push_status() {
+        // Full pushall response: push_status + msg 0.
+        assert!(is_full_snapshot_message(
+            &json!({ "print": { "command": "push_status", "msg": 0 } })
+        ));
+        // A delta also says push_status but msg == 1 -> NOT the full snapshot.
+        assert!(!is_full_snapshot_message(
+            &json!({ "print": { "command": "push_status", "msg": 1 } })
+        ));
+        // Older firmware without msg: fall back to the command check.
+        assert!(is_full_snapshot_message(
+            &json!({ "print": { "command": "push_status" } })
+        ));
+        // Not a push_status at all.
+        assert!(!is_full_snapshot_message(
+            &json!({ "print": { "command": "gcode_line" } })
+        ));
     }
 
     // --- property-based tests -------------------------------------------------

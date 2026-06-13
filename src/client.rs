@@ -19,10 +19,13 @@ use serde_json::Value;
 
 use crate::config::ResolvedTarget;
 use crate::core::command::{Command, SequenceIds};
-use crate::core::report::ReportState;
-use crate::core::status::PrinterStatus;
-use crate::core::verify::{self, EffectStatus};
+use crate::core::report::{ReportState, is_full_snapshot_message};
+use crate::core::session::VerifySession;
 use crate::core::version::DeviceVersion;
+
+// Verify-result types live in `core` (pure, I/O-free) and are re-exported here so
+// existing `client::{CommandOutcome, VerifyStage}` users keep working.
+pub use crate::core::session::{CommandOutcome, VerifyStage};
 
 const MQTT_PORT: u16 = 8883;
 const MQTT_USER: &str = "bblp";
@@ -54,38 +57,6 @@ pub trait StatusSource {
 pub enum WatchStep {
     Continue,
     Stop,
-}
-
-/// Which stage of verification failed to confirm a command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VerifyStage {
-    /// No usable ACK arrived (the printer never echoed our `sequence_id`).
-    Ack,
-    /// The ACK was `success`, but the command's *effect* was never observed in
-    /// the report before the timeout (e.g. a print that never started).
-    Effect,
-}
-
-/// The result of verifying a control command.
-///
-/// The printer echoes a command's `sequence_id` back with `result`/`reason`
-/// (observed on the A1 mini); the ACK is necessary but **not sufficient**. For
-/// commands with an observable effect (a print start, pause/resume/stop) we also
-/// read the report back and confirm the effect — and watch for a new
-/// `print_error` — because an ACK of `success` can still be followed by nothing
-/// happening (observed: a failing SD card ACKed `project_file` then never
-/// printed). See [`crate::core::verify`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CommandOutcome {
-    /// ACKed `success` **and**, for effectful commands, the effect was observed.
-    Verified,
-    /// The printer rejected the command (ACK `result != success`) or a new
-    /// device error appeared right after it. `reason` is human-readable.
-    Rejected { reason: String },
-    /// Sent but not confirmed — never assume success. `stage` says whether we
-    /// never saw an ACK ([`VerifyStage::Ack`]) or saw the ACK but never the
-    /// effect ([`VerifyStage::Effect`]).
-    Unverified { stage: VerifyStage },
 }
 
 /// The report topic for a serial: `device/{serial}/report`.
@@ -153,7 +124,7 @@ impl LanMqttClient {
                 // not an unsolicited delta that merely carries a `print` object: a
                 // delta would be a partial snapshot missing most fields. Check the
                 // raw message before merging (msg is per-message).
-                let full = is_full_message(&json);
+                let full = is_full_snapshot_message(&json);
                 state.apply(json);
                 if full {
                     return Ok(state);
@@ -392,96 +363,25 @@ impl LanMqttClient {
             .await
             .map_err(|e| ClientError::Mqtt(e.to_string()))?;
 
-        // The ACK comes back under the command's own category (print/system/…).
-        let cat = cmd.category();
-        let seq_ptr = format!("/{cat}/sequence_id");
-        let result_ptr = format!("/{cat}/result");
-        let reason_ptr = format!("/{cat}/reason");
-
-        // Per-phase budget starts after connect, so verification gets the full
-        // configured timeout regardless of how long connecting took. The outer
-        // net in send_and_verify guards a connect/network hang.
+        // All verify logic lives in the I/O-free VerifySession (see core::session,
+        // unit-tested via FakePrinter). This is just the transport: feed it each
+        // report message; on timeout, ask it for the unverified verdict.
+        //
+        // The per-phase budget starts after connect so verification gets the full
+        // configured timeout regardless of how long connecting took; the outer net
+        // in send_and_verify guards a connect/network hang.
+        let mut session = VerifySession::new(cmd.clone(), seq);
         let deadline = tokio::time::Instant::now() + self.timeout;
-
-        let mut state = ReportState::new();
-        let mut acked = false;
-        // print_error as it stood before the command took effect, so we react
-        // only to a NEW fault (the pushall snapshot supplies it).
-        let mut baseline_error: Option<i64> = None;
-
         loop {
             let ev = match tokio::time::timeout_at(deadline, poll(&mut eventloop)).await {
-                Err(_) => {
-                    // Verify timeout: distinguish "never ACKed" from "ACKed but
-                    // the effect never showed".
-                    let stage = if acked {
-                        VerifyStage::Effect
-                    } else {
-                        VerifyStage::Ack
-                    };
-                    return Ok(CommandOutcome::Unverified { stage });
-                }
+                Err(_) => return Ok(session.timed_out()),
                 Ok(ev) => ev?,
             };
-
-            let Event::Incoming(Packet::Publish(p)) = ev else {
-                continue;
-            };
-            let Ok(json) = serde_json::from_slice::<Value>(&p.payload) else {
-                continue;
-            };
-            // Check the raw message for the full snapshot before merging (msg is
-            // per-message), then merge.
-            let full = is_full_message(&json);
-            state.apply(json);
-
-            // Capture the baseline print_error the first time we see the full
-            // pushall snapshot.
-            if baseline_error.is_none() && full {
-                baseline_error = Some(
-                    PrinterStatus::from_state(state.get())
-                        .print_error
-                        .unwrap_or(0),
-                );
-            }
-
-            // Phase 1 — the ACK echoes our sequence_id and carries result/reason.
-            if !acked {
-                let echoed = state.pointer(&seq_ptr).and_then(|v| v.as_str()) == Some(seq);
-                if let (true, Some(result)) =
-                    (echoed, state.pointer(&result_ptr).and_then(|v| v.as_str()))
-                {
-                    if !result.eq_ignore_ascii_case("success") {
-                        let reason = state
-                            .pointer(&reason_ptr)
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(result)
-                            .to_string();
-                        return Ok(CommandOutcome::Rejected { reason });
-                    }
-                    acked = true;
-                    // For commands with no readable effect, the ACK is final.
-                    if !verify::has_observable_effect(cmd) {
-                        return Ok(CommandOutcome::Verified);
-                    }
-                }
-            }
-
-            // Phase 2 — confirm the effect actually happened (and no new fault).
-            if acked {
-                let status = PrinterStatus::from_state(state.get());
-                match verify::evaluate(cmd, &status, baseline_error) {
-                    EffectStatus::Observed => return Ok(CommandOutcome::Verified),
-                    EffectStatus::NewError(code) => {
-                        return Ok(CommandOutcome::Rejected {
-                            reason: format!(
-                                "device reported error 0x{code:08X} after the command; \
-                                 the effect was not observed (state unchanged)"
-                            ),
-                        });
-                    }
-                    EffectStatus::Pending => {}
-                }
+            if let Event::Incoming(Packet::Publish(p)) = ev
+                && let Ok(json) = serde_json::from_slice::<Value>(&p.payload)
+                && let Some(outcome) = session.observe(json)
+            {
+                return Ok(outcome);
             }
         }
     }
@@ -571,28 +471,6 @@ async fn poll(eventloop: &mut EventLoop) -> Result<Event, ClientError> {
         .map_err(|e| ClientError::Mqtt(e.to_string()))
 }
 
-/// Whether a **single raw report message** is the full `pushall` response.
-///
-/// Observed on the A1 mini (`tools/capture_report_delta.py`): the full snapshot
-/// carries `print.msg == 0` with all ~64 fields, while periodic **deltas** carry
-/// `print.msg == 1` with only the changed fields — and **both** set
-/// `command == "push_status"`. So the command alone is not a reliable
-/// full-vs-delta signal; `msg == 0` is.
-///
-/// This deliberately inspects the **raw incoming message**, not the merged state:
-/// `msg` is a per-message flag, so once a delta (`msg == 1`) is merged it would
-/// overwrite a snapshot's `msg == 0`, making merged-state inspection unreliable.
-/// Missing `msg` falls back to the command check (older firmware may omit it).
-fn is_full_message(message: &Value) -> bool {
-    let print = message.get("print");
-    let is_push_status = print
-        .and_then(|p| p.get("command"))
-        .and_then(|v| v.as_str())
-        == Some("push_status");
-    let msg = print.and_then(|p| p.get("msg")).and_then(|v| v.as_i64());
-    is_push_status && msg.is_none_or(|m| m == 0)
-}
-
 /// Build a rustls config that accepts the printer's self-signed certificate.
 fn tls_config() -> Result<TlsConfiguration, ClientError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -670,26 +548,5 @@ mod tests {
     #[test]
     fn tls_config_builds() {
         assert!(tls_config().is_ok());
-    }
-
-    #[test]
-    fn full_snapshot_is_msg_zero_not_just_push_status() {
-        use serde_json::json;
-        // Full pushall response: push_status + msg 0.
-        assert!(is_full_message(
-            &json!({ "print": { "command": "push_status", "msg": 0 } })
-        ));
-        // A delta also says push_status but msg == 1 -> NOT the full snapshot.
-        assert!(!is_full_message(
-            &json!({ "print": { "command": "push_status", "msg": 1 } })
-        ));
-        // Older firmware without msg: fall back to the command check.
-        assert!(is_full_message(
-            &json!({ "print": { "command": "push_status" } })
-        ));
-        // Not a push_status at all.
-        assert!(!is_full_message(
-            &json!({ "print": { "command": "gcode_line" } })
-        ));
     }
 }
