@@ -68,13 +68,18 @@ camera is missing or broken — driving an **external** camera from the print's
 own layer events:
 
 ```bash
-# Watch the active print; grab one frame per layer with any capture tool
-bambu timelapse capture --out-dir ./tl --on-layer-cmd 'fswebcam -r 1280x720 {frame}'
+# Watch the active print; grab one frame per layer with any capture tool.
+# The capture command goes after `--` (so its own flags are fine):
+bambu timelapse capture --out-dir ./tl -- fswebcam -r 1280x720 {frame}
+
+# An IP camera (e.g. an ATOM Cam running atomcam_tools) over plain HTTP:
+bambu timelapse capture --out-dir ./tl -- \
+  curl -s -m 15 -o {frame} "http://$ATOMCAM_HOST/cgi-bin/get_jpeg.cgi"
 ```
 
-`capture` runs the command as argv (no shell; `{frame}`/`{layer}`/`{outdir}` are
-substituted), skips a failed grab and continues, and suggests an `ffmpeg` line at
-the end.
+`capture` runs the command as argv (**no shell**; `{frame}`/`{layer}`/`{outdir}`
+are substituted into distinct argv elements), skips a failed grab and continues,
+and prints a suggested `ffmpeg` line at the end to stitch the frames.
 
 Other control: `bambu speed <silent|standard|sport|ludicrous>` (verified via
 `spd_lvl`), `bambu light on|off [--node chamber|work]`, `bambu gcode <line>`

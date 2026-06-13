@@ -296,11 +296,13 @@ enum TimelapseAction {
     },
     /// Drive an EXTERNAL camera: watch the active print and run a capture
     /// command on each new layer (works even with no/!broken built-in camera).
+    ///
+    /// The capture command goes after `--` and runs as argv (no shell), so its
+    /// own flags are fine. Tokens {frame} (the numbered output path), {layer} and
+    /// {outdir} are substituted. E.g. an ATOM Cam / IP camera:
+    ///   bambu timelapse capture --out-dir ./tl -- \
+    ///     curl -s -m 15 -o {frame} http://$ATOMCAM_HOST/cgi-bin/get_jpeg.cgi
     Capture {
-        /// Capture command run per layer, as argv (no shell). Tokens {frame},
-        /// {layer}, {outdir} are substituted. E.g. `fswebcam -r 1280x720 {frame}`.
-        #[arg(long = "on-layer-cmd", required = true, num_args = 1.., value_name = "CMD")]
-        on_layer_cmd: Vec<String>,
         /// Directory for captured frames (created if missing).
         #[arg(long, default_value = "./timelapse")]
         out_dir: std::path::PathBuf,
@@ -310,10 +312,6 @@ enum TimelapseAction {
         /// Frame file extension used for {frame} paths.
         #[arg(long, default_value = "jpg")]
         ext: String,
-        /// Optional assemble command (argv, no shell) run once at the end;
-        /// {outdir} is substituted. If omitted, a suggested ffmpeg line is shown.
-        #[arg(long = "assemble-cmd", num_args = 1.., value_name = "CMD")]
-        assemble_cmd: Option<Vec<String>>,
         /// Poll the printer every N seconds (sends `pushall`) for a higher layer
         /// detection rate. Default: passive (printer's ~2s push).
         #[arg(long)]
@@ -321,6 +319,10 @@ enum TimelapseAction {
         /// Give up watching after this many seconds (default 6h).
         #[arg(long, default_value_t = 21600)]
         timeout: u64,
+        /// The capture command (after `--`), as argv: program then args, with
+        /// {frame}/{layer}/{outdir} tokens. Run directly, never via a shell.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1.., value_name = "CMD")]
+        on_layer_cmd: Vec<String>,
     },
 }
 
@@ -1693,7 +1695,6 @@ fn run_timelapse(cli: &Cli, action: &TimelapseAction) -> Result<(), CliError> {
             out_dir,
             every,
             ext,
-            assemble_cmd,
             interval,
             timeout,
         } => run_timelapse_capture(
@@ -1702,7 +1703,6 @@ fn run_timelapse(cli: &Cli, action: &TimelapseAction) -> Result<(), CliError> {
             out_dir,
             *every,
             ext,
-            assemble_cmd.as_deref(),
             interval.map(Duration::from_secs),
             *timeout,
         ),
@@ -1723,14 +1723,12 @@ fn timelapse_set(cli: &Cli, control: TimelapseControl, timeout_secs: u64) -> Res
 /// the printer's own `layer_num` is the trigger; the user supplies any capture
 /// tool. Capture runs as argv (no shell) with `{frame}`/`{layer}`/`{outdir}`
 /// substituted; a failed grab is logged and skipped so it never aborts the watch.
-#[allow(clippy::too_many_arguments)]
 fn run_timelapse_capture(
     cli: &Cli,
     on_layer_cmd: &[String],
     out_dir: &std::path::Path,
     every: u64,
     ext: &str,
-    assemble_cmd: Option<&[String]>,
     interval: Option<Duration>,
     timeout_secs: u64,
 ) -> Result<(), CliError> {
@@ -1842,7 +1840,7 @@ fn run_timelapse_capture(
             "failures": failures,
             "out_dir": out_dir.to_string_lossy(),
             "ended_by": ended_by,
-            "suggested_assemble": (captured > 0 && assemble_cmd.is_none()).then_some(suggested.clone()),
+            "suggested_assemble": (captured > 0).then_some(suggested.clone()),
         }));
     }
     if captured == 0 {
@@ -1852,7 +1850,12 @@ fn run_timelapse_capture(
         );
         return Ok(());
     }
-    finish_timelapse(out_dir, &suggested, assemble_cmd, want_json(cli))
+    // Frames are written; stitching is left to the user (avoids a second
+    // command-with-flags arg, and ffmpeg invocations vary). Print the suggestion.
+    if !want_json(cli) {
+        println!("to build a video:\n  {suggested}");
+    }
+    Ok(())
 }
 
 /// A suggested `ffmpeg` line to stitch the frames (glob handles the layer suffix
@@ -1894,45 +1897,6 @@ fn run_capture_cmd(
         Ok(())
     } else {
         Err(format!("{prog:?} exited with {status}"))
-    }
-}
-
-/// Assemble the captured frames into a video, or print the suggested ffmpeg line.
-fn finish_timelapse(
-    out_dir: &std::path::Path,
-    suggested: &str,
-    assemble_cmd: Option<&[String]>,
-    json: bool,
-) -> Result<(), CliError> {
-    match assemble_cmd {
-        Some(argv) if !argv.is_empty() => {
-            let subst = |s: &str| s.replace("{outdir}", &out_dir.to_string_lossy());
-            let prog = subst(&argv[0]);
-            let args: Vec<String> = argv[1..].iter().map(|a| subst(a)).collect();
-            // Log only the program, not its args: a user's assemble command may
-            // carry credentials/tokens, and the OS process table already exposes
-            // them — don't additionally print them to our own log.
-            eprintln!("assembling with {prog} ({} arg(s)) …", args.len());
-            let status = std::process::Command::new(&prog)
-                .args(&args)
-                .status()
-                .map_err(|e| CliError::new(exit::GENERAL, format!("spawn {prog:?}: {e}")))?;
-            if !status.success() {
-                return Err(CliError::new(
-                    exit::GENERAL,
-                    format!("assemble command exited with {status}"),
-                ));
-            }
-            Ok(())
-        }
-        // No assemble step requested: suggest one (already echoed in the JSON
-        // summary, so only print it in human mode).
-        _ => {
-            if !json {
-                println!("to build a video:\n  {suggested}");
-            }
-            Ok(())
-        }
     }
 }
 
