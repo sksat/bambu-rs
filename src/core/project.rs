@@ -132,6 +132,15 @@ pub fn verify_expectations(
     expect_md5: Option<&str>,
     expect_plate: Option<u32>,
 ) -> Result<(), ExpectError> {
+    // Defensive: the inspection must be of the plate we're verifying. The CLI
+    // always inspects `requested_plate`, but enforcing the invariant here keeps a
+    // future caller from accidentally verifying md5 against the wrong plate.
+    if inspection.plate != requested_plate {
+        return Err(ExpectError::PlateMismatch {
+            expected: inspection.plate,
+            requested: requested_plate,
+        });
+    }
     if let Some(want) = expect_plate
         && want != requested_plate
     {
@@ -184,12 +193,17 @@ fn parse_plate_json(raw: &[u8]) -> (Option<String>, Vec<String>) {
         .get("bed_type")
         .and_then(|b| b.as_str())
         .map(str::to_owned);
+    // Bound the colours defensively (a malicious .3mf could pack a huge array);
+    // a real plate has a handful. Cap count and per-entry length.
     let colors = v
         .get("filament_colors")
         .and_then(|c| c.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|c| c.as_str().map(str::to_owned))
+                .filter_map(|c| c.as_str())
+                .filter(|s| s.len() <= 32)
+                .take(64)
+                .map(str::to_owned)
                 .collect()
         })
         .unwrap_or_default();
@@ -324,5 +338,26 @@ mod tests {
         );
         // No expectations -> ok.
         assert!(verify_expectations(&inspection, 1, None, None).is_ok());
+    }
+
+    #[test]
+    fn verify_expectations_rejects_an_inspection_of_the_wrong_plate() {
+        // Defensive invariant: inspecting plate 1 but verifying for plate 2 must
+        // fail even with no caller expectations (guards against a future bug).
+        let inspection = PlateInspection {
+            plate: 1,
+            gcode_md5: "f4dc55fd36f79d26aca4003e36b48d4f".to_string(),
+            sidecar_md5: None,
+            sidecar_matches: true,
+            bed_type: None,
+            filament_colors: vec![],
+        };
+        assert_eq!(
+            verify_expectations(&inspection, 2, None, None),
+            Err(ExpectError::PlateMismatch {
+                expected: 1,
+                requested: 2
+            })
+        );
     }
 }

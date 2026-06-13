@@ -1208,30 +1208,37 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
             // printer is reachable, else show the payload alone). A plain start
             // doesn't inspect at all — that path stays fast and unchanged.
             let has_expect = expect_md5.is_some() || expect_plate.is_some();
-            let inspection: Option<PlateInspection> = if is_3mf && has_expect {
+            let mut inspection: Option<PlateInspection> = None;
+            // For a best-effort dry-run, remember why inspection failed so the
+            // plan can say so explicitly (never a silent/ambiguous null).
+            let mut inspect_error: Option<String> = None;
+            if is_3mf && has_expect {
                 let insp = inspect_remote_plate(cli, file, *plate)?;
                 project::verify_expectations(&insp, *plate, expect_md5.as_deref(), *expect_plate)
                     .map_err(|e| CliError::new(exit::VALIDATION, e.to_string()))?;
-                Some(insp)
+                inspection = Some(insp);
             } else if is_3mf && *dry_run {
                 match inspect_remote_plate(cli, file, *plate) {
-                    Ok(insp) => Some(insp),
+                    Ok(insp) => inspection = Some(insp),
                     Err(e) => {
                         eprintln!(
                             "note: could not inspect the on-printer file ({}); \
                              showing the payload only",
                             e.message
                         );
-                        None
+                        inspect_error = Some(e.message);
                     }
                 }
-            } else {
-                None
-            };
+            }
 
             if *dry_run {
                 // Real plan: the resolved payload + what the on-printer file holds.
-                print_json(&start_plan_json(&cmd, file, inspection.as_ref()));
+                print_json(&start_plan_json(
+                    &cmd,
+                    file,
+                    inspection.as_ref(),
+                    inspect_error.as_deref(),
+                ));
                 return Ok(());
             }
             if !*confirm {
@@ -1314,20 +1321,21 @@ fn inspect_remote_plate(
     plate: u32,
 ) -> Result<PlateInspection, CliError> {
     let ftps = FtpsClient::new(resolve_target(cli)?);
-    // A unique temp path so concurrent dry-runs don't collide.
-    let tmp = std::env::temp_dir().join(format!(
-        "bambu-inspect-{}-{plate}.3mf",
-        std::process::id()
-    ));
-    let result = (|| {
-        ftps.download(on_printer_path, &tmp)?; // FtpError -> exit 7
-        let bytes = std::fs::read(&tmp)
-            .map_err(|e| CliError::new(exit::GENERAL, format!("reading downloaded 3mf: {e}")))?;
-        project::inspect_plate(&bytes, plate)
-            .map_err(|e| CliError::new(exit::VALIDATION, format!("3mf inspection: {e}")))
-    })();
-    let _ = std::fs::remove_file(&tmp);
-    result
+    // Download into a freshly-created, randomly-named temp DIR (O_EXCL): an
+    // attacker can't pre-create/symlink a path they can't predict, and the dir
+    // (with the downloaded file and its `.part`) is RAII-removed on every exit
+    // path — normal, `?`-error, or panic. Avoids the classic /tmp symlink/TOCTOU.
+    let dir = tempfile::Builder::new()
+        .prefix("bambu-inspect-")
+        .tempdir()
+        .map_err(|e| CliError::new(exit::GENERAL, format!("creating temp dir: {e}")))?;
+    let tmp = dir.path().join("inspect.3mf");
+    ftps.download(on_printer_path, &tmp)?; // FtpError -> exit 7
+    let bytes = std::fs::read(&tmp)
+        .map_err(|e| CliError::new(exit::GENERAL, format!("reading downloaded 3mf: {e}")))?;
+    project::inspect_plate(&bytes, plate)
+        .map_err(|e| CliError::new(exit::VALIDATION, format!("3mf inspection: {e}")))
+    // `dir` drops here (or at any `?` above) -> the temp dir is removed.
 }
 
 /// Build the `--dry-run` plan: the exact command payload plus what the
@@ -1337,10 +1345,12 @@ fn start_plan_json(
     cmd: &ProtoCommand,
     file: &str,
     inspection: Option<&PlateInspection>,
+    inspect_error: Option<&str>,
 ) -> serde_json::Value {
-    let mut warnings: Vec<String> = Vec::new();
-    let inspection_json = match inspection {
-        Some(i) => {
+    let inspection_json = match (inspection, inspect_error) {
+        // Inspected the on-printer file successfully.
+        (Some(i), _) => {
+            let mut warnings: Vec<String> = Vec::new();
             if !i.sidecar_matches {
                 warnings.push(
                     "the file's own .gcode.md5 sidecar disagrees with the computed md5; \
@@ -1349,6 +1359,7 @@ fn start_plan_json(
                 );
             }
             serde_json::json!({
+                "inspected": true,
                 "file": file,
                 "plate": i.plate,
                 "gcode_md5": i.gcode_md5,
@@ -1360,7 +1371,14 @@ fn start_plan_json(
                 "warnings": warnings,
             })
         }
-        None => serde_json::Value::Null,
+        // Best-effort inspection was attempted but failed — say so explicitly,
+        // so an agent reading stdout never mistakes "couldn't check" for "fine".
+        (None, Some(err)) => serde_json::json!({
+            "inspected": false,
+            "error": err,
+        }),
+        // No inspection applies (raw .gcode has no plate/md5 metadata).
+        (None, None) => serde_json::Value::Null,
     };
     serde_json::json!({
         "command": cmd.to_payload("1"),
