@@ -480,12 +480,16 @@ fn run_hms(cli: &Cli) -> Result<(), CliError> {
 }
 
 /// The report fields whose change triggers a new `watch` progress line.
+/// Temperatures are rounded to whole °C so heating/cooling is visible (each 1 °C
+/// step prints a line) without spamming on sub-degree jitter.
 #[derive(PartialEq)]
 struct WatchKey {
     gcode_state: Option<String>,
     stg_cur: Option<i64>,
     mc_percent: Option<i64>,
     layer_num: Option<i64>,
+    nozzle: Option<i64>,
+    bed: Option<i64>,
     error: Option<i64>,
 }
 
@@ -521,6 +525,8 @@ fn watch_to_terminal(
             stg_cur: st.stg_cur,
             mc_percent: st.mc_percent,
             layer_num: st.layer_num,
+            nozzle: st.nozzle_temper.map(|v| v.round() as i64),
+            bed: st.bed_temper.map(|v| v.round() as i64),
             error: st.error.as_ref().map(|e| e.code),
         };
         if last.as_ref() != Some(&key) {
@@ -533,12 +539,22 @@ fn watch_to_terminal(
                 Some(e) => format!("  ⚠ {}", e.hex),
                 None => String::new(),
             };
+            // Nozzle/bed as current°→target° (target omitted when off/unset).
+            let temp = |cur: Option<f64>, tgt: Option<f64>| match cur {
+                Some(c) => match tgt.filter(|t| *t > 0.0) {
+                    Some(t) => format!("{c:.0}/{t:.0}"),
+                    None => format!("{c:.0}"),
+                },
+                None => "-".to_string(),
+            };
             eprintln!(
-                "{:<8} {:>3}%  layer {}/{}{stage}{err}",
+                "{:<8} {:>3}%  layer {}/{}  N{} B{}{stage}{err}",
                 st.gcode_state.as_deref().unwrap_or("?"),
                 st.mc_percent.unwrap_or(0),
                 st.layer_num.unwrap_or(0),
                 st.total_layer_num.unwrap_or(0),
+                temp(st.nozzle_temper, st.nozzle_target),
+                temp(st.bed_temper, st.bed_target),
             );
         }
         // A device fault is an anomaly worth stopping for, even mid-RUNNING.
