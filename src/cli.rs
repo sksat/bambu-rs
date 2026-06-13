@@ -7,13 +7,14 @@
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
-use crate::client::{ClientError, LanMqttClient, StatusSource};
+use crate::client::{ClientError, LanMqttClient, StatusSource, WatchStep};
 use crate::config::{self, Config, ConfigError, Overrides, Profile};
-use crate::core::status::PrinterStatus;
+use crate::core::status::{GcodeState, PrinterStatus};
 
 /// Exit codes (a subset of the documented scheme).
 mod exit {
@@ -61,6 +62,15 @@ enum Command {
     },
     /// Fetch and print a status snapshot.
     Status,
+    /// Watch the current print to a terminal state (like `gh run watch`).
+    Watch {
+        /// Exit non-zero if the print ends in a FAILED state.
+        #[arg(long)]
+        exit_status: bool,
+        /// Give up after this many seconds (default 6h).
+        #[arg(long, default_value_t = 21600)]
+        timeout: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -136,6 +146,10 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
     match &cli.command {
         Command::Config { action } => run_config(cli, action),
         Command::Status => run_status(cli),
+        Command::Watch {
+            exit_status,
+            timeout,
+        } => run_watch(cli, *exit_status, *timeout),
     }
 }
 
@@ -234,6 +248,66 @@ fn run_status(cli: &Cli) -> Result<(), CliError> {
         print_status_human(&output);
     }
     Ok(())
+}
+
+fn run_watch(cli: &Cli, exit_status: bool, timeout_secs: u64) -> Result<(), CliError> {
+    let cfg = Config::load_or_default(&config_path()?)?;
+    let profile_name = selected_profile_name(cli, &cfg).ok();
+    let profile = profile_name.as_deref().and_then(|n| cfg.profile(n));
+    let overrides = flag_overrides(cli).over(Overrides::from_env());
+    let target = config::resolve(profile, &overrides)?;
+    let model = target.model.clone();
+
+    let client = LanMqttClient::new(target).with_timeout(Duration::from_secs(timeout_secs));
+
+    // Print a progress line (to stderr) whenever state / percent / layer changes.
+    let mut last: Option<(Option<String>, Option<i64>, Option<i64>)> = None;
+    let final_state = client.watch(|state| {
+        let st = PrinterStatus::from_state(state.get());
+        let key = (st.gcode_state.clone(), st.mc_percent, st.layer_num);
+        if last.as_ref() != Some(&key) {
+            last = Some(key);
+            eprintln!(
+                "{:<8} {:>3}%  layer {}/{}",
+                st.gcode_state.as_deref().unwrap_or("?"),
+                st.mc_percent.unwrap_or(0),
+                st.layer_num.unwrap_or(0),
+                st.total_layer_num.unwrap_or(0),
+            );
+        }
+        match st.state() {
+            Some(s) if is_watch_terminal(s) => WatchStep::Stop,
+            _ => WatchStep::Continue,
+        }
+    })?;
+
+    let status = PrinterStatus::from_state(final_state.get());
+    let failed = exit_status && status.state() == Some(GcodeState::Failed);
+    let output = StatusOutput {
+        printer: profile_name,
+        model: model.to_string(),
+        status,
+    };
+    if cli.json || !std::io::stdout().is_terminal() {
+        print_json(&output);
+    } else {
+        print_status_human(&output);
+    }
+    if failed {
+        return Err(CliError::new(
+            exit::GENERAL,
+            "print ended in a FAILED state",
+        ));
+    }
+    Ok(())
+}
+
+/// A print is "done" for watching once it finishes, fails, or returns to idle.
+fn is_watch_terminal(state: GcodeState) -> bool {
+    matches!(
+        state,
+        GcodeState::Finish | GcodeState::Failed | GcodeState::Idle
+    )
 }
 
 /// Resolve which profile name to use: explicit `--printer`, else the default.

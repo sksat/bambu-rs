@@ -12,7 +12,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, TlsConfiguration, Transport};
+use rumqttc::{
+    AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS, TlsConfiguration, Transport,
+};
 use serde_json::Value;
 
 use crate::config::ResolvedTarget;
@@ -40,6 +42,13 @@ pub enum ClientError {
 /// and tests don't depend on the concrete MQTT client.
 pub trait StatusSource {
     fn fetch_snapshot(&self) -> Result<ReportState, ClientError>;
+}
+
+/// Whether [`LanMqttClient::watch`] should keep watching or stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchStep {
+    Continue,
+    Stop,
 }
 
 /// The report topic for a serial: `device/{serial}/report`.
@@ -71,59 +80,111 @@ impl LanMqttClient {
         self
     }
 
-    async fn fetch_async(&self) -> Result<ReportState, ClientError> {
+    /// Connect, subscribe to the report topic, and request a `pushall`.
+    async fn connect(&self) -> Result<(AsyncClient, EventLoop), ClientError> {
         let mut opts = MqttOptions::new("bambu-rs", &self.target.ip, MQTT_PORT);
         opts.set_credentials(MQTT_USER, &self.target.access_code);
         opts.set_keep_alive(Duration::from_secs(30));
         opts.set_transport(Transport::Tls(tls_config()?));
 
-        let (client, mut eventloop) = AsyncClient::new(opts, 16);
+        let (client, eventloop) = AsyncClient::new(opts, 16);
         client
             .subscribe(report_topic(&self.target.serial), QoS::AtMostOnce)
             .await
             .map_err(|e| ClientError::Mqtt(e.to_string()))?;
-        let pushall = Command::PushAll.to_payload("0").to_string();
         client
             .publish(
                 request_topic(&self.target.serial),
                 QoS::AtMostOnce,
                 false,
-                pushall,
+                Command::PushAll.to_payload("0").to_string(),
             )
             .await
             .map_err(|e| ClientError::Mqtt(e.to_string()))?;
+        Ok((client, eventloop))
+    }
 
+    async fn fetch_async(&self) -> Result<ReportState, ClientError> {
+        // Hold `_client` so the event loop stays connected.
+        let (_client, mut eventloop) = self.connect().await?;
         let mut state = ReportState::new();
         loop {
-            let event = eventloop
-                .poll()
-                .await
-                .map_err(|e| ClientError::Mqtt(e.to_string()))?;
-            if let Event::Incoming(Packet::Publish(p)) = event
+            if let Event::Incoming(Packet::Publish(p)) = poll(&mut eventloop).await?
                 && let Ok(json) = serde_json::from_slice::<Value>(&p.payload)
             {
                 state.apply(json);
-                // Return once we have the print object (the pushall snapshot).
-                if state.pointer("/print").is_some() {
+                // Wait for the actual pushall response (command == "push_status"),
+                // not an unsolicited delta that merely carries a `print` object: a
+                // delta would be a partial snapshot missing most fields.
+                if is_full_snapshot(&state) {
                     return Ok(state);
                 }
             }
         }
     }
-}
 
-impl StatusSource for LanMqttClient {
-    fn fetch_snapshot(&self) -> Result<ReportState, ClientError> {
+    async fn watch_async<F: FnMut(&ReportState) -> WatchStep>(
+        &self,
+        mut on_update: F,
+    ) -> Result<ReportState, ClientError> {
+        let (_client, mut eventloop) = self.connect().await?;
+        let mut state = ReportState::new();
+        loop {
+            if let Event::Incoming(Packet::Publish(p)) = poll(&mut eventloop).await?
+                && let Ok(json) = serde_json::from_slice::<Value>(&p.payload)
+            {
+                state.apply(json);
+                if state.pointer("/print").is_some() && matches!(on_update(&state), WatchStep::Stop)
+                {
+                    return Ok(state);
+                }
+            }
+        }
+    }
+
+    /// Watch the printer, invoking `on_update` on every merged report until it
+    /// returns [`WatchStep::Stop`], or the timeout elapses.
+    pub fn watch<F: FnMut(&ReportState) -> WatchStep>(
+        &self,
+        on_update: F,
+    ) -> Result<ReportState, ClientError> {
+        self.run_with_timeout(self.watch_async(on_update))
+    }
+
+    fn run_with_timeout<Fut>(&self, fut: Fut) -> Result<ReportState, ClientError>
+    where
+        Fut: std::future::Future<Output = Result<ReportState, ClientError>>,
+    {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| ClientError::Runtime(e.to_string()))?;
         rt.block_on(async {
-            tokio::time::timeout(self.timeout, self.fetch_async())
+            tokio::time::timeout(self.timeout, fut)
                 .await
                 .unwrap_or(Err(ClientError::Timeout(self.timeout)))
         })
     }
+}
+
+impl StatusSource for LanMqttClient {
+    fn fetch_snapshot(&self) -> Result<ReportState, ClientError> {
+        self.run_with_timeout(self.fetch_async())
+    }
+}
+
+/// Poll the event loop, mapping errors to [`ClientError`].
+async fn poll(eventloop: &mut EventLoop) -> Result<Event, ClientError> {
+    eventloop
+        .poll()
+        .await
+        .map_err(|e| ClientError::Mqtt(e.to_string()))
+}
+
+/// Whether the merged state holds the full `pushall` response, which the printer
+/// marks with `command == "push_status"` (as opposed to a partial delta).
+fn is_full_snapshot(state: &ReportState) -> bool {
+    state.pointer("/print/command").and_then(|v| v.as_str()) == Some("push_status")
 }
 
 /// Build a rustls config that accepts the printer's self-signed certificate.
