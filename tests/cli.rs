@@ -42,6 +42,13 @@ fn status_without_config_or_env_is_validation_error() {
 }
 
 #[test]
+fn gcode_without_confirm_is_refused() {
+    let cfg = tmp_cfg("gcode-noconfirm");
+    bambu(&cfg).args(["gcode", "G28"]).assert().code(4); // CONFIRM_REQUIRED
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[test]
 fn config_add_requires_a_printer_name() {
     let cfg = tmp_cfg("add-noname");
     bambu(&cfg)

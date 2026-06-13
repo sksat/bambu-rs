@@ -18,7 +18,7 @@ use rumqttc::{
 use serde_json::Value;
 
 use crate::config::ResolvedTarget;
-use crate::core::command::Command;
+use crate::core::command::{Command, SequenceIds};
 use crate::core::report::ReportState;
 
 const MQTT_PORT: u16 = 8883;
@@ -149,6 +149,52 @@ impl LanMqttClient {
         on_update: F,
     ) -> Result<ReportState, ClientError> {
         self.run_with_timeout(self.watch_async(on_update))
+    }
+
+    async fn send_and_watch_async<F: FnMut(&ReportState) -> WatchStep>(
+        &self,
+        commands: &[Command],
+        mut on_update: F,
+    ) -> Result<ReportState, ClientError> {
+        let (client, mut eventloop) = self.connect().await?;
+        // connect() already used sequence id "0" for the pushall.
+        let mut ids = SequenceIds::new();
+        let _ = ids.next_id();
+        for cmd in commands {
+            client
+                .publish(
+                    request_topic(&self.target.serial),
+                    QoS::AtLeastOnce, // control commands go at QoS 1
+                    false,
+                    cmd.to_payload(&ids.next_id()).to_string(),
+                )
+                .await
+                .map_err(|e| ClientError::Mqtt(e.to_string()))?;
+        }
+
+        let mut state = ReportState::new();
+        loop {
+            if let Event::Incoming(Packet::Publish(p)) = poll(&mut eventloop).await?
+                && let Ok(json) = serde_json::from_slice::<Value>(&p.payload)
+            {
+                state.apply(json);
+                if state.pointer("/print").is_some() && matches!(on_update(&state), WatchStep::Stop)
+                {
+                    return Ok(state);
+                }
+            }
+        }
+    }
+
+    /// Publish `commands` (after the initial pushall) on a **single** connection,
+    /// then watch the resulting reports until `on_update` stops or the timeout
+    /// elapses. One connection respects the A1/P1 single-client MQTT limit.
+    pub fn send_and_watch<F: FnMut(&ReportState) -> WatchStep>(
+        &self,
+        commands: &[Command],
+        on_update: F,
+    ) -> Result<ReportState, ClientError> {
+        self.run_with_timeout(self.send_and_watch_async(commands, on_update))
     }
 
     fn run_with_timeout<Fut>(&self, fut: Fut) -> Result<ReportState, ClientError>

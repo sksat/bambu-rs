@@ -14,12 +14,14 @@ use serde::Serialize;
 
 use crate::client::{ClientError, LanMqttClient, StatusSource, WatchStep};
 use crate::config::{self, Config, ConfigError, Overrides, Profile};
+use crate::core::command::Command as ProtoCommand;
 use crate::core::status::{GcodeState, PrinterStatus};
 
 /// Exit codes (a subset of the documented scheme).
 mod exit {
     pub const GENERAL: u8 = 1;
     pub const VALIDATION: u8 = 3;
+    pub const CONFIRM_REQUIRED: u8 = 4;
     pub const VERIFY_TIMEOUT: u8 = 6;
     pub const TRANSPORT: u8 = 7;
 }
@@ -69,6 +71,17 @@ enum Command {
         exit_status: bool,
         /// Give up after this many seconds (default 6h).
         #[arg(long, default_value_t = 21600)]
+        timeout: u64,
+    },
+    /// Send a raw G-code line and watch the report (control; needs --confirm).
+    Gcode {
+        /// The G-code line, e.g. "G28" (home all axes).
+        line: String,
+        /// Required to actually send a control command.
+        #[arg(long)]
+        confirm: bool,
+        /// Watch the report for this many seconds after sending.
+        #[arg(long, default_value_t = 30)]
         timeout: u64,
     },
 }
@@ -150,6 +163,11 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             exit_status,
             timeout,
         } => run_watch(cli, *exit_status, *timeout),
+        Command::Gcode {
+            line,
+            confirm,
+            timeout,
+        } => run_gcode(cli, line, *confirm, *timeout),
     }
 }
 
@@ -300,6 +318,56 @@ fn run_watch(cli: &Cli, exit_status: bool, timeout_secs: u64) -> Result<(), CliE
         ));
     }
     Ok(())
+}
+
+fn run_gcode(cli: &Cli, line: &str, confirm: bool, timeout_secs: u64) -> Result<(), CliError> {
+    if !confirm {
+        return Err(CliError::new(
+            exit::CONFIRM_REQUIRED,
+            "refusing to send a control command without --confirm",
+        ));
+    }
+    let cfg = Config::load_or_default(&config_path()?)?;
+    let profile_name = selected_profile_name(cli, &cfg).ok();
+    let profile = profile_name.as_deref().and_then(|n| cfg.profile(n));
+    let overrides = flag_overrides(cli).over(Overrides::from_env());
+    let target = config::resolve(profile, &overrides)?;
+
+    let client = LanMqttClient::new(target).with_timeout(Duration::from_secs(timeout_secs));
+    eprintln!("sending gcode_line {line:?}; watching the report for {timeout_secs}s …");
+
+    // Print a line whenever any of the motion-relevant fields change.
+    let mut last: Option<String> = None;
+    let result = client.send_and_watch(&[ProtoCommand::GcodeLine(line.to_string())], |state| {
+        let st = PrinterStatus::from_state(state.get());
+        let mc_stage = state.pointer("/print/mc_print_stage").and_then(|v| {
+            v.as_str()
+                .map(String::from)
+                .or_else(|| v.as_i64().map(|n| n.to_string()))
+        });
+        let summary = format!(
+            "gcode_state={} stg_cur={:?} mc_print_stage={:?} print_error={:?} nozzle={:?} bed={:?}",
+            st.gcode_state.as_deref().unwrap_or("?"),
+            st.stg_cur,
+            mc_stage,
+            st.print_error,
+            st.nozzle_temper,
+            st.bed_temper,
+        );
+        if last.as_deref() != Some(summary.as_str()) {
+            eprintln!("{summary}");
+            last = Some(summary);
+        }
+        WatchStep::Continue // observe for the whole window
+    });
+
+    match result {
+        Ok(_) | Err(ClientError::Timeout(_)) => {
+            eprintln!("done (watch window elapsed)");
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// A print is "done" for watching once it finishes, fails, or returns to idle.
