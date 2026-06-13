@@ -4,5 +4,6 @@
 //! Submodules are added one TDD slice at a time.
 
 pub mod capability;
+pub mod command;
 pub mod firmware;
 pub mod model;
