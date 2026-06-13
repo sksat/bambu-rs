@@ -52,7 +52,7 @@ Full details (flags, AMS mapping, external spool, `--dry-run`) in
 
 ## Status / roadmap
 
-LAN MVP: `status` / `watch` / `hms`, file upload, and printing a pre-sliced
+LAN MVP: `status` (one-shot or `--watch` to monitor) / `hms`, file upload, and printing a pre-sliced
 `.gcode.3mf` (FTPS upload → MQTT `project_file`) with safety guards. Camera, AMS
 ops, deeper slicer integration and the MCP server come later.
 

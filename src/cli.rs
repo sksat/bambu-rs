@@ -69,27 +69,27 @@ enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    /// Fetch and print a status snapshot.
-    Status,
+    /// Print a status snapshot; with --watch, monitor continuously.
+    Status {
+        /// Continuously monitor: print live updates and do NOT stop at job
+        /// completion (runs until --timeout or Ctrl-C). To watch a print *to
+        /// completion*, use `job start --watch`.
+        #[arg(long)]
+        watch: bool,
+        /// With --watch, poll every N seconds (sends `pushall`) for a higher
+        /// data rate, like Bambu Studio. Default: passive (printer's ~2s push).
+        #[arg(long)]
+        interval: Option<u64>,
+        /// With --watch, stop after this many seconds (default 6h; or Ctrl-C).
+        #[arg(long, default_value_t = 21600)]
+        timeout: u64,
+    },
     /// Decode the active HMS (Health Management System) alerts.
     Hms,
     /// Start, pause, resume or stop a print job.
     Job {
         #[command(subcommand)]
         action: JobAction,
-    },
-    /// Watch the current print to a terminal state (like `gh run watch`).
-    Watch {
-        /// Exit non-zero if the print ends in a FAILED state.
-        #[arg(long)]
-        exit_status: bool,
-        /// Give up after this many seconds (default 6h).
-        #[arg(long, default_value_t = 21600)]
-        timeout: u64,
-        /// Poll the printer every N seconds (sends `pushall`) for a higher data
-        /// rate, like Bambu Studio. Default: passive (printer's own ~2s push).
-        #[arg(long)]
-        interval: Option<u64>,
     },
     /// Transfer files to/from the printer over FTPS.
     File {
@@ -316,13 +316,12 @@ pub fn run() -> ExitCode {
 fn dispatch(cli: &Cli) -> Result<(), CliError> {
     match &cli.command {
         Command::Config { action } => run_config(cli, action),
-        Command::Status => run_status(cli),
-        Command::Hms => run_hms(cli),
-        Command::Watch {
-            exit_status,
-            timeout,
+        Command::Status {
+            watch,
             interval,
-        } => run_watch(cli, *exit_status, *timeout, *interval),
+            timeout,
+        } => run_status(cli, *watch, *interval, *timeout),
+        Command::Hms => run_hms(cli),
         Command::Job { action } => run_job(cli, action),
         Command::File { action } => run_file(cli, action),
         Command::Camera { action } => run_camera(cli, action),
@@ -426,24 +425,34 @@ fn run_config(cli: &Cli, action: &ConfigAction) -> Result<(), CliError> {
     }
 }
 
-fn run_status(cli: &Cli) -> Result<(), CliError> {
+fn run_status(
+    cli: &Cli,
+    watch: bool,
+    interval_secs: Option<u64>,
+    timeout_secs: u64,
+) -> Result<(), CliError> {
     let cfg = Config::load_or_default(&config_path()?)?;
     let profile_name = selected_profile_name(cli, &cfg)?;
     let profile = profile_name.as_deref().and_then(|n| cfg.profile(n));
-
     let overrides = flag_overrides(cli).over(Overrides::from_env());
     let target = config::resolve(profile, &overrides)?;
-    let model = target.model.clone();
+    let model = target.model.to_string();
+
+    if watch {
+        // Continuous monitor: live updates that do NOT stop at job completion
+        // (runs until --timeout or Ctrl-C). Output goes to stdout.
+        let client = LanMqttClient::new(target).with_timeout(Duration::from_secs(timeout_secs));
+        let interval = interval_secs.map(Duration::from_secs);
+        return watch_to_terminal(&client, cli, model, profile_name, false, interval, true);
+    }
 
     let state = LanMqttClient::new(target).fetch_snapshot()?;
     let status = PrinterStatus::from_state(state.get());
-
     let output = StatusOutput {
         printer: profile_name,
-        model: model.to_string(),
+        model,
         status,
     };
-
     if want_json(cli) {
         print_json(&output);
     } else {
@@ -502,24 +511,6 @@ struct WatchKey {
     error: Option<i64>,
 }
 
-fn run_watch(
-    cli: &Cli,
-    exit_status: bool,
-    timeout_secs: u64,
-    interval_secs: Option<u64>,
-) -> Result<(), CliError> {
-    let cfg = Config::load_or_default(&config_path()?)?;
-    let profile_name = selected_profile_name(cli, &cfg)?;
-    let profile = profile_name.as_deref().and_then(|n| cfg.profile(n));
-    let overrides = flag_overrides(cli).over(Overrides::from_env());
-    let target = config::resolve(profile, &overrides)?;
-    let model = target.model.to_string();
-
-    let client = LanMqttClient::new(target).with_timeout(Duration::from_secs(timeout_secs));
-    let interval = interval_secs.map(Duration::from_secs);
-    watch_to_terminal(&client, cli, model, profile_name, exit_status, interval)
-}
-
 /// Watch the printer to a terminal state, **or until a device error appears**,
 /// printing a progress line (to stderr) on every change. Used by `watch` and by
 /// `job start --watch`. A `print_error` mid-job is treated as an anomaly: stop,
@@ -532,9 +523,10 @@ fn watch_to_terminal(
     profile_name: Option<String>,
     exit_status: bool,
     interval: Option<Duration>,
+    continuous: bool,
 ) -> Result<(), CliError> {
     let mut last: Option<WatchKey> = None;
-    let final_state = client.watch(interval, |state| {
+    let result = client.watch(interval, |state| {
         let st = PrinterStatus::from_state(state.get());
         let key = WatchKey {
             gcode_state: st.gcode_state.clone(),
@@ -567,7 +559,7 @@ fn watch_to_terminal(
                 Some(m) => format!("  ETA {}", fmt_eta(m)),
                 None => String::new(),
             };
-            eprintln!(
+            let line = format!(
                 "{:<8} {:>3}%  layer {}/{}  N{} B{}{eta}{stage}{err}",
                 st.gcode_state.as_deref().unwrap_or("?"),
                 st.mc_percent.unwrap_or(0),
@@ -576,6 +568,24 @@ fn watch_to_terminal(
                 temp(st.nozzle_temper, st.nozzle_target),
                 temp(st.bed_temper, st.bed_target),
             );
+            // Continuous monitor (`status --watch`) is the command's own output →
+            // stdout (NDJSON under --json). A to-terminal watch keeps stdout clean
+            // for the final snapshot, so its progress goes to stderr.
+            if continuous {
+                if want_json(cli) {
+                    if let Ok(j) = serde_json::to_string(&st) {
+                        println!("{j}");
+                    }
+                } else {
+                    println!("{line}");
+                }
+            } else {
+                eprintln!("{line}");
+            }
+        }
+        // A continuous monitor never stops on its own (runs until timeout / Ctrl-C).
+        if continuous {
+            return WatchStep::Continue;
         }
         // A device fault is an anomaly worth stopping for, even mid-RUNNING.
         if st.error.is_some() {
@@ -585,7 +595,14 @@ fn watch_to_terminal(
             Some(s) if is_watch_terminal(s) => WatchStep::Stop,
             _ => WatchStep::Continue,
         }
-    })?;
+    });
+
+    let final_state = match result {
+        Ok(fs) => fs,
+        // The continuous monitor ends only via its timeout (or Ctrl-C): not a failure.
+        Err(ClientError::Timeout(_)) if continuous => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
 
     let status = PrinterStatus::from_state(final_state.get());
     let error = status.error.clone();
@@ -728,7 +745,15 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
                 let (model, profile_name) = watch_identity(cli)?;
                 let watcher = connect_client(cli, *watch_timeout)?;
                 let watch_interval = interval.map(Duration::from_secs);
-                watch_to_terminal(&watcher, cli, model, profile_name, true, watch_interval)
+                watch_to_terminal(
+                    &watcher,
+                    cli,
+                    model,
+                    profile_name,
+                    true,
+                    watch_interval,
+                    false,
+                )
             } else {
                 report_command_outcome(outcome)
             }
