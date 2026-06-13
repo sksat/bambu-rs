@@ -149,11 +149,13 @@ impl LanMqttClient {
             if let Event::Incoming(Packet::Publish(p)) = poll(&mut eventloop).await?
                 && let Ok(json) = serde_json::from_slice::<Value>(&p.payload)
             {
-                state.apply(json);
-                // Wait for the actual pushall response (command == "push_status"),
+                // Wait for the actual pushall response (push_status, msg == 0),
                 // not an unsolicited delta that merely carries a `print` object: a
-                // delta would be a partial snapshot missing most fields.
-                if is_full_snapshot(&state) {
+                // delta would be a partial snapshot missing most fields. Check the
+                // raw message before merging (msg is per-message).
+                let full = is_full_message(&json);
+                state.apply(json);
+                if full {
                     return Ok(state);
                 }
             }
@@ -428,11 +430,14 @@ impl LanMqttClient {
             let Ok(json) = serde_json::from_slice::<Value>(&p.payload) else {
                 continue;
             };
+            // Check the raw message for the full snapshot before merging (msg is
+            // per-message), then merge.
+            let full = is_full_message(&json);
             state.apply(json);
 
             // Capture the baseline print_error the first time we see the full
             // pushall snapshot.
-            if baseline_error.is_none() && is_full_snapshot(&state) {
+            if baseline_error.is_none() && full {
                 baseline_error = Some(
                     PrinterStatus::from_state(state.get())
                         .print_error
@@ -566,17 +571,20 @@ async fn poll(eventloop: &mut EventLoop) -> Result<Event, ClientError> {
         .map_err(|e| ClientError::Mqtt(e.to_string()))
 }
 
-/// Whether the merged state holds the full `pushall` response.
+/// Whether a **single raw report message** is the full `pushall` response.
 ///
 /// Observed on the A1 mini (`tools/capture_report_delta.py`): the full snapshot
 /// carries `print.msg == 0` with all ~64 fields, while periodic **deltas** carry
 /// `print.msg == 1` with only the changed fields — and **both** set
 /// `command == "push_status"`. So the command alone is not a reliable
-/// full-vs-delta signal; `msg == 0` is. We treat it as full when it's a
-/// `push_status` and `msg` is either absent (older firmware that may not send it)
-/// or zero, so a delta (`msg == 1`) arriving first is not mistaken for the snapshot.
-fn is_full_snapshot(state: &ReportState) -> bool {
-    let print = state.pointer("/print");
+/// full-vs-delta signal; `msg == 0` is.
+///
+/// This deliberately inspects the **raw incoming message**, not the merged state:
+/// `msg` is a per-message flag, so once a delta (`msg == 1`) is merged it would
+/// overwrite a snapshot's `msg == 0`, making merged-state inspection unreliable.
+/// Missing `msg` falls back to the command check (older firmware may omit it).
+fn is_full_message(message: &Value) -> bool {
+    let print = message.get("print");
     let is_push_status =
         print.and_then(|p| p.get("command")).and_then(|v| v.as_str()) == Some("push_status");
     let msg = print.and_then(|p| p.get("msg")).and_then(|v| v.as_i64());
@@ -665,18 +673,21 @@ mod tests {
     #[test]
     fn full_snapshot_is_msg_zero_not_just_push_status() {
         use serde_json::json;
-        let with = |v| {
-            let mut rs = ReportState::new();
-            rs.apply(v);
-            is_full_snapshot(&rs)
-        };
         // Full pushall response: push_status + msg 0.
-        assert!(with(json!({ "print": { "command": "push_status", "msg": 0 } })));
+        assert!(is_full_message(
+            &json!({ "print": { "command": "push_status", "msg": 0 } })
+        ));
         // A delta also says push_status but msg == 1 -> NOT the full snapshot.
-        assert!(!with(json!({ "print": { "command": "push_status", "msg": 1 } })));
+        assert!(!is_full_message(
+            &json!({ "print": { "command": "push_status", "msg": 1 } })
+        ));
         // Older firmware without msg: fall back to the command check.
-        assert!(with(json!({ "print": { "command": "push_status" } })));
+        assert!(is_full_message(
+            &json!({ "print": { "command": "push_status" } })
+        ));
         // Not a push_status at all.
-        assert!(!with(json!({ "print": { "command": "gcode_line" } })));
+        assert!(!is_full_message(
+            &json!({ "print": { "command": "gcode_line" } })
+        ));
     }
 }

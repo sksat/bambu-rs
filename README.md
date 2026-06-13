@@ -76,8 +76,8 @@ Other control: `bambu speed <silent|standard|sport|ludicrous>` (verified via
 `spd_lvl`), `bambu light on|off [--node chamber|work]`, `bambu gcode <line>`
 (with a static safety guard — over-limit temps / cold extrusion are refused
 unless `--force`), and `bambu ams <resume|reset|pause|change|set-filament|settings>`
-(spec-derived, `--confirm`/`--dry-run` gated). Deeper slicer integration and the
-MCP server come later.
+(spec-derived; all need `--confirm`, and `change`/`set-filament` also support
+`--dry-run`). Deeper slicer integration and the MCP server come later.
 
 Control requires the printer to be in **LAN-only + Developer Mode** (since the
 Jan-2025 Authorization Control System).

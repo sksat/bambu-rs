@@ -130,8 +130,9 @@ with open(OUT, "w") as f:
             obj = json.loads(payload)
         except Exception:
             continue
-        # Whether this looks like the full snapshot or a delta.
-        is_full = obj.get("print", {}).get("command") == "push_status"
+        # Full snapshot vs delta: the printer uses print.msg (0 = full,
+        # 1 = delta); command == "push_status" alone is NOT reliable (both use it).
+        is_full = obj.get("print", {}).get("msg") == 0
         rec = {"t_ms": round((time.time() - start) * 1000), "full": is_full, "msg": obj}
         f.write(json.dumps(rec, sort_keys=True) + "\n")
         f.flush()

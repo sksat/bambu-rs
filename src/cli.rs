@@ -1302,9 +1302,21 @@ fn run_ams(cli: &Cli, action: &AmsAction) -> Result<(), CliError> {
             dry_run,
             confirm,
         } => {
+            // Guard the nozzle temps the same way the raw-gcode guard does, so an
+            // AMS change can't command an unsafe temperature.
+            let max = TempLimits::default().max_nozzle as i64;
+            let curr = curr_temp.unwrap_or(*tar_temp);
+            for (label, t) in [("--tar-temp", *tar_temp), ("--curr-temp", curr)] {
+                if t < 0 || t > max {
+                    return Err(CliError::new(
+                        exit::VALIDATION,
+                        format!("{label} {t}°C is out of range (0..={max})"),
+                    ));
+                }
+            }
             let cmd = ProtoCommand::AmsChangeFilament {
                 target: *tray,
-                curr_temp: curr_temp.unwrap_or(*tar_temp),
+                curr_temp: curr,
                 tar_temp: *tar_temp,
             };
             if *dry_run {
@@ -1337,6 +1349,26 @@ fn run_ams(cli: &Cli, action: &AmsAction) -> Result<(), CliError> {
             dry_run,
             confirm,
         } => {
+            // Validate the user input before building the command.
+            if min > max {
+                return Err(CliError::new(
+                    exit::VALIDATION,
+                    format!("--min {min} must be <= --max {max}"),
+                ));
+            }
+            let limit = TempLimits::default().max_nozzle as i64;
+            if *min < 0 || *max > limit {
+                return Err(CliError::new(
+                    exit::VALIDATION,
+                    format!("nozzle temps must be within 0..={limit}°C"),
+                ));
+            }
+            if color.len() != 8 || !color.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(CliError::new(
+                    exit::VALIDATION,
+                    format!("--color must be 8 hex digits RRGGBBAA (got {color:?})"),
+                ));
+            }
             let cmd = ProtoCommand::AmsFilamentSetting(Box::new(AmsFilamentSetting {
                 ams_id: *ams,
                 tray_id: *tray,
