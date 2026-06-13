@@ -1055,7 +1055,10 @@ fn run_light(cli: &Cli, on: bool, node: &str, timeout_secs: u64) -> Result<(), C
         node.as_str(),
         if on { "on" } else { "off" }
     );
-    report_command_outcome(client.send_and_verify(&ProtoCommand::Led { node, on })?)
+    report_command_outcome(
+        cli,
+        client.send_and_verify(&ProtoCommand::Led { node, on })?,
+    )
 }
 
 fn run_speed(cli: &Cli, level: &str, timeout_secs: u64) -> Result<(), CliError> {
@@ -1077,7 +1080,10 @@ fn run_speed(cli: &Cli, level: &str, timeout_secs: u64) -> Result<(), CliError> 
         level.as_str(),
         level.level()
     );
-    report_command_outcome(client.send_and_verify(&ProtoCommand::PrintSpeed(level))?)
+    report_command_outcome(
+        cli,
+        client.send_and_verify(&ProtoCommand::PrintSpeed(level))?,
+    )
 }
 
 fn run_reboot(cli: &Cli, confirm: bool) -> Result<(), CliError> {
@@ -1122,7 +1128,10 @@ fn run_gcode(
     }
     let client = connect_client(cli, timeout_secs)?;
     eprintln!("sending gcode_line {line:?} …");
-    report_command_outcome(client.send_and_verify(&ProtoCommand::GcodeLine(line.to_string()))?)
+    report_command_outcome(
+        cli,
+        client.send_and_verify(&ProtoCommand::GcodeLine(line.to_string()))?,
+    )
 }
 
 fn run_file(cli: &Cli, action: &FileAction) -> Result<(), CliError> {
@@ -1285,7 +1294,7 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
                     false,
                 )
             } else {
-                report_command_outcome(outcome)
+                report_command_outcome(cli, outcome)
             }
         }
         JobAction::Pause { confirm } => job_control(cli, ProtoCommand::Pause, *confirm),
@@ -1429,7 +1438,7 @@ fn run_ams(cli: &Cli, action: &AmsAction) -> Result<(), CliError> {
             }
             let client = connect_client(cli, 15)?;
             eprintln!("{what} … (AMS commands are [spec]; the ACK confirms acceptance)");
-            report_command_outcome(client.send_and_verify(&cmd)?)
+            report_command_outcome(cli, client.send_and_verify(&cmd)?)
         };
     match action {
         AmsAction::Resume { confirm } => control(
@@ -1491,7 +1500,7 @@ fn run_ams(cli: &Cli, action: &AmsAction) -> Result<(), CliError> {
                 "changing filament to tray {tray} … [spec, untested on this unit] — \
                  the ACK confirms acceptance; watch `bambu status` for the physical change"
             );
-            report_command_outcome(client.send_and_verify(&cmd)?)
+            report_command_outcome(cli, client.send_and_verify(&cmd)?)
         }
         AmsAction::SetFilament {
             ams,
@@ -1592,7 +1601,7 @@ fn run_calibrate(
     eprintln!(
         "starting calibration (bed_level={bed_level} vibration={vibration} motor_noise={motor_noise}) …"
     );
-    report_command_outcome(client.send_and_verify(&cmd)?)
+    report_command_outcome(cli, client.send_and_verify(&cmd)?)
 }
 
 fn job_control(cli: &Cli, cmd: ProtoCommand, confirm: bool) -> Result<(), CliError> {
@@ -1603,7 +1612,7 @@ fn job_control(cli: &Cli, cmd: ProtoCommand, confirm: bool) -> Result<(), CliErr
         ));
     }
     let client = connect_client(cli, 15)?;
-    report_command_outcome(client.send_and_verify(&cmd)?)
+    report_command_outcome(cli, client.send_and_verify(&cmd)?)
 }
 
 fn run_camera(cli: &Cli, action: &CameraAction) -> Result<(), CliError> {
@@ -1703,7 +1712,10 @@ fn run_timelapse(cli: &Cli, action: &TimelapseAction) -> Result<(), CliError> {
 fn timelapse_set(cli: &Cli, control: TimelapseControl, timeout_secs: u64) -> Result<(), CliError> {
     let client = connect_client(cli, timeout_secs)?;
     eprintln!("setting timelapse {} …", control.as_str());
-    report_command_outcome(client.send_and_verify(&ProtoCommand::IpcamTimelapse(control))?)
+    report_command_outcome(
+        cli,
+        client.send_and_verify(&ProtoCommand::IpcamTimelapse(control))?,
+    )
 }
 
 /// Drive an external camera: watch the active print and run a capture command on
@@ -1939,10 +1951,33 @@ fn connect_client(cli: &Cli, timeout_secs: u64) -> Result<LanMqttClient, CliErro
 }
 
 /// Map a control command's verification outcome to output + an exit code.
-fn report_command_outcome(outcome: CommandOutcome) -> Result<(), CliError> {
+///
+/// Under `--json` the outcome is emitted to stdout as a stable object for every
+/// variant (so an agent gets a machine-readable verdict on writes, not just
+/// reads); the exit code is unchanged. Without `--json` the verdict is the exit
+/// code plus a human line (stderr).
+fn report_command_outcome(cli: &Cli, outcome: CommandOutcome) -> Result<(), CliError> {
+    if want_json(cli) {
+        let v = match &outcome {
+            CommandOutcome::Verified => serde_json::json!({ "outcome": "verified" }),
+            CommandOutcome::Rejected { reason } => {
+                serde_json::json!({ "outcome": "rejected", "reason": reason })
+            }
+            CommandOutcome::Unverified { stage } => serde_json::json!({
+                "outcome": "unverified",
+                "stage": match stage {
+                    VerifyStage::Ack => "ack",
+                    VerifyStage::Effect => "effect",
+                },
+            }),
+        };
+        print_json(&v);
+    }
     match outcome {
         CommandOutcome::Verified => {
-            eprintln!("verified: the printer confirmed the command took effect");
+            if !want_json(cli) {
+                eprintln!("verified: the printer confirmed the command took effect");
+            }
             Ok(())
         }
         CommandOutcome::Rejected { reason } => Err(CliError::new(
