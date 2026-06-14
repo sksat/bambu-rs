@@ -22,8 +22,10 @@
 //! autonomous `ams` deltas — `ams` (the complete `ams.ams[].tray[]` structure)
 //! appeared only in the full `pushall`. So on the A1 mini there are no partial
 //! tray-array deltas and wholesale replacement is correct; a per-path array-merge
-//! policy would only add a stale-entry risk for an unobserved case. (Behaviour
-//! during an active multi-colour print, or on other models, is not yet verified.)
+//! policy would only add a stale-entry risk for an unobserved case. Re-confirmed
+//! during a real 2-colour print: a red→black swap surfaced only via the scalar
+//! `tray_now`/`tray_pre`/`tray_tar` deltas; the `ams.ams[].tray[]` array still
+//! came only in full pushalls, never partially. (Other models: not verified.)
 //! The engine applies messages in **arrival order** (last-writer-wins); reordering
 //! / dropping stale deltas is the transport layer's responsibility.
 

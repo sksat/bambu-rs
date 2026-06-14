@@ -290,7 +290,13 @@ reseat also left the tray fields unchanged). So the A1 mini does **not** send
 partial tray-array deltas: the report engine's wholesale array replacement is
 correct here, and `status`/`watch` (which re-pushall) always get the full AMS.
 This settled the deferred "merge AMS tray arrays by index" question — not needed
-on the A1 mini. (Behaviour during an active multi-colour print is not yet tested.)
+on the A1 mini. **Confirmed during an active 2-colour print** (a real red→black
+filament swap at layer 3): of 325 report messages, the `ams` **deltas carried only
+scalar keys** (`tray_now`, `tray_pre`, `tray_tar`, `version` — `tray_now` went
+255→`0`(red)→`3`(black) across the swap), while the `ams.ams[].tray[]` **array
+appeared only in full pushalls**, never as a partial delta. So even mid-print the
+tray array is sent whole — wholesale replacement is correct; the swap itself is
+tracked by the `tray_now`/`tray_pre`/`tray_tar` scalars. **[observed]**
 
 ## Errors: `print_error` is a separate channel from HMS
 
