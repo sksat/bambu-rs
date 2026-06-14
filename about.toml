@@ -1,0 +1,18 @@
+# cargo-about config for the embedded license notice (the `license-notice`
+# feature; see build.rs). `accepted` is the SPDX allow-list for the dependency
+# graph — cargo-about errors on any crate whose license isn't listed, which is
+# the point (it forces a human to vet new licenses). Tune after a real
+# `cargo about generate` run reports unmatched crates.
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "OpenSSL",
+]

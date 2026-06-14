@@ -23,6 +23,18 @@ name = "bambu"
 path = "src/main.rs"
 required-features = ["cli"]
 
+# cargo-binstall: install the prebuilt release binary instead of compiling.
+# Asset names come from the release workflow; `{ name }` = crate "bambu-rs",
+# `{ bin }` = binary "bambu". Unix assets are .tar.gz (tgz), Windows is .zip.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }-v{ version }.tar.gz"
+bin-dir = "{ name }-{ target }-v{ version }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }-v{ version }.zip"
+pkg-fmt = "zip"
+
 [features]
 default = ["cli", "server"]
 # CLI-only dependencies (clap, etc.) are gated here so library-only consumers don't pull them.
@@ -48,6 +60,11 @@ server = [
 # the API server and embeds `web/dist/` via rust-embed.
 dashboard = ["server", "dep:rust-embed"]
 ts-rs = ["dep:ts-rs"]
+# Embed OSS license notices (via arkedge/notalawyer + cargo-about) into the
+# binary, exposing a `--license-notice` flag. Off by default and used only for
+# release builds: enabling it makes build.rs require `cargo-about` on the build
+# host, so normal dev/CI builds and `cargo install` never need it.
+license-notice = ["cli", "dep:notalawyer", "dep:notalawyer-clap", "dep:notalawyer-build"]
 
 [dependencies]
 anyhow = "1.0.102"
@@ -57,6 +74,9 @@ clap = { version = "4.6.1", features = ["derive", "env"], optional = true }
 futures-util = { version = "0.3.31", default-features = false, optional = true }
 md-5 = "0.11.0"
 native-tls = "0.2.18"
+# License-notice embedding (release only, behind the `license-notice` feature).
+notalawyer = { version = "0.2.0", optional = true }
+notalawyer-clap = { version = "0.2.0", optional = true }
 rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls"] }
 rust-embed = { version = "8.11.0", optional = true }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "logging", "tls12"] }
@@ -74,6 +94,16 @@ tower = { version = "0.5.3", optional = true }
 tower-http = { version = "0.6.11", features = ["cors", "trace", "compression-gzip"], optional = true }
 ts-rs = { version = "12", optional = true }
 zip = { version = "7.2.0", default-features = false, features = ["deflate"] }
+
+# Release binaries are stripped (rustc-side, so it works for every cross target
+# uniformly without a per-target `strip` tool).
+[profile.release]
+strip = true
+
+[build-dependencies]
+# Generates the embedded license notice (shells out to cargo-about). Optional —
+# only pulled in (and only invoked by build.rs) under the `license-notice` feature.
+notalawyer-build = { version = "0.2.0", optional = true }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"

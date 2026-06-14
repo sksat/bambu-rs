@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
+    # Tags too, so the full lint/test/frontend/msrv suite gates the exact commit
+    # a release is built from (release.yml builds binaries; this proves them).
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 env:
@@ -24,8 +27,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
       - name: Format
         run: cargo fmt --all -- --check
+      # `dashboard,ts-rs` is every feature EXCEPT `license-notice` (which is a
+      # release-only feature whose build.rs needs cargo-about — see Cargo.toml).
+      # Avoid `--all-features` so CI never drags in that toolchain requirement.
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --features dashboard,ts-rs -- -D warnings
 
   # Test the meaningful feature combinations, not just --all-features — a
   # library-only consumer builds with default-features off, and the server /
@@ -45,8 +51,10 @@ jobs:
             features: ""
           - name: dashboard
             features: "--no-default-features --features dashboard"
-          - name: all-features
-            features: "--all-features"
+          # Every feature except the release-only `license-notice` (its build.rs
+          # needs cargo-about, so it's not exercised in CI — see Cargo.toml).
+          - name: full
+            features: "--features dashboard,ts-rs"
     name: test (${{ matrix.name }})
     steps:
       - uses: actions/checkout@v6.0.3
@@ -136,4 +144,5 @@ jobs:
       - name: Build + test on MSRV
         env:
           RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
-        run: cargo test --all-features
+        # Not --all-features: license-notice is release-only (needs cargo-about).
+        run: cargo test --features dashboard,ts-rs

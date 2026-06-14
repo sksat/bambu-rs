@@ -545,6 +545,14 @@ pub fn run() -> ExitCode {
     // Pull BAMBU_* from a local .env (without overriding real env vars) so an
     // interactive user need not export them every time.
     config::load_dotenv();
+    // With the `license-notice` feature (release builds), add a `--license-notice`
+    // flag that prints the embedded third-party notices; otherwise a plain parse.
+    #[cfg(feature = "license-notice")]
+    let cli = {
+        use notalawyer_clap::{ParseExt, include_notice};
+        Cli::parse_with_license_notice(include_notice!())
+    };
+    #[cfg(not(feature = "license-notice"))]
     let cli = Cli::parse();
     match dispatch(&cli) {
         Ok(()) => ExitCode::SUCCESS,

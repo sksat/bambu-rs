@@ -1,0 +1,190 @@
+name: Release
+
+# Tag-triggered. Push a tag `vX.Y.Z` (matching Cargo.toml `version`) to build the
+# dashboard-enabled `bambu` binary for every target and draft a GitHub Release
+# with cargo-binstall-compatible assets. The release is created as a DRAFT —
+# review it, then publish manually.
+on:
+  push:
+    tags: ["v*"]
+  # Lets you exercise the build matrix (no release) from the Actions tab.
+  workflow_dispatch:
+
+permissions:
+  contents: write # softprops/action-gh-release creates the draft release
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Build the dashboard SPA once; every target build embeds this exact dist.
+  dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.3
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "11.6.0"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Build SPA
+        run: |
+          pnpm -C web install --frozen-lockfile
+          pnpm -C web build
+      - name: Assert the SPA built
+        run: test -s web/dist/index.html
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          retention-days: 7
+          if-no-files-found: error
+
+  # One release binary per target. Linux targets cross-compile in pinned old-glibc
+  # / musl `cross` images (see Cross.toml); macOS and Windows build natively on
+  # the matching runner. Every binary is --features dashboard,license-notice.
+  build:
+    needs: dashboard
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest, cross: true, archive: tar.gz }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, cross: true, archive: tar.gz }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-latest, cross: true, archive: tar.gz }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, cross: true, archive: tar.gz }
+          - { target: x86_64-apple-darwin, os: macos-15-intel, cross: false, archive: tar.gz }
+          - { target: aarch64-apple-darwin, os: macos-14, cross: false, archive: tar.gz }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, cross: false, archive: zip }
+    runs-on: ${{ matrix.os }}
+    name: build (${{ matrix.target }})
+    steps:
+      - uses: actions/checkout@v6.0.3
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable, 2026-03-27
+        with:
+          toolchain: "1.96.0"
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          key: release-${{ matrix.target }}
+
+      # gnu/musl targets build via cross (pinned images in Cross.toml).
+      - name: Install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@0.2.5
+
+      # Native targets need cargo-about on the host for the license notice; cross
+      # targets get it inside the container (Cross.toml pre-build). Keep the
+      # version in sync with Cross.toml.
+      - name: Install cargo-about
+        if: ${{ !matrix.cross }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.0
+
+      - name: Download SPA
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+
+      # The binary embeds web/dist at compile time; an empty dist silently ships
+      # the fallback page, so fail loudly if the SPA isn't there.
+      - name: Assert the SPA is present
+        shell: bash
+        run: test -s web/dist/index.html
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          FLAGS="--release --locked --no-default-features --features dashboard,license-notice --target ${{ matrix.target }} --bin bambu"
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build $FLAGS
+          else
+            cargo build $FLAGS
+          fi
+
+      - name: Install GNU tar (macOS, for reproducible archives)
+        if: runner.os == 'macOS'
+        run: brew install gnu-tar
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          TARGET="${{ matrix.target }}"
+          STAGE="bambu-rs-${TARGET}-v${VERSION}"
+          mkdir -p "dist/${STAGE}"
+          cp "target/${TARGET}/release/bambu" "dist/${STAGE}/bambu"
+          cp README.md LICENSE "dist/${STAGE}/"
+          chmod 755 "dist/${STAGE}/bambu"
+          if [ "$RUNNER_OS" = "macOS" ]; then TAR=gtar; SHA="shasum -a 256"; else TAR=tar; SHA="sha256sum"; fi
+          # Reproducible: sorted, zeroed owner/group/mtime; gzip -n drops the timestamp.
+          "$TAR" --sort=name --owner=0 --group=0 --numeric-owner --mtime='UTC 2020-01-01' \
+            -C dist -cf - "${STAGE}" | gzip -9 -n > "dist/${STAGE}.tar.gz"
+          cp "target/${TARGET}/release/bambu" "dist/bambu-${TARGET}"
+          ( cd dist && $SHA "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256" )
+          ( cd dist && $SHA "bambu-${TARGET}" > "bambu-${TARGET}.sha256" )
+          rm -rf "dist/${STAGE}"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $VERSION = $env:GITHUB_REF_NAME -replace '^v',''
+          $TARGET = "${{ matrix.target }}"
+          $STAGE = "bambu-rs-$TARGET-v$VERSION"
+          New-Item -ItemType Directory -Force -Path "dist/$STAGE" | Out-Null
+          Copy-Item "target/$TARGET/release/bambu.exe" "dist/$STAGE/bambu.exe"
+          Copy-Item README.md,LICENSE "dist/$STAGE/"
+          # Normalise mtimes so the zip is closer to reproducible (Compress-Archive
+          # deflate still isn't bit-identical — see RELEASING.md).
+          Get-ChildItem -Recurse "dist/$STAGE" | ForEach-Object { $_.LastWriteTime = [datetime]'2020-01-01Z' }
+          Compress-Archive -Path "dist/$STAGE" -DestinationPath "dist/$STAGE.zip" -CompressionLevel Optimal
+          Copy-Item "target/$TARGET/release/bambu.exe" "dist/bambu-$TARGET.exe"
+          $h = (Get-FileHash "dist/$STAGE.zip" -Algorithm SHA256).Hash.ToLower()
+          "$h  $STAGE.zip" | Out-File -Encoding ascii "dist/$STAGE.zip.sha256"
+          $hb = (Get-FileHash "dist/bambu-$TARGET.exe" -Algorithm SHA256).Hash.ToLower()
+          "$hb  bambu-$TARGET.exe" | Out-File -Encoding ascii "dist/bambu-$TARGET.exe.sha256"
+          Remove-Item -Recurse -Force "dist/$STAGE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          retention-days: 7
+          if-no-files-found: error
+
+  # Assemble the draft GitHub Release from all the per-target assets.
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download all release assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: List assets
+        run: ls -la dist
+      - name: Draft GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          name: ${{ github.ref_name }}
+          files: dist/*
