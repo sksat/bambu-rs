@@ -3,11 +3,18 @@
    card grid. Mobile-first; widens gracefully. Dark by default, light fallback. */
 :root {
   --bg: #0d0c0b; /* warm near-black so the amber accent + greys read as one family */
+  /* panels sit one step above the page: a faintly warmer surface so each region
+     (camera / controls / temps …) reads as a distinct plate, not a hairline box
+     floating in the void. --panel-2 is the next step up, for floating UI. */
+  --panel: #181611;
+  --panel-2: #211e18;
   --fg: #e4e2dd;
-  --dim: #8f8b82; /* warm grey, 5.8:1 on --bg (was 4.0:1, below AA) */
-  --hair: #ffffff33;
+  --dim: #9a958b; /* warm grey, ~6.4:1 on --bg — secondary text/units/targets */
+  --label: #b5afa3; /* uppercase legends: brighter than --dim so groups have a head */
+  --hair: #ffffff3b;
   --hair-2: #ffffff0a;
   --ring: #ffffff5c; /* 3.3:1 — meets the non-text contrast minimum for edges/borders */
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.45); /* barely-there lift on dark */
   --accent: #d8a657; /* amber readout */
   --accent-2: #e8c08a;
   --ok: #8fb573;
@@ -22,22 +29,30 @@
 :root[data-theme="light"],
 :root[data-theme="light"] body {
   --bg: #faf9f7;
+  --panel: #ffffff;
+  --panel-2: #ffffff;
   --fg: #21242b;
   --dim: #5f636b;
-  --hair: #0000002e;
+  --label: #474b53;
+  --hair: #00000033;
   --hair-2: #0000000a;
   --ring: #00000040;
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.07), 0 1px 2px rgba(0, 0, 0, 0.04);
   --accent: #b4801f;
   --accent-2: #936614;
 }
 @media (prefers-color-scheme: light) {
   :root:not([data-theme]) {
     --bg: #faf9f7;
+    --panel: #ffffff;
+    --panel-2: #ffffff;
     --fg: #21242b;
     --dim: #5f636b;
-    --hair: #0000002e;
+    --label: #474b53;
+    --hair: #00000033;
     --hair-2: #0000000a;
     --ring: #00000040;
+    --shadow: 0 1px 3px rgba(0, 0, 0, 0.07), 0 1px 2px rgba(0, 0, 0, 0.04);
     --accent: #b4801f;
     --accent-2: #936614;
   }
@@ -130,9 +145,11 @@ body {
   }
 }
 .panel {
+  background: var(--panel);
   border: 1px solid var(--hair);
   border-radius: 10px;
   padding: 1.1rem 1.15rem;
+  box-shadow: var(--shadow);
 }
 .span-all {
   grid-column: 1 / -1;
@@ -140,11 +157,11 @@ body {
 
 /* labels: the small uppercase legend under/over every value */
 .lbl {
-  font-size: 0.62rem;
+  font-size: 0.64rem;
   letter-spacing: 0.11em;
   text-transform: uppercase;
   font-weight: 600;
-  color: var(--dim);
+  color: var(--label);
 }
 .dim {
   color: var(--dim);
@@ -717,7 +734,7 @@ body {
   transform: translateY(1px);
 }
 .btn:disabled {
-  opacity: 0.5;
+  opacity: 0.6;
   cursor: default;
 }
 .btn--sm {
@@ -832,12 +849,13 @@ body {
   padding: 1rem;
 }
 .modal__box {
-  background: var(--bg);
-  border: 1px solid var(--hair);
+  background: var(--panel-2);
+  border: 1px solid var(--ring);
   border-radius: 12px;
   padding: 1.2rem;
   max-width: 24rem;
   width: 100%;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
 }
 .modal__msg {
   margin: 0 0 0.4rem;
