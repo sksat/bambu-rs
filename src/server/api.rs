@@ -33,15 +33,17 @@ use tokio::sync::watch;
 use super::assets::static_handler;
 #[cfg(test)]
 use super::control::FakeController;
-use super::control::{ControlAction, ControlError, Controller};
+use super::control::{
+    Axis, ControlAction, ControlError, Controller, HomeAxes, TempPart, temp_line,
+};
 #[cfg(test)]
 use super::files::FakeFiles;
 use super::files::FileStore;
 #[cfg(test)]
 use super::start::FakeStarter;
 use super::start::{StartRequest, Starter};
-use crate::core::command::{LedNode, SpeedLevel};
-use crate::core::safety::{GcodeVerdict, TempLimits, check_gcode};
+use crate::core::command::{AmsControl, LedNode, SpeedLevel};
+use crate::core::safety::{GcodeVerdict, TempLimits, check_extrude, check_gcode, check_jog};
 use crate::core::session::CommandOutcome;
 use crate::core::status::{Ams, AmsTray, AmsUnit, Filament, LightReport, Online, PrinterStatus};
 
@@ -290,6 +292,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/light", post(light))
         .route("/api/speed", post(speed))
         .route("/api/gcode", post(gcode))
+        .route("/api/home", post(home))
+        .route("/api/move", post(move_axis))
+        .route("/api/extrude", post(extrude))
+        .route("/api/temp", post(temp))
+        .route("/api/calibrate", post(calibrate))
+        .route("/api/ams", post(ams))
+        .route("/api/reboot", post(reboot))
+        .route("/api/steppers", post(steppers))
         // Uploads stream to a temp file, so the cap bounds disk, not memory.
         .route(
             "/api/files/upload",
@@ -445,6 +455,281 @@ fn bad_request(msg: String) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
 }
 
+// ── Shared control gates ─────────────────────────────────────────────────────
+
+/// Refuse a control action while the printer is busy (409). The predicate
+/// mirrors `job_start`'s idle guard exactly: any of RUNNING/PAUSE/PREPARE/SLICING
+/// (case-insensitive) is "busy". `None` ⇒ idle, run the action.
+fn require_idle(st: &AppState) -> Option<Response> {
+    let state = st
+        .source
+        .current()
+        .gcode_state
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if matches!(state.as_str(), "RUNNING" | "PAUSE" | "PREPARE" | "SLICING") {
+        return Some(
+            (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": format!("printer is busy ({state}); operation refused") })),
+            )
+                .into_response(),
+        );
+    }
+    None
+}
+
+/// Require explicit `{"confirm": true}` before a destructive action (428 if not).
+/// `None` ⇒ confirmed, proceed.
+fn need_confirm(confirm: bool) -> Option<Response> {
+    if confirm {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::PRECONDITION_REQUIRED,
+            Json(json!({ "error": "confirm required: POST {\"confirm\": true}" })),
+        )
+            .into_response(),
+    )
+}
+
+// ── Machine control (write) endpoints ────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct HomeBody {
+    #[serde(default = "default_axes")]
+    axes: String,
+}
+
+fn default_axes() -> String {
+    "all".to_string()
+}
+
+/// Home one or all axes (`G28`). Idle-gated (no confirm).
+async fn home(State(st): State<AppState>, Json(b): Json<HomeBody>) -> Response {
+    let axes = match b.axes.as_str() {
+        "all" => HomeAxes::All,
+        "x" => HomeAxes::X,
+        "y" => HomeAxes::Y,
+        "z" => HomeAxes::Z,
+        other => return bad_request(format!("unknown axes {other:?}")),
+    };
+    if let Some(busy) = require_idle(&st) {
+        return busy;
+    }
+    execute(st, ControlAction::Home(axes)).await
+}
+
+#[derive(Deserialize)]
+struct MoveBody {
+    axis: String,
+    delta: f64,
+    #[serde(default = "default_move_feedrate")]
+    feedrate: u32,
+}
+
+fn default_move_feedrate() -> u32 {
+    3000
+}
+
+/// Jog a single axis a relative distance (`G91; G1; G90`). Idle-gated, no
+/// confirm; the distance and feedrate are bounds-checked.
+async fn move_axis(State(st): State<AppState>, Json(b): Json<MoveBody>) -> Response {
+    let axis = match b.axis.as_str() {
+        "x" => Axis::X,
+        "y" => Axis::Y,
+        "z" => Axis::Z,
+        other => return bad_request(format!("unknown axis {other:?}")),
+    };
+    if let GcodeVerdict::Block(reason) = check_jog(b.delta) {
+        return bad_request(reason);
+    }
+    if !(60..=6000).contains(&b.feedrate) {
+        return bad_request(format!("feedrate {} out of range (60..=6000)", b.feedrate));
+    }
+    if let Some(busy) = require_idle(&st) {
+        return busy;
+    }
+    execute(
+        st,
+        ControlAction::Move {
+            axis,
+            delta: b.delta,
+            feedrate: b.feedrate,
+        },
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+struct ExtrudeBody {
+    delta: f64,
+    #[serde(default = "default_extrude_feedrate")]
+    feedrate: u32,
+}
+
+fn default_extrude_feedrate() -> u32 {
+    300
+}
+
+/// Extrude or retract filament (`M83; G1 E; M82`). Idle-gated, no confirm. The
+/// cold-extrusion guard reads the live nozzle temperature and has **no** force
+/// bypass.
+async fn extrude(State(st): State<AppState>, Json(b): Json<ExtrudeBody>) -> Response {
+    let nozzle_temper = st.source.current().nozzle_temper;
+    if let GcodeVerdict::Block(reason) = check_extrude(b.delta, nozzle_temper) {
+        return bad_request(reason);
+    }
+    if !(60..=6000).contains(&b.feedrate) {
+        return bad_request(format!("feedrate {} out of range (60..=6000)", b.feedrate));
+    }
+    if let Some(busy) = require_idle(&st) {
+        return busy;
+    }
+    execute(
+        st,
+        ControlAction::Extrude {
+            delta: b.delta,
+            feedrate: b.feedrate,
+        },
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+struct TempBody {
+    part: String,
+    celsius: u32,
+    #[serde(default)]
+    confirm: bool,
+    /// Override the temperature ceiling (over-limit setpoint).
+    #[serde(default)]
+    force: bool,
+}
+
+/// Set a heater target (`M104`/`M140`). Not idle-gated — a cooldown (`celsius:
+/// 0`) is the abort valve and is always allowed without confirm. A non-zero
+/// setpoint needs confirm (428) and must clear the safety ceiling (400) unless
+/// `force` overrides it, exactly like `/api/gcode`.
+async fn temp(State(st): State<AppState>, Json(b): Json<TempBody>) -> Response {
+    let part = match b.part.as_str() {
+        "nozzle" => TempPart::Nozzle,
+        "bed" => TempPart::Bed,
+        other => return bad_request(format!("unknown part {other:?}")),
+    };
+    let line = temp_line(part, b.celsius);
+    if !b.force
+        && let GcodeVerdict::Block(reason) = check_gcode(&line, &TempLimits::default())
+    {
+        return bad_request(format!(
+            "unsafe temperature (use force to override): {reason}"
+        ));
+    }
+    // A cooldown (0 °C) is always allowed — it's the panic "turn it off" valve.
+    if b.celsius > 0
+        && let Some(unconfirmed) = need_confirm(b.confirm)
+    {
+        return unconfirmed;
+    }
+    execute(
+        st,
+        ControlAction::SetTemp {
+            part,
+            celsius: b.celsius,
+        },
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+struct CalibrateBody {
+    #[serde(default)]
+    bed_level: bool,
+    #[serde(default)]
+    vibration: bool,
+    #[serde(default)]
+    motor_noise: bool,
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// Run one or more calibrations. Requires at least one flag (400), confirm
+/// (428), and an idle printer (409).
+async fn calibrate(State(st): State<AppState>, Json(b): Json<CalibrateBody>) -> Response {
+    if !(b.bed_level || b.vibration || b.motor_noise) {
+        return bad_request(
+            "select at least one calibration (bed_level/vibration/motor_noise)".to_string(),
+        );
+    }
+    if let Some(unconfirmed) = need_confirm(b.confirm) {
+        return unconfirmed;
+    }
+    if let Some(busy) = require_idle(&st) {
+        return busy;
+    }
+    execute(
+        st,
+        ControlAction::Calibrate {
+            bed_level: b.bed_level,
+            vibration: b.vibration,
+            motor_noise: b.motor_noise,
+        },
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+struct AmsBody {
+    action: String,
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// AMS control. `resume` clears a pause and is allowed any time (no confirm,
+/// no idle gate); `reset`/`pause` are destructive — confirm (428) + idle (409).
+async fn ams(State(st): State<AppState>, Json(b): Json<AmsBody>) -> Response {
+    let action = match b.action.as_str() {
+        "resume" => AmsControl::Resume,
+        "reset" => AmsControl::Reset,
+        "pause" => AmsControl::Pause,
+        other => return bad_request(format!("unknown ams action {other:?}")),
+    };
+    // resume is the "carry on" action; reset/pause change AMS state, so gate them.
+    if !matches!(action, AmsControl::Resume) {
+        if let Some(unconfirmed) = need_confirm(b.confirm) {
+            return unconfirmed;
+        }
+        if let Some(busy) = require_idle(&st) {
+            return busy;
+        }
+    }
+    execute(st, ControlAction::Ams(action)).await
+}
+
+/// Reboot the printer (`system.reboot`). Confirm (428) + idle (409). Fire-and-
+/// forget — there's no ACK to read back, so a success is 202 (Unverified).
+async fn reboot(State(st): State<AppState>, body: Option<Json<ConfirmBody>>) -> Response {
+    if let Some(unconfirmed) = need_confirm(body.map(|b| b.confirm).unwrap_or(false)) {
+        return unconfirmed;
+    }
+    if let Some(busy) = require_idle(&st) {
+        return busy;
+    }
+    execute(st, ControlAction::Reboot).await
+}
+
+/// Disable the stepper motors (`M84`). Confirm (428) + idle (409).
+async fn steppers(State(st): State<AppState>, body: Option<Json<ConfirmBody>>) -> Response {
+    if let Some(unconfirmed) = need_confirm(body.map(|b| b.confirm).unwrap_or(false)) {
+        return unconfirmed;
+    }
+    if let Some(busy) = require_idle(&st) {
+        return busy;
+    }
+    execute(st, ControlAction::DisableSteppers).await
+}
+
 // ── Print start ────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -526,18 +811,8 @@ async fn job_start(State(st): State<AppState>, Json(b): Json<StartBody>) -> Resp
             .into_response();
     };
     // Idle guard: refuse to start over an active job.
-    let state = st
-        .source
-        .current()
-        .gcode_state
-        .unwrap_or_default()
-        .to_ascii_uppercase();
-    if matches!(state.as_str(), "RUNNING" | "PAUSE" | "PREPARE" | "SLICING") {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({ "error": format!("printer is busy ({state}); cannot start a print") })),
-        )
-            .into_response();
+    if let Some(busy) = require_idle(&st) {
+        return busy;
     }
     let starter = st.starter.clone();
     let res = tokio::task::spawn_blocking(move || starter.start(&req)).await;
@@ -1208,6 +1483,401 @@ mod tests {
         TestServer::new(router(state))
             .post("/api/job/start")
             .json(&json!({ "file": "/c.3mf", "confirm": true }))
+            .await
+            .assert_status(StatusCode::CONFLICT);
+    }
+
+    // ── machine control: helpers ──
+
+    /// A test server whose source is RUNNING (busy), to exercise the idle guard.
+    fn busy_app(controller: impl Controller + 'static) -> TestServer {
+        let state = AppState {
+            source: Arc::new(FakeSource::ramping(Duration::from_millis(50))),
+            controller: Arc::new(controller),
+            files: Arc::new(FakeFiles),
+            starter: Arc::new(FakeStarter),
+            password: None,
+            start_lock: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        TestServer::new(router(state))
+    }
+
+    /// An idle source reporting a hot nozzle, so the cold-extrude guard passes.
+    struct HotSource(watch::Sender<PrinterStatus>);
+    impl HotSource {
+        fn new() -> Self {
+            let (tx, _rx) = watch::channel(PrinterStatus {
+                gcode_state: Some("IDLE".to_string()),
+                print_error: Some(0),
+                nozzle_temper: Some(220.0),
+                ..Default::default()
+            });
+            Self(tx)
+        }
+    }
+    impl PrinterSource for HotSource {
+        fn current(&self) -> PrinterStatus {
+            self.0.borrow().clone()
+        }
+        fn subscribe(&self) -> watch::Receiver<PrinterStatus> {
+            self.0.subscribe()
+        }
+    }
+
+    /// A test server with an idle, hot-nozzle source (for extrude success).
+    fn hot_app(controller: impl Controller + 'static) -> TestServer {
+        let state = AppState {
+            source: Arc::new(HotSource::new()),
+            controller: Arc::new(controller),
+            files: Arc::new(FakeFiles),
+            starter: Arc::new(FakeStarter),
+            password: None,
+            start_lock: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        TestServer::new(router(state))
+    }
+
+    // ── machine control: home ──
+    #[tokio::test]
+    async fn home_all_on_idle_runs() {
+        app(None, FakeController::verified())
+            .post("/api/home")
+            .json(&json!({}))
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn home_does_not_require_confirm() {
+        app(None, FakeController::verified())
+            .post("/api/home")
+            .json(&json!({ "axes": "z" }))
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn home_on_busy_printer_is_409() {
+        busy_app(FakeController::verified())
+            .post("/api/home")
+            .json(&json!({ "axes": "all" }))
+            .await
+            .assert_status(StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn home_unknown_axes_is_400() {
+        app(None, FakeController::verified())
+            .post("/api/home")
+            .json(&json!({ "axes": "w" }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    // ── machine control: move (jog) ──
+    #[tokio::test]
+    async fn move_in_range_on_idle_runs_without_confirm() {
+        app(None, FakeController::verified())
+            .post("/api/move")
+            .json(&json!({ "axis": "x", "delta": 10.0 }))
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn move_over_bound_is_400() {
+        app(None, FakeController::verified())
+            .post("/api/move")
+            .json(&json!({ "axis": "x", "delta": 999.0 }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn move_zero_delta_is_400() {
+        app(None, FakeController::verified())
+            .post("/api/move")
+            .json(&json!({ "axis": "y", "delta": 0.0 }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn move_out_of_range_feedrate_is_400() {
+        app(None, FakeController::verified())
+            .post("/api/move")
+            .json(&json!({ "axis": "x", "delta": 5.0, "feedrate": 1 }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn move_on_busy_printer_is_409() {
+        busy_app(FakeController::verified())
+            .post("/api/move")
+            .json(&json!({ "axis": "x", "delta": 5.0 }))
+            .await
+            .assert_status(StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn move_unknown_axis_is_400() {
+        app(None, FakeController::verified())
+            .post("/api/move")
+            .json(&json!({ "axis": "w", "delta": 5.0 }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    // ── machine control: extrude ──
+    #[tokio::test]
+    async fn extrude_on_cold_nozzle_is_400() {
+        // idle source has nozzle_temper = None (cold) → refused.
+        app(None, FakeController::verified())
+            .post("/api/extrude")
+            .json(&json!({ "delta": 5.0 }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn extrude_cold_guard_has_no_force_bypass() {
+        // The cold guard takes no force field, but even an over-limit-style
+        // attempt can't bypass it: a cold nozzle stays a 400.
+        app(None, FakeController::verified())
+            .post("/api/extrude")
+            .json(&json!({ "delta": 5.0, "force": true }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn extrude_on_hot_idle_nozzle_runs() {
+        hot_app(FakeController::verified())
+            .post("/api/extrude")
+            .json(&json!({ "delta": 5.0 }))
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn extrude_over_bound_is_400() {
+        hot_app(FakeController::verified())
+            .post("/api/extrude")
+            .json(&json!({ "delta": 999.0 }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn extrude_zero_delta_is_400() {
+        hot_app(FakeController::verified())
+            .post("/api/extrude")
+            .json(&json!({ "delta": 0.0 }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    // ── machine control: temp ──
+    #[tokio::test]
+    async fn temp_setpoint_needs_confirm() {
+        app(None, FakeController::verified())
+            .post("/api/temp")
+            .json(&json!({ "part": "nozzle", "celsius": 210 }))
+            .await
+            .assert_status(StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn temp_setpoint_confirmed_runs() {
+        app(None, FakeController::verified())
+            .post("/api/temp")
+            .json(&json!({ "part": "nozzle", "celsius": 210, "confirm": true }))
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn temp_cooldown_is_allowed_without_confirm() {
+        // celsius:0 is the abort valve — no confirm, and allowed even while busy.
+        busy_app(FakeController::verified())
+            .post("/api/temp")
+            .json(&json!({ "part": "nozzle", "celsius": 0 }))
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn temp_over_limit_is_400_unless_forced() {
+        let s = app(None, FakeController::verified());
+        s.post("/api/temp")
+            .json(&json!({ "part": "nozzle", "celsius": 999, "confirm": true }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+        // force overrides the ceiling, exactly like /api/gcode.
+        s.post("/api/temp")
+            .json(&json!({ "part": "nozzle", "celsius": 999, "confirm": true, "force": true }))
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn temp_unknown_part_is_400() {
+        app(None, FakeController::verified())
+            .post("/api/temp")
+            .json(&json!({ "part": "chamber", "celsius": 50 }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn temp_is_not_idle_gated_for_a_setpoint() {
+        // A non-zero setpoint with confirm runs even on a busy printer.
+        busy_app(FakeController::verified())
+            .post("/api/temp")
+            .json(&json!({ "part": "bed", "celsius": 60, "confirm": true }))
+            .await
+            .assert_status_ok();
+    }
+
+    // ── machine control: calibrate ──
+    #[tokio::test]
+    async fn calibrate_needs_confirm() {
+        app(None, FakeController::verified())
+            .post("/api/calibrate")
+            .json(&json!({ "bed_level": true }))
+            .await
+            .assert_status(StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn calibrate_with_no_flags_is_400() {
+        app(None, FakeController::verified())
+            .post("/api/calibrate")
+            .json(&json!({ "confirm": true }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn calibrate_confirmed_on_idle_runs() {
+        app(None, FakeController::verified())
+            .post("/api/calibrate")
+            .json(&json!({ "bed_level": true, "confirm": true }))
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn calibrate_on_busy_printer_is_409() {
+        busy_app(FakeController::verified())
+            .post("/api/calibrate")
+            .json(&json!({ "vibration": true, "confirm": true }))
+            .await
+            .assert_status(StatusCode::CONFLICT);
+    }
+
+    // ── machine control: ams ──
+    #[tokio::test]
+    async fn ams_reset_needs_confirm() {
+        app(None, FakeController::verified())
+            .post("/api/ams")
+            .json(&json!({ "action": "reset" }))
+            .await
+            .assert_status(StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn ams_reset_confirmed_on_idle_runs() {
+        app(None, FakeController::verified())
+            .post("/api/ams")
+            .json(&json!({ "action": "reset", "confirm": true }))
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn ams_reset_on_busy_printer_is_409() {
+        busy_app(FakeController::verified())
+            .post("/api/ams")
+            .json(&json!({ "action": "reset", "confirm": true }))
+            .await
+            .assert_status(StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn ams_resume_is_allowed_without_confirm_even_when_busy() {
+        // resume clears a pause — no confirm, no idle gate.
+        busy_app(FakeController::verified())
+            .post("/api/ams")
+            .json(&json!({ "action": "resume" }))
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn ams_unknown_action_is_400() {
+        app(None, FakeController::verified())
+            .post("/api/ams")
+            .json(&json!({ "action": "eject" }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    // ── machine control: reboot ──
+    #[tokio::test]
+    async fn reboot_needs_confirm() {
+        app(None, FakeController::verified())
+            .post("/api/reboot")
+            .await
+            .assert_status(StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn reboot_confirmed_on_idle_is_202() {
+        // Reboot is fire-and-forget: a success is Unverified → 202.
+        let c = FakeController::returning(CommandOutcome::Unverified {
+            stage: VerifyStage::Ack,
+        });
+        app(None, c)
+            .post("/api/reboot")
+            .json(&json!({ "confirm": true }))
+            .await
+            .assert_status(StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn reboot_on_busy_printer_is_409() {
+        busy_app(FakeController::verified())
+            .post("/api/reboot")
+            .json(&json!({ "confirm": true }))
+            .await
+            .assert_status(StatusCode::CONFLICT);
+    }
+
+    // ── machine control: steppers ──
+    #[tokio::test]
+    async fn steppers_needs_confirm() {
+        app(None, FakeController::verified())
+            .post("/api/steppers")
+            .await
+            .assert_status(StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn steppers_confirmed_on_idle_runs() {
+        app(None, FakeController::verified())
+            .post("/api/steppers")
+            .json(&json!({ "confirm": true }))
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn steppers_on_busy_printer_is_409() {
+        busy_app(FakeController::verified())
+            .post("/api/steppers")
+            .json(&json!({ "confirm": true }))
             .await
             .assert_status(StatusCode::CONFLICT);
     }

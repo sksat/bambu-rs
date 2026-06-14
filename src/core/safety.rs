@@ -44,6 +44,68 @@ impl GcodeVerdict {
     }
 }
 
+/// Below this nozzle temperature (°C), extruding is refused outright: pushing
+/// filament through a cold nozzle grinds the gears / strips the drive. This is a
+/// hard guard with **no** `--force` bypass — unlike the temperature ceiling.
+pub const MIN_EXTRUDE_TEMP_C: f64 = 170.0;
+
+/// The largest single relative jog (mm) a move may request, per axis.
+pub const MAX_JOG_MM: f64 = 50.0;
+
+/// The largest single relative extrude/retract (mm) a move may request.
+pub const MAX_EXTRUDE_MM: f64 = 50.0;
+
+/// Vet a relative jog of `delta_mm` (a single axis move).
+///
+/// Blocks a non-finite (`NaN`/`±inf`) or zero delta — a no-op move is almost
+/// always a mistake — and anything past [`MAX_JOG_MM`] in either direction.
+pub fn check_jog(delta_mm: f64) -> GcodeVerdict {
+    if !delta_mm.is_finite() {
+        return GcodeVerdict::Block("jog distance must be a finite number".to_string());
+    }
+    if delta_mm == 0.0 {
+        return GcodeVerdict::Block("jog distance must not be zero".to_string());
+    }
+    if delta_mm.abs() > MAX_JOG_MM {
+        return GcodeVerdict::Block(format!(
+            "jog distance {delta_mm} mm exceeds the {MAX_JOG_MM:.0} mm limit"
+        ));
+    }
+    GcodeVerdict::Allow
+}
+
+/// Vet a relative extrude/retract of `delta_mm`, given the current nozzle
+/// temperature `nozzle_temper` (°C).
+///
+/// Blocks a non-finite or zero delta, anything past [`MAX_EXTRUDE_MM`], and —
+/// the cold-extrusion guard — any extrude while the nozzle is below
+/// [`MIN_EXTRUDE_TEMP_C`]. A missing temperature (`None`) is treated as too
+/// cold. There is **no** `--force` bypass for the cold guard.
+pub fn check_extrude(delta_mm: f64, nozzle_temper: Option<f64>) -> GcodeVerdict {
+    if !delta_mm.is_finite() {
+        return GcodeVerdict::Block("extrude distance must be a finite number".to_string());
+    }
+    if delta_mm == 0.0 {
+        return GcodeVerdict::Block("extrude distance must not be zero".to_string());
+    }
+    if delta_mm.abs() > MAX_EXTRUDE_MM {
+        return GcodeVerdict::Block(format!(
+            "extrude distance {delta_mm} mm exceeds the {MAX_EXTRUDE_MM:.0} mm limit"
+        ));
+    }
+    // Cold-extrusion guard: refuse below the minimum (a missing reading counts
+    // as too cold). No force override here — see MIN_EXTRUDE_TEMP_C.
+    match nozzle_temper {
+        Some(t) if t >= MIN_EXTRUDE_TEMP_C => GcodeVerdict::Allow,
+        Some(t) => GcodeVerdict::Block(format!(
+            "nozzle is {t:.0}°C; must be at least {MIN_EXTRUDE_TEMP_C:.0}°C to extrude"
+        )),
+        None => GcodeVerdict::Block(format!(
+            "nozzle temperature unknown; must be at least {MIN_EXTRUDE_TEMP_C:.0}°C to extrude"
+        )),
+    }
+}
+
 /// Statically vet a raw G-code payload against `limits`.
 ///
 /// A payload may contain more than one line (a `\n`/`\r` could otherwise hide a
@@ -217,5 +279,95 @@ mod tests {
         // Only the first line is "safe"; the hidden second line must still block.
         assert!(check_gcode("G28\nM104 S999", &limits()).is_blocked());
         assert!(check_gcode("G28\r\nM302", &limits()).is_blocked());
+    }
+
+    #[test]
+    fn jog_in_range_is_allowed() {
+        assert_eq!(check_jog(1.0), GcodeVerdict::Allow);
+        assert_eq!(check_jog(-10.0), GcodeVerdict::Allow);
+        // At the limit (either sign) is allowed; one past is not.
+        assert_eq!(check_jog(MAX_JOG_MM), GcodeVerdict::Allow);
+        assert_eq!(check_jog(-MAX_JOG_MM), GcodeVerdict::Allow);
+    }
+
+    #[test]
+    fn jog_zero_is_blocked() {
+        assert!(check_jog(0.0).is_blocked());
+        // -0.0 is still zero.
+        assert!(check_jog(-0.0).is_blocked());
+    }
+
+    #[test]
+    fn jog_over_bound_is_blocked() {
+        assert!(check_jog(MAX_JOG_MM + 0.1).is_blocked());
+        assert!(check_jog(-(MAX_JOG_MM + 0.1)).is_blocked());
+        assert!(check_jog(1000.0).is_blocked());
+    }
+
+    #[test]
+    fn jog_non_finite_is_blocked() {
+        assert!(check_jog(f64::NAN).is_blocked());
+        assert!(check_jog(f64::INFINITY).is_blocked());
+        assert!(check_jog(f64::NEG_INFINITY).is_blocked());
+    }
+
+    #[test]
+    fn extrude_when_hot_enough_is_allowed() {
+        // At the minimum is allowed (>=).
+        assert_eq!(
+            check_extrude(5.0, Some(MIN_EXTRUDE_TEMP_C)),
+            GcodeVerdict::Allow
+        );
+        assert_eq!(check_extrude(5.0, Some(220.0)), GcodeVerdict::Allow);
+        // Retract (negative) is fine too.
+        assert_eq!(check_extrude(-5.0, Some(220.0)), GcodeVerdict::Allow);
+        // At the distance limit is allowed.
+        assert_eq!(
+            check_extrude(MAX_EXTRUDE_MM, Some(220.0)),
+            GcodeVerdict::Allow
+        );
+        assert_eq!(
+            check_extrude(-MAX_EXTRUDE_MM, Some(220.0)),
+            GcodeVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn extrude_cold_is_blocked() {
+        // Below the minimum.
+        assert!(check_extrude(5.0, Some(MIN_EXTRUDE_TEMP_C - 0.1)).is_blocked());
+        assert!(check_extrude(5.0, Some(25.0)).is_blocked());
+        // Unknown temperature is treated as too cold.
+        assert!(check_extrude(5.0, None).is_blocked());
+    }
+
+    #[test]
+    fn extrude_zero_is_blocked() {
+        // Blocked even when hot.
+        assert!(check_extrude(0.0, Some(220.0)).is_blocked());
+        assert!(check_extrude(-0.0, Some(220.0)).is_blocked());
+    }
+
+    #[test]
+    fn extrude_over_bound_is_blocked() {
+        // Blocked even when hot.
+        assert!(check_extrude(MAX_EXTRUDE_MM + 0.1, Some(220.0)).is_blocked());
+        assert!(check_extrude(-(MAX_EXTRUDE_MM + 0.1), Some(220.0)).is_blocked());
+        assert!(check_extrude(1000.0, Some(220.0)).is_blocked());
+    }
+
+    #[test]
+    fn extrude_non_finite_is_blocked() {
+        assert!(check_extrude(f64::NAN, Some(220.0)).is_blocked());
+        assert!(check_extrude(f64::INFINITY, Some(220.0)).is_blocked());
+        assert!(check_extrude(f64::NEG_INFINITY, Some(220.0)).is_blocked());
+    }
+
+    #[test]
+    fn extrude_distance_checked_before_temperature() {
+        // An over-bound (or non-finite) distance blocks regardless of temp —
+        // including when temp is None — so the bound error wins, not "too cold".
+        assert!(check_extrude(1000.0, None).is_blocked());
+        assert!(check_extrude(f64::NAN, None).is_blocked());
     }
 }
