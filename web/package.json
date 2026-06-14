@@ -9,13 +9,15 @@
     "build": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "gen:types": "rm -rf src/bindings && TS_RS_LARGE_INT=number TS_RS_EXPORT_DIR=web/src/bindings cargo test --manifest-path ../Cargo.toml --features ts-rs export_bindings"
+    "gen:types": "rm -rf src/bindings && TS_RS_LARGE_INT=number TS_RS_EXPORT_DIR=web/src/bindings cargo test --manifest-path ../Cargo.toml --features ts-rs export_bindings",
+    "e2e": "playwright test"
   },
   "dependencies": {
     "react": "^19.2.7",
     "react-dom": "^19.2.7"
   },
   "devDependencies": {
+    "@playwright/test": "^1.60.0",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.2",
