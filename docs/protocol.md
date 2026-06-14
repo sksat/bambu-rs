@@ -194,6 +194,25 @@ with an observable effect, also confirm the effect in the report and watch for a
 **not** a reliable "started" signal — it updated to the new job even though the
 print never began. **[observed]** (see `src/core/verify.rs`)
 
+### Machine control via `gcode_line` (dashboard `/api/*`) **[observed]**
+
+Confirmed on the A1 mini through the machine-control endpoints (idle printer):
+
+- **Home** `G28` (and `G28 X`/`Y`/`Z`) — ACKs `success`.
+- **Multi-line `gcode_line` works**: a single `gcode_line` whose `param` contains
+  `\n`-separated statements is **accepted and ACKed** — e.g. jog sends one command
+  `"G91\nG1 Z5 F600\nG90"` (relative move, then restore absolute). So jog/extrude
+  ship as one command, not three. (Even if a future firmware only ran the first
+  line, every sliced job's preamble re-asserts `G90`, so a leaked relative mode
+  isn't a print hazard — but the A1 runs the whole payload.)
+- **Set temperature**: `M104 S{c}` / `M140 S{c}` (no-wait forms) move
+  `nozzle_target` / `bed_target` in the report (readback confirmed: `M104 S50` →
+  `nozzle_target=50`, `S0` → `0`). Never use the `M109`/`M190` wait-forms from a
+  control surface — they stall the queue.
+- **Cold-extrude guard** is enforced client-side against the live `nozzle_temper`
+  (refused below 170 °C), distinct from the unconditional `M302` block.
+- Extrude `M83\nG1 E{d} F{f}\nM82`, disable steppers `M84` — same ACK semantics.
+
 ## Printing a job: on-printer file layout + `project_file`
 
 The printer's FTP root has, among others, two dirs that matter for printing
