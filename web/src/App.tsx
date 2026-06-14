@@ -1,25 +1,25 @@
+import { useEffect, useState } from "react";
 import { useStatus } from "./useStatus";
 import type { Conn, TempPoint } from "./useStatus";
+import { sendControl } from "./control";
 import type { Ams, AmsTray, PrinterStatus } from "./types";
 import "./app.css";
 
-// Instrument / telemetry dashboard: dense tabular readouts, hairline-ruled
-// sections, one accent. Driven by the /api/ws stream (see useStatus).
+// Instrument / telemetry dashboard: dense tabular readouts, one accent, panels
+// that reflow fluidly from a single phone column to a multi-column desktop grid
+// (resolution-driven, not a separate mobile build). Driven by the /api/ws stream.
 export function App() {
-  const { status, conn, history, authError } = useStatus();
+  const { status, conn, history } = useStatus();
+  const control = useControl();
   return (
     <div className="term">
       <TopBar conn={conn} />
-      {authError ? (
-        <p className="waiting auth-err" data-testid="auth-error">
-          unauthorized — the token is wrong or stale. Open the latest dashboard URL
-          (the <code>?token=…</code> changes when the server restarts).
-        </p>
-      ) : status ? (
-        <main>
+      {status ? (
+        <main className="grid">
           <JobSection s={status} />
           <TempSection s={status} history={history} />
           {status.ams && <AmsSection ams={status.ams} />}
+          <Controls control={control} />
           <HealthSection s={status} />
           <FooterSection s={status} />
         </main>
@@ -27,6 +27,18 @@ export function App() {
         <p className="waiting" data-testid="waiting">
           awaiting telemetry…
         </p>
+      )}
+      {control.toast && (
+        <div className={`toast toast--${control.toast.kind}`} data-testid="toast">
+          {control.toast.msg}
+        </div>
+      )}
+      {control.confirmStop && (
+        <ConfirmDialog
+          message="Stop the running print? This can't be undone."
+          onConfirm={() => control.confirmAndStop()}
+          onCancel={() => control.cancelStop()}
+        />
       )}
     </div>
   );
@@ -46,6 +58,152 @@ function TopBar({ conn }: { conn: Conn }) {
   );
 }
 
+// ── control state ───────────────────────────────────────────────────────────
+
+interface Toast {
+  kind: "ok" | "warn" | "err";
+  msg: string;
+}
+
+function useControl() {
+  const [password, setPassword] = useState<string>(() => sessionStorage.getItem("bambu_pw") ?? "");
+  const [needPassword, setNeedPassword] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [toast, setToast] = useState<Toast | null>(null);
+  const [confirmStop, setConfirmStop] = useState(false);
+
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 4000);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  const act = async (label: string, path: string, body: Record<string, unknown> | null) => {
+    setBusy(label);
+    const res = await sendControl(path, body, password || null);
+    setBusy(null);
+    switch (res.kind) {
+      case "ok":
+        setToast({ kind: "ok", msg: `${label}: verified` });
+        break;
+      case "accepted":
+        setToast({ kind: "warn", msg: `${label}: sent (unverified)` });
+        break;
+      case "rejected":
+        setToast({ kind: "err", msg: `${label}: rejected — ${res.reason}` });
+        break;
+      case "needPassword":
+        setNeedPassword(true);
+        setToast({ kind: "err", msg: "control needs a password" });
+        break;
+      case "error":
+        setToast({ kind: "err", msg: `${label}: ${res.message}` });
+        break;
+    }
+  };
+
+  return {
+    password,
+    needPassword,
+    busy,
+    toast,
+    confirmStop,
+    setPassword: (pw: string) => {
+      setPassword(pw);
+      sessionStorage.setItem("bambu_pw", pw);
+    },
+    pause: () => act("pause", "/api/job/pause", { confirm: true }),
+    resume: () => act("resume", "/api/job/resume", { confirm: true }),
+    requestStop: () => setConfirmStop(true),
+    cancelStop: () => setConfirmStop(false),
+    confirmAndStop: () => {
+      setConfirmStop(false);
+      void act("stop", "/api/job/stop", { confirm: true });
+    },
+    light: (on: boolean) => act(`light ${on ? "on" : "off"}`, "/api/light", { node: "chamber", on }),
+    speed: (level: string) => act(`speed ${level}`, "/api/speed", { level }),
+  };
+}
+
+type Control = ReturnType<typeof useControl>;
+
+function Controls({ control }: { control: Control }) {
+  const b = control.busy;
+  return (
+    <section className="panel">
+      <div className="lbl">controls</div>
+      <div className="btns">
+        <button className="btn" disabled={!!b} onClick={() => void control.pause()}>
+          pause
+        </button>
+        <button className="btn" disabled={!!b} onClick={() => void control.resume()}>
+          resume
+        </button>
+        <button className="btn btn--danger" disabled={!!b} onClick={() => control.requestStop()}>
+          stop
+        </button>
+      </div>
+      <div className="btns">
+        <button className="btn" disabled={!!b} onClick={() => void control.light(true)}>
+          light on
+        </button>
+        <button className="btn" disabled={!!b} onClick={() => void control.light(false)}>
+          light off
+        </button>
+      </div>
+      <div className="btns">
+        {["silent", "standard", "sport", "ludicrous"].map((l) => (
+          <button key={l} className="btn btn--sm" disabled={!!b} onClick={() => void control.speed(l)}>
+            {l}
+          </button>
+        ))}
+      </div>
+      {control.needPassword && (
+        <label className="pwrow">
+          <span className="lbl">control password</span>
+          <input
+            type="password"
+            className="pw"
+            autoComplete="off"
+            value={control.password}
+            onChange={(e) => control.setPassword(e.target.value)}
+            placeholder="set, then retry"
+            data-testid="password"
+          />
+        </label>
+      )}
+    </section>
+  );
+}
+
+function ConfirmDialog({
+  message,
+  onConfirm,
+  onCancel,
+}: {
+  message: string;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="modal" role="dialog" aria-modal="true" data-testid="confirm">
+      <div className="modal__box">
+        <p className="modal__msg">{message}</p>
+        <div className="btns">
+          <button className="btn" onClick={onCancel}>
+            cancel
+          </button>
+          <button className="btn btn--danger" onClick={onConfirm} data-testid="confirm-stop">
+            stop print
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── read-only sections ──────────────────────────────────────────────────────
+
 function JobSection({ s }: { s: PrinterStatus }) {
   const state = s.gcode_state ?? "—";
   const pct = s.mc_percent ?? 0;
@@ -54,7 +212,7 @@ function JobSection({ s }: { s: PrinterStatus }) {
   const shown = preparing ? prepPct : pct;
   const file = s.gcode_file ?? s.subtask_name;
   return (
-    <section className="sec">
+    <section className="panel span-all">
       <div className="job">
         <span className={`state state--${state.toLowerCase()}`} data-testid="state">
           {state}
@@ -99,7 +257,8 @@ function TempSection({ s, history }: { s: PrinterStatus; history: TempPoint[] })
   ).filter((e): e is [string, number] => e[1] != null);
   const running = s.gcode_state === "RUNNING";
   return (
-    <section className="sec">
+    <section className="panel">
+      <div className="lbl">temperatures</div>
       <div className="temps">
         <TempReadout label="nozzle" cur={s.nozzle_temper} target={s.nozzle_target} accent />
         <TempReadout label="bed" cur={s.bed_temper} target={s.bed_target} />
@@ -147,7 +306,7 @@ function AmsSection({ ams }: { ams: Ams }) {
   const active = ams.active_tray;
   const swapping = active != null && ams.target_tray != null && active !== ams.target_tray;
   return (
-    <section className="sec">
+    <section className="panel">
       <div className="secline">
         <span className="lbl">ams</span>
         {swapping ? (
@@ -201,7 +360,7 @@ function HealthSection({ s }: { s: PrinterStatus }) {
   const hms = s.hms ?? [];
   if (hms.length === 0 && !s.error) return null;
   return (
-    <section className="sec sec--health" data-testid="health">
+    <section className="panel span-all sec--health" data-testid="health">
       <div className="secline">
         <span className="lbl alert">health</span>
       </div>
@@ -241,7 +400,7 @@ function FooterSection({ s }: { s: PrinterStatus }) {
   if (s.upgrade?.new_version_state === 1) chips.push(["firmware", "update available"]);
   if (chips.length === 0) return null;
   return (
-    <section className="sec foot" data-testid="foot">
+    <section className="panel span-all foot" data-testid="foot">
       {chips.map(([k, v]) => (
         <span className="fchip" key={k}>
           <span className="lbl">{k}</span>

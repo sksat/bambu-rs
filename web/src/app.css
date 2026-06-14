@@ -43,10 +43,27 @@ body {
 }
 
 .term {
-  max-width: 760px;
+  max-width: 1100px;
   margin: 0 auto;
   padding: max(0.5rem, env(safe-area-inset-top)) clamp(0.75rem, 4vw, 1.5rem)
     max(1.25rem, env(safe-area-inset-bottom));
+}
+
+/* Resolution-flexible layout: panels reflow from one phone column to a
+   multi-column desktop grid as the viewport allows — no fixed breakpoints. */
+.grid {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  align-items: start;
+}
+.panel {
+  border: 1px solid var(--hair);
+  border-radius: 10px;
+  padding: 0.9rem;
+}
+.span-all {
+  grid-column: 1 / -1;
 }
 
 /* labels: the small uppercase legend under/over every value */
@@ -433,4 +450,112 @@ body {
 .auth-err {
   color: var(--err);
   max-width: 32rem;
+}
+
+/* ── controls ────────────────────────────────────────────────────────────── */
+.btns {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.55rem;
+}
+.btn {
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  color: var(--fg);
+  background: var(--hair-2);
+  border: 1px solid var(--hair);
+  border-radius: 6px;
+  padding: 0.4rem 0.7rem;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.btn:hover {
+  border-color: var(--accent);
+}
+.btn:active {
+  transform: translateY(1px);
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.btn--sm {
+  font-size: 0.74rem;
+  padding: 0.3rem 0.5rem;
+}
+.btn--danger {
+  color: var(--err);
+  border-color: color-mix(in srgb, var(--err) 45%, transparent);
+}
+.btn--danger:hover {
+  border-color: var(--err);
+}
+.pwrow {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin-top: 0.7rem;
+}
+.pw {
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--hair);
+  border-radius: 6px;
+  padding: 0.4rem 0.55rem;
+}
+.pw:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* ── toast ───────────────────────────────────────────────────────────────── */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: max(1rem, env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  max-width: min(92vw, 30rem);
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  padding: 0.6rem 0.9rem;
+  border-radius: 8px;
+  border: 1px solid var(--hair);
+  background: var(--panel-2, #1e2127);
+  color: var(--fg);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+}
+.toast--ok {
+  border-color: color-mix(in srgb, var(--ok) 55%, transparent);
+}
+.toast--warn {
+  border-color: color-mix(in srgb, var(--warn) 55%, transparent);
+}
+.toast--err {
+  border-color: color-mix(in srgb, var(--err) 55%, transparent);
+  color: var(--err);
+}
+
+/* ── confirm modal ───────────────────────────────────────────────────────── */
+.modal {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.55);
+  padding: 1rem;
+}
+.modal__box {
+  background: var(--bg);
+  border: 1px solid var(--hair);
+  border-radius: 12px;
+  padding: 1.2rem;
+  max-width: 24rem;
+  width: 100%;
+}
+.modal__msg {
+  margin: 0 0 0.4rem;
+  font-size: 0.95rem;
 }

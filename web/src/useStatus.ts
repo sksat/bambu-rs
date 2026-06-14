@@ -11,50 +11,25 @@ export interface TempPoint {
 const HISTORY = 180; // ~3 min at 1 Hz; the sparkline window
 
 /**
- * Subscribe to `/api/ws` (token from `?token=`), auto-reconnecting. Returns the
- * latest status, the connection state, and a rolling history of nozzle/bed
- * temperatures for the sparklines.
+ * Subscribe to `/api/ws` (open — reads need no auth), auto-reconnecting. Returns
+ * the latest status, the connection state, and a rolling history of nozzle/bed
+ * temperatures for the sparkline.
  */
-export function useStatus(): {
-  status: PrinterStatus | null;
-  conn: Conn;
-  history: TempPoint[];
-  authError: boolean;
-} {
+export function useStatus(): { status: PrinterStatus | null; conn: Conn; history: TempPoint[] } {
   const [status, setStatus] = useState<PrinterStatus | null>(null);
   const [conn, setConn] = useState<Conn>("connecting");
   const [history, setHistory] = useState<TempPoint[]>([]);
-  const [authError, setAuthError] = useState(false);
   // Guard against pushing a history point for an unchanged frame we re-render.
   const lastTemp = useRef<string>("");
 
   useEffect(() => {
-    const token = new URLSearchParams(location.search).get("token") ?? "";
     let ws: WebSocket | null = null;
     let retry: ReturnType<typeof setTimeout> | undefined;
     let closed = false;
 
-    // A one-shot probe: fetch can read a 401 (a WebSocket handshake can't), so
-    // this turns a token mismatch from a silent "awaiting telemetry" into a
-    // clear message — and paints the first frame without waiting for the WS.
-    fetch("/api/status", { headers: { Authorization: `Bearer ${token}` } })
-      .then((r) => {
-        if (r.status === 401) {
-          setAuthError(true);
-          return null;
-        }
-        return r.ok ? (r.json() as Promise<PrinterStatus>) : null;
-      })
-      .then((s) => {
-        if (s) setStatus(s);
-      })
-      .catch(() => {
-        /* network hiccup; the WS will retry */
-      });
-
     const connect = () => {
       const proto = location.protocol === "https:" ? "wss" : "ws";
-      ws = new WebSocket(`${proto}://${location.host}/api/ws?token=${encodeURIComponent(token)}`);
+      ws = new WebSocket(`${proto}://${location.host}/api/ws`);
       ws.onopen = () => setConn("live");
       ws.onmessage = (ev) => {
         let s: PrinterStatus;
@@ -76,7 +51,7 @@ export function useStatus(): {
       ws.onclose = () => {
         if (closed) return;
         setConn("offline");
-        retry = setTimeout(connect, 2000);
+        retry = setTimeout(connect, 2000); // fixed-backoff reconnect
       };
       ws.onerror = () => ws?.close();
     };
@@ -89,5 +64,5 @@ export function useStatus(): {
     };
   }, []);
 
-  return { status, conn, history, authError };
+  return { status, conn, history };
 }
