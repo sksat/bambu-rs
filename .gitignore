@@ -2,8 +2,11 @@
 **/*.rs.bk
 *.pdb
 
-# Claude Code runtime state (lock files, scheduled tasks)
-/.claude
+# Claude Code runtime state (lock files, scheduled tasks) — but keep committed
+# skills that ship with the repo.
+/.claude/*
+!/.claude/skills/
+/.claude/skills/*-workspace/
 
 # Slicer (OrcaSlicer / BambuStudio CLI) output artifacts
 /result.json
