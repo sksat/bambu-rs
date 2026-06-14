@@ -41,6 +41,10 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("file").first()).toContainText(".3mf");
   });
 
+  test("shows file thumbnails (embedded plate preview)", async ({ page }) => {
+    await expect(page.getByTestId("thumb").first()).toBeVisible();
+  });
+
   test("has a GitHub repo link", async ({ page }) => {
     await expect(page.getByTestId("github")).toHaveAttribute("href", /github\.com/);
   });

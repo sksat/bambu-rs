@@ -197,9 +197,8 @@ body {
 /* job / state */
 .job {
   display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 0.75rem;
+  align-items: center;
+  gap: 0.9rem;
   margin-bottom: 0.7rem;
 }
 .state {
@@ -223,6 +222,7 @@ body {
   color: var(--accent);
 }
 .job__meta {
+  margin-left: auto;
   text-align: right;
   min-width: 0;
 }
@@ -700,4 +700,27 @@ body {
   .trays {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+}
+
+/* ── thumbnails (embedded plate preview) ─────────────────────────────────── */
+.thumb {
+  display: block;
+  object-fit: contain;
+  background: var(--hair-2);
+  border: 1px solid var(--hair);
+  border-radius: 6px;
+  image-rendering: auto;
+}
+.thumb--job {
+  width: 56px;
+  height: 56px;
+  flex: none;
+}
+.thumb--row {
+  width: 34px;
+  height: 34px;
+  flex: none;
+}
+.filerow .fname {
+  flex: 1;
 }

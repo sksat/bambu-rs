@@ -1,6 +1,25 @@
+import { useState } from "react";
 import type { TempPoint } from "../useStatus";
 import type { AmsTray } from "../types";
 import { remainText, swatch } from "../format";
+
+/// The plate preview embedded in a sliced .3mf; renders nothing if absent or for
+/// non-.3mf files.
+export function Thumb({ file, className }: { file: string; className?: string }) {
+  const [ok, setOk] = useState(true);
+  if (!ok || !file.toLowerCase().endsWith(".3mf")) return null;
+  const name = file.startsWith("/") ? file : `/${file}`;
+  return (
+    <img
+      className={className ?? "thumb"}
+      loading="lazy"
+      alt=""
+      src={`/api/files/thumbnail?name=${encodeURIComponent(name)}`}
+      onError={() => setOk(false)}
+      data-testid="thumb"
+    />
+  );
+}
 
 export function Field({ label, value, big }: { label: string; value: string; big?: boolean }) {
   return (

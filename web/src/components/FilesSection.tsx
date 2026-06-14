@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Thumb } from "./widgets";
 
 // Files on the printer: list + upload + start a print. Listing is open; upload
 // and start carry the control password (set in Controls) when required.
@@ -72,6 +73,7 @@ export function FilesSection() {
       <ul className="filelist">
         {(files ?? []).map((f) => (
           <li key={f} className="filerow" data-testid="file">
+            <Thumb file={f} className="thumb thumb--row" />
             <span className="fname">{f}</span>
             {printable(f) && (
               <button className="btn btn--sm" onClick={() => setPrinting(f)} data-testid="print">

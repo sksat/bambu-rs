@@ -15,7 +15,10 @@ use std::time::Duration;
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Query, Request, State};
-use axum::http::{StatusCode, header::AUTHORIZATION};
+use axum::http::{
+    StatusCode,
+    header::{AUTHORIZATION, CONTENT_TYPE},
+};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -254,7 +257,8 @@ pub fn router(state: AppState) -> Router {
     let reads = Router::new()
         .route("/api/status", get(status))
         .route("/api/ws", get(status_ws))
-        .route("/api/files", get(list_files));
+        .route("/api/files", get(list_files))
+        .route("/api/files/thumbnail", get(file_thumbnail));
     let writes = Router::new()
         .route("/api/job/pause", post(job_pause))
         .route("/api/job/resume", post(job_resume))
@@ -527,6 +531,37 @@ async fn list_files(State(st): State<AppState>, Query(q): Query<ListQuery>) -> R
 }
 
 #[derive(Deserialize)]
+struct ThumbQuery {
+    name: String,
+    #[serde(default = "default_plate")]
+    plate: u32,
+}
+
+/// Serve the embedded plate preview PNG for a `.3mf` (open read). 404 if absent.
+async fn file_thumbnail(State(st): State<AppState>, Query(q): Query<ThumbQuery>) -> Response {
+    if q.name.is_empty() || q.name.contains("..") {
+        return bad_request(format!("invalid name {:?}", q.name));
+    }
+    let remote = if q.name.starts_with('/') {
+        q.name.clone()
+    } else {
+        format!("/{}", q.name)
+    };
+    let files = st.files.clone();
+    let plate = q.plate;
+    match tokio::task::spawn_blocking(move || files.thumbnail(&remote, plate)).await {
+        Ok(Ok(Some(png))) => ([(CONTENT_TYPE, "image/png")], png).into_response(),
+        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "thumbnail task failed" })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
 struct UploadQuery {
     dir: Option<String>,
     name: String,
@@ -791,6 +826,15 @@ mod tests {
                 .iter()
                 .any(|f| f == "coin2c.gcode.3mf")
         );
+    }
+
+    #[tokio::test]
+    async fn thumbnail_returns_png() {
+        let res = app(None, FakeController::verified())
+            .get("/api/files/thumbnail?name=coin2c.gcode.3mf")
+            .await;
+        res.assert_status_ok();
+        assert_eq!(res.header("content-type"), "image/png");
     }
 
     #[tokio::test]

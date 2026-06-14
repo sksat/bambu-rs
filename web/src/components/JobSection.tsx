@@ -1,6 +1,6 @@
 import type { PrinterStatus } from "../types";
 import { fmtEta, speedName } from "../format";
-import { Bar, Field } from "./widgets";
+import { Bar, Field, Thumb } from "./widgets";
 
 export function JobSection({ s }: { s: PrinterStatus }) {
   const state = s.gcode_state ?? "—";
@@ -12,6 +12,7 @@ export function JobSection({ s }: { s: PrinterStatus }) {
   return (
     <section className="panel span-all">
       <div className="job">
+        {file && <Thumb file={file} className="thumb thumb--job" />}
         <span className={`state state--${state.toLowerCase()}`} data-testid="state">
           {state}
         </span>
