@@ -185,6 +185,29 @@ enum Command {
         #[arg(long)]
         confirm: bool,
     },
+    /// Serve the real-time web dashboard (HTTP server + embedded SPA).
+    #[cfg(feature = "dashboard")]
+    Dashboard {
+        /// Bind host. Default 127.0.0.1; a non-loopback host serves over the
+        /// network (a token is then required and a warning is printed).
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Bind port.
+        #[arg(long, default_value_t = 8088)]
+        port: u16,
+        /// Bearer token for the API (a random one is generated + printed if omitted).
+        #[arg(long)]
+        token: Option<String>,
+        /// Serve deterministic fake data (no printer needed; for demos/E2E).
+        #[arg(long)]
+        fake: bool,
+        /// Poll the printer every N seconds for live updates (default: passive).
+        #[arg(long)]
+        interval: Option<u64>,
+        /// External RTSP camera URL to bridge to the browser.
+        #[arg(long)]
+        camera_rtsp: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -549,6 +572,23 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             timeout,
         } => run_gcode(cli, line, *confirm, *force, *timeout),
         Command::Reboot { confirm } => run_reboot(cli, *confirm),
+        #[cfg(feature = "dashboard")]
+        Command::Dashboard {
+            host,
+            port,
+            token,
+            fake,
+            interval,
+            camera_rtsp,
+        } => run_dashboard(
+            cli,
+            host,
+            *port,
+            token.clone(),
+            *fake,
+            *interval,
+            camera_rtsp.clone(),
+        ),
     }
 }
 
@@ -1105,6 +1145,34 @@ fn run_reboot(cli: &Cli, confirm: bool) -> Result<(), CliError> {
          No ACK is expected; it may rejoin DHCP on a different IP."
     );
     Ok(())
+}
+
+#[cfg(feature = "dashboard")]
+#[allow(clippy::too_many_arguments)]
+fn run_dashboard(
+    cli: &Cli,
+    host: &str,
+    port: u16,
+    token: Option<String>,
+    fake: bool,
+    interval: Option<u64>,
+    camera_rtsp: Option<String>,
+) -> Result<(), CliError> {
+    // Live mode needs a connection target; fake mode doesn't touch the printer.
+    let target = if fake {
+        None
+    } else {
+        Some(resolve_target(cli)?)
+    };
+    let opts = crate::dashboard::DashboardOpts {
+        host: host.to_string(),
+        port,
+        token,
+        fake,
+        interval: interval.map(Duration::from_secs),
+        camera_rtsp,
+    };
+    crate::dashboard::serve(target, opts).map_err(|e| CliError::new(exit::GENERAL, e.to_string()))
 }
 
 fn run_gcode(

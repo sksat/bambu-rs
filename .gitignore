@@ -14,3 +14,8 @@
 /captures
 # .env holds BAMBU_ACCESS_CODE and friends — never commit it
 .env
+
+# Web dashboard: build output (CI builds it; not committed) + node deps
+/web/dist/*
+!/web/dist/.gitkeep
+/web/node_modules

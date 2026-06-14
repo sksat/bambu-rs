@@ -22,4 +22,6 @@ pub mod cli;
 pub mod client;
 pub mod config;
 pub mod core;
+#[cfg(feature = "dashboard")]
+pub mod dashboard;
 pub mod ftp;

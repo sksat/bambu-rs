@@ -27,13 +27,35 @@ required-features = ["cli"]
 default = ["cli"]
 # CLI-only dependencies (clap, etc.) are gated here so library-only consumers don't pull them.
 cli = ["dep:clap"]
+# The embedded web dashboard (HTTP server + embedded SPA). Off by default so
+# library/CLI-only users pull no web server. Adds the extra tokio features the
+# server needs (the base tokio is rt/time/macros only).
+dashboard = [
+    "cli",
+    "dep:axum",
+    "dep:axum-extra",
+    "dep:tower",
+    "dep:tower-http",
+    "dep:rust-embed",
+    "dep:base64",
+    "dep:rand",
+    "tokio/rt-multi-thread",
+    "tokio/sync",
+    "tokio/net",
+    "tokio/process",
+]
 
 [dependencies]
 anyhow = "1.0.102"
+axum = { version = "0.8.9", features = ["ws"], optional = true }
+axum-extra = { version = "0.12.6", features = ["typed-header"], optional = true }
+base64 = { version = "0.22.1", optional = true }
 clap = { version = "4.6.1", features = ["derive"], optional = true }
 md-5 = "0.11.0"
 native-tls = "0.2.18"
+rand = { version = "0.10.1", optional = true }
 rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls"] }
+rust-embed = { version = "8.11.0", optional = true }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-pki-types = "1.14.1"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -45,9 +67,12 @@ tempfile = "3.27.0"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", default-features = false, features = ["rt", "time", "macros"] }
 toml = "1.1.2"
+tower = { version = "0.5.3", optional = true }
+tower-http = { version = "0.6.11", features = ["cors", "trace", "compression-gzip"], optional = true }
 zip = { version = "7.2.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
+axum-test = "20.1.0"
 predicates = "3.1.4"
 proptest = "1.11.0"
