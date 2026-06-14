@@ -4,9 +4,11 @@
 //! the CLI. The LAN access code stays server-side and never reaches the browser.
 
 pub mod assets;
+pub mod live;
 pub mod server;
 
 use crate::config::ResolvedTarget;
+pub use live::LiveSource;
 pub use server::{AppState, FakeSource, PrinterSource};
 
 /// Options for [`serve`].
@@ -24,22 +26,29 @@ pub struct DashboardOpts {
 }
 
 /// Run the dashboard server (blocking; owns its own multi-thread runtime).
-pub fn serve(_target: Option<ResolvedTarget>, opts: DashboardOpts) -> anyhow::Result<()> {
+pub fn serve(target: Option<ResolvedTarget>, opts: DashboardOpts) -> anyhow::Result<()> {
     let token = opts.token.clone().unwrap_or_else(generate_token);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     rt.block_on(async move {
-        // The live source (MQTT monitor bridge) is wired in P2; until then every
-        // mode serves a ramping fake so the UI and charts have moving data.
-        let tick = opts.interval.unwrap_or(std::time::Duration::from_secs(1));
-        let source: std::sync::Arc<dyn PrinterSource> =
-            std::sync::Arc::new(FakeSource::ramping(tick));
-        if !opts.fake {
-            eprintln!(
-                "note: live mode isn't wired yet (serving fake data); pass --fake to silence this"
-            );
-        }
+        // Live mode bridges the real MQTT monitor; otherwise serve a ramping fake
+        // so the UI still has moving data (`--fake`, or no printer configured).
+        let source: std::sync::Arc<dyn PrinterSource> = match target {
+            Some(t) if !opts.fake => {
+                eprintln!("connecting to the printer over LAN…");
+                std::sync::Arc::new(LiveSource::connect(t, opts.interval))
+            }
+            _ => {
+                if !opts.fake {
+                    eprintln!(
+                        "note: no printer configured; serving fake data (pass --fake to silence)"
+                    );
+                }
+                let tick = opts.interval.unwrap_or(std::time::Duration::from_secs(1));
+                std::sync::Arc::new(FakeSource::ramping(tick))
+            }
+        };
         let addr = format!("{}:{}", opts.host, opts.port);
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
