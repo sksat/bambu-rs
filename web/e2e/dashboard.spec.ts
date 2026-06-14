@@ -55,6 +55,12 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("start-result")).toContainText("busy");
   });
 
+  test("gcode console sends a line", async ({ page }) => {
+    await page.getByTestId("gcode-input").fill("G28");
+    await page.getByTestId("gcode-send").click();
+    await expect(page.getByTestId("toast")).toContainText("verified");
+  });
+
   test("theme toggle cycles auto → dark → light", async ({ page }) => {
     const btn = page.getByTestId("theme");
     await expect(page.locator("html")).not.toHaveAttribute("data-theme", /.+/); // auto

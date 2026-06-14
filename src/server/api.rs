@@ -36,6 +36,7 @@ use super::files::FileStore;
 use super::start::FakeStarter;
 use super::start::{StartRequest, Starter};
 use crate::core::command::{LedNode, SpeedLevel};
+use crate::core::safety::{GcodeVerdict, TempLimits, check_gcode};
 use crate::core::session::CommandOutcome;
 use crate::core::status::{Ams, AmsTray, AmsUnit, Filament, Online, PrinterStatus};
 
@@ -261,6 +262,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/job/start", post(job_start))
         .route("/api/light", post(light))
         .route("/api/speed", post(speed))
+        .route("/api/gcode", post(gcode))
         // Uploads can be large (sliced 3mf); raise the body cap from the 2 MB default.
         .route(
             "/api/files/upload",
@@ -329,6 +331,37 @@ async fn speed(State(st): State<AppState>, Json(b): Json<SpeedBody>) -> Response
         other => return bad_request(format!("unknown speed level {other:?}")),
     };
     execute(st, ControlAction::Speed(level)).await
+}
+
+#[derive(Deserialize)]
+struct GcodeBody {
+    line: String,
+    #[serde(default)]
+    confirm: bool,
+    /// Override the safety blocklist (over-limit temps / cold extrusion).
+    #[serde(default)]
+    force: bool,
+}
+
+/// Send a raw gcode line. Mirrors the CLI `gcode`: requires confirm (428), and
+/// the safety blocklist refuses dangerous lines (400) unless `force`.
+async fn gcode(State(st): State<AppState>, Json(b): Json<GcodeBody>) -> Response {
+    if b.line.trim().is_empty() {
+        return bad_request("empty gcode line".to_string());
+    }
+    if !b.confirm {
+        return (
+            StatusCode::PRECONDITION_REQUIRED,
+            Json(json!({ "error": "confirm required: POST {\"confirm\": true}" })),
+        )
+            .into_response();
+    }
+    if !b.force
+        && let GcodeVerdict::Block(reason) = check_gcode(&b.line, &TempLimits::default())
+    {
+        return bad_request(format!("unsafe gcode (use force to override): {reason}"));
+    }
+    execute(st, ControlAction::Gcode(b.line)).await
 }
 
 /// Require `{"confirm": true}` before running a destructive action (428 if not).
@@ -705,6 +738,40 @@ mod tests {
             .post("/api/light")
             .authorization_bearer("secret")
             .json(&json!({ "node": "chamber", "on": true }))
+            .await
+            .assert_status_ok();
+    }
+
+    // ── gcode ──
+    #[tokio::test]
+    async fn gcode_needs_confirmation() {
+        app(None, FakeController::verified())
+            .post("/api/gcode")
+            .json(&json!({ "line": "G28" }))
+            .await
+            .assert_status(StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn gcode_safe_line_runs() {
+        app(None, FakeController::verified())
+            .post("/api/gcode")
+            .json(&json!({ "line": "G28", "confirm": true }))
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn gcode_unsafe_line_is_blocked_unless_forced() {
+        let s = app(None, FakeController::verified());
+        // An over-limit nozzle temp is on the blocklist.
+        s.post("/api/gcode")
+            .json(&json!({ "line": "M104 S999", "confirm": true }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+        // force overrides it.
+        s.post("/api/gcode")
+            .json(&json!({ "line": "M104 S999", "confirm": true, "force": true }))
             .await
             .assert_status_ok();
     }

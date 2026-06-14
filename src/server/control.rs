@@ -20,6 +20,7 @@ pub enum ControlAction {
     Stop,
     Light { node: LedNode, on: bool },
     Speed(SpeedLevel),
+    Gcode(String),
 }
 
 impl ControlAction {
@@ -30,6 +31,7 @@ impl ControlAction {
             ControlAction::Stop => ProtoCommand::Stop,
             ControlAction::Light { node, on } => ProtoCommand::Led { node, on },
             ControlAction::Speed(level) => ProtoCommand::PrintSpeed(level),
+            ControlAction::Gcode(line) => ProtoCommand::GcodeLine(line),
         }
     }
 }

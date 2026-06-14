@@ -1,7 +1,14 @@
+import { useState } from "react";
 import type { Control } from "../useControl";
 
 export function Controls({ control }: { control: Control }) {
   const b = control.busy;
+  const [line, setLine] = useState("");
+  const [force, setForce] = useState(false);
+  const sendGcode = () => {
+    const l = line.trim();
+    if (l) void control.gcode(l, force);
+  };
   return (
     <section className="panel">
       <div className="lbl">controls</div>
@@ -35,6 +42,27 @@ export function Controls({ control }: { control: Control }) {
             {l}
           </button>
         ))}
+      </div>
+      <div className="gcoderow">
+        <span className="lbl">gcode</span>
+        <input
+          className="pw"
+          placeholder="e.g. G28"
+          value={line}
+          disabled={!!b}
+          onChange={(e) => setLine(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") sendGcode();
+          }}
+          data-testid="gcode-input"
+        />
+        <button className="btn btn--sm" disabled={!!b} onClick={sendGcode} data-testid="gcode-send">
+          send
+        </button>
+        <label className="startrow" title="override the safety blocklist">
+          <input type="checkbox" checked={force} onChange={(e) => setForce(e.target.checked)} />
+          <span className="lbl">force</span>
+        </label>
       </div>
       {control.needPassword && (
         <label className="pwrow">

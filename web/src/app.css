@@ -655,3 +655,16 @@ body {
 .startnum {
   width: 5rem;
 }
+
+/* ── gcode console ───────────────────────────────────────────────────────── */
+.gcoderow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.6rem;
+}
+.gcoderow .pw {
+  flex: 1;
+  min-width: 8rem;
+}

@@ -65,6 +65,8 @@ export function useControl() {
     },
     light: (on: boolean) => act(`light ${on ? "on" : "off"}`, "/api/light", { node: "chamber", on }),
     speed: (level: string) => act(`speed ${level}`, "/api/speed", { level }),
+    gcode: (line: string, force: boolean) =>
+      act(`gcode ${line}`, "/api/gcode", { line, confirm: true, force }),
   };
 }
 
