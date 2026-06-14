@@ -163,6 +163,16 @@ body {
   font-weight: 600;
   color: var(--label);
 }
+/* Two tiers of legend: structural group headings (a panel's own title and each
+   folded sub-section — block-level div.lbl, or the .secline header) sit one step
+   above the inline field micro-labels (PROGRESS / WIFI / units) that share .lbl,
+   so the eye can find group boundaries before reading values. */
+div.lbl,
+.secline > .lbl {
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--fg);
+}
 .dim {
   color: var(--dim);
 }
@@ -701,7 +711,7 @@ body {
 }
 .fchip__v {
   font-family: var(--mono);
-  font-size: 0.8rem;
+  font-size: 0.84rem;
 }
 
 .auth-err {
@@ -727,25 +737,28 @@ body {
   cursor: pointer;
   -webkit-tap-highlight-color: transparent;
 }
-.btn:hover {
+.btn:hover:not(:disabled) {
   border-color: var(--accent);
 }
-.btn:active {
+.btn:active:not(:disabled) {
   transform: translateY(1px);
 }
+/* Disabled: keep the full-opacity outline (so the control still reads as a
+   button that's present) but mute the label and drop every hover/variant
+   affordance — inert, not invisible. */
 .btn:disabled {
-  opacity: 0.6;
+  color: var(--dim);
   cursor: default;
 }
 .btn--sm {
   font-size: 0.74rem;
   padding: 0.3rem 0.5rem;
 }
-.btn--danger {
+.btn--danger:not(:disabled) {
   color: var(--err);
   border-color: color-mix(in srgb, var(--err) 45%, transparent);
 }
-.btn--danger:hover {
+.btn--danger:hover:not(:disabled) {
   border-color: var(--err);
 }
 /* Active state for the speed segmented control: accent border + text and a
@@ -956,6 +969,14 @@ body {
 }
 .msub:first-of-type {
   margin-top: 0.7rem;
+}
+/* The machine fold no longer carries its own "machine" title — its first group
+   (move) opens directly under the .cfold rule, so drop that group's redundant
+   second hairline + spacing and let the fold rule do the separating. */
+.cfold > .msub:first-child {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
 }
 
 /* The jog control reads as a printer bed (3×3 XY pad) with the gantry (Z
@@ -1341,11 +1362,11 @@ body {
   line-height: 1.4;
   margin: 0.5rem 0;
 }
-.btn--go {
+.btn--go:not(:disabled) {
   color: var(--ok);
   border-color: color-mix(in srgb, var(--ok) 45%, transparent);
 }
-.btn--go:hover {
+.btn--go:hover:not(:disabled) {
   border-color: var(--ok);
 }
 

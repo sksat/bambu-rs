@@ -58,8 +58,6 @@ export function MachineSection({ s, control }: { s: PrinterStatus; control: Cont
 
   return (
     <div className="cfold" data-testid="machine">
-      <div className="lbl">machine</div>
-
       {/* ── MOVE: printer-shaped jog control ─────────────────────────────── */}
       <div className="msub">
         <div className="lbl">move</div>
