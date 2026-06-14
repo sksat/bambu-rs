@@ -98,6 +98,26 @@ fn expect_guards_reject_raw_gcode_offline() {
 }
 
 #[test]
+fn ams_map_out_of_range_fails_fast_offline() {
+    // Tray range is checked before any network I/O, so a bad --ams-map exits 3
+    // even with no printer. (Length-vs-filament-count needs the 3mf, so it isn't
+    // checked here.)
+    let cfg = tmp_cfg("ams-range");
+    bambu(&cfg)
+        .args([
+            "job",
+            "start",
+            "/cache/x.gcode.3mf",
+            "--ams-map",
+            "0,9",
+            "--dry-run",
+        ])
+        .assert()
+        .code(3);
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[test]
 fn job_start_and_pause_need_confirm() {
     let cfg = tmp_cfg("job-confirm");
     bambu(&cfg)

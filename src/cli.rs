@@ -445,6 +445,7 @@ enum FileAction {
 }
 
 /// A CLI error carrying the exit code to return.
+#[derive(Debug)]
 struct CliError {
     code: u8,
     message: String,
@@ -1230,6 +1231,18 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
             }
             let cmd = build_start_command(file, *plate, ams_map.as_deref(), bed_type, *timelapse)?;
 
+            // The AMS mapping (if any), for validation + dry-run preview.
+            let ams_mapping: Option<Vec<i32>> = match &cmd {
+                ProtoCommand::ProjectFile(pf) if pf.use_ams => Some(pf.ams_mapping.clone()),
+                _ => None,
+            };
+            // Tray-range is cheap and needs no inspection — fail fast on EVERY
+            // path (even a plain confirm or an unreachable printer). The
+            // filament-count match needs the 3mf, so it runs below once inspected.
+            if let Some(m) = &ams_mapping {
+                validate_ams_map(m, None)?;
+            }
+
             // When an expect-guard is given, inspecting the on-printer file is
             // MANDATORY (the caller asked us to verify) and a mismatch is fatal.
             // A bare --dry-run inspects BEST-EFFORT (enrich the plan if the
@@ -1240,14 +1253,38 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
             // For a best-effort dry-run, remember why inspection failed so the
             // plan can say so explicitly (never a silent/ambiguous null).
             let mut inspect_error: Option<String> = None;
-            if is_3mf && has_expect {
-                let insp = inspect_remote_plate(cli, file, *plate)?;
-                project::verify_expectations(&insp, *plate, expect_md5.as_deref(), *expect_plate)
-                    .map_err(|e| CliError::new(exit::VALIDATION, e.to_string()))?;
-                inspection = Some(insp);
-            } else if is_3mf && *dry_run {
+            if is_3mf && (has_expect || ams_mapping.is_some() || *dry_run) {
+                let mandatory = has_expect || ams_mapping.is_some();
                 match inspect_remote_plate(cli, file, *plate) {
-                    Ok(insp) => inspection = Some(insp),
+                    Ok(insp) => {
+                        project::verify_expectations(
+                            &insp,
+                            *plate,
+                            expect_md5.as_deref(),
+                            *expect_plate,
+                        )
+                        .map_err(|e| CliError::new(exit::VALIDATION, e.to_string()))?;
+                        // Filament-count check now that we know the plate's
+                        // filaments. On a real start a mismatch is fatal (exit 3);
+                        // on --dry-run it's downgraded to a warning so the plan
+                        // (which also flags it) still prints for the agent to fix.
+                        if let Some(m) = &ams_mapping {
+                            match validate_ams_map(m, Some(insp.filament_colors.len())) {
+                                Ok(warns) => {
+                                    for w in warns {
+                                        eprintln!("warning: {w}");
+                                    }
+                                }
+                                Err(e) if *dry_run => eprintln!("warning: {}", e.message),
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        inspection = Some(insp);
+                    }
+                    // Inspection is mandatory when an expect-guard or an AMS
+                    // mapping needs the filament count; only best-effort for a
+                    // bare dry-run.
+                    Err(e) if mandatory => return Err(e),
                     Err(e) => {
                         eprintln!(
                             "note: could not inspect the on-printer file ({}); \
@@ -1266,6 +1303,7 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
                     file,
                     inspection.as_ref(),
                     inspect_error.as_deref(),
+                    ams_mapping.as_deref(),
                 ));
                 return Ok(());
             }
@@ -1340,6 +1378,74 @@ fn parse_ams_map(map: &str) -> Result<Vec<i32>, CliError> {
         .map_err(|_| CliError::new(exit::VALIDATION, format!("invalid --ams-map: {map:?}")))
 }
 
+/// Validate a parsed `--ams-map`. Tray range is **always** checked (needs only
+/// the mapping); the filament-count match is checked only when `filament_count`
+/// is known (we have to inspect the on-printer 3mf for that). A wrong mapping is
+/// the AMS footgun the plan calls out — refuse (exit 3) rather than mis-print.
+/// Returns warnings (non-fatal advisories) for the caller to surface.
+fn validate_ams_map(
+    mapping: &[i32],
+    filament_count: Option<usize>,
+) -> Result<Vec<String>, CliError> {
+    // Range: A1 AMS Lite has trays 0..=3; -1 = external spool.
+    for (i, &v) in mapping.iter().enumerate() {
+        if !(-1..=3).contains(&v) {
+            return Err(CliError::new(
+                exit::VALIDATION,
+                format!(
+                    "--ams-map[{i}]={v} is out of range (AMS trays are 0..3, or -1 for the \
+                     external spool)"
+                ),
+            ));
+        }
+    }
+    if let Some(n) = filament_count
+        && mapping.len() != n
+    {
+        return Err(CliError::new(
+            exit::VALIDATION,
+            format!(
+                "--ams-map has {} entr{} but the plate has {n} filament(s) — one tray per \
+                 filament, in order",
+                mapping.len(),
+                if mapping.len() == 1 { "y" } else { "ies" },
+            ),
+        ));
+    }
+    let mut warnings = Vec::new();
+    if mapping.iter().filter(|&&v| v == -1).count() > 1 {
+        warnings.push(
+            "more than one filament is mapped to the external spool (-1); only one filament can \
+             physically feed from it — verify this is intended"
+                .to_string(),
+        );
+    }
+    Ok(warnings)
+}
+
+/// Build the dry-run `ams_mapping_preview`: one entry per plate filament, pairing
+/// its colour (the device-confirmed count source) with the tray it's mapped to.
+fn ams_mapping_preview(colors: &[String], mapping: &[i32]) -> serde_json::Value {
+    let entries: Vec<serde_json::Value> = mapping
+        .iter()
+        .enumerate()
+        .map(|(i, &tray)| {
+            let source = if tray == -1 {
+                "external spool".to_string()
+            } else {
+                format!("AMS tray {tray}")
+            };
+            serde_json::json!({
+                "filament": i,
+                "color": colors.get(i),
+                "tray": tray,
+                "source": source,
+            })
+        })
+        .collect();
+    serde_json::Value::Array(entries)
+}
+
 /// Download the on-printer `.3mf` to a temp file and inspect the given plate.
 /// The temp file is always removed (success or error). A download failure maps
 /// to exit 7 (transport), a parse/missing-plate to exit 3 (validation).
@@ -1374,6 +1480,7 @@ fn start_plan_json(
     file: &str,
     inspection: Option<&PlateInspection>,
     inspect_error: Option<&str>,
+    ams_mapping: Option<&[i32]>,
 ) -> serde_json::Value {
     let inspection_json = match (inspection, inspect_error) {
         // Inspected the on-printer file successfully.
@@ -1386,6 +1493,18 @@ fn start_plan_json(
                         .to_string(),
                 );
             }
+            // Pair each filament with the tray it'll draw from, so the mapping can
+            // be eyeballed before --confirm (the plan's mandatory AMS preview).
+            let ams_preview = ams_mapping.map(|m| ams_mapping_preview(&i.filament_colors, m));
+            if let Some(m) = ams_mapping
+                && m.len() != i.filament_colors.len()
+            {
+                warnings.push(format!(
+                    "--ams-map has {} entries but the plate has {} filament(s)",
+                    m.len(),
+                    i.filament_colors.len()
+                ));
+            }
             serde_json::json!({
                 "inspected": true,
                 "file": file,
@@ -1395,6 +1514,7 @@ fn start_plan_json(
                 "sidecar_matches": i.sidecar_matches,
                 "bed_type": i.bed_type,
                 "filament_colors": i.filament_colors,
+                "ams_mapping_preview": ams_preview,
                 "source": "on-printer file (downloaded for inspection)",
                 "warnings": warnings,
             })
@@ -2077,7 +2197,7 @@ fn fmt_eta(min: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{fmt_eta, subst_capture_tokens};
+    use super::{ams_mapping_preview, fmt_eta, subst_capture_tokens, validate_ams_map};
 
     #[test]
     fn eta_formats_minutes_and_hours() {
@@ -2085,6 +2205,45 @@ mod tests {
         assert_eq!(fmt_eta(59), "59m");
         assert_eq!(fmt_eta(60), "1h00m");
         assert_eq!(fmt_eta(95), "1h35m");
+    }
+
+    #[test]
+    fn ams_map_range_is_always_checked() {
+        // -1..=3 are fine (count unknown).
+        assert!(validate_ams_map(&[0, 3, -1], None).is_ok());
+        // Out of range -> error even without a filament count.
+        assert!(validate_ams_map(&[0, 4], None).is_err());
+        assert!(validate_ams_map(&[-2], None).is_err());
+    }
+
+    #[test]
+    fn ams_map_length_must_match_filament_count_when_known() {
+        // 2 filaments, 2 entries -> ok.
+        assert!(validate_ams_map(&[0, 1], Some(2)).is_ok());
+        // 2 entries but 3 filaments -> error.
+        assert!(validate_ams_map(&[0, 1], Some(3)).is_err());
+        // 1 entry, 2 filaments -> error (the classic footgun).
+        assert!(validate_ams_map(&[0], Some(2)).is_err());
+    }
+
+    #[test]
+    fn ams_map_warns_on_multiple_external_spools() {
+        let warns = validate_ams_map(&[-1, -1], Some(2)).unwrap();
+        assert!(warns.iter().any(|w| w.contains("external spool")));
+        // A single -1 is fine, no warning.
+        assert!(validate_ams_map(&[0, -1], Some(2)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ams_preview_pairs_filaments_with_trays() {
+        let colors = vec!["#F2754E".to_string(), "#0000FF".to_string()];
+        let v = ams_mapping_preview(&colors, &[2, -1]);
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr[0]["color"], "#F2754E");
+        assert_eq!(arr[0]["tray"], 2);
+        assert_eq!(arr[0]["source"], "AMS tray 2");
+        assert_eq!(arr[1]["tray"], -1);
+        assert_eq!(arr[1]["source"], "external spool");
     }
 
     #[test]
