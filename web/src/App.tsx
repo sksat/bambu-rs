@@ -26,7 +26,7 @@ export function App() {
             <JobSection s={status} />
             <TempSection s={status} history={history} />
             {status.ams && <AmsSection ams={status.ams} />}
-            <Controls control={control} />
+            <Controls control={control} status={status} />
             <FilesSection sdcard={status.sdcard} />
             <HealthSection s={status} />
             <FooterSection s={status} />

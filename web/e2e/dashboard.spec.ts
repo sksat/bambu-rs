@@ -24,9 +24,35 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("toast")).toContainText("verified");
   });
 
-  test("light on reports verified", async ({ page }) => {
-    await page.getByRole("button", { name: "light on", exact: true }).click();
+  test("light toggle reflects reported state and toggles", async ({ page }) => {
+    const toggle = page.getByTestId("light-toggle");
+    await expect(toggle).toHaveAttribute("data-state", "off");
+    await expect(toggle).toHaveAttribute("aria-checked", "false");
+    await toggle.click();
     await expect(page.getByTestId("toast")).toContainText("verified");
+  });
+
+  test("speed shows the active tier", async ({ page }) => {
+    await expect(page.getByTestId("speed-standard")).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByTestId("speed-silent")).toHaveAttribute("aria-pressed", "false");
+  });
+
+  test("job controls are gated by the printer state", async ({ page }) => {
+    // resume is valid only while PAUSE — the fake never pauses, so it stays
+    // disabled regardless of phase (the clearest proof state-gating is on).
+    await expect(page.getByRole("button", { name: "resume", exact: true })).toBeDisabled();
+    // The fake source cycles RUNNING → FINISH, so pause/stop availability must
+    // track the *displayed* state, not a fixed assumption. Poll state + the
+    // buttons together so we evaluate a single consistent frame.
+    await expect
+      .poll(async () => {
+        const state = ((await page.getByTestId("state").textContent()) ?? "").toUpperCase().trim();
+        const pause = await page.getByRole("button", { name: "pause", exact: true }).isEnabled();
+        const stop = await page.getByRole("button", { name: "stop", exact: true }).isEnabled();
+        const running = state === "RUNNING";
+        return pause === running && stop === running;
+      })
+      .toBeTruthy();
   });
 
   test("stop requires confirmation, then verifies", async ({ page }) => {

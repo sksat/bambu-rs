@@ -550,6 +550,36 @@ body {
 .btn--danger:hover {
   border-color: var(--err);
 }
+/* Active state for the speed segmented control: accent border + text and a
+   touch more weight — never color-only, so it reads without hue too. */
+.btn.is-active {
+  color: var(--accent);
+  border-color: var(--accent);
+  font-weight: 650;
+}
+/* Light toggle: a small status dot, dim when off/unknown, accent when on. */
+.light-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+.light-toggle .dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--dim);
+  border: 1px solid var(--hair);
+  flex: none;
+}
+.light-toggle.is-on {
+  color: var(--accent);
+  border-color: var(--accent);
+  font-weight: 650;
+}
+.light-toggle.is-on .dot {
+  background: var(--accent);
+  border-color: var(--accent);
+}
 .pwrow {
   display: flex;
   flex-direction: column;
