@@ -275,7 +275,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/ws", get(status_ws))
         .route("/api/files", get(list_files))
         .route("/api/files/thumbnail", get(file_thumbnail))
-        .route("/api/files/raw", get(file_raw));
+        .route("/api/files/raw", get(file_raw))
+        .route("/api/files/gcode", get(file_gcode));
     let writes = Router::new()
         .route("/api/job/pause", post(job_pause))
         .route("/api/job/resume", post(job_resume))
@@ -627,6 +628,45 @@ async fn file_raw(State(st): State<AppState>, Query(q): Query<RawQuery>) -> Resp
 }
 
 #[derive(Deserialize)]
+struct GcodeFileQuery {
+    name: String,
+    #[serde(default = "default_plate")]
+    plate: u32,
+}
+
+/// Serve a sliced `.3mf`'s plate gcode (`Metadata/plate_N.gcode`) as plain text
+/// for the 3D viewer's toolpath render (open read). 404 if the plate has none.
+///
+/// Why a dedicated endpoint instead of `raw`: three's `3MFLoader` doesn't follow
+/// Bambu's external-component mesh refs (`3D/Objects/*.model`), so a sliced
+/// `.gcode.3mf` renders empty. The embedded gcode toolpath always renders.
+async fn file_gcode(State(st): State<AppState>, Query(q): Query<GcodeFileQuery>) -> Response {
+    let remote = if q.name.starts_with('/') {
+        q.name.clone()
+    } else {
+        format!("/{}", q.name)
+    };
+    // Like the thumbnail read: .3mf at a safe path, bounded plate — it downloads
+    // the whole file, so don't let it pull arbitrary files.
+    if !is_safe_remote_path(&remote) || !remote.to_ascii_lowercase().ends_with(".3mf") {
+        return bad_request(format!("gcode needs a .3mf printer path: {:?}", q.name));
+    }
+    if !(1..=64).contains(&q.plate) {
+        return bad_request("plate out of range (1..64)".to_string());
+    }
+    let files = st.files.clone();
+    let plate = q.plate;
+    match tokio::task::spawn_blocking(move || files.gcode(&remote, plate)).await {
+        Ok(Ok(Some(gcode))) => {
+            ([(CONTENT_TYPE, "text/plain; charset=utf-8")], gcode).into_response()
+        }
+        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
+        Err(_) => server_error("gcode task failed".to_string()),
+    }
+}
+
+#[derive(Deserialize)]
 struct UploadQuery {
     dir: Option<String>,
     name: String,
@@ -968,6 +1008,29 @@ mod tests {
     async fn raw_rejects_other_extensions() {
         app(None, FakeController::verified())
             .get("/api/files/raw?name=/secret.txt")
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn gcode_file_serves_plate_toolpath() {
+        let res = app(None, FakeController::verified())
+            .get("/api/files/gcode?name=/coin2c.gcode.3mf&plate=1")
+            .await;
+        res.assert_status_ok();
+        assert!(
+            res.header("content-type")
+                .to_str()
+                .unwrap()
+                .starts_with("text/plain")
+        );
+        assert!(res.text().contains("G1"));
+    }
+
+    #[tokio::test]
+    async fn gcode_file_rejects_non_3mf() {
+        app(None, FakeController::verified())
+            .get("/api/files/gcode?name=/raw.gcode")
             .await
             .assert_status(StatusCode::BAD_REQUEST);
     }

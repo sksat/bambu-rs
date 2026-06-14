@@ -27,6 +27,23 @@ pub trait FileStore: Send + Sync {
     fn thumbnail(&self, remote_path: &str, plate: u32) -> Result<Option<Vec<u8>>, String>;
     /// Fetch a file's raw bytes (for the 3D viewer). Capped at [`RAW_MAX`].
     fn fetch(&self, remote_path: &str) -> Result<Vec<u8>, String>;
+    /// Extract the plate's gcode (`Metadata/plate_N.gcode`) from a `.3mf` — the
+    /// toolpath the 3D viewer renders for a sliced file. `None` if absent.
+    fn gcode(&self, remote_path: &str, plate: u32) -> Result<Option<Vec<u8>>, String>;
+}
+
+/// Extract `Metadata/plate_{plate}.gcode` (the sliced toolpath) from a `.3mf`.
+fn extract_gcode(zip_bytes: &[u8], plate: u32) -> Result<Option<Vec<u8>>, String> {
+    use std::io::Read;
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).map_err(|e| e.to_string())?;
+    let mut entry = match archive.by_name(&format!("Metadata/plate_{plate}.gcode")) {
+        Ok(e) => e,
+        Err(_) => return Ok(None),
+    };
+    let mut buf = Vec::new();
+    entry.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    Ok((!buf.is_empty()).then_some(buf))
 }
 
 /// Cap for [`FileStore::fetch`] — the whole file is buffered for the viewer.
@@ -63,7 +80,15 @@ pub struct LiveFiles {
     /// Short-TTL cache of directory listings (key = dir), to bound FTPS connects
     /// under the UI's auto-refresh.
     list_cache: Mutex<HashMap<String, (Instant, Vec<FileEntry>)>>,
+    /// Cache of extracted plate gcode (key `path#plate`). Like thumbnails, this
+    /// means downloading the whole `.3mf` over FTPS, so cache it; only modestly
+    /// sized toolpaths are kept (see [`GCODE_CACHE_MAX`]).
+    gcode_cache: Mutex<HashMap<String, Option<Vec<u8>>>>,
 }
+
+/// Don't cache plate gcode larger than this (a big print's toolpath is many MB;
+/// the viewer only opens one at a time, so the win is re-opens, not memory).
+const GCODE_CACHE_MAX: usize = 8 * 1024 * 1024;
 
 impl LiveFiles {
     pub fn new(target: ResolvedTarget) -> Self {
@@ -71,6 +96,7 @@ impl LiveFiles {
             target,
             thumb_cache: Mutex::new(HashMap::new()),
             list_cache: Mutex::new(HashMap::new()),
+            gcode_cache: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -153,6 +179,37 @@ impl FileStore for LiveFiles {
         }
         std::fs::read(tmp.path()).map_err(|e| e.to_string())
     }
+
+    fn gcode(&self, remote_path: &str, plate: u32) -> Result<Option<Vec<u8>>, String> {
+        let key = format!("{remote_path}#{plate}");
+        if let Some(hit) = self
+            .gcode_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return Ok(hit.clone());
+        }
+        let tmp = tempfile::Builder::new()
+            .prefix("bambu-gcode-")
+            .tempfile()
+            .map_err(|e| e.to_string())?;
+        FtpsClient::new(self.target.clone())
+            .download(remote_path, tmp.path())
+            .map_err(|e| e.to_string())?;
+        let bytes = std::fs::read(tmp.path()).map_err(|e| e.to_string())?;
+        let gcode = extract_gcode(&bytes, plate)?;
+        // Only cache modest toolpaths (keys are caller-controlled on an open
+        // endpoint); always bound the entry count.
+        if gcode.as_ref().is_none_or(|g| g.len() <= GCODE_CACHE_MAX) {
+            let mut cache = self.gcode_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.len() >= 16 {
+                cache.clear();
+            }
+            cache.insert(key, gcode.clone());
+        }
+        Ok(gcode)
+    }
 }
 
 /// A canned file store for `--fake` mode and tests.
@@ -183,6 +240,27 @@ impl FileStore for FakeFiles {
         // Not a real 3mf; the viewer surfaces a load error in --fake mode.
         Ok(b"fake-model".to_vec())
     }
+    fn gcode(&self, _remote_path: &str, _plate: u32) -> Result<Option<Vec<u8>>, String> {
+        // A tiny sample toolpath (a few stacked square perimeters) so the viewer
+        // and E2E render a real, non-empty model in --fake mode.
+        Ok(Some(fake_gcode().into_bytes()))
+    }
+}
+
+/// A small valid gcode toolpath: 6 layers of a 20 mm square perimeter, with
+/// extrusion moves so [`GCodeLoader`] draws extruded (not travel) segments.
+fn fake_gcode() -> String {
+    let mut s = String::from("; fake sample toolpath\nG21\nG90\nM82\n");
+    let mut e = 0.0_f64;
+    for layer in 0..6 {
+        let z = 0.2 * (layer as f64 + 1.0);
+        s.push_str(&format!("G1 Z{z:.2} F600\nG1 X10 Y10 F3000\n"));
+        for &(x, y) in &[(30.0, 10.0), (30.0, 30.0), (10.0, 30.0), (10.0, 10.0)] {
+            e += 1.0;
+            s.push_str(&format!("G1 X{x:.1} Y{y:.1} E{e:.3} F1200\n"));
+        }
+    }
+    s
 }
 
 /// A 1×1 PNG (the `--fake` placeholder preview).
@@ -215,5 +293,31 @@ mod tests {
             Some(TINY_PNG)
         );
         assert_eq!(extract_thumbnail(&buf, 2).unwrap(), None); // no plate 2
+    }
+
+    #[test]
+    fn extracts_plate_gcode_from_a_3mf_zip() {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zw.start_file::<_, ()>("Metadata/plate_1.gcode", zip::write::FileOptions::default())
+                .unwrap();
+            zw.write_all(b"G1 X0 Y0\nG1 X10 Y10 E1\n").unwrap();
+            zw.finish().unwrap();
+        }
+        assert!(
+            extract_gcode(&buf, 1)
+                .unwrap()
+                .unwrap()
+                .starts_with(b"G1 X0 Y0")
+        );
+        assert_eq!(extract_gcode(&buf, 2).unwrap(), None); // no plate 2
+    }
+
+    #[test]
+    fn fake_gcode_is_parseable_extruding_toolpath() {
+        let g = String::from_utf8(fake_gcode().into_bytes()).unwrap();
+        assert!(g.contains("G1 X30.0 Y10.0 E"));
     }
 }
