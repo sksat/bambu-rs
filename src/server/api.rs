@@ -43,7 +43,7 @@ use super::start::{StartRequest, Starter};
 use crate::core::command::{LedNode, SpeedLevel};
 use crate::core::safety::{GcodeVerdict, TempLimits, check_gcode};
 use crate::core::session::CommandOutcome;
-use crate::core::status::{Ams, AmsTray, AmsUnit, Filament, Online, PrinterStatus};
+use crate::core::status::{Ams, AmsTray, AmsUnit, Filament, LightReport, Online, PrinterStatus};
 
 /// Something that can provide the printer's current status and a live stream of
 /// updates. Abstracted so the server is testable without a network: tests and
@@ -120,6 +120,10 @@ impl FakeSource {
                 color: Some("DE4343FF".to_string()),
             }),
             ams: Some(fake_ams()),
+            lights: vec![LightReport {
+                node: "chamber_light".to_string(),
+                mode: "off".to_string(),
+            }],
             ..Default::default()
         };
         let (tx, rx) = watch::channel(initial.clone());
