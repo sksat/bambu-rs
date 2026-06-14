@@ -226,7 +226,9 @@ function JobSection({ s }: { s: PrinterStatus }) {
                 {s.spd_mag != null && s.spd_mag !== 100 ? ` ${s.spd_mag}%` : ""}
               </span>
             )}
-            {s.stage && <span className="chip">{s.stage.replace(/_/g, " ")}</span>}
+            {s.stage && s.stage !== "no_stage" && (
+              <span className="chip">{s.stage.replace(/_/g, " ")}</span>
+            )}
             {preparing && <span className="chip warn">preparing</span>}
           </div>
         </div>
