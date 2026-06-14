@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { Thumb } from "./widgets";
-import { Viewer3D } from "./Viewer3D";
+import { ModelView } from "./Viewer3D";
 
 interface FileEntry {
   name: string;
@@ -18,7 +18,7 @@ export function FilesSection({ sdcard }: { sdcard?: boolean | null }) {
   const [msg, setMsg] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [printing, setPrinting] = useState<string | null>(null);
-  const [viewing, setViewing] = useState<string | null>(null);
+  const [detail, setDetail] = useState<{ path: string; entry: FileEntry } | null>(null);
 
   const refresh = useCallback(async (d: string) => {
     try {
@@ -123,27 +123,27 @@ export function FilesSection({ sdcard }: { sdcard?: boolean | null }) {
               <span className="fname">{e.name}/</span>
             </li>
           ) : (
-            <li key={e.name} className="filerow" data-testid="file">
+            <li
+              key={e.name}
+              className={`filerow${printable(e.name) ? " filerow--file" : ""}`}
+              data-testid="file"
+              onClick={printable(e.name) ? () => setDetail({ path: join(e.name), entry: e }) : undefined}
+              title={printable(e.name) ? "open details" : undefined}
+            >
               <Thumb file={join(e.name)} className="thumb thumb--row" />
               <span className="fname">{e.name}</span>
               <span className="fsize dim">{fmtSize(e.size)}</span>
               {printable(e.name) && (
-                <>
-                  <button
-                    className="btn btn--sm"
-                    onClick={() => setViewing(join(e.name))}
-                    data-testid="view3d"
-                  >
-                    3D
-                  </button>
-                  <button
-                    className="btn btn--sm"
-                    onClick={() => setPrinting(join(e.name))}
-                    data-testid="print"
-                  >
-                    print
-                  </button>
-                </>
+                <button
+                  className="btn btn--sm"
+                  onClick={(ev) => {
+                    ev.stopPropagation();
+                    setPrinting(join(e.name));
+                  }}
+                  data-testid="print"
+                >
+                  print
+                </button>
               )}
             </li>
           ),
@@ -151,9 +151,75 @@ export function FilesSection({ sdcard }: { sdcard?: boolean | null }) {
         {sorted.length === 0 && <li className="dim">empty</li>}
       </ul>
       {printing && <StartDialog path={printing} onClose={() => setPrinting(null)} />}
-      {viewing && <Viewer3D path={viewing} onClose={() => setViewing(null)} />}
+      {detail && (
+        <FileDetail
+          path={detail.path}
+          entry={detail.entry}
+          onClose={() => setDetail(null)}
+          onPrint={() => {
+            setPrinting(detail.path);
+            setDetail(null);
+          }}
+        />
+      )}
     </section>
   );
+}
+
+// A file's detail screen: its metadata alongside the embedded 3D viewer, with a
+// shortcut to the print dialog. Replaces the old per-row "3D" button.
+function FileDetail({
+  path,
+  entry,
+  onClose,
+  onPrint,
+}: {
+  path: string;
+  entry: FileEntry;
+  onClose: () => void;
+  onPrint: () => void;
+}) {
+  const name = path.split("/").pop() ?? path;
+  return (
+    <div className="modal" role="dialog" aria-modal="true" data-testid="file-detail">
+      <div className="modal__box modal__box--detail">
+        <div className="detail__head">
+          <span className="lbl">file</span>
+          <span className="detail__name">{name}</span>
+          <button className="btn btn--sm detail__close" onClick={onClose}>
+            close
+          </button>
+        </div>
+        <div className="detail__body">
+          <div className="detail__info">
+            <Thumb file={path} className="thumb thumb--detail" />
+            <dl className="kv">
+              <dt>name</dt>
+              <dd>{name}</dd>
+              <dt>type</dt>
+              <dd>{fileKind(name)}</dd>
+              <dt>size</dt>
+              <dd>{fmtSize(entry.size) || "—"}</dd>
+              <dt>path</dt>
+              <dd className="kv__path">{path}</dd>
+            </dl>
+            <button className="btn btn--go detail__print" onClick={onPrint} data-testid="detail-print">
+              print…
+            </button>
+          </div>
+          <ModelView path={path} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function fileKind(name: string): string {
+  const n = name.toLowerCase();
+  if (n.endsWith(".gcode.3mf")) return "sliced 3MF";
+  if (n.endsWith(".3mf")) return "3MF model";
+  if (n.endsWith(".gcode")) return "G-code";
+  return "file";
 }
 
 function StartDialog({ path, onClose }: { path: string; onClose: () => void }) {
@@ -218,6 +284,7 @@ function StartDialog({ path, onClose }: { path: string; onClose: () => void }) {
             <span className="start__name">{name}</span>
           </div>
         </div>
+        <ModelView path={path} />
         {is3mf && (
           <div className="startform">
             <label className="startrow">

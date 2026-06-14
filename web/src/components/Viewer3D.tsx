@@ -12,7 +12,11 @@ type THREE = typeof import("three");
 //               that reveals the extrusion trail as a head marker walks the path,
 //               so you can watch how the head moves.
 // three.js is dynamically imported (a lazy chunk) only when the viewer opens.
-export function Viewer3D({ path, onClose }: { path: string; onClose: () => void }) {
+//
+// `ModelView` is the embeddable engine (mode toggle + canvas + playback) with no
+// modal chrome, so it can be dropped into the file-detail screen and the
+// pre-print dialog as well as a standalone modal.
+export function ModelView({ path }: { path: string }) {
   const is3mf = path.toLowerCase().endsWith(".3mf");
   const mount = useRef<HTMLDivElement>(null);
   const [mode, setMode] = useState<Mode>(is3mf ? "mesh" : "toolpath");
@@ -179,65 +183,56 @@ export function Viewer3D({ path, onClose }: { path: string; onClose: () => void 
   };
 
   return (
-    <div className="modal" role="dialog" aria-modal="true" data-testid="viewer">
-      <div className="modal__box modal__box--viewer">
-        <div className="viewer__head">
-          <span className="lbl">3D view</span>
-          <span className="dim viewer__name">{path.split("/").pop()}</span>
-          {is3mf && (
-            <span className="viewer__modes" role="group" aria-label="view mode">
-              <button
-                className={`btn btn--sm${mode === "mesh" ? " is-active" : ""}`}
-                aria-pressed={mode === "mesh"}
-                onClick={() => setMode("mesh")}
-                data-testid="viewer-mode-mesh"
-              >
-                mesh
-              </button>
-              <button
-                className={`btn btn--sm${mode === "toolpath" ? " is-active" : ""}`}
-                aria-pressed={mode === "toolpath"}
-                onClick={() => setMode("toolpath")}
-                data-testid="viewer-mode-toolpath"
-              >
-                toolpath
-              </button>
-            </span>
-          )}
-          <button className="btn btn--sm viewer__close" onClick={onClose}>
-            close
+    <div className="modelview">
+      {is3mf && (
+        <div className="viewer__modes" role="group" aria-label="view mode">
+          <button
+            className={`btn btn--sm${mode === "mesh" ? " is-active" : ""}`}
+            aria-pressed={mode === "mesh"}
+            onClick={() => setMode("mesh")}
+            data-testid="viewer-mode-mesh"
+          >
+            mesh
+          </button>
+          <button
+            className={`btn btn--sm${mode === "toolpath" ? " is-active" : ""}`}
+            aria-pressed={mode === "toolpath"}
+            onClick={() => setMode("toolpath")}
+            data-testid="viewer-mode-toolpath"
+          >
+            toolpath
           </button>
         </div>
-        <div className="viewer__canvas" ref={mount} data-testid="viewer-canvas" />
-        {mode === "toolpath" && scrubbable && (
-          <div className="viewer__play" data-testid="viewer-play-bar">
-            <button
-              className="btn btn--sm"
-              onClick={togglePlay}
-              data-testid="viewer-play"
-              aria-label={playing ? "pause" : "play"}
-            >
-              {playing ? "⏸" : "▶"}
-            </button>
-            <input
-              className="viewer__scrub"
-              type="range"
-              min={0}
-              max={totalRef.current || 1}
-              value={Math.round(progress * (totalRef.current || 1))}
-              onChange={(e) => onScrub(Number(e.target.value))}
-              data-testid="viewer-scrub"
-              aria-label="playback position"
-            />
-            <span className="viewer__pct mono">{Math.round(progress * 100)}%</span>
-          </div>
-        )}
-        {status && (
-          <div className="dim viewer__status" data-testid="viewer-status">
-            {status}
-          </div>
-        )}
-      </div>
+      )}
+      <div className="viewer__canvas" ref={mount} data-testid="viewer-canvas" />
+      {mode === "toolpath" && scrubbable && (
+        <div className="viewer__play" data-testid="viewer-play-bar">
+          <button
+            className="btn btn--sm"
+            onClick={togglePlay}
+            data-testid="viewer-play"
+            aria-label={playing ? "pause" : "play"}
+          >
+            {playing ? "⏸" : "▶"}
+          </button>
+          <input
+            className="viewer__scrub"
+            type="range"
+            min={0}
+            max={totalRef.current || 1}
+            value={Math.round(progress * (totalRef.current || 1))}
+            onChange={(e) => onScrub(Number(e.target.value))}
+            data-testid="viewer-scrub"
+            aria-label="playback position"
+          />
+          <span className="viewer__pct mono">{Math.round(progress * 100)}%</span>
+        </div>
+      )}
+      {status && (
+        <div className="dim viewer__status" data-testid="viewer-status">
+          {status}
+        </div>
+      )}
     </div>
   );
 }

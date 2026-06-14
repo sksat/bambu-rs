@@ -81,12 +81,19 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("thumb").first()).toBeVisible();
   });
 
-  test("3D button opens the viewer", async ({ page }) => {
-    await page.getByTestId("view3d").first().click();
-    await expect(page.getByTestId("viewer")).toBeVisible();
+  test("clicking a file opens its detail with the 3D viewer", async ({ page }) => {
+    // Click the row (top-left, away from the print button) to open details.
+    await page
+      .getByTestId("file")
+      .filter({ hasText: ".3mf" })
+      .first()
+      .click({ position: { x: 6, y: 6 } });
+    await expect(page.getByTestId("file-detail")).toBeVisible();
     await expect(page.getByTestId("viewer-canvas")).toBeVisible();
+    // Mode toggle is present (mesh / toolpath).
+    await expect(page.getByTestId("viewer-mode-toolpath")).toBeVisible();
     await page.getByRole("button", { name: "close" }).click();
-    await expect(page.getByTestId("viewer")).toHaveCount(0);
+    await expect(page.getByTestId("file-detail")).toHaveCount(0);
   });
 
   test("has a GitHub repo link", async ({ page }) => {

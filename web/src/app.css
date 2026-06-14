@@ -863,7 +863,8 @@ body {
 
 /* start-print dialog */
 .modal__box--start {
-  max-width: 27rem;
+  max-width: min(92vw, 32rem);
+  width: 100%;
 }
 .start__head {
   display: flex;
@@ -895,30 +896,20 @@ body {
   border-color: var(--ok);
 }
 
-/* ── 3D viewer ───────────────────────────────────────────────────────────── */
-.modal__box--viewer {
-  max-width: min(92vw, 880px);
-  width: 100%;
-}
-.viewer__head {
+/* ── 3D viewer (embeddable engine: file detail + pre-print dialog) ────────── */
+.modelview {
   display: flex;
-  align-items: center;
-  gap: 0.6rem;
-  margin-bottom: 0.6rem;
-}
-.viewer__name {
-  font-family: var(--mono);
-  font-size: 0.8rem;
-  word-break: break-all;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-width: 0;
 }
 .viewer__modes {
   display: flex;
   gap: 0.3rem;
-  margin-left: auto;
 }
 .viewer__canvas {
   width: 100%;
-  height: min(64vh, 560px);
+  height: min(52vh, 460px);
   border: 1px solid var(--hair);
   border-radius: 8px;
   overflow: hidden;
@@ -945,4 +936,74 @@ body {
   font-family: var(--mono);
   font-size: 0.8rem;
   margin-top: 0.5rem;
+}
+
+/* ── File detail screen (metadata + embedded viewer) ─────────────────────── */
+.modal__box--detail {
+  max-width: min(94vw, 980px);
+  width: 100%;
+}
+.detail__head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.6rem;
+}
+.detail__name {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  word-break: break-all;
+}
+.detail__close {
+  margin-left: auto;
+}
+.detail__body {
+  display: flex;
+  gap: 1rem;
+  align-items: flex-start;
+}
+.detail__info {
+  flex: 0 0 230px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+.detail__body .modelview {
+  flex: 1;
+}
+.thumb--detail {
+  width: 100%;
+  height: auto;
+  aspect-ratio: 1;
+  border-radius: 8px;
+}
+.kv {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.2rem 0.6rem;
+  margin: 0;
+  font-size: 0.8rem;
+}
+.kv dt {
+  color: var(--dim);
+}
+.kv dd {
+  margin: 0;
+  font-family: var(--mono);
+  word-break: break-all;
+}
+.kv__path {
+  font-size: 0.72rem;
+}
+.detail__print {
+  align-self: flex-start;
+}
+@media (max-width: 640px) {
+  .detail__body {
+    flex-direction: column;
+  }
+  .detail__info {
+    flex: none;
+    width: 100%;
+  }
 }
