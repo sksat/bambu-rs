@@ -45,18 +45,24 @@
 - **cargo-binstall**: `[package.metadata.binstall]` in `Cargo.toml` matches the
   asset names, so `cargo binstall bambu-rs` works once a release exists.
 
-## Not yet verified on a real tag run
+## Verification status
 
-This pipeline is authored but **has not been run end-to-end** yet. Watch the
-first real tag for:
+The host-side of the pipeline is verified locally (x86_64-linux, 2026-06-15);
+the Linux **cross** link step needs Docker and hasn't been run.
 
-- **native-tls / OpenSSL under `cross`** (highest risk): the crate uses
-  `suppaftp` with `native-tls` (OpenSSL) for FTPS. Linking OpenSSL inside the
-  old gnu/musl `cross` images can fail; if it does, the fix is vendored OpenSSL
-  or moving FTPS to a rustls backend. Test the musl targets first.
-- **`about.toml` accept-list**: `cargo-about` errors on any dependency license
-  not in the list. Run `cargo install --locked cargo-about@0.9.0 && cargo build
-  --features dashboard,license-notice` once locally and add any reported
-  licenses before tagging, or the build panics.
-- **Empty SPA**: the build asserts `web/dist/index.html` exists, but confirm the
-  published binary serves the real dashboard (not the fallback page).
+- ⚠️ **native-tls / OpenSSL under `cross`** — the one unverified step (highest
+  risk). The crate uses `suppaftp` with `native-tls` (OpenSSL) for FTPS; linking
+  OpenSSL inside the old gnu/musl `cross` images can fail. If it does, the fix is
+  vendored OpenSSL or a rustls FTPS backend. **Needs Docker** — exercise it from
+  the Actions tab via `workflow_dispatch` (runs the whole matrix, no tag), and
+  test the musl targets first.
+- ✅ **`about.toml` accept-list** — verified: `cargo install --locked --features
+  cli cargo-about@0.9.0` then `cargo build --release --no-default-features
+  --features dashboard,license-notice --bin bambu` builds clean (every dependency
+  license is accepted; no panic). Re-run after a dependency bump and add any
+  reported licenses.
+- ✅ **license notice** — verified: `bambu --license-notice` prints the embedded
+  notice (~7.6k lines, all deps).
+- ✅ **self-contained SPA** — verified: a release `--features dashboard` binary
+  run from a directory with no `web/dist` still serves the real dashboard, so the
+  SPA is embedded via rust-embed in release (not read from disk).
