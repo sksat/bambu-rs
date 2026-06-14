@@ -12,8 +12,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::{StatusCode, header::AUTHORIZATION};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -28,6 +29,9 @@ use super::assets::static_handler;
 #[cfg(test)]
 use super::control::FakeController;
 use super::control::{ControlAction, ControlError, Controller};
+#[cfg(test)]
+use super::files::FakeFiles;
+use super::files::FileStore;
 use crate::core::command::{LedNode, SpeedLevel};
 use crate::core::session::CommandOutcome;
 use crate::core::status::{Ams, AmsTray, AmsUnit, Filament, Online, PrinterStatus};
@@ -220,6 +224,7 @@ impl PrinterSource for FakeSource {
 pub struct AppState {
     pub source: Arc<dyn PrinterSource>,
     pub controller: Arc<dyn Controller>,
+    pub files: Arc<dyn FileStore>,
     /// Optional password gating **write** (control) requests; `None` = control is
     /// open. Reads are always unauthenticated.
     pub password: Option<String>,
@@ -231,6 +236,7 @@ impl AppState {
         Self {
             source: Arc::new(FakeSource::idle()),
             controller: Arc::new(FakeController::verified()),
+            files: Arc::new(FakeFiles),
             password: None,
         }
     }
@@ -241,13 +247,19 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     let reads = Router::new()
         .route("/api/status", get(status))
-        .route("/api/ws", get(status_ws));
+        .route("/api/ws", get(status_ws))
+        .route("/api/files", get(list_files));
     let writes = Router::new()
         .route("/api/job/pause", post(job_pause))
         .route("/api/job/resume", post(job_resume))
         .route("/api/job/stop", post(job_stop))
         .route("/api/light", post(light))
         .route("/api/speed", post(speed))
+        // Uploads can be large (sliced 3mf); raise the body cap from the 2 MB default.
+        .route(
+            "/api/files/upload",
+            post(upload_file).layer(DefaultBodyLimit::max(256 * 1024 * 1024)),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_password,
@@ -357,6 +369,61 @@ fn bad_request(msg: String) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
 }
 
+// ── File endpoints ─────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ListQuery {
+    dir: Option<String>,
+}
+
+/// List files on the printer (open read). `?dir=` defaults to `/`.
+async fn list_files(State(st): State<AppState>, Query(q): Query<ListQuery>) -> Response {
+    let dir = q.dir.unwrap_or_else(|| "/".to_string());
+    let files = st.files.clone();
+    match tokio::task::spawn_blocking(move || files.list(&dir)).await {
+        Ok(Ok(names)) => Json(json!({ "files": names })).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "file task failed" })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct UploadQuery {
+    dir: Option<String>,
+    name: String,
+}
+
+/// Upload a file to the printer (write). The body is the raw file bytes;
+/// `?name=` is the filename and `?dir=` the destination (default `/`).
+async fn upload_file(
+    State(st): State<AppState>,
+    Query(q): Query<UploadQuery>,
+    body: Bytes,
+) -> Response {
+    // Reject path-traversal / nested names — `name` is a single filename.
+    if q.name.is_empty() || q.name.contains('/') || q.name.contains('\\') || q.name.contains("..") {
+        return bad_request(format!("invalid filename {:?}", q.name));
+    }
+    let dir = q.dir.unwrap_or_else(|| "/".to_string());
+    let remote = format!("{}/{}", dir.trim_end_matches('/'), q.name);
+    let name = q.name.clone();
+    let files = st.files.clone();
+    let bytes = body.to_vec();
+    match tokio::task::spawn_blocking(move || files.upload(&remote, bytes)).await {
+        Ok(Ok(())) => Json(json!({ "uploaded": name })).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "upload task failed" })),
+        )
+            .into_response(),
+    }
+}
+
 /// Upgrade to a WebSocket that pushes a `PrinterStatus` JSON frame on connect and
 /// on every subsequent change.
 async fn status_ws(State(st): State<AppState>, ws: WebSocketUpgrade) -> Response {
@@ -420,6 +487,7 @@ mod tests {
         let state = AppState {
             source: Arc::new(FakeSource::idle()),
             controller: Arc::new(controller),
+            files: Arc::new(FakeFiles),
             password: password.map(str::to_owned),
         };
         TestServer::new(router(state))
@@ -538,6 +606,50 @@ mod tests {
             .assert_status_ok();
     }
 
+    // ── files ──
+    #[tokio::test]
+    async fn list_files_is_open() {
+        let res = app(Some("secret"), FakeController::verified())
+            .get("/api/files")
+            .await;
+        res.assert_status_ok();
+        let body: serde_json::Value = res.json();
+        assert!(
+            body["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f == "coin2c.gcode.3mf")
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_open_when_no_password() {
+        app(None, FakeController::verified())
+            .post("/api/files/upload?name=part.gcode.3mf")
+            .bytes(b"PK\x03\x04 fake 3mf".to_vec().into())
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn upload_needs_password_when_set() {
+        app(Some("secret"), FakeController::verified())
+            .post("/api/files/upload?name=part.gcode.3mf")
+            .bytes(b"data".to_vec().into())
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_path_traversal() {
+        app(None, FakeController::verified())
+            .post("/api/files/upload?name=../etc/passwd")
+            .bytes(b"data".to_vec().into())
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
     // WebSocket tests need the real HTTP transport (the mocked one can't upgrade).
     fn ws_server(state: AppState) -> TestServer {
         TestServer::builder().http_transport().build(router(state))
@@ -560,6 +672,7 @@ mod tests {
         let state = AppState {
             source: Arc::new(FakeSource::ramping(Duration::from_millis(5))),
             controller: Arc::new(FakeController::verified()),
+            files: Arc::new(FakeFiles),
             password: None,
         };
         let mut ws = ws_server(state)

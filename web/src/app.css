@@ -592,3 +592,50 @@ body {
   margin: 0 0 0.4rem;
   font-size: 0.95rem;
 }
+
+/* ── github link ─────────────────────────────────────────────────────────── */
+.ghlink {
+  display: inline-flex;
+  align-items: center;
+  color: var(--dim);
+}
+.ghlink:hover {
+  color: var(--fg);
+}
+
+/* ── files ───────────────────────────────────────────────────────────────── */
+.btn--busy {
+  opacity: 0.6;
+  cursor: default;
+}
+.files__msg {
+  font-family: var(--mono);
+  font-size: 0.76rem;
+  margin: 0.2rem 0 0.4rem;
+}
+.filelist {
+  list-style: none;
+  margin: 0.3rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.filerow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  padding: 0.4rem 0.5rem;
+  border: 1px solid transparent;
+  border-radius: 6px;
+}
+.filerow:hover {
+  border-color: var(--hair);
+  background: var(--hair-2);
+}
+.fname {
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  word-break: break-all;
+}

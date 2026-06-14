@@ -36,6 +36,15 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("toast")).toContainText("verified");
   });
 
+  test("lists files from the printer", async ({ page }) => {
+    await expect(page.getByTestId("files")).toBeVisible();
+    await expect(page.getByTestId("file").first()).toContainText(".3mf");
+  });
+
+  test("has a GitHub repo link", async ({ page }) => {
+    await expect(page.getByTestId("github")).toHaveAttribute("href", /github\.com/);
+  });
+
   test("theme toggle cycles auto → dark → light", async ({ page }) => {
     const btn = page.getByTestId("theme");
     await expect(page.locator("html")).not.toHaveAttribute("data-theme", /.+/); // auto

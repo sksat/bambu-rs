@@ -5,6 +5,7 @@ import { JobSection } from "./components/JobSection";
 import { TempSection } from "./components/TempSection";
 import { AmsSection } from "./components/AmsSection";
 import { Controls, ConfirmDialog } from "./components/Controls";
+import { FilesSection } from "./components/FilesSection";
 import { HealthSection } from "./components/HealthSection";
 import { FooterSection } from "./components/FooterSection";
 import "./app.css";
@@ -24,6 +25,7 @@ export function App() {
           <TempSection s={status} history={history} />
           {status.ams && <AmsSection ams={status.ams} />}
           <Controls control={control} />
+          <FilesSection />
           <HealthSection s={status} />
           <FooterSection s={status} />
         </main>

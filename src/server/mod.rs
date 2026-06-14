@@ -10,6 +10,7 @@ pub mod api;
 #[cfg(feature = "dashboard")]
 pub mod assets;
 pub mod control;
+pub mod files;
 pub mod live;
 
 use std::sync::Arc;
@@ -18,6 +19,7 @@ use std::time::Duration;
 use crate::config::ResolvedTarget;
 pub use api::{AppState, FakeSource, PrinterSource};
 pub use control::{Controller, FakeController, LiveController};
+pub use files::{FakeFiles, FileStore, LiveFiles};
 pub use live::LiveSource;
 
 /// Options for [`serve`].
@@ -43,12 +45,17 @@ pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<
     rt.block_on(async move {
         // Live mode bridges the real MQTT monitor (and controls the real device);
         // otherwise serve a ramping fake so the UI still has moving data.
-        let (source, controller): (Arc<dyn PrinterSource>, Arc<dyn Controller>) = match target {
+        let (source, controller, files): (
+            Arc<dyn PrinterSource>,
+            Arc<dyn Controller>,
+            Arc<dyn FileStore>,
+        ) = match target {
             Some(t) if !opts.fake => {
                 eprintln!("connecting to the printer over LAN…");
                 (
                     Arc::new(LiveSource::connect(t.clone(), opts.interval)),
-                    Arc::new(LiveController::new(t)),
+                    Arc::new(LiveController::new(t.clone())),
+                    Arc::new(LiveFiles::new(t)),
                 )
             }
             _ => {
@@ -61,6 +68,7 @@ pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<
                 (
                     Arc::new(FakeSource::ramping(tick)),
                     Arc::new(FakeController::verified()),
+                    Arc::new(FakeFiles),
                 )
             }
         };
@@ -86,6 +94,7 @@ pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<
         let state = AppState {
             source,
             controller,
+            files,
             password: opts.password,
         };
         axum::serve(listener, api::router(state))
