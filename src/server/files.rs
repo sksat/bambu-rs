@@ -30,6 +30,45 @@ pub trait FileStore: Send + Sync {
     /// Extract the plate's gcode (`Metadata/plate_N.gcode`) from a `.3mf` — the
     /// toolpath the 3D viewer renders for a sliced file. `None` if absent.
     fn gcode(&self, remote_path: &str, plate: u32) -> Result<Option<Vec<u8>>, String>;
+    /// Extract the object mesh model XML(s) from a `.3mf` — the geometry the 3D
+    /// viewer renders as a solid mesh. Bambu stores meshes in external component
+    /// files (`3D/Objects/*.model`) that three's 3MF loader won't follow, so we
+    /// pull them out ourselves. Empty when the file embeds no mesh.
+    fn models(&self, remote_path: &str) -> Result<Vec<String>, String>;
+}
+
+/// Cap on total mesh-XML bytes returned for one `.3mf` (the viewer buffers them).
+const MODELS_MAX: usize = 48 * 1024 * 1024;
+
+/// Extract every `3D/**/*.model` entry that carries a `<mesh>` (the geometry).
+/// The root `3D/3dmodel.model` is only component references — no `<mesh>` — so it
+/// is skipped; the actual meshes live in `3D/Objects/*.model`.
+fn extract_models(zip_bytes: &[u8]) -> Result<Vec<String>, String> {
+    use std::io::Read;
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    let mut total = 0usize;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+        let name = entry.name().to_string();
+        if !(name.starts_with("3D/") && name.ends_with(".model")) {
+            continue;
+        }
+        let mut buf = String::new();
+        if entry.read_to_string(&mut buf).is_err() {
+            continue; // not UTF-8 / unreadable — skip
+        }
+        if !buf.contains("<mesh") {
+            continue; // a references-only model (e.g. the root) has no geometry
+        }
+        total += buf.len();
+        if total > MODELS_MAX {
+            break;
+        }
+        out.push(buf);
+    }
+    Ok(out)
 }
 
 /// Extract `Metadata/plate_{plate}.gcode` (the sliced toolpath) from a `.3mf`.
@@ -84,6 +123,9 @@ pub struct LiveFiles {
     /// means downloading the whole `.3mf` over FTPS, so cache it; only modestly
     /// sized toolpaths are kept (see [`GCODE_CACHE_MAX`]).
     gcode_cache: Mutex<HashMap<String, Option<Vec<u8>>>>,
+    /// Cache of extracted mesh model XML(s) (key = path), same rationale as the
+    /// gcode cache; only modestly sized meshes are kept.
+    models_cache: Mutex<HashMap<String, Vec<String>>>,
 }
 
 /// Don't cache plate gcode larger than this (a big print's toolpath is many MB;
@@ -97,6 +139,7 @@ impl LiveFiles {
             thumb_cache: Mutex::new(HashMap::new()),
             list_cache: Mutex::new(HashMap::new()),
             gcode_cache: Mutex::new(HashMap::new()),
+            models_cache: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -210,6 +253,36 @@ impl FileStore for LiveFiles {
         }
         Ok(gcode)
     }
+
+    fn models(&self, remote_path: &str) -> Result<Vec<String>, String> {
+        if let Some(hit) = self
+            .models_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(remote_path)
+        {
+            return Ok(hit.clone());
+        }
+        let tmp = tempfile::Builder::new()
+            .prefix("bambu-mesh-")
+            .tempfile()
+            .map_err(|e| e.to_string())?;
+        FtpsClient::new(self.target.clone())
+            .download(remote_path, tmp.path())
+            .map_err(|e| e.to_string())?;
+        let bytes = std::fs::read(tmp.path()).map_err(|e| e.to_string())?;
+        let models = extract_models(&bytes)?;
+        // Only cache modest meshes (keys are caller-controlled); bound the count.
+        let total: usize = models.iter().map(String::len).sum();
+        if total <= GCODE_CACHE_MAX {
+            let mut cache = self.models_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.len() >= 16 {
+                cache.clear();
+            }
+            cache.insert(remote_path.to_string(), models.clone());
+        }
+        Ok(models)
+    }
 }
 
 /// A canned file store for `--fake` mode and tests.
@@ -245,7 +318,32 @@ impl FileStore for FakeFiles {
         // and E2E render a real, non-empty model in --fake mode.
         Ok(Some(fake_gcode().into_bytes()))
     }
+    fn models(&self, _remote_path: &str) -> Result<Vec<String>, String> {
+        // A unit cube as a 3MF mesh model, so the viewer/E2E render a real solid
+        // mesh in --fake mode.
+        Ok(vec![FAKE_CUBE_MODEL.to_string()])
+    }
 }
+
+/// A 10 mm cube as a minimal 3MF mesh model (8 vertices, 12 triangles) — the
+/// `--fake` mesh the viewer renders.
+const FAKE_CUBE_MODEL: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+ <resources><object id="1" type="model"><mesh>
+  <vertices>
+   <vertex x="0" y="0" z="0"/><vertex x="10" y="0" z="0"/><vertex x="10" y="10" z="0"/><vertex x="0" y="10" z="0"/>
+   <vertex x="0" y="0" z="10"/><vertex x="10" y="0" z="10"/><vertex x="10" y="10" z="10"/><vertex x="0" y="10" z="10"/>
+  </vertices>
+  <triangles>
+   <triangle v1="0" v2="2" v3="1"/><triangle v1="0" v2="3" v3="2"/>
+   <triangle v1="4" v2="5" v3="6"/><triangle v1="4" v2="6" v3="7"/>
+   <triangle v1="0" v2="1" v3="5"/><triangle v1="0" v2="5" v3="4"/>
+   <triangle v1="1" v2="2" v3="6"/><triangle v1="1" v2="6" v3="5"/>
+   <triangle v1="2" v2="3" v3="7"/><triangle v1="2" v2="7" v3="6"/>
+   <triangle v1="3" v2="0" v3="4"/><triangle v1="3" v2="4" v3="7"/>
+  </triangles>
+ </mesh></object></resources>
+</model>"#;
 
 /// A small valid gcode toolpath: 6 layers of a 20 mm square perimeter, with
 /// extrusion moves so [`GCodeLoader`] draws extruded (not travel) segments.
@@ -319,5 +417,41 @@ mod tests {
     fn fake_gcode_is_parseable_extruding_toolpath() {
         let g = String::from_utf8(fake_gcode().into_bytes()).unwrap();
         assert!(g.contains("G1 X30.0 Y10.0 E"));
+    }
+
+    #[test]
+    fn extracts_only_mesh_bearing_models_from_a_3mf_zip() {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            // Root model: component references only, no <mesh> — must be skipped.
+            zw.start_file::<_, ()>("3D/3dmodel.model", zip::write::FileOptions::default())
+                .unwrap();
+            zw.write_all(
+                b"<model><resources><object id=\"2\"><components/></object></resources></model>",
+            )
+            .unwrap();
+            // Object model: carries the actual <mesh> — must be returned.
+            zw.start_file::<_, ()>(
+                "3D/Objects/part_1.model",
+                zip::write::FileOptions::default(),
+            )
+            .unwrap();
+            zw.write_all(b"<model><resources><object id=\"1\"><mesh><vertices/></mesh></object></resources></model>")
+                .unwrap();
+            zw.finish().unwrap();
+        }
+        let models = extract_models(&buf).unwrap();
+        assert_eq!(models.len(), 1);
+        assert!(models[0].contains("<mesh"));
+    }
+
+    #[test]
+    fn fake_cube_model_is_a_valid_mesh() {
+        let models = FakeFiles.models("/x.3mf").unwrap();
+        assert_eq!(models.len(), 1);
+        assert!(models[0].contains("<vertex "));
+        assert!(models[0].contains("<triangle "));
     }
 }

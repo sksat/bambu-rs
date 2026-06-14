@@ -911,7 +911,9 @@ body {
   font-size: 0.8rem;
   word-break: break-all;
 }
-.viewer__close {
+.viewer__modes {
+  display: flex;
+  gap: 0.3rem;
   margin-left: auto;
 }
 .viewer__canvas {
@@ -920,7 +922,24 @@ body {
   border: 1px solid var(--hair);
   border-radius: 8px;
   overflow: hidden;
-  background: #111317;
+  background: #1b1e24; /* matches the soft slate scene background */
+}
+/* Toolpath playback: play/pause + a scrubber + a percent readout. */
+.viewer__play {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 0.5rem;
+}
+.viewer__scrub {
+  flex: 1;
+  accent-color: var(--accent);
+}
+.viewer__pct {
+  min-width: 2.8em;
+  text-align: right;
+  font-size: 0.8rem;
+  color: var(--dim);
 }
 .viewer__status {
   font-family: var(--mono);

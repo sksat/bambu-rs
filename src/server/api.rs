@@ -280,7 +280,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/files", get(list_files))
         .route("/api/files/thumbnail", get(file_thumbnail))
         .route("/api/files/raw", get(file_raw))
-        .route("/api/files/gcode", get(file_gcode));
+        .route("/api/files/gcode", get(file_gcode))
+        .route("/api/files/mesh", get(file_mesh));
     let writes = Router::new()
         .route("/api/job/pause", post(job_pause))
         .route("/api/job/resume", post(job_resume))
@@ -671,6 +672,32 @@ async fn file_gcode(State(st): State<AppState>, Query(q): Query<GcodeFileQuery>)
 }
 
 #[derive(Deserialize)]
+struct MeshQuery {
+    name: String,
+}
+
+/// Serve a `.3mf`'s embedded object meshes as `{ "models": [<3MF model XML>, …] }`
+/// for the 3D viewer's solid-mesh render (open read). The viewer parses the mesh
+/// XML itself because three's `3MFLoader` won't follow Bambu's external-component
+/// refs. Empty `models` when the file embeds no mesh.
+async fn file_mesh(State(st): State<AppState>, Query(q): Query<MeshQuery>) -> Response {
+    let remote = if q.name.starts_with('/') {
+        q.name.clone()
+    } else {
+        format!("/{}", q.name)
+    };
+    if !is_safe_remote_path(&remote) || !remote.to_ascii_lowercase().ends_with(".3mf") {
+        return bad_request(format!("mesh needs a .3mf printer path: {:?}", q.name));
+    }
+    let files = st.files.clone();
+    match tokio::task::spawn_blocking(move || files.models(&remote)).await {
+        Ok(Ok(models)) => Json(json!({ "models": models })).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
+        Err(_) => server_error("mesh task failed".to_string()),
+    }
+}
+
+#[derive(Deserialize)]
 struct UploadQuery {
     dir: Option<String>,
     name: String,
@@ -1035,6 +1062,26 @@ mod tests {
     async fn gcode_file_rejects_non_3mf() {
         app(None, FakeController::verified())
             .get("/api/files/gcode?name=/raw.gcode")
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mesh_file_serves_object_models() {
+        let res = app(None, FakeController::verified())
+            .get("/api/files/mesh?name=/coin2c.gcode.3mf")
+            .await;
+        res.assert_status_ok();
+        let body: serde_json::Value = res.json();
+        let models = body["models"].as_array().unwrap();
+        assert_eq!(models.len(), 1);
+        assert!(models[0].as_str().unwrap().contains("<triangle "));
+    }
+
+    #[tokio::test]
+    async fn mesh_file_rejects_non_3mf() {
+        app(None, FakeController::verified())
+            .get("/api/files/mesh?name=/raw.gcode")
             .await
             .assert_status(StatusCode::BAD_REQUEST);
     }
