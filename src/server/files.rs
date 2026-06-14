@@ -3,13 +3,17 @@
 //! uses [`LiveFiles`] (FTPS). Listing is a read (open); upload is a write
 //! (password-gated). Both are blocking — call from `spawn_blocking`.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use crate::config::ResolvedTarget;
-use crate::ftp::FtpsClient;
+use crate::ftp::{FileEntry, FtpsClient};
 
 /// Something that can list and upload files on the printer, and fetch the plate
 /// preview embedded in a sliced `.3mf`.
 pub trait FileStore: Send + Sync {
-    fn list(&self, dir: &str) -> Result<Vec<String>, String>;
+    /// List a directory (with dir/size info).
+    fn list(&self, dir: &str) -> Result<Vec<FileEntry>, String>;
     fn upload(&self, remote_path: &str, bytes: Vec<u8>) -> Result<(), String>;
     /// The embedded plate preview PNG for a sliced `.3mf` (`Metadata/plate_N.png`),
     /// or `None` when the file has no such thumbnail.
@@ -40,18 +44,25 @@ fn extract_thumbnail(zip_bytes: &[u8], plate: u32) -> Result<Option<Vec<u8>>, St
 /// Real printer storage over implicit FTPS.
 pub struct LiveFiles {
     target: ResolvedTarget,
+    /// Cache of extracted thumbnails (key `path#plate`). Pulling a preview means
+    /// downloading the whole `.3mf` over FTPS, so cache it — otherwise repeated
+    /// list renders re-download every file and thumbnails flicker / time out.
+    thumb_cache: Mutex<HashMap<String, Option<Vec<u8>>>>,
 }
 
 impl LiveFiles {
     pub fn new(target: ResolvedTarget) -> Self {
-        Self { target }
+        Self {
+            target,
+            thumb_cache: Mutex::new(HashMap::new()),
+        }
     }
 }
 
 impl FileStore for LiveFiles {
-    fn list(&self, dir: &str) -> Result<Vec<String>, String> {
+    fn list(&self, dir: &str) -> Result<Vec<FileEntry>, String> {
         FtpsClient::new(self.target.clone())
-            .list(dir)
+            .list_entries(dir)
             .map_err(|e| e.to_string())
     }
 
@@ -70,6 +81,10 @@ impl FileStore for LiveFiles {
     }
 
     fn thumbnail(&self, remote_path: &str, plate: u32) -> Result<Option<Vec<u8>>, String> {
+        let key = format!("{remote_path}#{plate}");
+        if let Some(hit) = self.thumb_cache.lock().unwrap().get(&key) {
+            return Ok(hit.clone());
+        }
         let tmp = tempfile::Builder::new()
             .prefix("bambu-thumb-")
             .tempfile()
@@ -78,7 +93,9 @@ impl FileStore for LiveFiles {
             .download(remote_path, tmp.path())
             .map_err(|e| e.to_string())?;
         let bytes = std::fs::read(tmp.path()).map_err(|e| e.to_string())?;
-        extract_thumbnail(&bytes, plate)
+        let thumb = extract_thumbnail(&bytes, plate)?;
+        self.thumb_cache.lock().unwrap().insert(key, thumb.clone());
+        Ok(thumb)
     }
 }
 
@@ -86,10 +103,17 @@ impl FileStore for LiveFiles {
 pub struct FakeFiles;
 
 impl FileStore for FakeFiles {
-    fn list(&self, _dir: &str) -> Result<Vec<String>, String> {
+    fn list(&self, _dir: &str) -> Result<Vec<FileEntry>, String> {
+        let entry = |name: &str, is_dir: bool, size: u64| FileEntry {
+            name: name.to_string(),
+            is_dir,
+            size,
+        };
         Ok(vec![
-            "coin2c.gcode.3mf".to_string(),
-            "benchy_2c.3mf".to_string(),
+            entry("cache", true, 0),
+            entry("timelapse", true, 0),
+            entry("coin2c.gcode.3mf", false, 184_320),
+            entry("benchy_2c.3mf", false, 256_000),
         ])
     }
     fn upload(&self, _remote_path: &str, _bytes: Vec<u8>) -> Result<(), String> {

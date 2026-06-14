@@ -819,12 +819,16 @@ mod tests {
             .await;
         res.assert_status_ok();
         let body: serde_json::Value = res.json();
+        let files = body["files"].as_array().unwrap();
         assert!(
-            body["files"]
-                .as_array()
-                .unwrap()
+            files
                 .iter()
-                .any(|f| f == "coin2c.gcode.3mf")
+                .any(|f| f["name"] == "coin2c.gcode.3mf" && f["is_dir"] == false)
+        );
+        assert!(
+            files
+                .iter()
+                .any(|f| f["name"] == "cache" && f["is_dir"] == true)
         );
     }
 

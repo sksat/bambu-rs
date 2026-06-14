@@ -3,7 +3,7 @@ import type { PrinterStatus } from "../types";
 export function FooterSection({ s }: { s: PrinterStatus }) {
   const chips: Array<[string, string]> = [];
   if (s.wifi_signal) chips.push(["wifi", s.wifi_signal]);
-  if (s.sdcard != null) chips.push(["sd card", s.sdcard ? "present" : "none"]);
+  // SD card status lives in the Files panel header now.
   if (s.nozzle_diameter) {
     chips.push([
       "nozzle",

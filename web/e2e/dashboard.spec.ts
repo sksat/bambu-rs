@@ -36,9 +36,19 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("toast")).toContainText("verified");
   });
 
-  test("lists files from the printer", async ({ page }) => {
+  test("lists files and directories", async ({ page }) => {
     await expect(page.getByTestId("files")).toBeVisible();
     await expect(page.getByTestId("file").first()).toContainText(".3mf");
+    await expect(page.getByTestId("dir").first()).toBeVisible();
+    await expect(page.getByTestId("sd-chip")).toContainText("present");
+  });
+
+  test("navigates into a directory and back", async ({ page }) => {
+    await expect(page.getByTestId("files-path")).toHaveText("/");
+    await page.getByTestId("dir").first().click();
+    await expect(page.getByTestId("files-path")).not.toHaveText("/");
+    await page.getByTestId("updir").click();
+    await expect(page.getByTestId("files-path")).toHaveText("/");
   });
 
   test("shows file thumbnails (embedded plate preview)", async ({ page }) => {
@@ -49,11 +59,11 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("github")).toHaveAttribute("href", /github\.com/);
   });
 
-  test("print → dry-run shows a plan; start on a busy printer is refused", async ({ page }) => {
+  test("print → preview shows a plan; start on a busy printer is refused", async ({ page }) => {
     await page.getByTestId("print").first().click();
     await expect(page.getByTestId("start-dialog")).toBeVisible();
-    await page.getByRole("button", { name: "dry-run" }).click();
-    await expect(page.getByTestId("start-result")).toContainText("plan");
+    await page.getByRole("button", { name: "preview" }).click();
+    await expect(page.getByTestId("start-result")).toContainText("plate");
     // The fake source streams RUNNING, so the idle guard refuses a new print.
     await page.getByTestId("start-confirm").click();
     await expect(page.getByTestId("start-result")).toContainText("busy");

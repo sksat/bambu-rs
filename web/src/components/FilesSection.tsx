@@ -1,28 +1,47 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Thumb } from "./widgets";
 
-// Files on the printer: list + upload + start a print. Listing is open; upload
-// and start carry the control password (set in Controls) when required.
-export function FilesSection() {
-  const [files, setFiles] = useState<string[] | null>(null);
+interface FileEntry {
+  name: string;
+  is_dir: boolean;
+  size: number;
+}
+
+const REFRESH_MS = 5000;
+
+// A simple file browser over the printer's storage: directories (navigable) and
+// files (with plate thumbnails + a print action), auto-refreshing.
+export function FilesSection({ sdcard }: { sdcard?: boolean | null }) {
+  const [dir, setDir] = useState("/");
+  const [entries, setEntries] = useState<FileEntry[] | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [printing, setPrinting] = useState<string | null>(null);
 
-  const refresh = async () => {
+  const refresh = useCallback(async (d: string) => {
     try {
-      const r = await fetch("/api/files");
-      const d = (await r.json()) as { files?: string[]; error?: string };
-      if (r.ok) setFiles(d.files ?? []);
-      else setMsg(d.error ?? `HTTP ${r.status}`);
+      const r = await fetch(`/api/files?dir=${encodeURIComponent(d)}`);
+      const data = (await r.json()) as { files?: FileEntry[]; error?: string };
+      if (r.ok) {
+        setEntries(data.files ?? []);
+        setMsg(null);
+      } else {
+        setMsg(data.error ?? `HTTP ${r.status}`);
+      }
     } catch {
       setMsg("network error");
     }
-  };
-
-  useEffect(() => {
-    void refresh();
   }, []);
+
+  // (Re)load on directory change, and auto-refresh on a timer.
+  useEffect(() => {
+    void refresh(dir);
+    const id = setInterval(() => void refresh(dir), REFRESH_MS);
+    return () => clearInterval(id);
+  }, [dir, refresh]);
+
+  const join = (name: string) => (dir === "/" ? `/${name}` : `${dir}/${name}`);
+  const goUp = () => setDir((d) => d.replace(/\/[^/]+\/?$/, "") || "/");
 
   const onUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -30,17 +49,16 @@ export function FilesSection() {
     if (!file) return;
     setBusy(true);
     setMsg(`uploading ${file.name}…`);
-    const headers = authHeaders();
+    const pw = sessionStorage.getItem("bambu_pw");
+    const headers: Record<string, string> = {};
+    if (pw) headers["Authorization"] = `Bearer ${pw}`;
     try {
-      const r = await fetch(`/api/files/upload?name=${encodeURIComponent(file.name)}`, {
-        method: "POST",
-        headers,
-        body: file,
-      });
+      const q = `dir=${encodeURIComponent(dir)}&name=${encodeURIComponent(file.name)}`;
+      const r = await fetch(`/api/files/upload?${q}`, { method: "POST", headers, body: file });
       const d = (await r.json().catch(() => ({}))) as { error?: string };
       if (r.ok) {
         setMsg(`uploaded ${file.name}`);
-        void refresh();
+        void refresh(dir);
       } else if (r.status === 401) {
         setMsg("upload needs the control password — set it in Controls, then retry");
       } else {
@@ -53,11 +71,24 @@ export function FilesSection() {
     }
   };
 
+  const sorted = [...(entries ?? [])].sort((a, b) =>
+    a.is_dir !== b.is_dir ? (a.is_dir ? -1 : 1) : a.name.localeCompare(b.name),
+  );
+
   return (
     <section className="panel span-all" data-testid="files">
-      <div className="secline">
+      <div className="secline files__head">
         <span className="lbl">files</span>
-        <button className="btn btn--sm" onClick={() => void refresh()}>
+        <code className="path" data-testid="files-path">
+          {dir}
+        </code>
+        <span className="files__spacer" />
+        {sdcard != null && (
+          <span className={`chip${sdcard ? "" : " warn"}`} data-testid="sd-chip">
+            SD {sdcard ? "present" : "none"}
+          </span>
+        )}
+        <button className="btn btn--sm" onClick={() => void refresh(dir)}>
           refresh
         </button>
         <label className={`btn btn--sm${busy ? " btn--busy" : ""}`}>
@@ -71,55 +102,77 @@ export function FilesSection() {
         </div>
       )}
       <ul className="filelist">
-        {(files ?? []).map((f) => (
-          <li key={f} className="filerow" data-testid="file">
-            <Thumb file={f} className="thumb thumb--row" />
-            <span className="fname">{f}</span>
-            {printable(f) && (
-              <button className="btn btn--sm" onClick={() => setPrinting(f)} data-testid="print">
-                print
-              </button>
-            )}
+        {dir !== "/" && (
+          <li className="filerow filerow--dir" onClick={goUp} data-testid="updir">
+            <span className="ficon">↑</span>
+            <span className="fname">..</span>
           </li>
-        ))}
-        {files?.length === 0 && <li className="dim">no files</li>}
+        )}
+        {sorted.map((e) =>
+          e.is_dir ? (
+            <li
+              key={e.name}
+              className="filerow filerow--dir"
+              onClick={() => setDir(join(e.name))}
+              data-testid="dir"
+            >
+              <span className="ficon">▸</span>
+              <span className="fname">{e.name}/</span>
+            </li>
+          ) : (
+            <li key={e.name} className="filerow" data-testid="file">
+              <Thumb file={join(e.name)} className="thumb thumb--row" />
+              <span className="fname">{e.name}</span>
+              <span className="fsize dim">{fmtSize(e.size)}</span>
+              {printable(e.name) && (
+                <button
+                  className="btn btn--sm"
+                  onClick={() => setPrinting(join(e.name))}
+                  data-testid="print"
+                >
+                  print
+                </button>
+              )}
+            </li>
+          ),
+        )}
+        {sorted.length === 0 && <li className="dim">empty</li>}
       </ul>
-      {printing && <StartDialog file={printing} onClose={() => setPrinting(null)} />}
+      {printing && <StartDialog path={printing} onClose={() => setPrinting(null)} />}
     </section>
   );
 }
 
-function StartDialog({ file, onClose }: { file: string; onClose: () => void }) {
+function StartDialog({ path, onClose }: { path: string; onClose: () => void }) {
+  const name = path.split("/").pop() ?? path;
+  const is3mf = path.toLowerCase().endsWith(".3mf");
   const [plate, setPlate] = useState(1);
   const [useAms, setUseAms] = useState(false);
   const [amsMap, setAmsMap] = useState("");
   const [result, setResult] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const is3mf = file.toLowerCase().endsWith(".3mf");
 
   const run = async (dryRun: boolean) => {
     setBusy(true);
     setResult(dryRun ? "resolving plan…" : "starting…");
     const ams_map = useAms
-      ? amsMap
-          .split(",")
-          .map((s) => s.trim())
-          .filter(Boolean)
-          .map(Number)
+      ? amsMap.split(",").map((s) => s.trim()).filter(Boolean).map(Number)
       : [];
-    const body = {
-      file: `/${file}`,
-      plate,
-      use_ams: useAms,
-      ams_map,
-      dry_run: dryRun,
-      confirm: !dryRun,
-    };
+    const pw = sessionStorage.getItem("bambu_pw");
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (pw) headers["Authorization"] = `Bearer ${pw}`;
     try {
       const r = await fetch("/api/job/start", {
         method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeaders() },
-        body: JSON.stringify(body),
+        headers,
+        body: JSON.stringify({
+          file: path,
+          plate,
+          use_ams: useAms,
+          ams_map,
+          dry_run: dryRun,
+          confirm: !dryRun,
+        }),
       });
       const d = (await r.json().catch(() => ({}))) as {
         error?: string;
@@ -127,11 +180,11 @@ function StartDialog({ file, onClose }: { file: string; onClose: () => void }) {
       };
       if (dryRun && r.status === 200 && d.plan) {
         setResult(
-          `plan — plate ${d.plan.plate}, ams ${
+          `will print plate ${d.plan.plate} · AMS ${
             d.plan.use_ams ? d.plan.ams_map.join(",") || "(none)" : "off"
-          }, bed ${d.plan.bed_type}`,
+          } · bed ${d.plan.bed_type}`,
         );
-      } else if (r.status === 200) setResult("print started (verified)");
+      } else if (r.status === 200) setResult("✓ print started");
       else if (r.status === 202) setResult("sent — not yet verified");
       else if (r.status === 401) setResult("needs the control password (set it in Controls)");
       else setResult(d.error ?? `HTTP ${r.status}`);
@@ -144,56 +197,63 @@ function StartDialog({ file, onClose }: { file: string; onClose: () => void }) {
 
   return (
     <div className="modal" role="dialog" aria-modal="true" data-testid="start-dialog">
-      <div className="modal__box">
-        <p className="modal__msg">
-          start print: <strong>{file}</strong>
-        </p>
-        <div className="startform">
-          <label className="startrow">
-            <span className="lbl">plate</span>
-            <input
-              type="number"
-              min={1}
-              className="pw startnum"
-              value={plate}
-              onChange={(e) => setPlate(Math.max(1, Number(e.target.value) || 1))}
-              data-testid="start-plate"
-              disabled={!is3mf}
-            />
-          </label>
-          {is3mf && (
+      <div className="modal__box modal__box--start">
+        <div className="start__head">
+          <Thumb file={path} className="thumb thumb--start" />
+          <div className="start__title">
+            <span className="lbl">start a print</span>
+            <span className="start__name">{name}</span>
+          </div>
+        </div>
+        {is3mf && (
+          <div className="startform">
             <label className="startrow">
-              <input type="checkbox" checked={useAms} onChange={(e) => setUseAms(e.target.checked)} />
-              <span className="lbl">use AMS</span>
-            </label>
-          )}
-          {is3mf && useAms && (
-            <label className="startrow">
-              <span className="lbl">tray map</span>
+              <span className="lbl">plate</span>
               <input
-                className="pw"
-                placeholder="e.g. 0,3 (-1 = external)"
-                value={amsMap}
-                onChange={(e) => setAmsMap(e.target.value)}
-                data-testid="start-amsmap"
+                type="number"
+                min={1}
+                className="pw startnum"
+                value={plate}
+                onChange={(e) => setPlate(Math.max(1, Number(e.target.value) || 1))}
+                data-testid="start-plate"
               />
             </label>
-          )}
-        </div>
+            <label className="startrow">
+              <input type="checkbox" checked={useAms} onChange={(e) => setUseAms(e.target.checked)} />
+              <span>use AMS (multi-colour)</span>
+            </label>
+            {useAms && (
+              <label className="startrow">
+                <span className="lbl">tray per filament</span>
+                <input
+                  className="pw"
+                  placeholder="0,3  (-1 = external spool)"
+                  value={amsMap}
+                  onChange={(e) => setAmsMap(e.target.value)}
+                  data-testid="start-amsmap"
+                />
+              </label>
+            )}
+          </div>
+        )}
+        <p className="start__help dim">
+          <strong>Preview</strong> resolves the exact plan without printing.{" "}
+          <strong>Start</strong> begins it — the printer must be idle.
+        </p>
         {result && (
-          <div className="dim files__msg" data-testid="start-result">
+          <div className="files__msg" data-testid="start-result">
             {result}
           </div>
         )}
         <div className="btns">
           <button className="btn" onClick={onClose}>
-            close
+            cancel
           </button>
-          <button className="btn btn--sm" disabled={busy} onClick={() => void run(true)}>
-            dry-run
+          <button className="btn" disabled={busy} onClick={() => void run(true)}>
+            preview
           </button>
           <button
-            className="btn btn--danger"
+            className="btn btn--go"
             disabled={busy}
             onClick={() => void run(false)}
             data-testid="start-confirm"
@@ -211,7 +271,14 @@ function printable(name: string): boolean {
   return n.endsWith(".3mf") || n.endsWith(".gcode");
 }
 
-function authHeaders(): Record<string, string> {
-  const pw = sessionStorage.getItem("bambu_pw");
-  return pw ? { Authorization: `Bearer ${pw}` } : {};
+function fmtSize(bytes: number): string {
+  if (!bytes) return "";
+  const u = ["B", "KB", "MB", "GB"];
+  let n = bytes;
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) {
+    n /= 1024;
+    i++;
+  }
+  return `${n >= 10 || i === 0 ? Math.round(n) : n.toFixed(1)} ${u[i]}`;
 }

@@ -25,7 +25,7 @@ export function App() {
           <TempSection s={status} history={history} />
           {status.ams && <AmsSection ams={status.ams} />}
           <Controls control={control} />
-          <FilesSection />
+          <FilesSection sdcard={status.sdcard} />
           <HealthSection s={status} />
           <FooterSection s={status} />
         </main>

@@ -9,12 +9,42 @@
 use std::path::Path;
 
 use native_tls::TlsConnector;
+use serde::Serialize;
 use suppaftp::{NativeTlsConnector, NativeTlsFtpStream};
 
 use crate::config::ResolvedTarget;
 
 const FTPS_PORT: u16 = 990;
 const FTP_USER: &str = "bblp";
+
+/// One entry from a directory listing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FileEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
+/// Parse one FTP `LIST` line into a [`FileEntry`]; `None` for unparseable lines
+/// (a `total N` header, blank lines, the `.`/`..` pseudo-entries).
+fn parse_list_line(line: &str) -> Option<FileEntry> {
+    // `ls -l` prefixes a `total N` summary line; suppaftp's lenient parser would
+    // otherwise turn it into a bogus entry named "total N".
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("total ") || trimmed.is_empty() {
+        return None;
+    }
+    let f = suppaftp::list::File::try_from(line).ok()?;
+    let name = f.name().to_string();
+    if name == "." || name == ".." || name.is_empty() {
+        return None;
+    }
+    Some(FileEntry {
+        name,
+        is_dir: f.is_directory(),
+        size: f.size() as u64,
+    })
+}
 
 /// Errors from FTPS operations. Messages never include the access code.
 #[derive(Debug, thiserror::Error)]
@@ -70,6 +100,17 @@ impl FtpsClient {
             .map_err(|e| FtpError::Ftp(e.to_string()))?;
         let _ = ftp.quit();
         Ok(names)
+    }
+
+    /// List `dir` with directory/size info (FTP `LIST`, parsed). Unparseable
+    /// lines (e.g. a `total N` header) are skipped.
+    pub fn list_entries(&self, dir: &str) -> Result<Vec<FileEntry>, FtpError> {
+        let mut ftp = self.connect()?;
+        let lines = ftp
+            .list(Some(dir))
+            .map_err(|e| FtpError::Ftp(e.to_string()))?;
+        let _ = ftp.quit();
+        Ok(lines.iter().filter_map(|l| parse_list_line(l)).collect())
     }
 
     /// Upload a local file to `remote_path` on the printer; returns bytes sent.
@@ -136,5 +177,23 @@ mod tests {
             Path::new("/tmp/v.mp4.part")
         );
         assert_eq!(part_path(Path::new("out.jpg")), Path::new("out.jpg.part"));
+    }
+
+    #[test]
+    fn parses_unix_list_lines_into_entries() {
+        let dir = parse_list_line("drwxr-xr-x 2 root root 4096 Jan 01 12:00 cache").unwrap();
+        assert_eq!(dir.name, "cache");
+        assert!(dir.is_dir);
+        let file =
+            parse_list_line("-rw-r--r-- 1 root root 1234 Jan 01 12:00 coin.gcode.3mf").unwrap();
+        assert_eq!(file.name, "coin.gcode.3mf");
+        assert!(!file.is_dir);
+        assert_eq!(file.size, 1234);
+        // Pseudo-entries and headers are skipped.
+        assert_eq!(parse_list_line("total 8"), None);
+        assert_eq!(
+            parse_list_line("drwxr-xr-x 2 root root 4096 Jan 01 12:00 ."),
+            None
+        );
     }
 }

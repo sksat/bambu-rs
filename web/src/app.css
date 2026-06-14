@@ -724,3 +724,69 @@ body {
 .filerow .fname {
   flex: 1;
 }
+
+/* ── file browser ────────────────────────────────────────────────────────── */
+.files__head {
+  align-items: center;
+  flex-wrap: wrap;
+}
+.path {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  color: var(--dim);
+}
+.files__spacer {
+  flex: 1;
+}
+.ficon {
+  font-family: var(--mono);
+  color: var(--dim);
+  width: 1rem;
+  text-align: center;
+  flex: none;
+}
+.filerow--dir {
+  cursor: pointer;
+}
+.filerow--dir .fname {
+  color: var(--accent-2);
+}
+.fsize {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
+/* start-print dialog */
+.modal__box--start {
+  max-width: 27rem;
+}
+.start__head {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  margin-bottom: 0.6rem;
+}
+.thumb--start {
+  width: 64px;
+  height: 64px;
+  flex: none;
+}
+.start__name {
+  display: block;
+  font-family: var(--mono);
+  font-size: 0.9rem;
+  word-break: break-all;
+}
+.start__help {
+  font-size: 0.74rem;
+  line-height: 1.4;
+  margin: 0.5rem 0;
+}
+.btn--go {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 45%, transparent);
+}
+.btn--go:hover {
+  border-color: var(--ok);
+}
