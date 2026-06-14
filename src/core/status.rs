@@ -686,13 +686,15 @@ fn as_i64_loose(v: &Value) -> Option<i64> {
 }
 
 /// Like [`as_i64_loose`] but for floats — the device sends some real-valued
-/// fields (e.g. AMS unit temperature, `"0.0"`) as strings.
+/// fields (e.g. AMS unit temperature, `"0.0"`) as strings. Non-finite values
+/// (`NaN`/`inf`) are rejected so they can't poison JSON serialization.
 fn as_f64_loose(v: &Value) -> Option<f64> {
-    match v {
+    let n = match v {
         Value::Number(n) => n.as_f64(),
         Value::String(s) => s.trim().parse::<f64>().ok(),
         _ => None,
-    }
+    }?;
+    n.is_finite().then_some(n)
 }
 
 /// Wire string for an HMS [`Module`]; unknown ids keep their hex so nothing is

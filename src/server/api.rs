@@ -700,12 +700,15 @@ async fn require_password(State(st): State<AppState>, req: Request, next: Next) 
     let Some(pw) = st.password.as_deref() else {
         return next.run(req).await; // no password configured: control is open
     };
+    // Accept any-case `Bearer <pw>`; compare in constant time.
     let given = req
         .headers()
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    if given == Some(pw) {
+        .and_then(|v| v.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, tok)| tok.trim());
+    if given.is_some_and(|tok| constant_time_eq(tok.as_bytes(), pw.as_bytes())) {
         next.run(req).await
     } else {
         eprintln!("auth: rejected write {} {}", req.method(), req.uri().path());
@@ -715,6 +718,14 @@ async fn require_password(State(st): State<AppState>, req: Request, next: Next) 
         )
             .into_response()
     }
+}
+
+/// Length-independent byte equality, to avoid leaking the password via timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 #[cfg(test)]

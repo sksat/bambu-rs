@@ -43,10 +43,13 @@ impl LiveSource {
             loop {
                 let client = LanMqttClient::new(target.clone()).with_timeout(STALL);
                 let _ = client.monitor(interval, |rs| {
-                    // `send` tolerates "no receivers"; the count check below is
-                    // what actually stops the thread.
-                    let _ = tx.send(PrinterStatus::from_state(rs.get()));
-                    WatchStep::Continue
+                    // Stop promptly when the source + all subscribers are gone,
+                    // instead of running until the next stall/transport break.
+                    if tx.send(PrinterStatus::from_state(rs.get())).is_err() {
+                        WatchStep::Stop
+                    } else {
+                        WatchStep::Continue
+                    }
                 });
                 if tx.receiver_count() == 0 {
                     break; // the source and all subscribers are gone
