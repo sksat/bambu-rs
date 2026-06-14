@@ -15,10 +15,16 @@ const HISTORY = 180; // ~3 min at 1 Hz; the sparkline window
  * latest status, the connection state, and a rolling history of nozzle/bed
  * temperatures for the sparklines.
  */
-export function useStatus(): { status: PrinterStatus | null; conn: Conn; history: TempPoint[] } {
+export function useStatus(): {
+  status: PrinterStatus | null;
+  conn: Conn;
+  history: TempPoint[];
+  authError: boolean;
+} {
   const [status, setStatus] = useState<PrinterStatus | null>(null);
   const [conn, setConn] = useState<Conn>("connecting");
   const [history, setHistory] = useState<TempPoint[]>([]);
+  const [authError, setAuthError] = useState(false);
   // Guard against pushing a history point for an unchanged frame we re-render.
   const lastTemp = useRef<string>("");
 
@@ -27,6 +33,24 @@ export function useStatus(): { status: PrinterStatus | null; conn: Conn; history
     let ws: WebSocket | null = null;
     let retry: ReturnType<typeof setTimeout> | undefined;
     let closed = false;
+
+    // A one-shot probe: fetch can read a 401 (a WebSocket handshake can't), so
+    // this turns a token mismatch from a silent "awaiting telemetry" into a
+    // clear message — and paints the first frame without waiting for the WS.
+    fetch("/api/status", { headers: { Authorization: `Bearer ${token}` } })
+      .then((r) => {
+        if (r.status === 401) {
+          setAuthError(true);
+          return null;
+        }
+        return r.ok ? (r.json() as Promise<PrinterStatus>) : null;
+      })
+      .then((s) => {
+        if (s) setStatus(s);
+      })
+      .catch(() => {
+        /* network hiccup; the WS will retry */
+      });
 
     const connect = () => {
       const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -65,5 +89,5 @@ export function useStatus(): { status: PrinterStatus | null; conn: Conn; history
     };
   }, []);
 
-  return { status, conn, history };
+  return { status, conn, history, authError };
 }

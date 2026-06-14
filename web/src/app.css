@@ -429,3 +429,8 @@ body {
     grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
   }
 }
+
+.auth-err {
+  color: var(--err);
+  max-width: 32rem;
+}

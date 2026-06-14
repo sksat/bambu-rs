@@ -237,7 +237,11 @@ async fn status(State(st): State<AppState>) -> Json<PrinterStatus> {
 /// Upgrade to a WebSocket that pushes a `PrinterStatus` JSON frame on connect and
 /// on every subsequent change.
 async fn status_ws(State(st): State<AppState>, ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(move |socket| stream_status(socket, st.source.clone()))
+    eprintln!("ws: client upgrade accepted");
+    ws.on_upgrade(move |socket| async move {
+        stream_status(socket, st.source.clone()).await;
+        eprintln!("ws: client disconnected");
+    })
 }
 
 async fn stream_status(mut socket: WebSocket, source: Arc<dyn PrinterSource>) {
@@ -266,6 +270,12 @@ async fn require_token(State(st): State<AppState>, req: Request, next: Next) -> 
     if authorized(&req, &st.token) {
         next.run(req).await
     } else {
+        eprintln!(
+            "auth: rejected {} {} (token present in query: {})",
+            req.method(),
+            req.uri().path(),
+            req.uri().query().is_some_and(|q| q.contains("token="))
+        );
         (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
     }
 }

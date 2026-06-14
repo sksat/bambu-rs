@@ -6,11 +6,16 @@ import "./app.css";
 // Instrument / telemetry dashboard: dense tabular readouts, hairline-ruled
 // sections, one accent. Driven by the /api/ws stream (see useStatus).
 export function App() {
-  const { status, conn, history } = useStatus();
+  const { status, conn, history, authError } = useStatus();
   return (
     <div className="term">
       <TopBar conn={conn} />
-      {status ? (
+      {authError ? (
+        <p className="waiting auth-err" data-testid="auth-error">
+          unauthorized — the token is wrong or stale. Open the latest dashboard URL
+          (the <code>?token=…</code> changes when the server restarts).
+        </p>
+      ) : status ? (
         <main>
           <JobSection s={status} />
           <TempSection s={status} history={history} />
