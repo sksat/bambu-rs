@@ -36,6 +36,15 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("toast")).toContainText("verified");
   });
 
+  test("theme toggle cycles auto → dark → light", async ({ page }) => {
+    const btn = page.getByTestId("theme");
+    await expect(page.locator("html")).not.toHaveAttribute("data-theme", /.+/); // auto
+    await btn.click();
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+    await btn.click();
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  });
+
   test("renders on a phone viewport", async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 850 });
     await expect(page.getByTestId("state")).toBeVisible();

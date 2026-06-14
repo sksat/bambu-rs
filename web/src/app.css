@@ -15,8 +15,21 @@
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Menlo", "Consolas", monospace;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
+/* Light palette: applied when the user picks light explicitly, or — in `auto`
+   (no data-theme) — when the OS prefers light. data-theme="dark" keeps the
+   :root dark defaults above. */
+:root[data-theme="light"],
+:root[data-theme="light"] body {
+  --bg: #faf9f7;
+  --fg: #21242b;
+  --dim: #7a7f88;
+  --hair: #00000014;
+  --hair-2: #0000000a;
+  --accent: #b4801f;
+  --accent-2: #936614;
+}
 @media (prefers-color-scheme: light) {
-  :root {
+  :root:not([data-theme]) {
     --bg: #faf9f7;
     --fg: #21242b;
     --dim: #7a7f88;
@@ -89,6 +102,26 @@ body {
   font-family: var(--mono);
   font-weight: 600;
   letter-spacing: 0.02em;
+}
+.hdr__right {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+.theme {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--dim);
+  background: transparent;
+  border: 1px solid var(--hair);
+  border-radius: 6px;
+  padding: 0.2rem 0.5rem;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.theme:hover {
+  border-color: var(--accent);
+  color: var(--fg);
 }
 .conn {
   display: inline-flex;
