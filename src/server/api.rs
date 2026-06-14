@@ -236,6 +236,19 @@ pub struct AppState {
     /// Optional password gating **write** (control) requests; `None` = control is
     /// open. Reads are always unauthenticated.
     pub password: Option<String>,
+    /// Held for the duration of a `job/start` so two concurrent starts can't both
+    /// pass the idle check.
+    pub start_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// A safe absolute path on the printer: starts with `/`, no traversal or scheme.
+fn is_safe_remote_path(p: &str) -> bool {
+    p.starts_with('/')
+        && p.len() > 1
+        && !p.contains("..")
+        && !p.contains("//")
+        && !p.contains('\\')
+        && !p.contains(':')
 }
 
 impl AppState {
@@ -247,6 +260,7 @@ impl AppState {
             files: Arc::new(FakeFiles),
             starter: Arc::new(FakeStarter),
             password: None,
+            start_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }
@@ -267,10 +281,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/light", post(light))
         .route("/api/speed", post(speed))
         .route("/api/gcode", post(gcode))
-        // Uploads can be large (sliced 3mf); raise the body cap from the 2 MB default.
+        // Uploads can be large (sliced 3mf); raise the body cap from the 2 MB
+        // default, but bound it — the body is buffered in memory. (Streaming
+        // straight to a temp file is a follow-up.)
         .route(
             "/api/files/upload",
-            post(upload_file).layer(DefaultBodyLimit::max(256 * 1024 * 1024)),
+            post(upload_file).layer(DefaultBodyLimit::max(128 * 1024 * 1024)),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -449,8 +465,13 @@ fn default_plate() -> u32 {
 /// an idle check against the live status (409 if the printer is busy).
 async fn job_start(State(st): State<AppState>, Json(b): Json<StartBody>) -> Response {
     let lower = b.file.to_ascii_lowercase();
-    if b.file.is_empty() || b.file.contains("..") {
-        return bad_request(format!("invalid file {:?}", b.file));
+    // Must be an absolute on-printer path — a relative one like `host/x.3mf`
+    // would become `ftp://host/x.3mf` and escape the printer's namespace.
+    if !is_safe_remote_path(&b.file) {
+        return bad_request(format!(
+            "file must be an absolute printer path: {:?}",
+            b.file
+        ));
     }
     if !(lower.ends_with(".3mf") || lower.ends_with(".gcode")) {
         return bad_request("file must be a .3mf or .gcode".to_string());
@@ -489,6 +510,14 @@ async fn job_start(State(st): State<AppState>, Json(b): Json<StartBody>) -> Resp
         )
             .into_response();
     }
+    // Serialize starts so two concurrent requests can't both pass the idle check.
+    let Ok(_guard) = st.start_lock.try_lock() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "a print start is already in progress" })),
+        )
+            .into_response();
+    };
     // Idle guard: refuse to start over an active job.
     let state = st
         .source
@@ -539,14 +568,19 @@ struct ThumbQuery {
 
 /// Serve the embedded plate preview PNG for a `.3mf` (open read). 404 if absent.
 async fn file_thumbnail(State(st): State<AppState>, Query(q): Query<ThumbQuery>) -> Response {
-    if q.name.is_empty() || q.name.contains("..") {
-        return bad_request(format!("invalid name {:?}", q.name));
-    }
     let remote = if q.name.starts_with('/') {
         q.name.clone()
     } else {
         format!("/{}", q.name)
     };
+    // Restrict the open thumbnail read to .3mf at a safe absolute path — it
+    // downloads the whole file, so don't let it pull arbitrary large files.
+    if !is_safe_remote_path(&remote) || !remote.to_ascii_lowercase().ends_with(".3mf") {
+        return bad_request(format!("thumbnail needs a .3mf printer path: {:?}", q.name));
+    }
+    if !(1..=64).contains(&q.plate) {
+        return bad_request("plate out of range (1..64)".to_string());
+    }
     let files = st.files.clone();
     let plate = q.plate;
     match tokio::task::spawn_blocking(move || files.thumbnail(&remote, plate)).await {
@@ -579,6 +613,10 @@ async fn upload_file(
         return bad_request(format!("invalid filename {:?}", q.name));
     }
     let dir = q.dir.unwrap_or_else(|| "/".to_string());
+    // Validate the destination dir too (root is allowed; otherwise a safe path).
+    if dir != "/" && !is_safe_remote_path(&dir) {
+        return bad_request(format!("invalid dir {dir:?}"));
+    }
     let remote = format!("{}/{}", dir.trim_end_matches('/'), q.name);
     let name = q.name.clone();
     let files = st.files.clone();
@@ -660,6 +698,7 @@ mod tests {
             files: Arc::new(FakeFiles),
             starter: Arc::new(FakeStarter),
             password: password.map(str::to_owned),
+            start_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         TestServer::new(router(state))
     }
@@ -842,6 +881,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thumbnail_rejects_non_3mf() {
+        app(None, FakeController::verified())
+            .get("/api/files/thumbnail?name=/timelapse/video.mp4")
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn start_rejects_relative_path() {
+        // A non-absolute path would become ftp://host/x and escape the printer.
+        app(None, FakeController::verified())
+            .post("/api/job/start")
+            .json(&json!({ "file": "host/evil.3mf", "confirm": true }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_traversal_dir() {
+        app(None, FakeController::verified())
+            .post("/api/files/upload?dir=../etc&name=a.3mf")
+            .bytes(b"data".to_vec().into())
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn upload_open_when_no_password() {
         app(None, FakeController::verified())
             .post("/api/files/upload?name=part.gcode.3mf")
@@ -931,6 +997,7 @@ mod tests {
             files: Arc::new(FakeFiles),
             starter: Arc::new(FakeStarter),
             password: None,
+            start_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         TestServer::new(router(state))
             .post("/api/job/start")
@@ -964,6 +1031,7 @@ mod tests {
             files: Arc::new(FakeFiles),
             starter: Arc::new(FakeStarter),
             password: None,
+            start_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         let mut ws = ws_server(state)
             .get_websocket("/api/ws")

@@ -82,7 +82,13 @@ impl FileStore for LiveFiles {
 
     fn thumbnail(&self, remote_path: &str, plate: u32) -> Result<Option<Vec<u8>>, String> {
         let key = format!("{remote_path}#{plate}");
-        if let Some(hit) = self.thumb_cache.lock().unwrap().get(&key) {
+        // Recover from a poisoned lock rather than panicking every later request.
+        if let Some(hit) = self
+            .thumb_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
             return Ok(hit.clone());
         }
         let tmp = tempfile::Builder::new()
@@ -94,7 +100,12 @@ impl FileStore for LiveFiles {
             .map_err(|e| e.to_string())?;
         let bytes = std::fs::read(tmp.path()).map_err(|e| e.to_string())?;
         let thumb = extract_thumbnail(&bytes, plate)?;
-        self.thumb_cache.lock().unwrap().insert(key, thumb.clone());
+        let mut cache = self.thumb_cache.lock().unwrap_or_else(|e| e.into_inner());
+        // Bound the cache — keys are caller-controlled on an open endpoint.
+        if cache.len() >= 128 {
+            cache.clear();
+        }
+        cache.insert(key, thumb.clone());
         Ok(thumb)
     }
 }

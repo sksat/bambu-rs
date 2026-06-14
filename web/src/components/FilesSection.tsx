@@ -23,7 +23,8 @@ export function FilesSection({ sdcard }: { sdcard?: boolean | null }) {
       const r = await fetch(`/api/files?dir=${encodeURIComponent(d)}`);
       const data = (await r.json()) as { files?: FileEntry[]; error?: string };
       if (r.ok) {
-        setEntries(data.files ?? []);
+        // Tolerate unexpected shapes (e.g. an older server) instead of crashing.
+        setEntries((data.files ?? []).filter((e): e is FileEntry => typeof e?.name === "string"));
         setMsg(null);
       } else {
         setMsg(data.error ?? `HTTP ${r.status}`);

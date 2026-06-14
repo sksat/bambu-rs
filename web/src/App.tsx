@@ -5,6 +5,7 @@ import { JobSection } from "./components/JobSection";
 import { TempSection } from "./components/TempSection";
 import { AmsSection } from "./components/AmsSection";
 import { Controls, ConfirmDialog } from "./components/Controls";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { FilesSection } from "./components/FilesSection";
 import { HealthSection } from "./components/HealthSection";
 import { FooterSection } from "./components/FooterSection";
@@ -20,15 +21,17 @@ export function App() {
     <div className="term">
       <Header conn={conn} />
       {status ? (
-        <main className="grid">
-          <JobSection s={status} />
-          <TempSection s={status} history={history} />
-          {status.ams && <AmsSection ams={status.ams} />}
-          <Controls control={control} />
-          <FilesSection sdcard={status.sdcard} />
-          <HealthSection s={status} />
-          <FooterSection s={status} />
-        </main>
+        <ErrorBoundary>
+          <main className="grid">
+            <JobSection s={status} />
+            <TempSection s={status} history={history} />
+            {status.ams && <AmsSection ams={status.ams} />}
+            <Controls control={control} />
+            <FilesSection sdcard={status.sdcard} />
+            <HealthSection s={status} />
+            <FooterSection s={status} />
+          </main>
+        </ErrorBoundary>
       ) : (
         <p className="waiting" data-testid="waiting">
           awaiting telemetry…

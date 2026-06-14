@@ -64,6 +64,7 @@ pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<
                     files: Arc::new(LiveFiles::new(t.clone())),
                     starter: Arc::new(LiveStarter::new(t)),
                     password,
+                    start_lock: Arc::new(tokio::sync::Mutex::new(())),
                 }
             }
             _ => {
@@ -79,6 +80,7 @@ pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<
                     files: Arc::new(FakeFiles),
                     starter: Arc::new(FakeStarter),
                     password,
+                    start_lock: Arc::new(tokio::sync::Mutex::new(())),
                 }
             }
         };
