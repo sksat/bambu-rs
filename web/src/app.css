@@ -1128,6 +1128,16 @@ body {
 .cam__col--rm {
   flex: 0 0 1.7rem;
 }
+/* manage dialog (floating) — wider than the default confirm box for URL inputs */
+.modal__box--cam {
+  max-width: 34rem;
+}
+.cam__modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.7rem;
+}
 .cam__row--head .cam__col,
 .cam__row--head .cam__col--label {
   font-size: 0.56rem;
