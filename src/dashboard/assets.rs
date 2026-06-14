@@ -24,14 +24,23 @@ pub(crate) async fn static_handler(uri: Uri) -> Response {
         // SPA fallback: serve index.html for client-side routes.
         None => match Assets::get("index.html") {
             Some(index) => ([(header::CONTENT_TYPE, "text/html")], index.data).into_response(),
+            // The frontend hasn't been built (web/dist is empty) — serve a tiny
+            // built-in page so the server still works (and tests don't depend on a
+            // `pnpm build`). A real build replaces this with the SPA.
             None => (
-                axum::http::StatusCode::NOT_FOUND,
-                "dashboard assets not built (run `pnpm build` in web/)",
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                FALLBACK_HTML,
             )
                 .into_response(),
         },
     }
 }
+
+/// Shown when `web/dist` hasn't been built (rust-embed found no `index.html`).
+const FALLBACK_HTML: &str = "<!doctype html><meta charset=utf-8><title>bambu dashboard</title>\
+<body style=\"font-family:system-ui;padding:2rem\"><h1>bambu dashboard</h1>\
+<p>The web UI isn't built yet. Run <code>pnpm -C web build</code> (or use a release \
+binary). The API at <code>/api/*</code> is available.</p></body>";
 
 fn mime_for(path: &str) -> &'static str {
     match path.rsplit('.').next() {

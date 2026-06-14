@@ -1,0 +1,6 @@
+# Supply-chain hardening: refuse npm package versions younger than this many
+# MINUTES (a "cooldown" so a freshly-published — possibly compromised — version
+# isn't pulled before the ecosystem catches/yanks it). 4320 = 3 days.
+minimumReleaseAge: 4320
+# Trusted exceptions go here if a fresh release is ever genuinely required:
+minimumReleaseAgeExclude: []
