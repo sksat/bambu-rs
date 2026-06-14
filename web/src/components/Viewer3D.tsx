@@ -21,6 +21,10 @@ export function ModelView({ path }: { path: string }) {
   const mount = useRef<HTMLDivElement>(null);
   const [mode, setMode] = useState<Mode>(is3mf ? "mesh" : "toolpath");
   const [status, setStatus] = useState("loading…");
+  // `noMesh` = this .3mf embeds no mesh, so the mesh toggle is disabled (rather
+  // than silently bouncing back to toolpath). `dims` is the model's size in mm.
+  const [noMesh, setNoMesh] = useState(false);
+  const [dims, setDims] = useState<{ x: number; y: number; z: number } | null>(null);
 
   // Playback state. The render loop owns `head` (a ref); React state mirrors it
   // for the slider. `seek` lets the slider jump the loop; `playing` gates it.
@@ -31,6 +35,12 @@ export function ModelView({ path }: { path: string }) {
   const totalRef = useRef(0);
   const playingRef = useRef(true);
   const seekRef = useRef<number | null>(null);
+
+  // Reset mesh-availability only when the file changes — not on a mode switch
+  // (which would clear the "no mesh" flag the moment we act on it).
+  useEffect(() => {
+    setNoMesh(false);
+  }, [path]);
 
   useEffect(() => {
     let disposed = false;
@@ -50,9 +60,10 @@ export function ModelView({ path }: { path: string }) {
           if (!r.ok) return setStatus(`couldn't load mesh (HTTP ${r.status})`);
           const models = ((await r.json()) as { models?: string[] }).models ?? [];
           if (!models.length) {
-            // Not a meshed .3mf (or extraction failed) — fall back to toolpath.
+            // This .3mf embeds no mesh (e.g. a plate-only slice) — mark mesh
+            // unavailable so its toggle is disabled, and show the toolpath.
             if (!disposed) {
-              setStatus("no embedded mesh — showing toolpath");
+              setNoMesh(true);
               setMode("toolpath");
             }
             return;
@@ -75,31 +86,59 @@ export function ModelView({ path }: { path: string }) {
         const w = el.clientWidth || 600;
         const h = el.clientHeight || 420;
         const scene = new THREE.Scene();
-        scene.background = new THREE.Color(0x1b1e24); // soft slate, not harsh black
         const camera = new THREE.PerspectiveCamera(45, w / h, 0.1, 100000);
-        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        // Transparent clear so the CSS white→grey gradient backdrop shows through.
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setClearColor(0x000000, 0);
         renderer.setPixelRatio(window.devicePixelRatio);
         renderer.setSize(w, h);
         el.appendChild(renderer.domElement);
-        scene.add(new THREE.HemisphereLight(0xffffff, 0x2a2e36, 1.25));
-        const key = new THREE.DirectionalLight(0xffffff, 1.0);
-        key.position.set(1, 1.4, 1);
+        scene.add(new THREE.HemisphereLight(0xffffff, 0xb6bac2, 1.1));
+        const key = new THREE.DirectionalLight(0xffffff, 0.85);
+        key.position.set(120, -160, 220);
         scene.add(key);
+        const fill = new THREE.DirectionalLight(0xffffff, 0.35);
+        fill.position.set(-150, 130, 90);
+        scene.add(fill);
 
-        // Printer space is Z-up; three is Y-up. Rotate so models stand correctly.
-        object.rotation.x = -Math.PI / 2;
-        // Center on the origin and frame the bounding sphere snugly.
-        const sphere = new THREE.Box3().setFromObject(object).getBoundingSphere(new THREE.Sphere());
-        object.position.sub(sphere.center);
+        // Lay the model on a build plate centred at the origin (so the plate
+        // centre is the view centre), Z up like the printer.
+        const BED = 180; // A1 mini build plate (mm)
+        const CELL = 20; // grid cell size (mm) — the scale reference
+        const box = new THREE.Box3().setFromObject(object);
+        const size = box.getSize(new THREE.Vector3());
+        const ctr = box.getCenter(new THREE.Vector3());
+        setDims({ x: size.x, y: size.y, z: size.z });
+        if (pb) {
+          // gcode is in absolute bed coordinates — shift so the bed centre is 0.
+          object.position.set(-BED / 2, -BED / 2, 0);
+        } else {
+          // mesh is in local coordinates — centre its footprint, rest base on bed.
+          object.position.set(-ctr.x, -ctr.y, -box.min.z);
+        }
         scene.add(object);
-        const r = sphere.radius || 50;
+
+        // The build plate: a soft surface + a grid that conveys scale.
+        const plate = new THREE.Mesh(
+          new THREE.PlaneGeometry(BED, BED),
+          new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.5 }),
+        );
+        plate.position.z = -0.05;
+        scene.add(plate);
+        const grid = new THREE.GridHelper(BED, BED / CELL, 0x8b93a0, 0xccd1d8);
+        grid.rotation.x = Math.PI / 2; // GridHelper sits in XZ; lay it flat in XY (Z up)
+        scene.add(grid);
+
+        // Frame the whole plate, looking at its centre.
+        camera.up.set(0, 0, 1);
+        const R = BED * 0.62;
         const vFov = (camera.fov * Math.PI) / 180;
-        let dist = r / Math.sin(vFov / 2);
+        let dist = R / Math.sin(vFov / 2);
         if (camera.aspect < 1) dist /= camera.aspect;
-        dist *= 1.2;
-        camera.position.copy(new THREE.Vector3(1, 0.85, 1).normalize().multiplyScalar(dist));
-        camera.near = Math.max(r / 100, 0.01);
-        camera.far = dist + r * 4;
+        dist *= 1.05;
+        camera.position.copy(new THREE.Vector3(0.9, -0.9, 0.72).normalize().multiplyScalar(dist));
+        camera.near = Math.max(dist / 100, 0.1);
+        camera.far = dist + BED * 4;
         camera.lookAt(0, 0, 0);
         camera.updateProjectionMatrix();
         const controls = new OrbitControls(camera, renderer.domElement);
@@ -189,6 +228,8 @@ export function ModelView({ path }: { path: string }) {
           <button
             className={`btn btn--sm${mode === "mesh" ? " is-active" : ""}`}
             aria-pressed={mode === "mesh"}
+            disabled={noMesh}
+            title={noMesh ? "this file has no embedded mesh (toolpath only)" : undefined}
             onClick={() => setMode("mesh")}
             data-testid="viewer-mode-mesh"
           >
@@ -228,6 +269,11 @@ export function ModelView({ path }: { path: string }) {
           <span className="viewer__pct mono">{Math.round(progress * 100)}%</span>
         </div>
       )}
+      {dims && !status && (
+        <div className="dim viewer__dims" data-testid="viewer-dims">
+          {fmtMm(dims.x)} × {fmtMm(dims.y)} × {fmtMm(dims.z)} mm · 180 mm plate, 20 mm grid
+        </div>
+      )}
       {status && (
         <div className="dim viewer__status" data-testid="viewer-status">
           {status}
@@ -235,6 +281,11 @@ export function ModelView({ path }: { path: string }) {
       )}
     </div>
   );
+}
+
+// Format a millimetre extent: whole numbers for big parts, one decimal for small.
+function fmtMm(v: number): string {
+  return v >= 10 ? String(Math.round(v)) : v.toFixed(1);
 }
 
 // A playback handle for the toolpath: reveal the extrusion trail up to point `k`
@@ -306,7 +357,7 @@ function buildToolpath(
   const group = new THREE.Group();
   const geo = new THREE.BufferGeometry();
   geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(segPos), 3));
-  const lineMat = new THREE.LineBasicMaterial({ color: 0xd8a657 }); // amber, easy on the eyes
+  const lineMat = new THREE.LineBasicMaterial({ color: 0xb4801f }); // deep amber — reads on light
   const line = new THREE.LineSegments(geo, lineMat);
   geo.setDrawRange(0, 0);
   group.add(line);
@@ -314,7 +365,7 @@ function buildToolpath(
   const sphereR = Math.max(0.6, span(pts) / 120);
   const marker = new THREE.Mesh(
     new THREE.SphereGeometry(sphereR, 16, 12),
-    new THREE.MeshBasicMaterial({ color: 0xf0e0c0 }),
+    new THREE.MeshBasicMaterial({ color: 0x7c2d12 }), // dark — the head, visible on light
   );
   group.add(marker);
 
@@ -331,7 +382,7 @@ function buildToolpath(
 function buildMesh(models: string[], THREE: THREE): import("three").Object3D {
   const group = new THREE.Group();
   const mat = new THREE.MeshStandardMaterial({
-    color: 0xb9bec8, // warm light grey — a neutral "print" look
+    color: 0x8f98a8, // medium slate — reads as a 3D print on the light backdrop
     metalness: 0.05,
     roughness: 0.72,
   });

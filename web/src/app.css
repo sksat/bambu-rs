@@ -913,7 +913,13 @@ body {
   border: 1px solid var(--hair);
   border-radius: 8px;
   overflow: hidden;
-  background: #1b1e24; /* matches the soft slate scene background */
+  /* White→grey studio backdrop (the WebGL clear is transparent over this). */
+  background: linear-gradient(180deg, #fdfdfe 0%, #d6dade 100%);
+}
+.viewer__dims {
+  font-family: var(--mono);
+  font-size: 0.76rem;
+  margin-top: 0.4rem;
 }
 /* Toolpath playback: play/pause + a scrubber + a percent readout. */
 .viewer__play {
