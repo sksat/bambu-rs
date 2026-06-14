@@ -71,6 +71,44 @@ bambu job start /cache/out.gcode.3mf --plate 1 --ams-map 0 --confirm --watch
 - `--watch` reports live progress (state, stage, **nozzle/bed temps**) and exits
   non-zero on a device error or FAILED end.
 
+## Multi-filament (AMS colour-switching) prints
+
+Slice a 2-colour model with **one filament preset per AMS slot** (`;`-separated,
+in filament-index order):
+
+```bash
+xvfb-run -a orca-slicer --slice 1 \
+  --load-settings "machine.json;process.json" \
+  --load-filaments "filament-a.json;filament-b.json" \
+  --allow-newer-file --export-3mf out.gcode.3mf  model_2color.3mf
+```
+
+The plate's `Metadata/plate_N.json` then has 2 `filament_colors`; `--ams-map`
+needs **one tray per filament, in that order**:
+
+```bash
+bambu file upload out.gcode.3mf --dest /cache
+# Preview the mapping first — shows filament[k] (colour) → tray and warns on a
+# count mismatch (downloads + inspects the on-printer 3mf):
+bambu job start /cache/out.gcode.3mf --plate 1 --ams-map 0,1 --dry-run
+# Then print: a wrong-length --ams-map is refused (exit 3) before anything moves.
+bambu job start /cache/out.gcode.3mf --plate 1 --ams-map 0,1 --confirm --watch
+```
+
+`--ams-map` is validated — tray range `0..3`/`-1` always (fails fast, offline
+too), and length == filament count once inspected; `-1` = external spool.
+
+**Keep a test print short** — to *see* a colour switch fast, slice a tiny model
+(~1 cm, few layers) with the colour change at an early layer + draft settings
+(thick layers, low/0 infill) and run `bambu speed sport`; heat + a few layers +
+one swap ≈ 5–10 min. Capture it with the external camera (this unit's built-in
+camera is dead):
+
+```bash
+bambu timelapse capture --out-dir ./tl -- \
+  curl -s -m15 -o {frame} "http://$ATOMCAM_HOST/cgi-bin/get_jpeg.cgi"
+```
+
 ## Sources
 - [Bambu Studio CLI Reference (Printago)](https://printago.io/blog/bambu-studio-cli-reference)
 - [Using OrcaSlicer in CLI mode (OrcaSlicer discussion #8593)](https://github.com/OrcaSlicer/OrcaSlicer/discussions/8593)
