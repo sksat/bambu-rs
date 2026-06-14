@@ -101,27 +101,42 @@ impl FakeSource {
         tokio::spawn(async move {
             let mut s = initial;
             let mut tick: i64 = 0;
+            // Perpetual cycle so a left-open demo never goes stale: ~100 ticks
+            // printing (heat + progress), then ~15 ticks FINISH/cool-down, then
+            // a fresh print. The sparkline shows the resulting saw-tooth.
+            const PRINT: i64 = 100;
+            const CYCLE: i64 = 115;
             loop {
                 tokio::time::sleep(interval).await;
                 tick += 1;
-                s.nozzle_temper = Some(approach(s.nozzle_temper.unwrap_or(25.0), 220.0, 8.0));
-                s.bed_temper = Some(approach(s.bed_temper.unwrap_or(25.0), 60.0, 4.0));
-                // Part-cooling fan spins up once the hotend is near temperature.
-                s.cooling_fan_speed = Some(if s.nozzle_temper.unwrap_or(0.0) >= 200.0 {
-                    100
-                } else {
-                    0
-                });
-                let pct = tick.min(100);
-                s.mc_percent = Some(pct);
-                s.layer_num = Some(pct * 2); // 200 total layers
-                s.remaining_time_min = Some((100 - pct) * 72 / 100);
-                if pct >= 100 {
-                    s.gcode_state = Some("FINISH".to_string());
-                    s.remaining_time_min = Some(0);
+                let p = tick % CYCLE;
+                if p == 1 {
+                    // A new print starts cold.
+                    s.nozzle_temper = Some(25.0);
+                    s.bed_temper = Some(25.0);
                 }
-                if task_tx.send(s.clone()).is_err() || pct >= 100 {
-                    break;
+                if (1..=PRINT).contains(&p) {
+                    s.gcode_state = Some("RUNNING".to_string());
+                    s.nozzle_temper = Some(approach(s.nozzle_temper.unwrap_or(25.0), 220.0, 8.0));
+                    s.bed_temper = Some(approach(s.bed_temper.unwrap_or(25.0), 60.0, 4.0));
+                    // Part-cooling fan spins up once the hotend is near temperature.
+                    let hot = s.nozzle_temper.unwrap_or(0.0) >= 200.0;
+                    s.cooling_fan_speed = Some(if hot { 100 } else { 0 });
+                    s.mc_percent = Some(p);
+                    s.layer_num = Some(p * 2); // 200 total layers
+                    s.remaining_time_min = Some((PRINT - p) * 72 / 100);
+                } else {
+                    // Finished: hold at 100% and cool toward ambient.
+                    s.gcode_state = Some("FINISH".to_string());
+                    s.mc_percent = Some(100);
+                    s.layer_num = Some(200);
+                    s.remaining_time_min = Some(0);
+                    s.cooling_fan_speed = Some(0);
+                    s.nozzle_temper = Some(approach(s.nozzle_temper.unwrap_or(220.0), 30.0, 12.0));
+                    s.bed_temper = Some(approach(s.bed_temper.unwrap_or(60.0), 30.0, 6.0));
+                }
+                if task_tx.send(s.clone()).is_err() {
+                    break; // all receivers gone
                 }
             }
         });
