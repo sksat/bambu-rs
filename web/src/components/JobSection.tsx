@@ -31,7 +31,7 @@ export function JobSection({ s }: { s: PrinterStatus }) {
           </div>
         </div>
       </div>
-      <Bar pct={shown} prep={preparing} />
+      <Bar pct={shown} prep={preparing} running={state === "RUNNING"} />
       <div className="readline">
         <Field label="progress" value={`${shown}%`} big />
         {s.layer_num != null && (

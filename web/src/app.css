@@ -56,24 +56,44 @@ body {
 }
 
 .term {
-  max-width: 1100px;
+  max-width: 1680px;
   margin: 0 auto;
-  padding: max(0.5rem, env(safe-area-inset-top)) clamp(0.75rem, 4vw, 1.5rem)
+  padding: max(0.5rem, env(safe-area-inset-top)) clamp(0.75rem, 4vw, 1.75rem)
     max(1.25rem, env(safe-area-inset-bottom));
 }
 
-/* Resolution-flexible layout: panels reflow from one phone column to a
-   multi-column desktop grid as the viewport allows — no fixed breakpoints. */
+/* Resolution-flexible layout: one phone column, then explicit column counts so
+   wide/4K screens fill with MORE columns (not stretched strips). Capped at 4. */
 .grid {
   display: grid;
-  gap: 0.75rem;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 0.85rem;
+  grid-template-columns: 1fr;
   align-items: start;
+}
+@media (min-width: 760px) {
+  .grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (min-width: 1280px) {
+  .grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+@media (min-width: 1800px) {
+  .grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+@media (min-width: 2600px) {
+  .term {
+    max-width: 2040px;
+  }
 }
 .panel {
   border: 1px solid var(--hair);
   border-radius: 10px;
-  padding: 0.9rem;
+  padding: 1.1rem 1.15rem;
 }
 .span-all {
   grid-column: 1 / -1;
@@ -233,12 +253,12 @@ body {
   border-color: color-mix(in srgb, var(--warn) 40%, transparent);
 }
 
-/* progress bar — thin, square, single accent */
+/* progress bar */
 .bar {
-  height: 0.45rem;
+  height: 0.55rem;
   background: var(--hair-2);
   border: 1px solid var(--hair);
-  border-radius: 2px;
+  border-radius: 3px;
   overflow: hidden;
 }
 .bar__fill {
@@ -246,33 +266,39 @@ body {
   background: var(--accent);
   transition: width 0.4s ease;
 }
+/* While running, the bar is green (matches the RUNNING state) — amber is kept
+   for attention/heating, so a full amber bar doesn't read as a warning. */
+.bar__fill--running {
+  background: var(--ok);
+}
 .bar__fill--prep {
-  background: repeating-linear-gradient(
-    90deg,
-    var(--accent) 0 6px,
-    transparent 6px 12px
-  );
+  background: repeating-linear-gradient(90deg, var(--accent) 0 6px, transparent 6px 12px);
 }
 
 .readline {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.4rem 1.6rem;
-  margin-top: 0.7rem;
+  gap: 0.5rem 2rem;
+  margin-top: 0.8rem;
+  align-items: baseline;
 }
 .field {
   display: flex;
   flex-direction: column;
   gap: 0.15rem;
 }
+/* Primary telemetry (progress / layer / eta) reads large and co-equal with the
+   state token — the most-glanced numbers. */
 .val {
   font-family: var(--mono);
   font-variant-numeric: tabular-nums;
-  font-size: 0.95rem;
+  font-size: 1.25rem;
 }
 .val--big {
-  font-size: 1.3rem;
+  font-size: 1.9rem;
+  font-weight: 650;
   color: var(--accent);
+  line-height: 1;
 }
 
 /* temperatures */
@@ -667,4 +693,11 @@ body {
 .gcoderow .pw {
   flex: 1;
   min-width: 8rem;
+}
+
+/* Roomier AMS on small phones: two trays per row instead of cramming four. */
+@media (max-width: 430px) {
+  .trays {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }

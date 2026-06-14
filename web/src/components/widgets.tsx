@@ -13,11 +13,12 @@ export function Field({ label, value, big }: { label: string; value: string; big
   );
 }
 
-export function Bar({ pct, prep }: { pct: number; prep?: boolean }) {
+export function Bar({ pct, prep, running }: { pct: number; prep?: boolean; running?: boolean }) {
+  const tone = prep ? " bar__fill--prep" : running ? " bar__fill--running" : "";
   return (
     <div className="bar">
       <div
-        className={`bar__fill${prep ? " bar__fill--prep" : ""}`}
+        className={`bar__fill${tone}`}
         style={{ width: `${Math.max(0, Math.min(100, pct))}%` }}
         data-testid="bar-fill"
       />
