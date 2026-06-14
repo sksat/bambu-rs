@@ -1,8 +1,13 @@
-//! The axum router, app state, the printer-source abstraction, and a fake source.
+//! The axum router, app state, the printer-source seam + fake source, and the
+//! HTTP API (reads + control).
 //!
-//! `PrinterSource` is the seam that keeps the dashboard testable without a real
-//! printer: tests and `--fake` mode use [`FakeSource`]; the live source (wrapping
-//! `LanMqttClient::monitor`) arrives in a later phase.
+//! Auth model: **reads** (`/api/status`, `/api/ws`) are always open; **writes**
+//! (control) are gated by an optional password (`None` = open). The token concept
+//! is gone — there's nothing to put in a URL.
+//!
+//! `PrinterSource`/`Controller` are the seams that keep the API testable without a
+//! real printer: tests and `--fake` use [`FakeSource`]/[`FakeController`]; live
+//! mode uses [`super::LiveSource`]/[`super::control::LiveController`].
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,11 +17,19 @@ use axum::extract::{Request, State};
 use axum::http::{StatusCode, header::AUTHORIZATION};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::Deserialize;
+use serde_json::json;
 use tokio::sync::watch;
 
+#[cfg(feature = "dashboard")]
 use super::assets::static_handler;
+#[cfg(test)]
+use super::control::FakeController;
+use super::control::{ControlAction, ControlError, Controller};
+use crate::core::command::{LedNode, SpeedLevel};
+use crate::core::session::CommandOutcome;
 use crate::core::status::{Ams, AmsTray, AmsUnit, Filament, Online, PrinterStatus};
 
 /// Something that can provide the printer's current status and a live stream of
@@ -206,8 +219,10 @@ impl PrinterSource for FakeSource {
 #[derive(Clone)]
 pub struct AppState {
     pub source: Arc<dyn PrinterSource>,
-    /// Bearer token required on all `/api/*` routes.
-    pub token: String,
+    pub controller: Arc<dyn Controller>,
+    /// Optional password gating **write** (control) requests; `None` = control is
+    /// open. Reads are always unauthenticated.
+    pub password: Option<String>,
 }
 
 impl AppState {
@@ -215,23 +230,131 @@ impl AppState {
     pub fn fake() -> Self {
         Self {
             source: Arc::new(FakeSource::idle()),
-            token: "testtoken".to_string(),
+            controller: Arc::new(FakeController::verified()),
+            password: None,
         }
     }
 }
 
-/// Build the dashboard router: token-gated `/api/*`, with the embedded SPA served
-/// (un-gated) as the fallback so the page can load before authenticating.
+/// Build the API router: open reads, password-gated writes, and — when the
+/// `dashboard` feature is on — the embedded SPA as the fallback.
 pub fn router(state: AppState) -> Router {
-    let api = Router::new()
+    let reads = Router::new()
         .route("/api/status", get(status))
-        .route("/api/ws", get(status_ws))
-        .layer(middleware::from_fn_with_state(state.clone(), require_token));
-    api.fallback(static_handler).with_state(state)
+        .route("/api/ws", get(status_ws));
+    let writes = Router::new()
+        .route("/api/job/pause", post(job_pause))
+        .route("/api/job/resume", post(job_resume))
+        .route("/api/job/stop", post(job_stop))
+        .route("/api/light", post(light))
+        .route("/api/speed", post(speed))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_password,
+        ));
+    let app = reads.merge(writes);
+    #[cfg(feature = "dashboard")]
+    let app = app.fallback(static_handler);
+    app.with_state(state)
 }
 
 async fn status(State(st): State<AppState>) -> Json<PrinterStatus> {
     Json(st.source.current())
+}
+
+// ── Control (write) endpoints ──────────────────────────────────────────────
+
+/// Body for a destructive job action — requires explicit `{"confirm": true}`,
+/// mirroring the CLI's `--confirm` (an absent/empty body is "not confirmed").
+#[derive(Deserialize, Default)]
+struct ConfirmBody {
+    #[serde(default)]
+    confirm: bool,
+}
+
+#[derive(Deserialize)]
+struct LightBody {
+    node: String,
+    on: bool,
+}
+
+#[derive(Deserialize)]
+struct SpeedBody {
+    level: String,
+}
+
+async fn job_pause(State(st): State<AppState>, body: Option<Json<ConfirmBody>>) -> Response {
+    run_confirmed(st, ControlAction::Pause, body).await
+}
+async fn job_resume(State(st): State<AppState>, body: Option<Json<ConfirmBody>>) -> Response {
+    run_confirmed(st, ControlAction::Resume, body).await
+}
+async fn job_stop(State(st): State<AppState>, body: Option<Json<ConfirmBody>>) -> Response {
+    run_confirmed(st, ControlAction::Stop, body).await
+}
+
+async fn light(State(st): State<AppState>, Json(b): Json<LightBody>) -> Response {
+    let node = match b.node.as_str() {
+        "chamber" => LedNode::ChamberLight,
+        "work" => LedNode::WorkLight,
+        other => return bad_request(format!("unknown light node {other:?}")),
+    };
+    execute(st, ControlAction::Light { node, on: b.on }).await
+}
+
+async fn speed(State(st): State<AppState>, Json(b): Json<SpeedBody>) -> Response {
+    let level = match b.level.as_str() {
+        "silent" => SpeedLevel::Silent,
+        "standard" => SpeedLevel::Standard,
+        "sport" => SpeedLevel::Sport,
+        "ludicrous" => SpeedLevel::Ludicrous,
+        other => return bad_request(format!("unknown speed level {other:?}")),
+    };
+    execute(st, ControlAction::Speed(level)).await
+}
+
+/// Require `{"confirm": true}` before running a destructive action (428 if not).
+async fn run_confirmed(
+    st: AppState,
+    action: ControlAction,
+    body: Option<Json<ConfirmBody>>,
+) -> Response {
+    if !body.map(|b| b.confirm).unwrap_or(false) {
+        return (
+            StatusCode::PRECONDITION_REQUIRED,
+            Json(json!({ "error": "confirm required: POST {\"confirm\": true}" })),
+        )
+            .into_response();
+    }
+    execute(st, action).await
+}
+
+/// Run a control action on the blocking pool and map the verify outcome to HTTP:
+/// verified → 200, unverified → 202, rejected → 409, transport error → 502.
+async fn execute(st: AppState, action: ControlAction) -> Response {
+    let controller = st.controller.clone();
+    match tokio::task::spawn_blocking(move || controller.execute(action)).await {
+        Ok(Ok(outcome)) => {
+            let code = match &outcome {
+                CommandOutcome::Verified => StatusCode::OK,
+                CommandOutcome::Unverified { .. } => StatusCode::ACCEPTED,
+                CommandOutcome::Rejected { .. } => StatusCode::CONFLICT,
+            };
+            (code, Json(outcome)).into_response()
+        }
+        Ok(Err(ControlError::Transport(e))) => {
+            (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "control task failed" })),
+        )
+            .into_response(),
+    }
+}
+
+fn bad_request(msg: String) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
 }
 
 /// Upgrade to a WebSocket that pushes a `PrinterStatus` JSON frame on connect and
@@ -262,49 +385,51 @@ async fn stream_status(mut socket: WebSocket, source: Arc<dyn PrinterSource>) {
     }
 }
 
-/// Reject `/api/*` requests without a matching token. The token may be supplied
-/// as `Authorization: Bearer <token>` (used by `fetch`) **or** as a `?token=`
-/// query parameter (used by the WebSocket, which can't set request headers in the
-/// browser). Tokens are base64url, so no percent-decoding is needed in the query.
-async fn require_token(State(st): State<AppState>, req: Request, next: Next) -> Response {
-    if authorized(&req, &st.token) {
-        next.run(req).await
-    } else {
-        eprintln!(
-            "auth: rejected {} {} (token present in query: {})",
-            req.method(),
-            req.uri().path(),
-            req.uri().query().is_some_and(|q| q.contains("token="))
-        );
-        (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
-    }
-}
-
-fn authorized(req: &Request, token: &str) -> bool {
-    let header_ok = req
+/// Gate **write** requests on the optional password. `None` ⇒ control is open
+/// (the default). When set, the password must arrive as `Authorization: Bearer
+/// <password>`. Reads never reach this middleware.
+async fn require_password(State(st): State<AppState>, req: Request, next: Next) -> Response {
+    let Some(pw) = st.password.as_deref() else {
+        return next.run(req).await; // no password configured: control is open
+    };
+    let given = req
         .headers()
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        == Some(token);
-    let query_ok = req.uri().query().is_some_and(|q| {
-        q.split('&')
-            .any(|kv| kv.strip_prefix("token=") == Some(token))
-    });
-    header_ok || query_ok
+        .and_then(|v| v.strip_prefix("Bearer "));
+    if given == Some(pw) {
+        next.run(req).await
+    } else {
+        eprintln!("auth: rejected write {} {}", req.method(), req.uri().path());
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "password required" })),
+        )
+            .into_response()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::session::VerifyStage;
     use axum_test::TestServer;
 
+    /// Build a test server with a chosen password + controller (idle source).
+    fn app(password: Option<&str>, controller: impl Controller + 'static) -> TestServer {
+        let state = AppState {
+            source: Arc::new(FakeSource::idle()),
+            controller: Arc::new(controller),
+            password: password.map(str::to_owned),
+        };
+        TestServer::new(router(state))
+    }
+
+    // ── reads are always open ──
     #[tokio::test]
-    async fn status_endpoint_returns_printer_status_json() {
-        let server = TestServer::new(router(AppState::fake()));
-        let res = server
+    async fn status_is_open_and_returns_printer_status_json() {
+        let res = app(None, FakeController::verified())
             .get("/api/status")
-            .authorization_bearer("testtoken")
             .await;
         res.assert_status_ok();
         let body: serde_json::Value = res.json();
@@ -313,30 +438,104 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_endpoint_rejects_without_token() {
-        let server = TestServer::new(router(AppState::fake()));
-        server
+    async fn status_is_open_even_when_a_password_is_set() {
+        // A password gates writes only — reads stay open.
+        app(Some("secret"), FakeController::verified())
             .get("/api/status")
             .await
-            .assert_status(StatusCode::UNAUTHORIZED);
+            .assert_status_ok();
+    }
+
+    // ── control: confirm gating ──
+    #[tokio::test]
+    async fn job_stop_needs_confirmation() {
+        app(None, FakeController::verified())
+            .post("/api/job/stop")
+            .await
+            .assert_status(StatusCode::PRECONDITION_REQUIRED);
     }
 
     #[tokio::test]
-    async fn status_endpoint_rejects_wrong_token() {
-        let server = TestServer::new(router(AppState::fake()));
-        server
-            .get("/api/status")
-            .authorization_bearer("nope")
-            .await
-            .assert_status(StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn unknown_path_falls_back_to_index_html_without_a_token() {
-        // Static assets must load without auth (so the SPA can then authenticate).
-        let server = TestServer::new(router(AppState::fake()));
-        let res = server.get("/some/spa/route").await;
+    async fn job_pause_confirmed_returns_verified() {
+        let res = app(None, FakeController::verified())
+            .post("/api/job/pause")
+            .json(&json!({ "confirm": true }))
+            .await;
         res.assert_status_ok();
+        assert_eq!(res.json::<serde_json::Value>()["outcome"], "verified");
+    }
+
+    // ── control: outcome → HTTP status ──
+    #[tokio::test]
+    async fn rejected_outcome_maps_to_409() {
+        let c = FakeController::returning(CommandOutcome::Rejected {
+            reason: "busy".into(),
+        });
+        app(None, c)
+            .post("/api/job/stop")
+            .json(&json!({ "confirm": true }))
+            .await
+            .assert_status(StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn unverified_outcome_maps_to_202() {
+        let c = FakeController::returning(CommandOutcome::Unverified {
+            stage: VerifyStage::Effect,
+        });
+        app(None, c)
+            .post("/api/light")
+            .json(&json!({ "node": "chamber", "on": true }))
+            .await
+            .assert_status(StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn transport_failure_maps_to_502() {
+        app(None, FakeController::failing())
+            .post("/api/light")
+            .json(&json!({ "node": "chamber", "on": false }))
+            .await
+            .assert_status(StatusCode::BAD_GATEWAY);
+    }
+
+    // ── control: input validation ──
+    #[tokio::test]
+    async fn unknown_light_node_is_400() {
+        app(None, FakeController::verified())
+            .post("/api/light")
+            .json(&json!({ "node": "kitchen", "on": true }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn speed_level_sets_ok() {
+        app(None, FakeController::verified())
+            .post("/api/speed")
+            .json(&json!({ "level": "standard" }))
+            .await
+            .assert_status_ok();
+    }
+
+    // ── control: password gating ──
+    #[tokio::test]
+    async fn write_without_password_is_401_when_one_is_set() {
+        app(Some("secret"), FakeController::verified())
+            .post("/api/light")
+            .json(&json!({ "node": "chamber", "on": true }))
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn write_with_correct_password_is_allowed() {
+        app(Some("secret"), FakeController::verified())
+            .post("/api/light")
+            .authorization_bearer("secret")
+            .json(&json!({ "node": "chamber", "on": true }))
+            .await
+            .assert_status_ok();
     }
 
     // WebSocket tests need the real HTTP transport (the mocked one can't upgrade).
@@ -345,10 +544,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ws_pushes_initial_status_with_query_token() {
-        // The browser WebSocket can't set headers, so the token rides in ?token=.
+    async fn ws_is_open_and_pushes_initial_status() {
         let mut ws = ws_server(AppState::fake())
-            .get_websocket("/api/ws?token=testtoken")
+            .get_websocket("/api/ws")
             .await
             .into_websocket()
             .await;
@@ -358,19 +556,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ws_rejects_without_token() {
-        let res = ws_server(AppState::fake()).get_websocket("/api/ws").await;
-        res.assert_status(StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
     async fn ws_streams_subsequent_updates_from_a_ramping_source() {
         let state = AppState {
             source: Arc::new(FakeSource::ramping(Duration::from_millis(5))),
-            token: "testtoken".to_string(),
+            controller: Arc::new(FakeController::verified()),
+            password: None,
         };
         let mut ws = ws_server(state)
-            .get_websocket("/api/ws?token=testtoken")
+            .get_websocket("/api/ws")
             .await
             .into_websocket()
             .await;

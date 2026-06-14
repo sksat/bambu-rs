@@ -185,19 +185,22 @@ enum Command {
         #[arg(long)]
         confirm: bool,
     },
-    /// Serve the real-time web dashboard (HTTP server + embedded SPA).
-    #[cfg(feature = "dashboard")]
-    Dashboard {
+    /// Serve the monitoring + control HTTP API (and the web dashboard SPA when
+    /// built with the `dashboard` feature).
+    #[cfg(feature = "server")]
+    #[command(alias = "dashboard")]
+    Serve {
         /// Bind host. Default 127.0.0.1; a non-loopback host serves over the
-        /// network (a token is then required and a warning is printed).
+        /// network (without --password, control is open — a warning is printed).
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
         /// Bind port.
         #[arg(long, default_value_t = 8088)]
         port: u16,
-        /// Bearer token for the API (a random one is generated + printed if omitted).
-        #[arg(long)]
-        token: Option<String>,
+        /// Password gating control (write) requests. Reads are always open; if
+        /// omitted, control is open too. May also be set via $BAMBU_SERVE_PASSWORD.
+        #[arg(long, env = "BAMBU_SERVE_PASSWORD")]
+        password: Option<String>,
         /// Serve deterministic fake data (no printer needed; for demos/E2E).
         #[arg(long)]
         fake: bool,
@@ -572,19 +575,19 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             timeout,
         } => run_gcode(cli, line, *confirm, *force, *timeout),
         Command::Reboot { confirm } => run_reboot(cli, *confirm),
-        #[cfg(feature = "dashboard")]
-        Command::Dashboard {
+        #[cfg(feature = "server")]
+        Command::Serve {
             host,
             port,
-            token,
+            password,
             fake,
             interval,
             camera_rtsp,
-        } => run_dashboard(
+        } => run_serve(
             cli,
             host,
             *port,
-            token.clone(),
+            password.clone(),
             *fake,
             *interval,
             camera_rtsp.clone(),
@@ -1147,13 +1150,13 @@ fn run_reboot(cli: &Cli, confirm: bool) -> Result<(), CliError> {
     Ok(())
 }
 
-#[cfg(feature = "dashboard")]
+#[cfg(feature = "server")]
 #[allow(clippy::too_many_arguments)]
-fn run_dashboard(
+fn run_serve(
     cli: &Cli,
     host: &str,
     port: u16,
-    token: Option<String>,
+    password: Option<String>,
     fake: bool,
     interval: Option<u64>,
     camera_rtsp: Option<String>,
@@ -1164,15 +1167,15 @@ fn run_dashboard(
     } else {
         Some(resolve_target(cli)?)
     };
-    let opts = crate::dashboard::DashboardOpts {
+    let opts = crate::server::ServeOpts {
         host: host.to_string(),
         port,
-        token,
+        password,
         fake,
         interval: interval.map(Duration::from_secs),
         camera_rtsp,
     };
-    crate::dashboard::serve(target, opts).map_err(|e| CliError::new(exit::GENERAL, e.to_string()))
+    crate::server::serve(target, opts).map_err(|e| CliError::new(exit::GENERAL, e.to_string()))
 }
 
 fn run_gcode(

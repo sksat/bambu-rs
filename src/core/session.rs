@@ -16,6 +16,7 @@
 //! - the `print_error` baseline is captured from the first **full** snapshot so
 //!   only a *new* fault is blamed on the command.
 
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::core::command::Command;
@@ -24,7 +25,8 @@ use crate::core::status::PrinterStatus;
 use crate::core::verify::{self, EffectStatus};
 
 /// Which stage of verification failed to confirm a command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VerifyStage {
     /// No usable ACK arrived (the printer never echoed our `sequence_id`).
     Ack,
@@ -39,7 +41,8 @@ pub enum VerifyStage {
 /// commands with an observable effect the effect is also confirmed from the
 /// report, and a new `print_error` after the command is treated as a rejection
 /// (observed: a failing SD card ACKed `project_file` then never printed).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum CommandOutcome {
     /// ACKed `success` **and**, for effectful commands, the effect was observed.
     Verified,

@@ -24,36 +24,34 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [features]
-default = ["cli"]
+default = ["cli", "server"]
 # CLI-only dependencies (clap, etc.) are gated here so library-only consumers don't pull them.
 cli = ["dep:clap"]
-# The embedded web dashboard (HTTP server + embedded SPA). Off by default so
-# library/CLI-only users pull no web server. Adds the extra tokio features the
-# server needs (the base tokio is rt/time/macros only).
-dashboard = [
+# The monitoring + control HTTP API server (axum). On by default; a library-only
+# consumer can drop it with `default-features = false`. Adds the extra tokio
+# features the server needs (the base tokio is rt/time/macros only).
+server = [
     "cli",
     "dep:axum",
     "dep:axum-extra",
     "dep:tower",
     "dep:tower-http",
-    "dep:rust-embed",
-    "dep:base64",
-    "dep:rand",
     "tokio/rt-multi-thread",
     "tokio/sync",
     "tokio/net",
     "tokio/process",
 ]
+# The embedded web dashboard SPA, served by `bambu serve` when enabled. Builds on
+# the API server and embeds `web/dist/` via rust-embed.
+dashboard = ["server", "dep:rust-embed"]
 
 [dependencies]
 anyhow = "1.0.102"
 axum = { version = "0.8.9", features = ["ws"], optional = true }
 axum-extra = { version = "0.12.6", features = ["typed-header"], optional = true }
-base64 = { version = "0.22.1", optional = true }
-clap = { version = "4.6.1", features = ["derive"], optional = true }
+clap = { version = "4.6.1", features = ["derive", "env"], optional = true }
 md-5 = "0.11.0"
 native-tls = "0.2.18"
-rand = { version = "0.10.1", optional = true }
 rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls"] }
 rust-embed = { version = "8.11.0", optional = true }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "logging", "tls12"] }

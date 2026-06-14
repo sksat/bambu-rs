@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-use super::server::PrinterSource;
+use super::api::PrinterSource;
 use crate::client::{LanMqttClient, WatchStep};
 use crate::config::ResolvedTarget;
 use crate::core::status::PrinterStatus;
