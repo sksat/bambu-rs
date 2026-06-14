@@ -19,11 +19,16 @@ export function AmsSection({ ams }: { ams: Ams }) {
       </div>
       {units.map((u) => (
         <div key={u.id} className="amsunit">
-          <div className="trays">
+          <div className="rack">
             {(u.trays ?? []).map((t) => (
               <Tray key={t.id} t={t} />
             ))}
-            {ams.external && <Tray t={ams.external} ext />}
+            {ams.external && (
+              <>
+                <span className="rack__sep" aria-hidden />
+                <Tray t={ams.external} ext />
+              </>
+            )}
           </div>
           {u.humidity != null && (
             <div className="amsmeta">

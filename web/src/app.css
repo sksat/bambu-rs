@@ -7,6 +7,7 @@
   --dim: #6b7079;
   --hair: #ffffff14;
   --hair-2: #ffffff0a;
+  --ring: #ffffff40; /* spool edge — stronger than --hair so near-black/white filament stays visible */
   --accent: #d8a657; /* amber readout */
   --accent-2: #e8c08a;
   --ok: #8fb573;
@@ -25,6 +26,7 @@
   --dim: #7a7f88;
   --hair: #00000014;
   --hair-2: #0000000a;
+  --ring: #00000040;
   --accent: #b4801f;
   --accent-2: #936614;
 }
@@ -35,6 +37,7 @@
     --dim: #7a7f88;
     --hair: #00000014;
     --hair-2: #0000000a;
+    --ring: #00000040;
     --accent: #b4801f;
     --accent-2: #936614;
   }
@@ -381,45 +384,120 @@ body {
   font-size: 0.74rem;
   color: var(--warn);
 }
-.trays {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(74px, 1fr));
-  gap: 0.5rem;
+/* The AMS rack: a horizontal row of filament SPOOLS (colour is the hero),
+   wrapping onto multiple rows on narrow/phone widths. */
+.rack {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 0.55rem 0.7rem;
 }
-.tray {
+/* A thin hairline divider that sets the external spool slightly apart. */
+.rack__sep {
+  align-self: stretch;
+  width: 1px;
+  min-height: 52px;
+  margin: 0 0.15rem;
+  background: var(--hair);
+}
+
+.spool {
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
-  gap: 0.18rem;
-  padding: 0.45rem;
-  border: 1px solid var(--hair);
-  border-radius: 6px;
+  align-items: center;
+  gap: 0.22rem;
+  width: 64px;
+  padding: 0.1rem 0;
 }
-.tray--active {
-  border-color: var(--accent);
-  box-shadow: inset 0 0 0 1px var(--accent);
+
+/* The spool face: an outer ring filled with the filament colour and a hollow
+   hub punched out with the panel background, edged by --ring (a stronger,
+   ~25% contrast token, not the faint --hair) so even near-black / near-white
+   filament stays visible on both themes. */
+.spool__disc {
+  position: relative;
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  --fil: var(--hair-2);
+  background:
+    radial-gradient(circle, var(--bg) 0 32%, transparent 32.5%),
+    var(--fil);
+  box-shadow:
+    inset 0 0 0 1px var(--ring),
+    0 0 0 1px var(--ring);
+  transition:
+    box-shadow 0.2s ease,
+    transform 0.2s ease;
 }
-.tray--target {
-  border-color: color-mix(in srgb, var(--warn) 55%, transparent);
+/* The hub gets its own ring so the centre hole reads as a real hole. */
+.spool__disc::before {
+  content: "";
+  position: absolute;
+  inset: 34%;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1px var(--ring);
 }
-.tray__sw {
-  width: 100%;
-  height: 1.5rem;
-  border-radius: 3px;
-  border: 1px solid var(--hair);
+
+/* Empty slot: dashed grey ring, no fill, no hub punch. */
+.spool--empty .spool__disc {
+  background: none;
+  box-shadow: none;
+  border: 1px dashed var(--dim);
 }
-.tray__id {
-  font-family: var(--mono);
-  font-size: 0.7rem;
+.spool--empty .spool__disc::before {
+  content: none;
+}
+.spool--empty .spool__id {
   color: var(--dim);
 }
-.tray__mat {
-  font-family: var(--mono);
-  font-size: 0.78rem;
+
+/* Active (loaded): accent glow ring + a small loaded marker. Never colour-only:
+   the ring widens and the id row carries an explicit marker dot. */
+.spool--active .spool__disc {
+  box-shadow:
+    inset 0 0 0 1px var(--ring),
+    0 0 0 2px var(--accent),
+    0 0 8px 0 color-mix(in srgb, var(--accent) 55%, transparent);
 }
-.tray__rem {
+.spool__load {
+  position: absolute;
+  right: -2px;
+  top: -2px;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 1.5px solid var(--bg);
+}
+.spool--active .spool__id {
+  color: var(--accent);
+  font-weight: 650;
+}
+
+/* Swap target (being loaded): dashed accent ring. */
+.spool--target .spool__disc {
+  box-shadow:
+    inset 0 0 0 1px var(--hair),
+    0 0 0 1px var(--accent);
+  outline: 2px dashed var(--accent);
+  outline-offset: 2px;
+}
+
+.spool__id {
   font-family: var(--mono);
   font-size: 0.72rem;
+  color: var(--fg);
+  text-align: center;
+  line-height: 1.15;
+}
+.spool__mat {
+  color: var(--dim);
+}
+.spool__rem {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.7rem;
   color: var(--dim);
 }
 .amsmeta {
@@ -498,12 +576,6 @@ body {
 .fchip__v {
   font-family: var(--mono);
   font-size: 0.8rem;
-}
-
-@media (min-width: 560px) {
-  .trays {
-    grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
-  }
 }
 
 .auth-err {
@@ -725,10 +797,12 @@ body {
   min-width: 8rem;
 }
 
-/* Roomier AMS on small phones: two trays per row instead of cramming four. */
+/* On small phones the spool rack centres its wrapped rows so the spools sit
+   evenly rather than left-stacking against the edge. */
 @media (max-width: 430px) {
-  .trays {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+  .rack {
+    justify-content: center;
+    gap: 0.7rem 0.9rem;
   }
 }
 

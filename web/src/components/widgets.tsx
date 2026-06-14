@@ -1,4 +1,5 @@
 import { useState } from "react";
+import type { CSSProperties } from "react";
 import type { TempPoint } from "../useStatus";
 import type { AmsTray } from "../types";
 import { remainText, swatch } from "../format";
@@ -80,13 +81,41 @@ export function TempReadout({
 
 export function Tray({ t, ext }: { t: AmsTray; ext?: boolean }) {
   const color = swatch(t.color, t.cols);
-  const cls = `tray${t.is_active ? " tray--active" : t.is_target ? " tray--target" : ""}`;
+  // State is never colour-only: the active spool also widens its ring + shows a
+  // "loaded" marker; the swap target gets a dashed accent ring.
+  const target = t.is_target && !t.is_active;
+  const cls = [
+    "spool",
+    ext ? "spool--ext" : "",
+    t.is_active ? "spool--active" : "",
+    target ? "spool--target" : "",
+    color ? "" : "spool--empty",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const temps =
+    t.nozzle_temp_min != null && t.nozzle_temp_max != null
+      ? `${t.nozzle_temp_min}–${t.nozzle_temp_max}°C`
+      : null;
+  const title = [t.name ?? t.material ?? undefined, temps].filter(Boolean).join(" · ") || undefined;
+  const id = ext ? "EXT" : t.id;
+  const rem = remainText(t.remain);
   return (
-    <div className={cls} data-testid={`tray-${ext ? "ext" : t.id}`} title={t.name ?? undefined}>
-      <span className="tray__sw" style={color ? { background: color } : { borderStyle: "dashed" }} />
-      <span className="tray__id">{ext ? "EXT" : t.id}</span>
-      <span className="tray__mat">{t.material ?? "—"}</span>
-      <span className="tray__rem">{remainText(t.remain)}</span>
+    <div className={cls} data-testid={`tray-${ext ? "ext" : t.id}`} title={title}>
+      <span
+        className="spool__disc"
+        // The filament colour is the hero; the hub punches a hole using the panel
+        // background so the ring reads as a wound spool seen face-on.
+        style={color ? ({ "--fil": color } as CSSProperties) : undefined}
+        aria-hidden
+      >
+        {t.is_active && <i className="spool__load" aria-hidden />}
+      </span>
+      <span className="spool__id">
+        {id}
+        <span className="spool__mat"> · {t.material ?? "—"}</span>
+      </span>
+      {rem !== "—" ? <span className="spool__rem">{rem}</span> : null}
     </div>
   );
 }
