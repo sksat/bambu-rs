@@ -17,7 +17,7 @@ use axum::{Json, Router};
 use tokio::sync::watch;
 
 use super::assets::static_handler;
-use crate::core::status::PrinterStatus;
+use crate::core::status::{Ams, AmsTray, AmsUnit, Filament, Online, PrinterStatus};
 
 /// Something that can provide the printer's current status and a live stream of
 /// updates. Abstracted so the server is testable without a network: tests and
@@ -53,20 +53,47 @@ impl FakeSource {
         Self { tx, _keepalive: rx }
     }
 
-    /// A printer simulating a running print: nozzle/bed temps ramp toward their
-    /// targets and progress advances one layer per `interval`, until 100% (then
-    /// it reports `FINISH`). Spawns a task on the current tokio runtime.
+    /// A printer simulating a 2-colour print: nozzle/bed temps ramp toward
+    /// target, fans spin up, progress advances one layer per `interval`, and a
+    /// loaded AMS (4 trays) is reported — enough to exercise every dashboard
+    /// card. Runs to 100% then reports `FINISH`. Spawns a task on the current
+    /// tokio runtime.
     pub fn ramping(interval: Duration) -> Self {
         let initial = PrinterStatus {
             gcode_state: Some("RUNNING".to_string()),
             print_error: Some(0),
+            subtask_name: Some("benchy_2c.3mf".to_string()),
+            gcode_file: Some("benchy_2c.3mf".to_string()),
+            print_type: Some("local".to_string()),
             nozzle_target: Some(220.0),
             bed_target: Some(60.0),
             nozzle_temper: Some(25.0),
             bed_temper: Some(25.0),
             mc_percent: Some(0),
             layer_num: Some(0),
-            total_layer_num: Some(100),
+            total_layer_num: Some(200),
+            remaining_time_min: Some(72),
+            spd_lvl: Some(2),
+            spd_mag: Some(100),
+            cooling_fan_speed: Some(0),
+            big_fan1_speed: Some(0),
+            heatbreak_fan_speed: Some(7000),
+            nozzle_diameter: Some("0.4".to_string()),
+            nozzle_type: Some("stainless_steel".to_string()),
+            sdcard: Some(true),
+            wifi_signal: Some("-58dBm".to_string()),
+            online: Some(Online {
+                ahb: Some(true),
+                rfid: Some(true),
+                version: Some(1),
+            }),
+            filament: Some(Filament {
+                location: "ams0".to_string(),
+                material: Some("PLA".to_string()),
+                name: Some("PLA Matte".to_string()),
+                color: Some("DE4343FF".to_string()),
+            }),
+            ams: Some(fake_ams()),
             ..Default::default()
         };
         let (tx, rx) = watch::channel(initial.clone());
@@ -79,11 +106,19 @@ impl FakeSource {
                 tick += 1;
                 s.nozzle_temper = Some(approach(s.nozzle_temper.unwrap_or(25.0), 220.0, 8.0));
                 s.bed_temper = Some(approach(s.bed_temper.unwrap_or(25.0), 60.0, 4.0));
+                // Part-cooling fan spins up once the hotend is near temperature.
+                s.cooling_fan_speed = Some(if s.nozzle_temper.unwrap_or(0.0) >= 200.0 {
+                    100
+                } else {
+                    0
+                });
                 let pct = tick.min(100);
                 s.mc_percent = Some(pct);
-                s.layer_num = Some(pct);
+                s.layer_num = Some(pct * 2); // 200 total layers
+                s.remaining_time_min = Some((100 - pct) * 72 / 100);
                 if pct >= 100 {
                     s.gcode_state = Some("FINISH".to_string());
+                    s.remaining_time_min = Some(0);
                 }
                 if task_tx.send(s.clone()).is_err() || pct >= 100 {
                     break;
@@ -91,6 +126,46 @@ impl FakeSource {
             }
         });
         Self { tx, _keepalive: rx }
+    }
+}
+
+/// A loaded AMS for the fake: 1 unit, 4 spools, red (tray 0) active.
+fn fake_ams() -> Ams {
+    let tray = |id: &str, material: &str, name: &str, color: &str, active: bool| AmsTray {
+        id: id.to_string(),
+        material: Some(material.to_string()),
+        name: Some(name.to_string()),
+        color: Some(color.to_string()),
+        cols: vec![color.to_string()],
+        remain: Some(-1), // A1 spools don't report a usable remaining %
+        state: Some(3),
+        nozzle_temp_min: Some(if material == "PETG" { 230 } else { 190 }),
+        nozzle_temp_max: Some(if material == "PETG" { 260 } else { 230 }),
+        is_active: active,
+        is_target: active,
+        ..Default::default()
+    };
+    Ams {
+        units: vec![AmsUnit {
+            id: "0".to_string(),
+            humidity: Some(5),
+            humidity_raw: Some(28),
+            temp: Some(0.0),
+            dry_time: None,
+            trays: vec![
+                tray("0", "PLA", "PLA Matte Red", "DE4343FF", true),
+                tray("1", "PLA", "PLA Basic Black", "000000FF", false),
+                tray("2", "PETG", "PETG Translucent", "D6ABFF80", false),
+                tray("3", "PLA", "PLA Wood", "918669FF", false),
+            ],
+        }],
+        external: None,
+        active_tray: Some("0".to_string()),
+        target_tray: Some("0".to_string()),
+        previous_tray: Some("255".to_string()),
+        ams_exist_bits: Some("1".to_string()),
+        tray_exist_bits: Some("f".to_string()),
+        tray_is_bbl_bits: Some("f".to_string()),
     }
 }
 
