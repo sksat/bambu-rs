@@ -10,12 +10,12 @@
 //! mode uses [`super::LiveSource`]/[`super::control::LiveController`].
 
 use std::io::Read;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{
     StatusCode,
     header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE},
@@ -32,6 +32,9 @@ use tokio::sync::watch;
 
 #[cfg(feature = "dashboard")]
 use super::assets::static_handler;
+#[cfg(test)]
+use super::camera::NoCamera;
+use super::camera::{CameraSource, ExternalCamera};
 #[cfg(test)]
 use super::control::FakeController;
 use super::control::{
@@ -248,11 +251,15 @@ pub struct AppState {
     /// Held for the duration of a `job/start` so two concurrent starts can't both
     /// pass the idle check.
     pub start_lock: Arc<tokio::sync::Mutex<()>>,
-    /// External IP-camera snapshot URL (single-JPEG-per-GET). `None` ⇒ no camera
-    /// configured: `/api/camera` reports `available: false` and the snapshot
-    /// endpoint 404s. Proxied server-side so a browser that can't reach the LAN
-    /// cam (e.g. over Tailscale) still gets a live view.
-    pub camera_url: Option<String>,
+    /// **External** IP cameras the server proxies (single-JPEG-per-GET). Held
+    /// behind a lock so the dashboard can add/remove them at runtime
+    /// (`/api/cameras/config`); seeded from `--camera-url` and in-memory only.
+    /// Proxied server-side so a browser that can't reach the LAN cam (e.g. over
+    /// Tailscale) still gets a live view.
+    pub external_cameras: Arc<RwLock<Vec<ExternalCamera>>>,
+    /// The **built-in** (printer chamber) camera, grabbed over TCP:6000 in live
+    /// mode; [`NoCamera`](super::camera::NoCamera) in fake / no-target mode.
+    pub internal_camera: Arc<dyn CameraSource>,
 }
 
 /// A safe absolute path on the printer: starts with `/`, no traversal or scheme.
@@ -275,7 +282,8 @@ impl AppState {
             starter: Arc::new(FakeStarter),
             password: None,
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
-            camera_url: None,
+            external_cameras: Arc::new(RwLock::new(Vec::new())),
+            internal_camera: Arc::new(NoCamera),
         }
     }
 }
@@ -291,8 +299,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/files/raw", get(file_raw))
         .route("/api/files/gcode", get(file_gcode))
         .route("/api/files/mesh", get(file_mesh))
-        .route("/api/camera", get(camera_info))
-        .route("/api/camera/snapshot", get(camera_snapshot));
+        .route("/api/cameras", get(cameras_list))
+        .route("/api/cameras/{id}/snapshot", get(camera_snapshot));
     let writes = Router::new()
         .route("/api/job/pause", post(job_pause))
         .route("/api/job/resume", post(job_resume))
@@ -309,6 +317,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/ams", post(ams))
         .route("/api/reboot", post(reboot))
         .route("/api/steppers", post(steppers))
+        .route(
+            "/api/cameras/config",
+            get(cameras_config_get).post(cameras_config_set),
+        )
         // Uploads stream to a temp file, so the cap bounds disk, not memory.
         .route(
             "/api/files/upload",
@@ -981,14 +993,13 @@ async fn file_mesh(State(st): State<AppState>, Query(q): Query<MeshQuery>) -> Re
     }
 }
 
-// ── Camera (external IP-camera proxy) ────────────────────────────────────────
-
-/// Report whether an external camera is configured (open read). The browser uses
-/// this to decide whether to render a live view — the snapshot URL is never
-/// exposed to the client, only proxied.
-async fn camera_info(State(st): State<AppState>) -> Json<serde_json::Value> {
-    Json(json!({ "available": st.camera_url.is_some() }))
-}
+// ── Cameras ──────────────────────────────────────────────────────────────────
+// The dashboard shows cameras as switchable tabs. Two kinds of source, listed
+// together by /api/cameras: the **built-in** printer chamber camera (TCP:6000,
+// often dead on the A1) and any number of **external** IP cameras the server
+// proxies (e.g. ATOM Cams over LAN). Externals can be set at launch (--camera-url,
+// repeatable) and edited at runtime via the gated config endpoint. IDs are
+// positional: "internal" for the built-in, "ext-{i}" for the i-th external.
 
 /// Cap a proxied camera frame to bound server memory (a single JPEG is well under
 /// this; a misbehaving upstream can't OOM us).
@@ -996,12 +1007,52 @@ const CAMERA_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// Upstream fetch timeout — a stalled camera shouldn't hang the request.
 const CAMERA_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Proxy a single JPEG from the configured external camera (open read). 404 when
-/// no camera is configured; 502 on any upstream/transport error. Runs the
-/// blocking `ureq` GET on the blocking pool and passes the upstream content-type
-/// through (defaulting to `image/jpeg`).
-async fn camera_snapshot(State(st): State<AppState>) -> Response {
-    let Some(url) = st.camera_url.clone() else {
+/// List the available cameras (open read) as `{id, kind, label}`. URLs are never
+/// exposed here — only the proxied snapshot is reachable, by id.
+async fn cameras_list(State(st): State<AppState>) -> Json<serde_json::Value> {
+    let mut cameras = Vec::new();
+    if st.internal_camera.configured() {
+        cameras.push(json!({ "id": "internal", "kind": "internal", "label": "built-in camera" }));
+    }
+    for (i, c) in st.external_cameras.read().unwrap().iter().enumerate() {
+        cameras.push(json!({ "id": format!("ext-{i}"), "kind": "external", "label": c.label }));
+    }
+    Json(json!({ "cameras": cameras }))
+}
+
+/// Proxy a single JPEG for one camera by id (open read). `internal` grabs the
+/// built-in cam over TCP:6000; `ext-{i}` proxies that external camera's URL. 404
+/// for an unknown id / unconfigured source; 502 when the grab fails.
+async fn camera_snapshot(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+    if id == "internal" {
+        if !st.internal_camera.configured() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        let cam = st.internal_camera.clone();
+        return match tokio::task::spawn_blocking(move || cam.snapshot()).await {
+            Ok(Ok(bytes)) => (
+                [
+                    (CONTENT_TYPE, "image/jpeg".to_string()),
+                    (CACHE_CONTROL, "no-store".to_string()),
+                ],
+                bytes,
+            )
+                .into_response(),
+            Ok(Err(e)) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
+            Err(_) => server_error("camera task failed".to_string()),
+        };
+    }
+    let url = id
+        .strip_prefix("ext-")
+        .and_then(|n| n.parse::<usize>().ok())
+        .and_then(|i| {
+            st.external_cameras
+                .read()
+                .unwrap()
+                .get(i)
+                .map(|c| c.url.clone())
+        });
+    let Some(url) = url else {
         return StatusCode::NOT_FOUND.into_response();
     };
     match tokio::task::spawn_blocking(move || fetch_camera_frame(&url)).await {
@@ -1016,6 +1067,59 @@ async fn camera_snapshot(State(st): State<AppState>) -> Response {
         Ok(Err(e)) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
         Err(_) => server_error("camera task failed".to_string()),
     }
+}
+
+/// Serialise the external list (with URLs) for the gated config endpoints.
+fn external_json(st: &AppState) -> Vec<serde_json::Value> {
+    st.external_cameras
+        .read()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .map(|(i, c)| json!({ "id": format!("ext-{i}"), "label": c.label, "url": c.url }))
+        .collect()
+}
+
+/// Current external-camera config (gated read) — includes URLs so the dashboard's
+/// manage form can prefill. The built-in camera isn't configurable, so it's not
+/// listed here.
+async fn cameras_config_get(State(st): State<AppState>) -> Json<serde_json::Value> {
+    Json(json!({ "external": external_json(&st) }))
+}
+
+#[derive(Deserialize)]
+struct ExternalCameraInput {
+    label: Option<String>,
+    url: String,
+}
+
+#[derive(Deserialize)]
+struct CamerasConfigBody {
+    external: Vec<ExternalCameraInput>,
+}
+
+/// Replace the external-camera list (write). Each URL must be `http(s)` (the proxy
+/// only speaks HTTP, and refusing other schemes blocks `file:`/`gopher:` SSRF). The
+/// list is in-memory only — it resets on restart; `--camera-url` is the persistent
+/// path. The built-in camera is untouched.
+async fn cameras_config_set(
+    State(st): State<AppState>,
+    Json(b): Json<CamerasConfigBody>,
+) -> Response {
+    let mut next = Vec::with_capacity(b.external.len());
+    for (i, e) in b.external.into_iter().enumerate() {
+        let url = e.url.trim().to_string();
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "camera URL must start with http:// or https://" })),
+            )
+                .into_response();
+        }
+        next.push(ExternalCamera::new(e.label, url, i));
+    }
+    *st.external_cameras.write().unwrap() = next;
+    Json(json!({ "external": external_json(&st) })).into_response()
 }
 
 /// Blocking single-shot GET of the camera URL. Returns `(content_type, bytes)` or
@@ -1193,7 +1297,8 @@ mod tests {
             starter: Arc::new(FakeStarter),
             password: password.map(str::to_owned),
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
-            camera_url: None,
+            external_cameras: Arc::new(RwLock::new(Vec::new())),
+            internal_camera: Arc::new(NoCamera),
         };
         TestServer::new(router(state))
     }
@@ -1435,23 +1540,89 @@ mod tests {
             .assert_status(StatusCode::BAD_REQUEST);
     }
 
-    // ── camera ──
+    // ── cameras (built-in + external proxies, listed as switchable sources) ──
     #[tokio::test]
-    async fn camera_reports_unavailable_when_unconfigured() {
-        // The default test AppState has no camera_url.
+    async fn cameras_list_is_empty_without_built_in_or_external() {
+        // Fake/test mode has no built-in camera and no external URLs.
         let res = app(None, FakeController::verified())
-            .get("/api/camera")
+            .get("/api/cameras")
             .await;
         res.assert_status_ok();
-        assert_eq!(res.json::<serde_json::Value>()["available"], false);
+        assert_eq!(
+            res.json::<serde_json::Value>()["cameras"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     #[tokio::test]
-    async fn camera_snapshot_is_404_when_unconfigured() {
-        app(None, FakeController::verified())
-            .get("/api/camera/snapshot")
+    async fn camera_snapshot_is_404_for_unknown_id() {
+        let server = app(None, FakeController::verified());
+        for id in ["internal", "ext-0", "bogus"] {
+            server
+                .get(&format!("/api/cameras/{id}/snapshot"))
+                .await
+                .assert_status(StatusCode::NOT_FOUND);
+        }
+    }
+
+    #[tokio::test]
+    async fn external_cameras_can_be_set_then_listed_and_cleared() {
+        let server = app(None, FakeController::verified());
+        // Configure two external cameras (one labelled, one auto-labelled).
+        let res = server
+            .post("/api/cameras/config")
+            .json(&json!({
+                "external": [
+                    { "label": "front", "url": "http://cam.local/a.jpg" },
+                    { "url": "http://cam.local/b.jpg" }
+                ]
+            }))
+            .await;
+        res.assert_status_ok();
+        // The open listing now shows both, with ids and labels but no URLs.
+        let list = server.get("/api/cameras").await.json::<serde_json::Value>();
+        let cams = list["cameras"].as_array().unwrap();
+        assert_eq!(cams.len(), 2);
+        assert_eq!(cams[0]["id"], "ext-0");
+        assert_eq!(cams[0]["label"], "front");
+        assert_eq!(cams[0]["kind"], "external");
+        assert_eq!(cams[1]["label"], "external 2"); // auto-labelled
+        assert!(cams[0].get("url").is_none()); // URL never exposed on the open list
+        // The gated config read echoes URLs back for the manage form.
+        let cfg = server
+            .get("/api/cameras/config")
             .await
-            .assert_status(StatusCode::NOT_FOUND);
+            .json::<serde_json::Value>();
+        assert_eq!(cfg["external"][0]["url"], "http://cam.local/a.jpg");
+        // Replacing with an empty list clears them.
+        server
+            .post("/api/cameras/config")
+            .json(&json!({ "external": [] }))
+            .await
+            .assert_status_ok();
+        let list = server.get("/api/cameras").await.json::<serde_json::Value>();
+        assert_eq!(list["cameras"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn camera_config_rejects_non_http_url() {
+        app(None, FakeController::verified())
+            .post("/api/cameras/config")
+            .json(&json!({ "external": [{ "url": "file:///etc/passwd" }] }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn camera_config_is_gated_by_password() {
+        app(Some("hunter2"), FakeController::verified())
+            .post("/api/cameras/config")
+            .json(&json!({ "external": [{ "url": "http://cam.local/a.jpg" }] }))
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -1572,7 +1743,8 @@ mod tests {
             starter: Arc::new(FakeStarter),
             password: None,
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
-            camera_url: None,
+            external_cameras: Arc::new(RwLock::new(Vec::new())),
+            internal_camera: Arc::new(NoCamera),
         };
         TestServer::new(router(state))
             .post("/api/job/start")
@@ -1592,7 +1764,8 @@ mod tests {
             starter: Arc::new(FakeStarter),
             password: None,
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
-            camera_url: None,
+            external_cameras: Arc::new(RwLock::new(Vec::new())),
+            internal_camera: Arc::new(NoCamera),
         };
         TestServer::new(router(state))
     }
@@ -1628,7 +1801,8 @@ mod tests {
             starter: Arc::new(FakeStarter),
             password: None,
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
-            camera_url: None,
+            external_cameras: Arc::new(RwLock::new(Vec::new())),
+            internal_camera: Arc::new(NoCamera),
         };
         TestServer::new(router(state))
     }
@@ -2004,7 +2178,8 @@ mod tests {
             starter: Arc::new(FakeStarter),
             password: None,
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
-            camera_url: None,
+            external_cameras: Arc::new(RwLock::new(Vec::new())),
+            internal_camera: Arc::new(NoCamera),
         };
         let mut ws = ws_server(state)
             .get_websocket("/api/ws")

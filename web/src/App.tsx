@@ -6,7 +6,7 @@ import { TempSection } from "./components/TempSection";
 import { AmsSection } from "./components/AmsSection";
 import { Controls, ConfirmDialog } from "./components/Controls";
 import { MachineSection } from "./components/MachineSection";
-import { CameraSection } from "./components/CameraSection";
+import { CamerasSection } from "./components/CameraSection";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { FilesSection } from "./components/FilesSection";
 import { HealthSection } from "./components/HealthSection";
@@ -24,13 +24,24 @@ export function App() {
       <Header conn={conn} />
       {status ? (
         <ErrorBoundary>
-          <main className="grid">
-            <JobSection s={status} />
-            <TempSection s={status} history={history} />
-            {status.ams && <AmsSection ams={status.ams} />}
-            <Controls control={control} status={status} />
-            <CameraSection />
-            <MachineSection s={status} control={control} />
+          {/* Monitoring-first: a hero row pairs the camera(s) with the vital
+              readouts; controls + machine sit below; files and health span full
+              width. On a phone it all collapses to one column (vitals first). */}
+          <main className="dash">
+            <section className="dash__hero">
+              <div className="dash__vitals">
+                <JobSection s={status} />
+                <TempSection s={status} history={history} />
+                {status.ams && <AmsSection ams={status.ams} />}
+              </div>
+              <div className="dash__cams">
+                <CamerasSection password={control.password || null} />
+              </div>
+            </section>
+            <section className="dash__ops">
+              <Controls control={control} status={status} />
+              <MachineSection s={status} control={control} />
+            </section>
             <FilesSection sdcard={status.sdcard} />
             <HealthSection s={status} />
             <FooterSection s={status} />

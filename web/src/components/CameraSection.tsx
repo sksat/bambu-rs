@@ -1,51 +1,243 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import {
+  listCameras,
+  getCamerasConfig,
+  setCamerasConfig,
+  type Camera,
+} from "../cameras";
 
-const REFRESH_MS = 1500; // snapshot poll cadence (the cam serves one JPEG per GET)
+// Refresh cadence (the delay AFTER a frame settles before fetching the next). We
+// drive the loop off the <img>'s load/error rather than a fixed timer so a slow
+// source can never be re-requested before the current grab finishes — important
+// for the A1 built-in cam, whose grab can take seconds to fail; a fixed timer
+// would cancel-and-retry faster than it errors, pile up server-side blocking
+// grabs, and never even notice it's offline.
+const FAST_MS = 800;
+const SLOW_MS = 5000;
 
-// A live view of an external IP camera the SERVER proxies (the LAN cam isn't
-// reachable from the dashboard's browser). On mount we ask /api/camera whether a
-// camera is configured; if so we render an <img> pointed at the proxied snapshot
-// endpoint, cache-busted on a timer so it refreshes like a slow video. If no
-// camera is configured the section renders nothing.
-export function CameraSection() {
-  const [available, setAvailable] = useState(false);
+// A live view of ONE camera by id: an <img> pointed at the proxied snapshot,
+// cache-busted each cycle. A configured-but-not-streaming source (e.g. the A1
+// built-in cam is off) shows an "offline" message and polls slowly. Re-mount it
+// (key by id) when the active tab changes to reset the loop cleanly.
+function CameraView({ id, label }: { id: string; label: string }) {
   const [ts, setTs] = useState(() => Date.now());
+  const [offline, setOffline] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
-  // Probe once on mount: tolerate any failure as "no camera".
-  useEffect(() => {
-    let live = true;
-    void (async () => {
-      try {
-        const r = await fetch("/api/camera");
-        const d = (await r.json()) as { available?: boolean };
-        if (live && r.ok && d.available) setAvailable(true);
-      } catch {
-        /* no camera */
-      }
-    })();
-    return () => {
-      live = false;
-    };
-  }, []);
+  useEffect(() => () => clearTimeout(timer.current), []);
 
-  // Once available, tick the cache-busting query so the <img> re-fetches.
-  useEffect(() => {
-    if (!available) return;
-    const id = setInterval(() => setTs(Date.now()), REFRESH_MS);
-    return () => clearInterval(id);
-  }, [available]);
-
-  if (!available) return null;
+  const scheduleNext = (delay: number) => {
+    clearTimeout(timer.current);
+    timer.current = setTimeout(() => setTs(Date.now()), delay);
+  };
 
   return (
-    <section className="panel cam" data-testid="camera">
-      <div className="lbl">camera</div>
+    <div className="cam__frame">
       <img
-        className="cam__view"
-        alt="external camera"
-        src={`/api/camera/snapshot?t=${ts}`}
+        className={offline ? "cam__view cam__view--off" : "cam__view"}
+        alt={label}
+        src={`/api/cameras/${id}/snapshot?t=${ts}`}
         data-testid="camera-view"
+        onLoad={() => {
+          if (offline) setOffline(false);
+          scheduleNext(FAST_MS);
+        }}
+        onError={() => {
+          if (!offline) setOffline(true);
+          scheduleNext(SLOW_MS);
+        }}
       />
+      {offline && (
+        <div className="cam__msg" data-testid="camera-offline">
+          no frame — camera offline
+        </div>
+      )}
+    </div>
+  );
+}
+
+// The cameras panel: a tab per available camera (built-in + each external) with
+// the active one shown live, plus a "manage" form to add/remove external cameras
+// at runtime. The built-in printer cam and external IP cams are deliberately
+// distinct sources, switchable rather than stacked.
+export function CamerasSection({ password }: { password: string | null }) {
+  const [cameras, setCameras] = useState<Camera[]>([]);
+  const [active, setActive] = useState<string>("");
+  const [managing, setManaging] = useState(false);
+
+  const reload = async () => {
+    const cams = await listCameras();
+    setCameras(cams);
+    setActive((a) => (cams.some((c) => c.id === a) ? a : (cams[0]?.id ?? "")));
+  };
+
+  useEffect(() => {
+    void reload();
+  }, []);
+
+  const activeCam = cameras.find((c) => c.id === active);
+
+  return (
+    <section className="panel cam" data-testid="cameras">
+      <div className="cam__head">
+        <span className="lbl">cameras</span>
+        <button
+          className="cam__manage"
+          data-testid="cameras-manage"
+          onClick={() => setManaging((m) => !m)}
+        >
+          {managing ? "close" : "manage"}
+        </button>
+      </div>
+
+      {managing ? (
+        <ManageCameras
+          password={password}
+          onSaved={async () => {
+            setManaging(false);
+            await reload();
+          }}
+        />
+      ) : cameras.length === 0 ? (
+        <div className="cam__empty" data-testid="cameras-empty">
+          no cameras configured
+        </div>
+      ) : (
+        <>
+          {cameras.length > 1 && (
+            <div className="cam__tabs" role="tablist">
+              {cameras.map((c) => (
+                <button
+                  key={c.id}
+                  role="tab"
+                  aria-selected={c.id === active}
+                  className={c.id === active ? "cam__tab cam__tab--on" : "cam__tab"}
+                  data-testid={`camera-tab-${c.id}`}
+                  onClick={() => setActive(c.id)}
+                >
+                  {c.label}
+                </button>
+              ))}
+            </div>
+          )}
+          {activeCam && <CameraView key={activeCam.id} id={activeCam.id} label={activeCam.label} />}
+        </>
+      )}
     </section>
+  );
+}
+
+interface Row {
+  label: string;
+  url: string;
+}
+
+// The manage form: edit the external-camera list (built-in isn't configurable).
+// Mirrors the dashboard's existing pattern — on a 401 it points the operator at
+// the Controls password rather than prompting separately.
+function ManageCameras({
+  password,
+  onSaved,
+}: {
+  password: string | null;
+  onSaved: () => Promise<void>;
+}) {
+  const [rows, setRows] = useState<Row[]>([]);
+  const [status, setStatus] = useState<string>("");
+
+  useEffect(() => {
+    void (async () => {
+      const cfg = await getCamerasConfig(password);
+      if (cfg === "needPassword") setStatus("needs the control password (set it in Controls)");
+      else if (cfg === "error") setStatus("couldn't load camera config");
+      else setRows(cfg.map((e) => ({ label: e.label, url: e.url })));
+    })();
+  }, [password]);
+
+  const save = async () => {
+    const external = rows
+      .map((r) => ({ label: r.label.trim() || undefined, url: r.url.trim() }))
+      .filter((r) => r.url);
+    setStatus("saving…");
+    const res = await setCamerasConfig(external, password);
+    if (res === "needPassword") setStatus("needs the control password (set it in Controls)");
+    else if ("error" in res) setStatus(`save failed: ${res.error}`);
+    else await onSaved();
+  };
+
+  return (
+    <div className="cam__form" data-testid="cameras-form">
+      <p className="cam__hint">
+        External snapshot cameras the dashboard proxies — one row per camera, each a
+        name and a URL that returns a single JPEG (e.g. <code>http://cam/snapshot.jpg</code>).
+        The built-in printer camera is added automatically and isn&apos;t listed here.
+      </p>
+      {rows.length > 0 ? (
+        <>
+          <div className="cam__row cam__row--head">
+            <span className="cam__col cam__col--label">name</span>
+            <span className="cam__col">snapshot URL</span>
+            <span className="cam__col--rm" aria-hidden="true" />
+          </div>
+          {rows.map((r, i) => (
+            <div className="cam__row" key={i}>
+              <input
+                className="cam__in cam__in--label"
+                placeholder="e.g. front"
+                aria-label={`camera ${i + 1} name`}
+                value={r.label}
+                onChange={(e) =>
+                  setRows((rs) => rs.map((x, j) => (j === i ? { ...x, label: e.target.value } : x)))
+                }
+              />
+              <input
+                className="cam__in"
+                placeholder="http://host/snapshot.jpg"
+                aria-label={`camera ${i + 1} URL`}
+                value={r.url}
+                data-testid={`camera-url-${i}`}
+                onChange={(e) =>
+                  setRows((rs) => rs.map((x, j) => (j === i ? { ...x, url: e.target.value } : x)))
+                }
+              />
+              <button
+                className="cam__rm"
+                data-testid={`camera-remove-${i}`}
+                title="remove this camera"
+                aria-label={`remove camera ${i + 1}`}
+                onClick={() => setRows((rs) => rs.filter((_, j) => j !== i))}
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+        </>
+      ) : (
+        <p className="cam__hint cam__hint--empty">
+          No external cameras yet — “+ add camera”, then Save.
+        </p>
+      )}
+      <div className="cam__row cam__row--actions">
+        <button
+          className="cam__btn"
+          data-testid="camera-add"
+          onClick={() => setRows((rs) => [...rs, { label: "", url: "" }])}
+        >
+          + add camera
+        </button>
+        <button
+          className="cam__btn cam__btn--save"
+          data-testid="cameras-save"
+          onClick={() => void save()}
+        >
+          save changes
+        </button>
+      </div>
+      {status && (
+        <div className="cam__status" data-testid="cameras-status">
+          {status}
+        </div>
+      )}
+    </div>
   );
 }

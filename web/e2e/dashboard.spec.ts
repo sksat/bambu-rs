@@ -164,10 +164,21 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("toast")).toContainText("verified");
   });
 
-  test("camera panel is absent when no camera is configured", async ({ page }) => {
-    // Fake mode runs without --camera-url, so /api/camera reports unavailable
-    // and the section renders nothing.
-    await expect(page.getByTestId("camera")).toHaveCount(0);
+  test("cameras panel shows the empty state and no live view in fake mode", async ({ page }) => {
+    // Fake mode has no built-in camera and no external URLs, so the cameras panel
+    // shows its empty state and renders no live view.
+    await expect(page.getByTestId("cameras")).toBeVisible();
+    await expect(page.getByTestId("cameras-empty")).toBeVisible();
+    await expect(page.getByTestId("camera-view")).toHaveCount(0);
+  });
+
+  test("cameras manage form lets you add an external camera row", async ({ page }) => {
+    // Open the manage form and add a row — purely client-side (no save), so it
+    // doesn't mutate the shared fake server that the other tests rely on.
+    await page.getByTestId("cameras-manage").click();
+    await expect(page.getByTestId("cameras-form")).toBeVisible();
+    await page.getByTestId("camera-add").click();
+    await expect(page.getByTestId("camera-url-0")).toBeVisible();
   });
 
   test("renders on a phone viewport", async ({ page }) => {

@@ -9,6 +9,7 @@
 pub mod api;
 #[cfg(feature = "dashboard")]
 pub mod assets;
+pub mod camera;
 pub mod control;
 pub mod files;
 pub mod live;
@@ -19,6 +20,7 @@ use std::time::Duration;
 
 use crate::config::ResolvedTarget;
 pub use api::{AppState, FakeSource, PrinterSource};
+pub use camera::{CameraSource, ExternalCamera, LiveCamera, NoCamera};
 pub use control::{Controller, FakeController, LiveController};
 pub use files::{FakeFiles, FileStore, LiveFiles};
 pub use live::LiveSource;
@@ -36,11 +38,11 @@ pub struct ServeOpts {
     /// Serve deterministic fake data instead of talking to a printer.
     pub fake: bool,
     pub interval: Option<Duration>,
-    pub camera_rtsp: Option<String>,
-    /// External IP-camera snapshot URL (single-JPEG-per-GET). When set, the
-    /// server proxies it via `/api/camera/snapshot` so a browser that can't reach
-    /// the LAN cam (e.g. over Tailscale) still gets a live view.
-    pub camera_url: Option<String>,
+    /// External IP cameras to seed at launch (each a single-JPEG-per-GET URL with
+    /// a label). The server proxies them via `/api/cameras/{id}/snapshot` so a
+    /// browser that can't reach the LAN cam (e.g. over Tailscale) still gets a live
+    /// view; the dashboard can add/remove more at runtime.
+    pub external_cameras: Vec<ExternalCamera>,
 }
 
 /// Run the server (blocking; owns its own multi-thread runtime).
@@ -54,9 +56,9 @@ pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<
         password,
         fake,
         interval,
-        camera_rtsp: _,
-        camera_url,
+        external_cameras,
     } = opts;
+    let external_cameras = Arc::new(std::sync::RwLock::new(external_cameras));
     rt.block_on(async move {
         // Live mode bridges the real MQTT monitor (and controls the real device);
         // otherwise serve a ramping fake so the UI still has moving data.
@@ -67,10 +69,11 @@ pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<
                     source: Arc::new(LiveSource::connect(t.clone(), interval)),
                     controller: Arc::new(LiveController::new(t.clone())),
                     files: Arc::new(LiveFiles::new(t.clone())),
-                    starter: Arc::new(LiveStarter::new(t)),
+                    starter: Arc::new(LiveStarter::new(t.clone())),
                     password,
                     start_lock: Arc::new(tokio::sync::Mutex::new(())),
-                    camera_url,
+                    external_cameras: external_cameras.clone(),
+                    internal_camera: Arc::new(LiveCamera::new(t)),
                 }
             }
             _ => {
@@ -87,7 +90,8 @@ pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<
                     starter: Arc::new(FakeStarter),
                     password,
                     start_lock: Arc::new(tokio::sync::Mutex::new(())),
-                    camera_url,
+                    external_cameras,
+                    internal_camera: Arc::new(NoCamera),
                 }
             }
         };

@@ -194,15 +194,13 @@ enum Command {
         /// Poll the printer every N seconds for live updates (default: passive).
         #[arg(long)]
         interval: Option<u64>,
-        /// External RTSP camera URL to bridge to the browser.
-        #[arg(long)]
-        camera_rtsp: Option<String>,
-        /// External IP-camera snapshot URL (single JPEG per GET, e.g. an ATOM Cam
-        /// `http://HOST/cgi-bin/get_jpeg.cgi`). The server proxies it so a browser
-        /// that can't reach the LAN cam still gets a live view. May also be set via
-        /// $BAMBU_CAMERA_URL.
-        #[arg(long, env = "BAMBU_CAMERA_URL")]
-        camera_url: Option<String>,
+        /// External IP-camera snapshot URL(s) the dashboard proxies (single JPEG
+        /// per GET, e.g. an ATOM Cam `http://HOST/cgi-bin/get_jpeg.cgi`). Repeat the
+        /// flag for multiple cameras, optionally labelling each as `label=url`. The
+        /// dashboard shows them as tabs and can add/remove more at runtime. May also
+        /// be set via $BAMBU_CAMERA_URL (comma-separated).
+        #[arg(long, env = "BAMBU_CAMERA_URL", value_delimiter = ',')]
+        camera_url: Vec<String>,
     },
 }
 
@@ -605,7 +603,6 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             password,
             fake,
             interval,
-            camera_rtsp,
             camera_url,
         } => run_serve(
             cli,
@@ -614,7 +611,6 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             password.clone(),
             *fake,
             *interval,
-            camera_rtsp.clone(),
             camera_url.clone(),
         ),
     }
@@ -1184,8 +1180,7 @@ fn run_serve(
     password: Option<String>,
     fake: bool,
     interval: Option<u64>,
-    camera_rtsp: Option<String>,
-    camera_url: Option<String>,
+    camera_url: Vec<String>,
 ) -> Result<(), CliError> {
     // Live mode needs a connection target; fake mode doesn't touch the printer.
     let target = if fake {
@@ -1193,14 +1188,23 @@ fn run_serve(
     } else {
         Some(resolve_target(cli)?)
     };
+    // Parse each `--camera-url` entry (`label=url` or a bare `url`) into a labelled
+    // external camera, dropping blanks; the post-filter index gives stable
+    // sequential auto-labels (external 1, external 2, …).
+    let external_cameras = camera_url
+        .iter()
+        .map(|e| e.trim())
+        .filter(|e| !e.is_empty())
+        .enumerate()
+        .filter_map(|(i, e)| crate::server::ExternalCamera::parse(e, i))
+        .collect();
     let opts = crate::server::ServeOpts {
         host: host.to_string(),
         port,
         password,
         fake,
         interval: interval.map(Duration::from_secs),
-        camera_rtsp,
-        camera_url,
+        external_cameras,
     };
     crate::server::serve(target, opts).map_err(|e| CliError::new(exit::GENERAL, e.to_string()))
 }

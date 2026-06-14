@@ -5,7 +5,7 @@
   --bg: #0a0b0d;
   --fg: #d7dae0;
   --dim: #6b7079;
-  --hair: #ffffff14;
+  --hair: #ffffff2e;
   --hair-2: #ffffff0a;
   --ring: #ffffff40; /* spool edge — stronger than --hair so near-black/white filament stays visible */
   --accent: #d8a657; /* amber readout */
@@ -24,7 +24,7 @@
   --bg: #faf9f7;
   --fg: #21242b;
   --dim: #7a7f88;
-  --hair: #00000014;
+  --hair: #0000002e;
   --hair-2: #0000000a;
   --ring: #00000040;
   --accent: #b4801f;
@@ -35,7 +35,7 @@
     --bg: #faf9f7;
     --fg: #21242b;
     --dim: #7a7f88;
-    --hair: #00000014;
+    --hair: #0000002e;
     --hair-2: #0000000a;
     --ring: #00000040;
     --accent: #b4801f;
@@ -65,27 +65,55 @@ body {
     max(1.25rem, env(safe-area-inset-bottom));
 }
 
-/* Resolution-flexible layout: one phone column, then explicit column counts so
-   wide/4K screens fill with MORE columns (not stretched strips). Capped at 4. */
-.grid {
-  display: grid;
+/* Monitoring-first layout: a vertical stack of rows. The hero row pairs the
+   camera(s) with the vital readouts; the ops row pairs controls with the machine
+   panel; files/health/footer span the full width. On a phone everything
+   collapses to one column with the vitals first (you glance at state, not video,
+   on a small screen). */
+.dash {
+  display: flex;
+  flex-direction: column;
   gap: 0.85rem;
-  grid-template-columns: 1fr;
-  align-items: start;
 }
-@media (min-width: 760px) {
-  .grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+.dash__hero,
+.dash__ops {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+.dash__vitals,
+.dash__cams {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  min-width: 0;
+}
+/* No camera configured ⇒ the container is empty ⇒ don't reserve a column. */
+.dash__cams:empty {
+  display: none;
+}
+@media (min-width: 900px) {
+  .dash__hero {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: start;
   }
-}
-@media (min-width: 1280px) {
-  .grid {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+  /* Camera leads (monitoring-first) and takes the larger share of the row. */
+  .dash__cams {
+    order: -1;
+    flex: 1.5 1 440px;
   }
-}
-@media (min-width: 1800px) {
-  .grid {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+  .dash__vitals {
+    flex: 1 1 360px;
+  }
+  .dash__ops {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: start;
+  }
+  .dash__ops > * {
+    flex: 1 1 340px;
+    min-width: 0;
   }
 }
 @media (min-width: 2600px) {
@@ -930,16 +958,182 @@ body {
   margin-top: 0.55rem;
 }
 
-/* ── external camera (server-proxied IP cam) ─────────────────────────────── */
+/* ── cameras (built-in over TCP:6000 + external server-proxied IP cam) ────── */
+.cam__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.cam__manage {
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--dim);
+  background: none;
+  border: 1px solid var(--hair);
+  border-radius: 6px;
+  padding: 0.22rem 0.6rem;
+  cursor: pointer;
+}
+.cam__manage:hover {
+  border-color: var(--ring);
+}
+/* tabs: browser-style — rounded tops sitting on a baseline, with the active tab
+   raised and merging into the camera view below it. */
+.cam__tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  margin-top: 0.6rem;
+  align-items: flex-end;
+  border-bottom: 1px solid var(--ring);
+}
+.cam__tab {
+  font-size: 0.84rem;
+  color: var(--dim);
+  background: var(--hair-2);
+  border: 1px solid var(--ring);
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
+  padding: 0.36rem 0.9rem;
+  margin-bottom: -1px; /* overlap the strip baseline so the active tab can cut it */
+  line-height: 1.2;
+  cursor: pointer;
+}
+.cam__tab:hover {
+  color: var(--fg);
+}
+.cam__tab--on,
+.cam__tab--on:hover {
+  color: var(--fg);
+  font-weight: 600;
+  background: var(--bg); /* match the view below so the tab "opens" into it */
+  border-color: var(--ring);
+  border-bottom: 1px solid var(--bg); /* punch through the baseline under the active tab */
+}
+/* the active view connects directly under the tab strip (no gap, square top), and
+   shares the stronger border so the whole tab→view outline reads as one shape */
+.cam__tabs + .cam__frame {
+  margin-top: 0;
+}
+.cam__tabs + .cam__frame .cam__view {
+  border-color: var(--ring);
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+.cam__empty {
+  margin-top: 0.55rem;
+  font-size: 0.72rem;
+  color: var(--dim);
+}
+.cam__frame {
+  position: relative;
+  margin-top: 0.55rem;
+}
 .cam__view {
   display: block;
   width: 100%;
-  margin-top: 0.55rem;
   aspect-ratio: 16 / 9;
   object-fit: contain;
   background: var(--hair-2);
   border: 1px solid var(--hair);
   border-radius: 8px;
+}
+/* A configured-but-not-streaming source (e.g. the A1 built-in cam is off): hide
+   the broken frame and show a quiet message instead. */
+.cam__view--off {
+  opacity: 0;
+}
+.cam__msg {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.7rem;
+  color: var(--dim);
+  pointer-events: none;
+}
+/* manage form: add/remove external cameras at runtime */
+.cam__form {
+  margin-top: 0.55rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.cam__row {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+}
+.cam__row--actions {
+  justify-content: space-between;
+  margin-top: 0.2rem;
+}
+.cam__in {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 0.72rem;
+  padding: 0.25rem 0.4rem;
+  color: var(--fg);
+  background: var(--hair-2);
+  border: 1px solid var(--hair);
+  border-radius: 6px;
+}
+.cam__in--label {
+  flex: 0 0 5.5rem;
+}
+.cam__rm,
+.cam__btn {
+  font-size: 0.7rem;
+  color: var(--dim);
+  background: var(--hair-2);
+  border: 1px solid var(--hair);
+  border-radius: 6px;
+  padding: 0.2rem 0.5rem;
+  cursor: pointer;
+}
+.cam__btn--save {
+  color: var(--fg);
+  border-color: var(--accent);
+}
+.cam__status {
+  font-size: 0.68rem;
+  color: var(--dim);
+}
+.cam__hint {
+  margin: 0;
+  font-size: 0.68rem;
+  line-height: 1.45;
+  color: var(--dim);
+}
+.cam__hint code {
+  font-size: 0.66rem;
+  color: var(--fg);
+}
+.cam__hint--empty {
+  padding: 0.1rem 0;
+}
+.cam__row--head {
+  margin-top: 0.1rem;
+}
+.cam__col {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.cam__col--label {
+  flex: 0 0 5.5rem;
+}
+.cam__col--rm {
+  flex: 0 0 1.7rem;
+}
+.cam__row--head .cam__col,
+.cam__row--head .cam__col--label {
+  font-size: 0.56rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
 }
 
 /* ── thumbnails (embedded plate preview) ─────────────────────────────────── */
