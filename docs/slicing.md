@@ -109,6 +109,15 @@ bambu timelapse capture --out-dir ./tl -- \
   curl -s -m15 -o {frame} "http://$ATOMCAM_HOST/cgi-bin/get_jpeg.cgi"
 ```
 
+`timelapse capture` is layer-synced (one frame per `layer_num`), so run it **with
+the print** either way — each opens its own MQTT connection (unique `client_id`),
+and this A1 mini happily holds several at once:
+
+- **Sequential:** `job start … --confirm` (returns once the print is verified
+  started), then `timelapse capture …`.
+- **Concurrent:** `job start … --confirm --watch` in one shell and
+  `timelapse capture …` in another — both run at the same time.
+
 ## Sources
 - [Bambu Studio CLI Reference (Printago)](https://printago.io/blog/bambu-studio-cli-reference)
 - [Using OrcaSlicer in CLI mode (OrcaSlicer discussion #8593)](https://github.com/OrcaSlicer/OrcaSlicer/discussions/8593)

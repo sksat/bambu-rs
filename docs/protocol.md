@@ -32,6 +32,24 @@ stdlib only, read-only. Scrubbed fixtures live in `tests/fixtures/`.
 - **Camera:** A1/P1 use a proprietary JPEG stream on TCP 6000; X1/X1E/H2D use
   RTSP over TLS on 322. **[spec]**
 
+### Concurrent MQTT connections — the "1-connection limit" did NOT reproduce
+
+The A1/P1 are widely said to allow only **one** LAN MQTT client (a 2nd connection
+kicks the 1st — the HA-vs-Studio churn). On **this A1 mini (fw 01.07.02.00) it did
+not reproduce**: two simultaneous TLS-MQTT connections both stayed up and both
+received the `pushall` + deltas for the test window (~17 s), with **distinct and
+even identical** `client_id`s — so this broker enforces neither a 1-connection
+limit nor client-id uniqueness. Two concurrent `bambu status` also both succeed.
+**[observed]**
+
+Caveat (scope of the test): 2 connections, read-only (subscribe + pushall),
+~17 s — untested at 3+ connections, past the 60 s keep-alive, or under control
+load. We still **connect-per-op** (a short connection per command — simple and
+safe regardless) but use a **unique `client_id` per connection**
+(`bambu-rs-<pid>-<n>`) so concurrent ops (e.g. `job start --watch` +
+`timelapse capture`) never collide. So timelapse capture works **either**
+sequentially (start the print, then capture) **or** concurrently with a watch.
+
 ## Access modes (decides what works)
 
 | Printer setting | LAN MQTT :8883 | reads | control (writes) |

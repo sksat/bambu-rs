@@ -59,6 +59,25 @@ pub enum WatchStep {
     Stop,
 }
 
+/// A per-connection-unique MQTT client id, `bambu-rs-<pid>-<n>`.
+///
+/// MQTT brokers normally disconnect an existing client when a new one connects
+/// with the **same** client id, so a fixed id would make two concurrent bambu-rs
+/// connections (e.g. `job start --watch` + `timelapse capture`) fight. The pid
+/// distinguishes processes; the atomic counter distinguishes connections within a
+/// process. (Observed: this A1 mini's broker happens *not* to enforce client-id
+/// uniqueness or a 1-connection limit — two connections coexist — but a unique id
+/// is the correct, portable behaviour regardless. See `docs/protocol.md`.)
+fn unique_client_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "bambu-rs-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// The report topic for a serial: `device/{serial}/report`.
 pub fn report_topic(serial: &str) -> String {
     format!("device/{serial}/report")
@@ -90,7 +109,7 @@ impl LanMqttClient {
 
     /// Connect, subscribe to the report topic, and request a `pushall`.
     async fn connect(&self) -> Result<(AsyncClient, EventLoop), ClientError> {
-        let mut opts = MqttOptions::new("bambu-rs", &self.target.ip, MQTT_PORT);
+        let mut opts = MqttOptions::new(unique_client_id(), &self.target.ip, MQTT_PORT);
         opts.set_credentials(MQTT_USER, &self.target.access_code);
         opts.set_keep_alive(Duration::from_secs(30));
         opts.set_transport(Transport::Tls(tls_config()?));
@@ -548,5 +567,13 @@ mod tests {
     #[test]
     fn tls_config_builds() {
         assert!(tls_config().is_ok());
+    }
+
+    #[test]
+    fn client_ids_are_unique_per_connection() {
+        let a = unique_client_id();
+        let b = unique_client_id();
+        assert!(a.starts_with("bambu-rs-"));
+        assert_ne!(a, b); // distinct ids so concurrent connections don't collide
     }
 }
