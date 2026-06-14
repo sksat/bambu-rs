@@ -4,6 +4,7 @@
 //! (password-gated). Both are blocking — call from `spawn_blocking`.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Mutex;
 
 use crate::config::ResolvedTarget;
@@ -14,7 +15,8 @@ use crate::ftp::{FileEntry, FtpsClient};
 pub trait FileStore: Send + Sync {
     /// List a directory (with dir/size info).
     fn list(&self, dir: &str) -> Result<Vec<FileEntry>, String>;
-    fn upload(&self, remote_path: &str, bytes: Vec<u8>) -> Result<(), String>;
+    /// Upload the already-staged `local` file to `remote_path`.
+    fn upload(&self, remote_path: &str, local: &Path) -> Result<(), String>;
     /// The embedded plate preview PNG for a sliced `.3mf` (`Metadata/plate_N.png`),
     /// or `None` when the file has no such thumbnail.
     fn thumbnail(&self, remote_path: &str, plate: u32) -> Result<Option<Vec<u8>>, String>;
@@ -66,16 +68,9 @@ impl FileStore for LiveFiles {
             .map_err(|e| e.to_string())
     }
 
-    fn upload(&self, remote_path: &str, bytes: Vec<u8>) -> Result<(), String> {
-        // FtpsClient uploads from a path (atomic .part rename), so stage the bytes
-        // in a temp file first.
-        let tmp = tempfile::Builder::new()
-            .prefix("bambu-upload-")
-            .tempfile()
-            .map_err(|e| e.to_string())?;
-        std::fs::write(tmp.path(), &bytes).map_err(|e| e.to_string())?;
+    fn upload(&self, remote_path: &str, local: &Path) -> Result<(), String> {
         FtpsClient::new(self.target.clone())
-            .upload(tmp.path(), remote_path)
+            .upload(local, remote_path)
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
@@ -127,7 +122,7 @@ impl FileStore for FakeFiles {
             entry("benchy_2c.3mf", false, 256_000),
         ])
     }
-    fn upload(&self, _remote_path: &str, _bytes: Vec<u8>) -> Result<(), String> {
+    fn upload(&self, _remote_path: &str, _local: &Path) -> Result<(), String> {
         Ok(())
     }
     fn thumbnail(&self, _remote_path: &str, _plate: u32) -> Result<Option<Vec<u8>>, String> {

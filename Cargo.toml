@@ -36,10 +36,13 @@ server = [
     "dep:axum-extra",
     "dep:tower",
     "dep:tower-http",
+    "dep:futures-util",
     "tokio/rt-multi-thread",
     "tokio/sync",
     "tokio/net",
     "tokio/process",
+    "tokio/fs",
+    "tokio/io-util",
 ]
 # The embedded web dashboard SPA, served by `bambu serve` when enabled. Builds on
 # the API server and embeds `web/dist/` via rust-embed.
@@ -51,6 +54,7 @@ anyhow = "1.0.102"
 axum = { version = "0.8.9", features = ["ws"], optional = true }
 axum-extra = { version = "0.12.6", features = ["typed-header"], optional = true }
 clap = { version = "4.6.1", features = ["derive", "env"], optional = true }
+futures-util = { version = "0.3.31", default-features = false, optional = true }
 md-5 = "0.11.0"
 native-tls = "0.2.18"
 rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls"] }

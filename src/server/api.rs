@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::{
@@ -23,8 +23,10 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
 
 #[cfg(feature = "dashboard")]
@@ -281,12 +283,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/light", post(light))
         .route("/api/speed", post(speed))
         .route("/api/gcode", post(gcode))
-        // Uploads can be large (sliced 3mf); raise the body cap from the 2 MB
-        // default, but bound it — the body is buffered in memory. (Streaming
-        // straight to a temp file is a follow-up.)
+        // Uploads stream to a temp file, so the cap bounds disk, not memory.
         .route(
             "/api/files/upload",
-            post(upload_file).layer(DefaultBodyLimit::max(128 * 1024 * 1024)),
+            post(upload_file).layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -601,12 +601,13 @@ struct UploadQuery {
     name: String,
 }
 
-/// Upload a file to the printer (write). The body is the raw file bytes;
-/// `?name=` is the filename and `?dir=` the destination (default `/`).
+/// Upload a file to the printer (write). The body is streamed straight to a temp
+/// file (not buffered in memory), then handed to the FTPS upload. `?name=` is the
+/// filename and `?dir=` the destination (default `/`).
 async fn upload_file(
     State(st): State<AppState>,
     Query(q): Query<UploadQuery>,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     // Reject path-traversal / nested names — `name` is a single filename.
     if q.name.is_empty() || q.name.contains('/') || q.name.contains('\\') || q.name.contains("..") {
@@ -618,18 +619,50 @@ async fn upload_file(
         return bad_request(format!("invalid dir {dir:?}"));
     }
     let remote = format!("{}/{}", dir.trim_end_matches('/'), q.name);
+
+    // Stream the request body to a temp file.
+    let tmp = match tempfile::Builder::new().prefix("bambu-upload-").tempfile() {
+        Ok(t) => t,
+        Err(e) => return server_error(e.to_string()),
+    };
+    {
+        let mut file = match tokio::fs::File::create(tmp.path()).await {
+            Ok(f) => f,
+            Err(e) => return server_error(e.to_string()),
+        };
+        let mut stream = body.into_data_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(_) => return bad_request("upload stream error".to_string()),
+            };
+            if file.write_all(&chunk).await.is_err() {
+                return server_error("writing upload".to_string());
+            }
+        }
+        if file.flush().await.is_err() {
+            return server_error("flushing upload".to_string());
+        }
+    }
+
     let name = q.name.clone();
+    let path = tmp.path().to_path_buf();
     let files = st.files.clone();
-    let bytes = body.to_vec();
-    match tokio::task::spawn_blocking(move || files.upload(&remote, bytes)).await {
+    let res = tokio::task::spawn_blocking(move || files.upload(&remote, &path)).await;
+    drop(tmp); // remove the staged file after the upload completes
+    match res {
         Ok(Ok(())) => Json(json!({ "uploaded": name })).into_response(),
         Ok(Err(e)) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "upload task failed" })),
-        )
-            .into_response(),
+        Err(_) => server_error("upload task failed".to_string()),
     }
+}
+
+fn server_error(msg: String) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": msg })),
+    )
+        .into_response()
 }
 
 /// Upgrade to a WebSocket that pushes a `PrinterStatus` JSON frame on connect and

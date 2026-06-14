@@ -262,6 +262,7 @@ dependencies = [
  "axum-extra",
  "axum-test",
  "clap",
+ "futures-util",
  "md-5",
  "native-tls",
  "predicates",
