@@ -6,9 +6,14 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::config::ResolvedTarget;
 use crate::ftp::{FileEntry, FtpsClient};
+
+/// How long a directory listing stays fresh before re-fetching over FTPS. Bounds
+/// the per-poll FTPS connect load (the UI auto-refreshes); writes invalidate it.
+const LIST_TTL: Duration = Duration::from_secs(6);
 
 /// Something that can list and upload files on the printer, and fetch the plate
 /// preview embedded in a sliced `.3mf`.
@@ -55,6 +60,9 @@ pub struct LiveFiles {
     /// downloading the whole `.3mf` over FTPS, so cache it — otherwise repeated
     /// list renders re-download every file and thumbnails flicker / time out.
     thumb_cache: Mutex<HashMap<String, Option<Vec<u8>>>>,
+    /// Short-TTL cache of directory listings (key = dir), to bound FTPS connects
+    /// under the UI's auto-refresh.
+    list_cache: Mutex<HashMap<String, (Instant, Vec<FileEntry>)>>,
 }
 
 impl LiveFiles {
@@ -62,22 +70,44 @@ impl LiveFiles {
         Self {
             target,
             thumb_cache: Mutex::new(HashMap::new()),
+            list_cache: Mutex::new(HashMap::new()),
         }
     }
 }
 
 impl FileStore for LiveFiles {
     fn list(&self, dir: &str) -> Result<Vec<FileEntry>, String> {
-        FtpsClient::new(self.target.clone())
+        if let Some((at, entries)) = self
+            .list_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(dir)
+            && at.elapsed() < LIST_TTL
+        {
+            return Ok(entries.clone());
+        }
+        let entries = FtpsClient::new(self.target.clone())
             .list_entries(dir)
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        let mut cache = self.list_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(dir.to_string(), (Instant::now(), entries.clone()));
+        Ok(entries)
     }
 
     fn upload(&self, remote_path: &str, local: &Path) -> Result<(), String> {
         FtpsClient::new(self.target.clone())
             .upload(local, remote_path)
             .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        // The directory changed — drop cached listings so the new file shows.
+        self.list_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        Ok(())
     }
 
     fn thumbnail(&self, remote_path: &str, plate: u32) -> Result<Option<Vec<u8>>, String> {
