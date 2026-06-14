@@ -115,8 +115,9 @@ body {
     flex: 1 1 320px;
   }
 }
-/* machine/motion controls folded into the controls panel — set off by a rule */
-.machine {
+/* sub-sections folded into the controls panel (machine, AMS) — each set off by a
+   rule so the one panel still reads as distinct groups */
+.cfold {
   margin-top: 0.9rem;
   padding-top: 0.9rem;
   border-top: 1px solid var(--hair);
@@ -340,7 +341,24 @@ body {
 /* temperatures */
 .temps {
   display: flex;
-  gap: 2rem;
+  flex-direction: column;
+  gap: 0.7rem;
+}
+/* one tier per metric: value on the left, its own graph filling the rest */
+.temprow {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+}
+.temprow .tr {
+  flex: 0 0 auto;
+  min-width: 5.5rem;
+}
+.temprow .spark {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 40px;
+  margin: 0;
 }
 .tr {
   display: flex;
@@ -409,6 +427,12 @@ body {
 }
 .fan--warn .fan__v {
   color: var(--err);
+}
+.fan__warn {
+  margin-left: 0.3rem;
+  font-size: 0.7rem;
+  color: var(--err);
+  white-space: nowrap;
 }
 
 /* AMS */
@@ -541,19 +565,43 @@ body {
   font-family: var(--mono);
   font-size: 0.74rem;
 }
+/* AMS humidity on a labelled humid↔dry track: the dot's position (and colour)
+   shows where this AMS sits; the end labels carry the direction without colour. */
 .hum {
   display: inline-flex;
-  gap: 2px;
+  align-items: center;
+  gap: 0.55rem;
+  font-size: 0.8rem;
+  color: var(--dim);
 }
-.hum__seg {
-  width: 7px;
-  height: 11px;
-  border: 1px solid var(--hair);
-  border-radius: 1px;
+.hum__end {
+  white-space: nowrap;
 }
-.hum__seg.on {
+.hum__track {
+  position: relative;
+  width: 8rem;
+  height: 4px;
+  background: var(--hair);
+  border-radius: 3px;
+}
+.hum__dot {
+  position: absolute;
+  top: 50%;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
   background: var(--accent);
-  border-color: var(--accent);
+  border: 1.5px solid var(--bg);
+}
+.hum--ok .hum__dot {
+  background: var(--ok);
+}
+.hum--warn .hum__dot {
+  background: var(--warn);
+}
+.hum--err .hum__dot {
+  background: var(--err);
 }
 
 /* health / alerts */
@@ -580,6 +628,31 @@ body {
 }
 .arow.sev-3 {
   border-left-color: var(--accent);
+}
+/* severity badge: a colour-independent level cue (text), tinted to match the
+   border. The number distinguishes sev-2 from sev-3, which share an amber hue. */
+.sev-tag {
+  font-size: 0.56rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 0.05rem 0.4rem;
+  border: 1px solid var(--hair);
+  border-radius: 999px;
+  color: var(--dim);
+  white-space: nowrap;
+}
+.sev-1 .sev-tag,
+.sev-tag--err {
+  color: var(--err);
+  border-color: var(--err);
+}
+.sev-2 .sev-tag {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+.sev-3 .sev-tag {
+  color: var(--accent);
+  border-color: var(--accent);
 }
 .acode {
   font-family: var(--mono);
@@ -729,6 +802,20 @@ body {
 }
 .toast--err {
   border-color: color-mix(in srgb, var(--err) 55%, transparent);
+  color: var(--err);
+}
+/* CUD: the leading glyph (✓ / ⚠ / ✕) carries the kind by shape; colour reinforces */
+.toast__icon {
+  margin-right: 0.4rem;
+  font-weight: 700;
+}
+.toast--ok .toast__icon {
+  color: var(--ok);
+}
+.toast--warn .toast__icon {
+  color: var(--warn);
+}
+.toast--err .toast__icon {
   color: var(--err);
 }
 

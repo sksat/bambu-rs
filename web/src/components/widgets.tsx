@@ -46,12 +46,30 @@ export function Bar({ pct, prep, running }: { pct: number; prep?: boolean; runni
   );
 }
 
-export function Humidity({ level }: { level: number }) {
+// The AMS reports a coarse 1–5 level on the wire field `humidity`, but a HIGHER
+// number means DRIER (verified against this device: level 5 with raw 0 = dry; the
+// upstream field name reads backwards). A bare bar didn't convey which way is good,
+// so show it on a labelled humid↔dry track: the dot sits toward "dry" when the
+// level is high. The end labels + position convey the meaning without relying on
+// colour (CUD); colour just reinforces (dry end green, humid end red).
+const DRY_WORD: Record<number, string> = { 5: "dry", 4: "good", 3: "fair", 2: "damp", 1: "wet" };
+
+export function Humidity({ level, raw }: { level: number; raw?: number | null }) {
+  const word = DRY_WORD[level] ?? `${level}/5`;
+  const tone = level >= 4 ? "ok" : level === 3 ? "warn" : "err";
+  // Position on a humid(left)↔dry(right) track: level 1 → 0%, level 5 → 100%.
+  const pct = ((Math.min(5, Math.max(1, level)) - 1) / 4) * 100;
   return (
-    <span className="hum" aria-label={`humidity ${level} of 5`}>
-      {[1, 2, 3, 4, 5].map((i) => (
-        <i key={i} className={`hum__seg${i <= level ? " on" : ""}`} />
-      ))}
+    <span
+      className={`hum hum--${tone}`}
+      aria-label={`humidity ${level} of 5 (${word})`}
+      title={`humidity ${level}/5 (${word})${raw != null ? ` · raw ${raw}` : ""} — higher is drier`}
+    >
+      <span className="hum__end">humid</span>
+      <span className="hum__track" aria-hidden="true">
+        <span className="hum__dot" style={{ left: `${pct}%` }} />
+      </span>
+      <span className="hum__end">dry</span>
     </span>
   );
 }
@@ -120,31 +138,37 @@ export function Tray({ t, ext }: { t: AmsTray; ext?: boolean }) {
   );
 }
 
-export function Sparkline({ history }: { history: TempPoint[] }) {
+// One series per chart: the nozzle and bed each get their own value+graph tier,
+// so the section reads by meaning (per metric), not "values" then "a graph".
+export function Sparkline({ history, metric }: { history: TempPoint[]; metric: "nozzle" | "bed" }) {
   const W = 600;
-  const H = 56;
+  const H = 40;
   const pad = 3;
-  const all = history.flatMap((p) => [p.nozzle, p.bed]).filter((v): v is number => v != null);
-  if (history.length < 2 || all.length === 0) {
-    return <div className="spark spark--empty" data-testid="spark" />;
+  const sel = (p: TempPoint) => (metric === "nozzle" ? p.nozzle : p.bed);
+  const vals = history.map(sel).filter((v): v is number => v != null);
+  if (history.length < 2 || vals.length === 0) {
+    return <div className="spark spark--empty" data-testid={`spark-${metric}`} />;
   }
-  const min = Math.min(...all);
-  const max = Math.max(...all);
+  const min = Math.min(...vals);
+  const max = Math.max(...vals);
   const range = Math.max(1, max - min);
   const x = (i: number) => pad + (i / (history.length - 1)) * (W - 2 * pad);
   const y = (v: number) => pad + (1 - (v - min) / range) * (H - 2 * pad);
-  const line = (sel: (p: TempPoint) => number | null) =>
-    history
-      .map((p, i) => {
-        const v = sel(p);
-        return v == null ? null : `${x(i).toFixed(1)},${y(v).toFixed(1)}`;
-      })
-      .filter(Boolean)
-      .join(" ");
+  const points = history
+    .map((p, i) => {
+      const v = sel(p);
+      return v == null ? null : `${x(i).toFixed(1)},${y(v).toFixed(1)}`;
+    })
+    .filter(Boolean)
+    .join(" ");
   return (
-    <svg className="spark" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" data-testid="spark">
-      <polyline className="spark__bed" points={line((p) => p.bed)} />
-      <polyline className="spark__nozzle" points={line((p) => p.nozzle)} />
+    <svg
+      className="spark"
+      viewBox={`0 0 ${W} ${H}`}
+      preserveAspectRatio="none"
+      data-testid={`spark-${metric}`}
+    >
+      <polyline className={`spark__${metric}`} points={points} />
     </svg>
   );
 }

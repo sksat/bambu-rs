@@ -28,13 +28,12 @@ export function App() {
               readouts; controls + machine sit below; files and health span full
               width. On a phone it all collapses to one column (vitals first). */}
           <main className="dash">
-            {/* Big status + AMS readout band across the top. */}
+            {/* Big status band across the top. */}
             <section className="dash__status">
               <JobSection s={status} />
-              {status.ams && <AmsSection ams={status.ams} />}
             </section>
             {/* Left: camera(s) with temperatures beneath. Right: one controls
-                section (job controls + machine/motion folded in). Stacks to a
+                section with the machine/motion and AMS folded in. Stacks to a
                 single column on a phone. */}
             <section className="dash__hero">
               <div className="dash__left">
@@ -44,6 +43,7 @@ export function App() {
               <div className="dash__control">
                 <Controls control={control} status={status}>
                   <MachineSection s={status} control={control} />
+                  {status.ams && <AmsSection ams={status.ams} />}
                 </Controls>
               </div>
             </section>
@@ -59,6 +59,11 @@ export function App() {
       )}
       {control.toast && (
         <div className={`toast toast--${control.toast.kind}`} data-testid="toast">
+          {/* CUD: kind is shown by a shape (✓ / ⚠ / ✕), not just the border
+              colour, so ok and warn don't blur together for colour-blind users. */}
+          <span className="toast__icon" aria-hidden="true">
+            {control.toast.kind === "ok" ? "✓" : control.toast.kind === "warn" ? "⚠" : "✕"}
+          </span>
           {control.toast.msg}
         </div>
       )}

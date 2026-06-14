@@ -6,7 +6,7 @@ export function AmsSection({ ams }: { ams: Ams }) {
   const active = ams.active_tray;
   const swapping = active != null && ams.target_tray != null && active !== ams.target_tray;
   return (
-    <section className="panel">
+    <div className="cfold" data-testid="ams">
       <div className="secline">
         <span className="lbl">ams</span>
         {swapping ? (
@@ -33,12 +33,12 @@ export function AmsSection({ ams }: { ams: Ams }) {
           {u.humidity != null && (
             <div className="amsmeta">
               <span className="lbl">humidity</span>
-              <Humidity level={u.humidity} />
+              <Humidity level={u.humidity} raw={u.humidity_raw} />
               {u.temp ? <span className="dim"> {u.temp.toFixed(0)}°C</span> : null}
             </div>
           )}
         </div>
       ))}
-    </section>
+    </div>
   );
 }
