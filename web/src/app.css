@@ -790,3 +790,36 @@ body {
 .btn--go:hover {
   border-color: var(--ok);
 }
+
+/* ── 3D viewer ───────────────────────────────────────────────────────────── */
+.modal__box--viewer {
+  max-width: min(92vw, 880px);
+  width: 100%;
+}
+.viewer__head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.6rem;
+}
+.viewer__name {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  word-break: break-all;
+}
+.viewer__close {
+  margin-left: auto;
+}
+.viewer__canvas {
+  width: 100%;
+  height: min(64vh, 560px);
+  border: 1px solid var(--hair);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #111317;
+}
+.viewer__status {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  margin-top: 0.5rem;
+}

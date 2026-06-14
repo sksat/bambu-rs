@@ -55,6 +55,14 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("thumb").first()).toBeVisible();
   });
 
+  test("3D button opens the viewer", async ({ page }) => {
+    await page.getByTestId("view3d").first().click();
+    await expect(page.getByTestId("viewer")).toBeVisible();
+    await expect(page.getByTestId("viewer-canvas")).toBeVisible();
+    await page.getByRole("button", { name: "close" }).click();
+    await expect(page.getByTestId("viewer")).toHaveCount(0);
+  });
+
   test("has a GitHub repo link", async ({ page }) => {
     await expect(page.getByTestId("github")).toHaveAttribute("href", /github\.com/);
   });

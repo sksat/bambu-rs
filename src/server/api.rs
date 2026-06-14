@@ -274,7 +274,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/status", get(status))
         .route("/api/ws", get(status_ws))
         .route("/api/files", get(list_files))
-        .route("/api/files/thumbnail", get(file_thumbnail));
+        .route("/api/files/thumbnail", get(file_thumbnail))
+        .route("/api/files/raw", get(file_raw));
     let writes = Router::new()
         .route("/api/job/pause", post(job_pause))
         .route("/api/job/resume", post(job_resume))
@@ -592,6 +593,36 @@ async fn file_thumbnail(State(st): State<AppState>, Query(q): Query<ThumbQuery>)
             Json(json!({ "error": "thumbnail task failed" })),
         )
             .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct RawQuery {
+    name: String,
+}
+
+/// Serve a `.3mf`/`.gcode`'s raw bytes for the 3D viewer (open read). Restricted
+/// to those extensions at a safe path; size-capped in [`FileStore::fetch`].
+async fn file_raw(State(st): State<AppState>, Query(q): Query<RawQuery>) -> Response {
+    let remote = if q.name.starts_with('/') {
+        q.name.clone()
+    } else {
+        format!("/{}", q.name)
+    };
+    let lower = remote.to_ascii_lowercase();
+    if !is_safe_remote_path(&remote) || !(lower.ends_with(".3mf") || lower.ends_with(".gcode")) {
+        return bad_request(format!("viewer needs a .3mf/.gcode path: {:?}", q.name));
+    }
+    let ctype = if lower.ends_with(".gcode") {
+        "text/plain; charset=utf-8"
+    } else {
+        "application/octet-stream"
+    };
+    let files = st.files.clone();
+    match tokio::task::spawn_blocking(move || files.fetch(&remote)).await {
+        Ok(Ok(bytes)) => ([(CONTENT_TYPE, ctype)], bytes).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
+        Err(_) => server_error("fetch task failed".to_string()),
     }
 }
 
@@ -922,6 +953,23 @@ mod tests {
             .await;
         res.assert_status_ok();
         assert_eq!(res.header("content-type"), "image/png");
+    }
+
+    #[tokio::test]
+    async fn raw_serves_3mf_bytes() {
+        let res = app(None, FakeController::verified())
+            .get("/api/files/raw?name=/cache/coin.gcode.3mf")
+            .await;
+        res.assert_status_ok();
+        assert_eq!(res.header("content-type"), "application/octet-stream");
+    }
+
+    #[tokio::test]
+    async fn raw_rejects_other_extensions() {
+        app(None, FakeController::verified())
+            .get("/api/files/raw?name=/secret.txt")
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

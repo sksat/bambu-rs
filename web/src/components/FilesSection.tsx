@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { Thumb } from "./widgets";
+import { Viewer3D } from "./Viewer3D";
 
 interface FileEntry {
   name: string;
@@ -17,6 +18,7 @@ export function FilesSection({ sdcard }: { sdcard?: boolean | null }) {
   const [msg, setMsg] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [printing, setPrinting] = useState<string | null>(null);
+  const [viewing, setViewing] = useState<string | null>(null);
 
   const refresh = useCallback(async (d: string) => {
     try {
@@ -126,13 +128,22 @@ export function FilesSection({ sdcard }: { sdcard?: boolean | null }) {
               <span className="fname">{e.name}</span>
               <span className="fsize dim">{fmtSize(e.size)}</span>
               {printable(e.name) && (
-                <button
-                  className="btn btn--sm"
-                  onClick={() => setPrinting(join(e.name))}
-                  data-testid="print"
-                >
-                  print
-                </button>
+                <>
+                  <button
+                    className="btn btn--sm"
+                    onClick={() => setViewing(join(e.name))}
+                    data-testid="view3d"
+                  >
+                    3D
+                  </button>
+                  <button
+                    className="btn btn--sm"
+                    onClick={() => setPrinting(join(e.name))}
+                    data-testid="print"
+                  >
+                    print
+                  </button>
+                </>
               )}
             </li>
           ),
@@ -140,6 +151,7 @@ export function FilesSection({ sdcard }: { sdcard?: boolean | null }) {
         {sorted.length === 0 && <li className="dim">empty</li>}
       </ul>
       {printing && <StartDialog path={printing} onClose={() => setPrinting(null)} />}
+      {viewing && <Viewer3D path={viewing} onClose={() => setViewing(null)} />}
     </section>
   );
 }

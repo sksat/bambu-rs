@@ -20,7 +20,12 @@ pub trait FileStore: Send + Sync {
     /// The embedded plate preview PNG for a sliced `.3mf` (`Metadata/plate_N.png`),
     /// or `None` when the file has no such thumbnail.
     fn thumbnail(&self, remote_path: &str, plate: u32) -> Result<Option<Vec<u8>>, String>;
+    /// Fetch a file's raw bytes (for the 3D viewer). Capped at [`RAW_MAX`].
+    fn fetch(&self, remote_path: &str) -> Result<Vec<u8>, String>;
 }
+
+/// Cap for [`FileStore::fetch`] — the whole file is buffered for the viewer.
+pub const RAW_MAX: u64 = 64 * 1024 * 1024;
 
 /// Extract `Metadata/plate_{plate}.png` (the slicer's plate preview) from a
 /// `.3mf` (a zip). Returns `None` if the entry is absent/empty.
@@ -103,6 +108,21 @@ impl FileStore for LiveFiles {
         cache.insert(key, thumb.clone());
         Ok(thumb)
     }
+
+    fn fetch(&self, remote_path: &str) -> Result<Vec<u8>, String> {
+        let tmp = tempfile::Builder::new()
+            .prefix("bambu-raw-")
+            .tempfile()
+            .map_err(|e| e.to_string())?;
+        FtpsClient::new(self.target.clone())
+            .download(remote_path, tmp.path())
+            .map_err(|e| e.to_string())?;
+        let meta = std::fs::metadata(tmp.path()).map_err(|e| e.to_string())?;
+        if meta.len() > RAW_MAX {
+            return Err(format!("file too large to view ({} bytes)", meta.len()));
+        }
+        std::fs::read(tmp.path()).map_err(|e| e.to_string())
+    }
 }
 
 /// A canned file store for `--fake` mode and tests.
@@ -128,6 +148,10 @@ impl FileStore for FakeFiles {
     fn thumbnail(&self, _remote_path: &str, _plate: u32) -> Result<Option<Vec<u8>>, String> {
         // A tiny valid PNG so the UI/E2E has something to render in --fake mode.
         Ok(Some(TINY_PNG.to_vec()))
+    }
+    fn fetch(&self, _remote_path: &str) -> Result<Vec<u8>, String> {
+        // Not a real 3mf; the viewer surfaces a load error in --fake mode.
+        Ok(b"fake-model".to_vec())
     }
 }
 
