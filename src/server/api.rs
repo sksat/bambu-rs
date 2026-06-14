@@ -32,6 +32,9 @@ use super::control::{ControlAction, ControlError, Controller};
 #[cfg(test)]
 use super::files::FakeFiles;
 use super::files::FileStore;
+#[cfg(test)]
+use super::start::FakeStarter;
+use super::start::{StartRequest, Starter};
 use crate::core::command::{LedNode, SpeedLevel};
 use crate::core::session::CommandOutcome;
 use crate::core::status::{Ams, AmsTray, AmsUnit, Filament, Online, PrinterStatus};
@@ -225,6 +228,7 @@ pub struct AppState {
     pub source: Arc<dyn PrinterSource>,
     pub controller: Arc<dyn Controller>,
     pub files: Arc<dyn FileStore>,
+    pub starter: Arc<dyn Starter>,
     /// Optional password gating **write** (control) requests; `None` = control is
     /// open. Reads are always unauthenticated.
     pub password: Option<String>,
@@ -237,6 +241,7 @@ impl AppState {
             source: Arc::new(FakeSource::idle()),
             controller: Arc::new(FakeController::verified()),
             files: Arc::new(FakeFiles),
+            starter: Arc::new(FakeStarter),
             password: None,
         }
     }
@@ -253,6 +258,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/job/pause", post(job_pause))
         .route("/api/job/resume", post(job_resume))
         .route("/api/job/stop", post(job_stop))
+        .route("/api/job/start", post(job_start))
         .route("/api/light", post(light))
         .route("/api/speed", post(speed))
         // Uploads can be large (sliced 3mf); raise the body cap from the 2 MB default.
@@ -341,11 +347,21 @@ async fn run_confirmed(
     execute(st, action).await
 }
 
-/// Run a control action on the blocking pool and map the verify outcome to HTTP:
-/// verified → 200, unverified → 202, rejected → 409, transport error → 502.
+/// Run a control action on the blocking pool and map the verify outcome to HTTP.
 async fn execute(st: AppState, action: ControlAction) -> Response {
     let controller = st.controller.clone();
-    match tokio::task::spawn_blocking(move || controller.execute(action)).await {
+    let res = tokio::task::spawn_blocking(move || controller.execute(action)).await;
+    verify_response(res)
+}
+
+/// Result of running a verify on the blocking pool: the verdict (or transport
+/// error), wrapped in the `spawn_blocking` join result.
+type VerifyJoin = Result<Result<CommandOutcome, ControlError>, tokio::task::JoinError>;
+
+/// Map a `spawn_blocking` verify result to HTTP: verified → 200, unverified →
+/// 202, rejected → 409, transport error → 502, join error → 500.
+fn verify_response(res: VerifyJoin) -> Response {
+    match res {
         Ok(Ok(outcome)) => {
             let code = match &outcome {
                 CommandOutcome::Verified => StatusCode::OK,
@@ -367,6 +383,92 @@ async fn execute(st: AppState, action: ControlAction) -> Response {
 
 fn bad_request(msg: String) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
+}
+
+// ── Print start ────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct StartBody {
+    file: String,
+    #[serde(default = "default_plate")]
+    plate: u32,
+    #[serde(default)]
+    confirm: bool,
+    #[serde(default)]
+    use_ams: bool,
+    #[serde(default)]
+    ams_map: Vec<i32>,
+    bed_type: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+fn default_plate() -> u32 {
+    1
+}
+
+/// Start a print. Safety mirrors the CLI: file/AMS-map validation, a `dry_run`
+/// that returns the resolved plan without sending, a `confirm` gate (428), and
+/// an idle check against the live status (409 if the printer is busy).
+async fn job_start(State(st): State<AppState>, Json(b): Json<StartBody>) -> Response {
+    let lower = b.file.to_ascii_lowercase();
+    if b.file.is_empty() || b.file.contains("..") {
+        return bad_request(format!("invalid file {:?}", b.file));
+    }
+    if !(lower.ends_with(".3mf") || lower.ends_with(".gcode")) {
+        return bad_request("file must be a .3mf or .gcode".to_string());
+    }
+    if b.use_ams {
+        for (i, v) in b.ams_map.iter().enumerate() {
+            if !(-1..=3).contains(v) {
+                return bad_request(format!(
+                    "ams_map[{i}]={v} out of range (trays 0..3, or -1 external)"
+                ));
+            }
+        }
+    }
+    let req = StartRequest {
+        file: b.file.clone(),
+        plate: b.plate,
+        use_ams: b.use_ams,
+        ams_map: b.ams_map.clone(),
+        bed_type: b.bed_type.clone().unwrap_or_else(|| "auto".to_string()),
+    };
+
+    if b.dry_run {
+        return Json(json!({ "plan": {
+            "file": req.file,
+            "plate": req.plate,
+            "use_ams": req.use_ams,
+            "ams_map": req.ams_map,
+            "bed_type": req.bed_type,
+        }}))
+        .into_response();
+    }
+    if !b.confirm {
+        return (
+            StatusCode::PRECONDITION_REQUIRED,
+            Json(json!({ "error": "confirm required: POST {\"confirm\": true} (try dry_run first)" })),
+        )
+            .into_response();
+    }
+    // Idle guard: refuse to start over an active job.
+    let state = st
+        .source
+        .current()
+        .gcode_state
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if matches!(state.as_str(), "RUNNING" | "PAUSE" | "PREPARE" | "SLICING") {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": format!("printer is busy ({state}); cannot start a print") })),
+        )
+            .into_response();
+    }
+    let starter = st.starter.clone();
+    let res = tokio::task::spawn_blocking(move || starter.start(&req)).await;
+    verify_response(res)
 }
 
 // ── File endpoints ─────────────────────────────────────────────────────────
@@ -488,6 +590,7 @@ mod tests {
             source: Arc::new(FakeSource::idle()),
             controller: Arc::new(controller),
             files: Arc::new(FakeFiles),
+            starter: Arc::new(FakeStarter),
             password: password.map(str::to_owned),
         };
         TestServer::new(router(state))
@@ -650,6 +753,77 @@ mod tests {
             .assert_status(StatusCode::BAD_REQUEST);
     }
 
+    // ── print start ──
+    #[tokio::test]
+    async fn start_dry_run_returns_plan_without_confirm() {
+        let res = app(None, FakeController::verified())
+            .post("/api/job/start")
+            .json(&json!({ "file": "/coin.gcode.3mf", "plate": 2, "dry_run": true }))
+            .await;
+        res.assert_status_ok();
+        let body: serde_json::Value = res.json();
+        assert_eq!(body["plan"]["plate"], 2);
+        assert_eq!(body["plan"]["bed_type"], "auto");
+    }
+
+    #[tokio::test]
+    async fn start_needs_confirmation() {
+        app(None, FakeController::verified())
+            .post("/api/job/start")
+            .json(&json!({ "file": "/coin.gcode.3mf" }))
+            .await
+            .assert_status(StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn start_confirmed_on_idle_printer_verifies() {
+        // AppState::fake() source is IDLE, so the idle guard passes.
+        app(None, FakeController::verified())
+            .post("/api/job/start")
+            .json(&json!({ "file": "/coin.gcode.3mf", "confirm": true }))
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn start_rejects_bad_filetype_and_traversal() {
+        let s = app(None, FakeController::verified());
+        s.post("/api/job/start")
+            .json(&json!({ "file": "/notes.txt", "confirm": true }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+        s.post("/api/job/start")
+            .json(&json!({ "file": "../secret.3mf", "confirm": true }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn start_rejects_out_of_range_ams_map() {
+        app(None, FakeController::verified())
+            .post("/api/job/start")
+            .json(&json!({ "file": "/c.3mf", "confirm": true, "use_ams": true, "ams_map": [0, 9] }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn start_on_busy_printer_is_409() {
+        // A RUNNING source → idle guard refuses.
+        let state = AppState {
+            source: Arc::new(FakeSource::ramping(Duration::from_millis(50))),
+            controller: Arc::new(FakeController::verified()),
+            files: Arc::new(FakeFiles),
+            starter: Arc::new(FakeStarter),
+            password: None,
+        };
+        TestServer::new(router(state))
+            .post("/api/job/start")
+            .json(&json!({ "file": "/c.3mf", "confirm": true }))
+            .await
+            .assert_status(StatusCode::CONFLICT);
+    }
+
     // WebSocket tests need the real HTTP transport (the mocked one can't upgrade).
     fn ws_server(state: AppState) -> TestServer {
         TestServer::builder().http_transport().build(router(state))
@@ -673,6 +847,7 @@ mod tests {
             source: Arc::new(FakeSource::ramping(Duration::from_millis(5))),
             controller: Arc::new(FakeController::verified()),
             files: Arc::new(FakeFiles),
+            starter: Arc::new(FakeStarter),
             password: None,
         };
         let mut ws = ws_server(state)

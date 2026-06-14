@@ -639,3 +639,19 @@ body {
   font-size: 0.82rem;
   word-break: break-all;
 }
+
+/* ── start-print dialog ──────────────────────────────────────────────────── */
+.startform {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin: 0.5rem 0;
+}
+.startrow {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.startnum {
+  width: 5rem;
+}

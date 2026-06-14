@@ -12,6 +12,7 @@ pub mod assets;
 pub mod control;
 pub mod files;
 pub mod live;
+pub mod start;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +22,7 @@ pub use api::{AppState, FakeSource, PrinterSource};
 pub use control::{Controller, FakeController, LiveController};
 pub use files::{FakeFiles, FileStore, LiveFiles};
 pub use live::LiveSource;
+pub use start::{FakeStarter, LiveStarter, Starter};
 
 /// Options for [`serve`].
 pub struct ServeOpts {
@@ -42,44 +44,51 @@ pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    let ServeOpts {
+        host,
+        port,
+        password,
+        fake,
+        interval,
+        camera_rtsp: _,
+    } = opts;
     rt.block_on(async move {
         // Live mode bridges the real MQTT monitor (and controls the real device);
         // otherwise serve a ramping fake so the UI still has moving data.
-        let (source, controller, files): (
-            Arc<dyn PrinterSource>,
-            Arc<dyn Controller>,
-            Arc<dyn FileStore>,
-        ) = match target {
-            Some(t) if !opts.fake => {
+        let state = match target {
+            Some(t) if !fake => {
                 eprintln!("connecting to the printer over LAN…");
-                (
-                    Arc::new(LiveSource::connect(t.clone(), opts.interval)),
-                    Arc::new(LiveController::new(t.clone())),
-                    Arc::new(LiveFiles::new(t)),
-                )
+                AppState {
+                    source: Arc::new(LiveSource::connect(t.clone(), interval)),
+                    controller: Arc::new(LiveController::new(t.clone())),
+                    files: Arc::new(LiveFiles::new(t.clone())),
+                    starter: Arc::new(LiveStarter::new(t)),
+                    password,
+                }
             }
             _ => {
-                if !opts.fake {
+                if !fake {
                     eprintln!(
                         "note: no printer configured; serving fake data (pass --fake to silence)"
                     );
                 }
-                let tick = opts.interval.unwrap_or(Duration::from_secs(1));
-                (
-                    Arc::new(FakeSource::ramping(tick)),
-                    Arc::new(FakeController::verified()),
-                    Arc::new(FakeFiles),
-                )
+                let tick = interval.unwrap_or(Duration::from_secs(1));
+                AppState {
+                    source: Arc::new(FakeSource::ramping(tick)),
+                    controller: Arc::new(FakeController::verified()),
+                    files: Arc::new(FakeFiles),
+                    starter: Arc::new(FakeStarter),
+                    password,
+                }
             }
         };
-        let addr = format!("{}:{}", opts.host, opts.port);
+        let addr = format!("{host}:{port}");
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .map_err(|e| anyhow::anyhow!("binding {addr}: {e}"))?;
-        let loopback =
-            opts.host.starts_with("127.") || opts.host == "localhost" || opts.host == "::1";
+        let loopback = host.starts_with("127.") || host == "localhost" || host == "::1";
         if !loopback {
-            match &opts.password {
+            match &state.password {
                 Some(_) => eprintln!(
                     "warning: serving on non-loopback {addr}; control requires the password, \
                      reads are open."
@@ -91,12 +100,6 @@ pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<
             }
         }
         eprintln!("bambu serve: http://{addr}/");
-        let state = AppState {
-            source,
-            controller,
-            files,
-            password: opts.password,
-        };
         axum::serve(listener, api::router(state))
             .await
             .map_err(|e| anyhow::anyhow!("serving: {e}"))

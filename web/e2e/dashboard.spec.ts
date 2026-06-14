@@ -45,6 +45,16 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("github")).toHaveAttribute("href", /github\.com/);
   });
 
+  test("print → dry-run shows a plan; start on a busy printer is refused", async ({ page }) => {
+    await page.getByTestId("print").first().click();
+    await expect(page.getByTestId("start-dialog")).toBeVisible();
+    await page.getByRole("button", { name: "dry-run" }).click();
+    await expect(page.getByTestId("start-result")).toContainText("plan");
+    // The fake source streams RUNNING, so the idle guard refuses a new print.
+    await page.getByTestId("start-confirm").click();
+    await expect(page.getByTestId("start-result")).toContainText("busy");
+  });
+
   test("theme toggle cycles auto → dark → light", async ({ page }) => {
     const btn = page.getByTestId("theme");
     await expect(page.locator("html")).not.toHaveAttribute("data-theme", /.+/); // auto
