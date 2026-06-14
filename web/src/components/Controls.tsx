@@ -153,11 +153,16 @@ export function ConfirmDialog({
   message,
   onConfirm,
   onCancel,
+  confirmLabel,
 }: {
   message: string;
   onConfirm: () => void;
   onCancel: () => void;
+  // Defaults preserve the original stop-print dialog (label + testid); machine
+  // actions pass their own label and reuse the generic confirm-ok testid.
+  confirmLabel?: string;
 }) {
+  const isStop = confirmLabel == null;
   return (
     <div className="modal" role="dialog" aria-modal="true" data-testid="confirm">
       <div className="modal__box">
@@ -166,8 +171,12 @@ export function ConfirmDialog({
           <button className="btn" onClick={onCancel}>
             cancel
           </button>
-          <button className="btn btn--danger" onClick={onConfirm} data-testid="confirm-stop">
-            stop print
+          <button
+            className="btn btn--danger"
+            onClick={onConfirm}
+            data-testid={isStop ? "confirm-stop" : "confirm-ok"}
+          >
+            {isStop ? "stop print" : confirmLabel}
           </button>
         </div>
       </div>

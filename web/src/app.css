@@ -806,6 +806,130 @@ body {
   }
 }
 
+/* ── machine control (jog / temp / filament / maintenance) ───────────────── */
+/* Each maintenance block is a hairline-separated sub-group under the panel. */
+.msub {
+  margin-top: 0.95rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid var(--hair);
+}
+.msub:first-of-type {
+  margin-top: 0.7rem;
+}
+
+/* The jog control reads as a printer bed (3×3 XY pad) with the gantry (Z
+   column) beside it — an axes diagram you can press. */
+.jog {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  margin-top: 0.55rem;
+}
+.jog__pad {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: repeat(3, 1fr);
+  gap: 0.35rem;
+  /* The bed: a square, hairline-framed plate the buttons sit on. */
+  padding: 0.4rem;
+  border: 1px solid var(--hair);
+  border-radius: 8px;
+  background: var(--hair-2);
+  width: min(13.5rem, 60vw);
+  aspect-ratio: 1;
+}
+.jog__corner {
+  /* empty grid cell */
+}
+.jog__z {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.35rem;
+}
+.jog__zlbl {
+  line-height: 1;
+}
+.jog__btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.05rem;
+  padding: 0.3rem;
+  line-height: 1.05;
+}
+.jog__pad .jog__btn {
+  width: 100%;
+  height: 100%;
+}
+.jog__z .jog__btn {
+  width: 3rem;
+  height: 3rem;
+}
+.jog__arrow {
+  font-size: 1rem;
+}
+.jog__ax {
+  font-size: 0.6rem;
+  color: var(--dim);
+  letter-spacing: 0.04em;
+}
+.jog__btn:hover:not(:disabled) .jog__ax {
+  color: var(--accent);
+}
+/* The centre home cell: the bed origin — accent-edged so it reads as the datum. */
+.jog__home {
+  font-size: 1.3rem;
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+.jog__home:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+/* Segmented control: jog step / extrude length pickers. */
+.seg {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin-top: 0.6rem;
+}
+.seg__opt {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Temperature rows: live readout + a small input + set/cool. */
+.trow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+  margin-top: 0.5rem;
+}
+.trow__name {
+  width: 3.2rem;
+}
+.trow__read {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.86rem;
+  min-width: 6.5rem;
+}
+.trow__in {
+  width: 4.2rem;
+  flex: none;
+}
+
+/* Maintenance: calibrate checkboxes wrap then the run button trails. */
+.calrow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.9rem;
+  margin-top: 0.55rem;
+}
+
 /* ── thumbnails (embedded plate preview) ─────────────────────────────────── */
 .thumb {
   display: block;

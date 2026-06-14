@@ -6,14 +6,35 @@ export interface Toast {
   msg: string;
 }
 
+/** A queued confirm-gated action: a human-readable message + the work to run
+ *  once the operator confirms it in the shared ConfirmDialog. */
+export interface ConfirmReq {
+  message: string;
+  run: () => void;
+}
+
+export type Axis = "x" | "y" | "z";
+export type TempPart = "nozzle" | "bed";
+export type AmsAction = "resume" | "reset" | "pause";
+
+export interface CalibrateOpts {
+  bed_level: boolean;
+  vibration: boolean;
+  motor_noise: boolean;
+}
+
 /** Control state + actions: posts to the API, surfaces a toast, handles the
- *  stop confirm dialog and the optional write password. */
+ *  stop confirm dialog, the generic machine confirm dialog, and the optional
+ *  write password. */
 export function useControl() {
   const [password, setPassword] = useState<string>(() => sessionStorage.getItem("bambu_pw") ?? "");
   const [needPassword, setNeedPassword] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
   const [confirmStop, setConfirmStop] = useState(false);
+  // The pending machine confirm (calibrate / reboot / steppers / ams-reset …);
+  // null when nothing awaits confirmation.
+  const [confirm, setConfirm] = useState<ConfirmReq | null>(null);
 
   useEffect(() => {
     if (!toast) return;
@@ -45,12 +66,18 @@ export function useControl() {
     }
   };
 
+  // Queue a confirm-gated action: shows the shared dialog, then runs `work` on
+  // confirm. Mirrors the requestStop/confirmAndStop flow for arbitrary writes.
+  const requestConfirm = (message: string, work: () => void) =>
+    setConfirm({ message, run: work });
+
   return {
     password,
     needPassword,
     busy,
     toast,
     confirmStop,
+    confirm,
     setPassword: (pw: string) => {
       setPassword(pw);
       sessionStorage.setItem("bambu_pw", pw);
@@ -67,6 +94,62 @@ export function useControl() {
     speed: (level: string) => act(`speed ${level}`, "/api/speed", { level }),
     gcode: (line: string, force: boolean) =>
       act(`gcode ${line}`, "/api/gcode", { line, confirm: true, force }),
+
+    // ── machine control ──────────────────────────────────────────────────────
+    // Generic confirm dialog plumbing (shared by the confirm-gated writes).
+    cancelConfirm: () => setConfirm(null),
+    runConfirm: () => {
+      const c = confirm;
+      setConfirm(null);
+      c?.run();
+    },
+
+    home: (axes: "all" | Axis) => act(`home ${axes}`, "/api/home", { axes }),
+    jog: (axis: Axis, delta: number, feedrate: number) =>
+      act(
+        `move ${axis.toUpperCase()} ${delta > 0 ? "+" : ""}${delta}`,
+        "/api/move",
+        { axis, delta, feedrate },
+      ),
+    extrude: (delta: number, feedrate: number) =>
+      act(`${delta < 0 ? "retract" : "extrude"} ${Math.abs(delta)}`, "/api/extrude", {
+        delta,
+        feedrate,
+      }),
+    // celsius > 0 needs confirm; the caller passes confirm=true once acknowledged.
+    setTemp: (part: TempPart, celsius: number, confirm: boolean, force = false) =>
+      act(`${part} ${celsius}°`, "/api/temp", { part, celsius, confirm, force }),
+    cooldown: (part: TempPart) =>
+      act(`${part} cool`, "/api/temp", { part, celsius: 0, confirm: false, force: false }),
+    calibrate: (opts: CalibrateOpts) => {
+      const picked = (
+        [
+          ["bed level", opts.bed_level],
+          ["vibration", opts.vibration],
+          ["motor noise", opts.motor_noise],
+        ] as Array<[string, boolean]>
+      )
+        .filter(([, on]) => on)
+        .map(([n]) => n)
+        .join(", ");
+      requestConfirm(`Run calibration (${picked})? The printer will move on its own.`, () => {
+        void act("calibrate", "/api/calibrate", { ...opts, confirm: true });
+      });
+    },
+    ams: (action: AmsAction, confirm: boolean) => {
+      if (!confirm) return act(`ams ${action}`, "/api/ams", { action, confirm: false });
+      requestConfirm(`AMS ${action}? This interrupts the current spool state.`, () => {
+        void act(`ams ${action}`, "/api/ams", { action, confirm: true });
+      });
+    },
+    reboot: () =>
+      requestConfirm("Reboot the printer? It will disconnect while it restarts.", () => {
+        void act("reboot", "/api/reboot", { confirm: true });
+      }),
+    steppers: () =>
+      requestConfirm("Disable the steppers? The axes will be free to move by hand.", () => {
+        void act("disable steppers", "/api/steppers", { confirm: true });
+      }),
   };
 }
 

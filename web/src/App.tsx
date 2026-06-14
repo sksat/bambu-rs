@@ -5,6 +5,7 @@ import { JobSection } from "./components/JobSection";
 import { TempSection } from "./components/TempSection";
 import { AmsSection } from "./components/AmsSection";
 import { Controls, ConfirmDialog } from "./components/Controls";
+import { MachineSection } from "./components/MachineSection";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { FilesSection } from "./components/FilesSection";
 import { HealthSection } from "./components/HealthSection";
@@ -27,6 +28,7 @@ export function App() {
             <TempSection s={status} history={history} />
             {status.ams && <AmsSection ams={status.ams} />}
             <Controls control={control} status={status} />
+            <MachineSection s={status} control={control} />
             <FilesSection sdcard={status.sdcard} />
             <HealthSection s={status} />
             <FooterSection s={status} />
@@ -47,6 +49,14 @@ export function App() {
           message="Stop the running print? This can't be undone."
           onConfirm={() => control.confirmAndStop()}
           onCancel={() => control.cancelStop()}
+        />
+      )}
+      {control.confirm && (
+        <ConfirmDialog
+          message={control.confirm.message}
+          confirmLabel="confirm"
+          onConfirm={() => control.runConfirm()}
+          onCancel={() => control.cancelConfirm()}
         />
       )}
     </div>

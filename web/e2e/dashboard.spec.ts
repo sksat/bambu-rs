@@ -125,6 +125,45 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
   });
 
+  test("machine panel renders with the jog D-pad", async ({ page }) => {
+    await expect(page.getByTestId("machine")).toBeVisible();
+    for (const id of [
+      "jog-yplus",
+      "jog-yminus",
+      "jog-xminus",
+      "jog-xplus",
+      "home-all",
+      "jog-zplus",
+      "jog-zminus",
+    ]) {
+      await expect(page.getByTestId(id)).toBeVisible();
+    }
+  });
+
+  test("jog/home are disabled while the printer is busy", async ({ page }) => {
+    // The fake source streams RUNNING (a busy state), so motion is gated off.
+    await expect
+      .poll(async () => {
+        const state = ((await page.getByTestId("state").textContent()) ?? "").toUpperCase().trim();
+        if (state !== "RUNNING") return null;
+        const home = await page.getByTestId("home-all").isDisabled();
+        const xplus = await page.getByTestId("jog-xplus").isDisabled();
+        const zplus = await page.getByTestId("jog-zplus").isDisabled();
+        return home && xplus && zplus;
+      })
+      .toBeTruthy();
+  });
+
+  test("setting a nozzle temperature reports verified (allowed while busy)", async ({ page }) => {
+    const set = page.getByTestId("temp-nozzle-set");
+    // Temperature changes are allowed even mid-job. The set button gates on a
+    // non-empty value (like gcode-send), so fill first, then it's enabled.
+    await page.getByTestId("temp-nozzle-input").fill("210");
+    await expect(set).toBeEnabled();
+    await set.click();
+    await expect(page.getByTestId("toast")).toContainText("verified");
+  });
+
   test("renders on a phone viewport", async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 850 });
     await expect(page.getByTestId("state")).toBeVisible();
