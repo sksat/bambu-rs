@@ -164,21 +164,57 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("toast")).toContainText("verified");
   });
 
-  test("cameras panel shows the empty state and no live view in fake mode", async ({ page }) => {
-    // Fake mode has no built-in camera and no external URLs, so the cameras panel
-    // shows its empty state and renders no live view.
-    await expect(page.getByTestId("cameras")).toBeVisible();
-    await expect(page.getByTestId("cameras-empty")).toBeVisible();
-    await expect(page.getByTestId("camera-view")).toHaveCount(0);
+  test("camera tabs render and switch the active source", async ({ page }) => {
+    // The E2E server is launched with two external --camera-url, so two tabs show.
+    const tabs = page.locator('[data-testid^="camera-tab-"]');
+    await expect(tabs).toHaveCount(2);
+    await expect(page.getByTestId("camera-view")).toBeVisible();
+    await expect(tabs.nth(0)).toHaveAttribute("aria-selected", "true");
+    await tabs.nth(1).click();
+    await expect(tabs.nth(1)).toHaveAttribute("aria-selected", "true");
+    await expect(tabs.nth(0)).toHaveAttribute("aria-selected", "false");
   });
 
-  test("cameras manage form lets you add an external camera row", async ({ page }) => {
-    // Open the manage form and add a row — purely client-side (no save), so it
-    // doesn't mutate the shared fake server that the other tests rely on.
+  test("a dead camera reports the offline state", async ({ page }) => {
+    // Both configured cameras point at dead URLs, so the snapshot 502s and the
+    // active view reports offline.
+    await expect(page.getByTestId("camera-offline")).toBeVisible({ timeout: 15000 });
+  });
+
+  test("camera manage modal: prefilled, adds a row, closes on scrim", async ({ page }) => {
     await page.getByTestId("cameras-manage").click();
-    await expect(page.getByTestId("cameras-form")).toBeVisible();
+    await expect(page.getByTestId("cameras-modal")).toBeVisible();
+    // Two configured cameras prefill two rows; wait for them before adding.
+    await expect(page.getByTestId("camera-url-1")).toBeVisible();
     await page.getByTestId("camera-add").click();
-    await expect(page.getByTestId("camera-url-0")).toBeVisible();
+    await expect(page.getByTestId("camera-url-2")).toBeVisible();
+    // Close by clicking the scrim (outside the box) — no save, so the shared
+    // server's camera list is untouched.
+    await page.getByTestId("cameras-modal").click({ position: { x: 6, y: 6 } });
+    await expect(page.getByTestId("cameras-modal")).toHaveCount(0);
+  });
+
+  test("file detail and start dialog close on scrim (outside) click", async ({ page }) => {
+    await page
+      .getByTestId("file")
+      .filter({ hasText: ".3mf" })
+      .first()
+      .click({ position: { x: 6, y: 6 } });
+    await expect(page.getByTestId("file-detail")).toBeVisible();
+    await page.getByTestId("file-detail").click({ position: { x: 6, y: 6 } });
+    await expect(page.getByTestId("file-detail")).toHaveCount(0);
+
+    await page.getByTestId("print").first().click();
+    await expect(page.getByTestId("start-dialog")).toBeVisible();
+    await page.getByTestId("start-dialog").click({ position: { x: 6, y: 6 } });
+    await expect(page.getByTestId("start-dialog")).toHaveCount(0);
+  });
+
+  test("stop confirm closes on scrim (outside) click", async ({ page }) => {
+    await page.getByRole("button", { name: "stop", exact: true }).click();
+    await expect(page.getByTestId("confirm")).toBeVisible();
+    await page.getByTestId("confirm").click({ position: { x: 6, y: 6 } });
+    await expect(page.getByTestId("confirm")).toHaveCount(0);
   });
 
   test("renders on a phone viewport", async ({ page }) => {

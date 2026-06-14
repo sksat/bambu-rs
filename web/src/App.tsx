@@ -28,19 +28,24 @@ export function App() {
               readouts; controls + machine sit below; files and health span full
               width. On a phone it all collapses to one column (vitals first). */}
           <main className="dash">
-            <section className="dash__hero">
-              <div className="dash__vitals">
-                <JobSection s={status} />
-                <TempSection s={status} history={history} />
-                {status.ams && <AmsSection ams={status.ams} />}
-              </div>
-              <div className="dash__cams">
-                <CamerasSection password={control.password || null} />
-              </div>
+            {/* Big status + AMS readout band across the top. */}
+            <section className="dash__status">
+              <JobSection s={status} />
+              {status.ams && <AmsSection ams={status.ams} />}
             </section>
-            <section className="dash__ops">
-              <Controls control={control} status={status} />
-              <MachineSection s={status} control={control} />
+            {/* Left: camera(s) with temperatures beneath. Right: one controls
+                section (job controls + machine/motion folded in). Stacks to a
+                single column on a phone. */}
+            <section className="dash__hero">
+              <div className="dash__left">
+                <CamerasSection password={control.password || null} />
+                <TempSection s={status} history={history} />
+              </div>
+              <div className="dash__control">
+                <Controls control={control} status={status}>
+                  <MachineSection s={status} control={control} />
+                </Controls>
+              </div>
             </section>
             <FilesSection sdcard={status.sdcard} />
             <HealthSection s={status} />

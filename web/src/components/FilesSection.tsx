@@ -181,7 +181,15 @@ function FileDetail({
 }) {
   const name = path.split("/").pop() ?? path;
   return (
-    <div className="modal" role="dialog" aria-modal="true" data-testid="file-detail">
+    <div
+      className="modal"
+      role="dialog"
+      aria-modal="true"
+      data-testid="file-detail"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
       <div className="modal__box modal__box--detail">
         <div className="detail__head">
           <span className="lbl">file</span>
@@ -275,7 +283,15 @@ function StartDialog({ path, onClose }: { path: string; onClose: () => void }) {
   };
 
   return (
-    <div className="modal" role="dialog" aria-modal="true" data-testid="start-dialog">
+    <div
+      className="modal"
+      role="dialog"
+      aria-modal="true"
+      data-testid="start-dialog"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
       <div className="modal__box modal__box--start">
         <div className="start__head">
           <Thumb file={path} className="thumb thumb--start" />

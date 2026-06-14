@@ -57,7 +57,7 @@ export function MachineSection({ s, control }: { s: PrinterStatus; control: Cont
   const anyCal = cal.bed_level || cal.vibration || cal.motor_noise;
 
   return (
-    <section className="panel" data-testid="machine">
+    <div className="machine" data-testid="machine">
       <div className="lbl">machine</div>
 
       {/* ── MOVE: printer-shaped jog control ─────────────────────────────── */}
@@ -354,6 +354,6 @@ export function MachineSection({ s, control }: { s: PrinterStatus; control: Cont
           </button>
         </div>
       </div>
-    </section>
+    </div>
   );
 }

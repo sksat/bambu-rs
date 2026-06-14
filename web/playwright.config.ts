@@ -17,7 +17,9 @@ export default defineConfig({
   },
   projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
   webServer: {
-    command: `bash -c "cd .. && cargo build --features dashboard --bin bambu && pnpm -C web build && exec ./target/debug/bambu serve --fake --host 127.0.0.1 --port ${PORT} --interval 1"`,
+    // Two (deliberately dead) external cameras so the dashboard renders camera
+    // tabs to exercise — their snapshots 502, which also covers the offline state.
+    command: `bash -c "cd .. && cargo build --features dashboard --bin bambu && pnpm -C web build && exec ./target/debug/bambu serve --fake --host 127.0.0.1 --port ${PORT} --interval 1 --camera-url 'cam a=http://127.0.0.1:59995/a.jpg' --camera-url 'cam b=http://127.0.0.1:59996/b.jpg'"`,
     url: `http://127.0.0.1:${PORT}/api/status`,
     reuseExistingServer: !process.env.CI,
     timeout: 180_000,

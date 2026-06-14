@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import type { Control } from "../useControl";
 import type { PrinterStatus } from "../types";
 
@@ -21,7 +21,17 @@ function jobAvail(state: string | null) {
   };
 }
 
-export function Controls({ control, status }: { control: Control; status: PrinterStatus }) {
+export function Controls({
+  control,
+  status,
+  children,
+}: {
+  control: Control;
+  status: PrinterStatus;
+  // Extra controls folded into this same panel (the machine/motion section), so
+  // the right column reads as one "controls" section rather than two boxes.
+  children?: ReactNode;
+}) {
   const b = control.busy;
   const [line, setLine] = useState("");
   const [force, setForce] = useState(false);
@@ -145,6 +155,7 @@ export function Controls({ control, status }: { control: Control; status: Printe
           />
         </label>
       )}
+      {children}
     </section>
   );
 }
@@ -164,7 +175,15 @@ export function ConfirmDialog({
 }) {
   const isStop = confirmLabel == null;
   return (
-    <div className="modal" role="dialog" aria-modal="true" data-testid="confirm">
+    <div
+      className="modal"
+      role="dialog"
+      aria-modal="true"
+      data-testid="confirm"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onCancel();
+      }}
+    >
       <div className="modal__box">
         <p className="modal__msg">{message}</p>
         <div className="btns">
