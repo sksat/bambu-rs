@@ -59,6 +59,47 @@ jobs:
       - name: Test (${{ matrix.name }})
         run: cargo test ${{ matrix.features }}
 
+  # The dashboard frontend: typecheck, build, prove the ts-rs bindings are still
+  # in sync with the Rust DTOs, then run the Playwright E2E (which itself builds
+  # the `bambu` binary with --features dashboard, builds the SPA, and drives
+  # `serve --fake`). Needs both the Rust toolchain and Node/pnpm.
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v6.0.3
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable, 2026-03-27
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "11.6.0"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Build
+        run: pnpm build
+      # The committed bindings must match what ts-rs generates from the Rust DTOs,
+      # so the frontend can't silently drift from the API contract.
+      - name: ts-rs bindings are in sync
+        run: |
+          pnpm gen:types
+          git diff --exit-code src/bindings \
+            || { echo "::error::ts-rs bindings are stale — run 'pnpm -C web gen:types' and commit"; exit 1; }
+      - name: Install Playwright browsers
+        run: pnpm exec playwright install --with-deps chromium
+      - name: E2E
+        run: pnpm e2e
+
   # Enforce the declared MSRV (Cargo.toml `rust-version`) — and prove this job is
   # actually exercising it. The MSRV is read FROM Cargo.toml (single source of
   # truth, no drift), and a guard asserts the active rustc really is that version
