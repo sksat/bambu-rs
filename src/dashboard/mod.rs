@@ -30,8 +30,11 @@ pub fn serve(_target: Option<ResolvedTarget>, opts: DashboardOpts) -> anyhow::Re
         .enable_all()
         .build()?;
     rt.block_on(async move {
-        // P0: always fake; the live source (monitor bridge) is wired in a later phase.
-        let source: std::sync::Arc<dyn PrinterSource> = std::sync::Arc::new(FakeSource::idle());
+        // The live source (MQTT monitor bridge) is wired in P2; until then every
+        // mode serves a ramping fake so the UI and charts have moving data.
+        let tick = opts.interval.unwrap_or(std::time::Duration::from_secs(1));
+        let source: std::sync::Arc<dyn PrinterSource> =
+            std::sync::Arc::new(FakeSource::ramping(tick));
         if !opts.fake {
             eprintln!(
                 "note: live mode isn't wired yet (serving fake data); pass --fake to silence this"

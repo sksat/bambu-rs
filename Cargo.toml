@@ -73,6 +73,6 @@ zip = { version = "7.2.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
-axum-test = "20.1.0"
+axum-test = { version = "20.1.0", features = ["ws"] }
 predicates = "3.1.4"
 proptest = "1.11.0"
