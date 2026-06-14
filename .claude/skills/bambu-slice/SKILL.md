@@ -87,8 +87,12 @@ curl -X POST "$B/api/job/start" -H 'content-type: application/json' -d '{"file":
   (Orca concatenates them, otherwise the path doubles and export fails).
 - The real settings preset is `Bambu Lab A1 mini 0.4 nozzle.json`; the bare
   `Bambu Lab A1 mini.json` is just a model descriptor, not a usable preset.
-- **AMS + single colour**: a slice made without AMS, started `use_ams=false` on an
-  AMS-equipped A1, paused before the first layer with `print_error 0x03008015`
-  (it expects an external spool). Either load an external spool, or assign the
-  filament to an AMS slot and start with `use_ams` + an `ams_map` (e.g. `[0]`).
-  The printer's screen shows the plain-language cause.
+- **AMS + single colour (verified on the real A1 mini)**: starting a single-filament
+  slice with `use_ams=false` on an **AMS-equipped** A1 fails before the first layer
+  with `print_error 0x03008015` — with no external spool, the printer has no source.
+  **Verified fix:** start with `use_ams` + an `ams_map` mapping the filament to a
+  *loaded* AMS slot, e.g. `bambu job start … --ams-map "0"` (or via the serve API,
+  `{"use_ams":true,"ams_map":[0]}`). A 12-layer test coin then ran start→FINISH with
+  `print_error=0`. (`-1` in the map = external spool, if you load one and prefer that.)
+  Always `--dry-run` first and watch the first layer; the printer screen also shows
+  the plain-language cause.
