@@ -138,7 +138,7 @@ calibration above finished at exactly this). So read `stg_cur` **together with
 `gcode_state` does. **[observed]**
 
 Stages confirmed on the A1 mini during a `bed_level + vibration` calibration
-(`bambu calibrate --bed-level --vibration --confirm`), in order: **[observed]**
+(`bambu calibrate auto --confirm`), in order: **[observed]**
 
 | `stg_cur` | name | seen during |
 |---|---|---|

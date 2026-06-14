@@ -82,6 +82,29 @@ fn job_start_dry_run_shows_payload_without_a_target() {
 }
 
 #[test]
+fn calibrate_subcommands_dry_run_and_confirm_gate() {
+    let cfg = tmp_cfg("calibrate");
+    // Per-type subcommand; dry run is human-readable (stderr) by default.
+    bambu(&cfg)
+        .args(["calibrate", "bed-level", "--dry-run"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("bed level"));
+    // --json gives the machine-readable plan/payload on stdout.
+    bambu(&cfg)
+        .args(["calibrate", "auto", "--dry-run", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("calibration"));
+    // Not a dry run and no --confirm → refused before any I/O (exit 4).
+    bambu(&cfg)
+        .args(["calibrate", "vibration"])
+        .assert()
+        .code(4); // CONFIRM_REQUIRED
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[test]
 fn expect_guards_reject_raw_gcode_offline() {
     // --expect-md5/--expect-plate are .3mf-only; on a raw .gcode they fail fast
     // (exit 3) before any network I/O, so this needs no printer.

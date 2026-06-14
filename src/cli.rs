@@ -146,23 +146,10 @@ enum Command {
         #[command(subcommand)]
         action: AmsAction,
     },
-    /// Run printer calibration (bed leveling / vibration / motor noise).
+    /// Run printer calibration — pick what to calibrate (a subcommand).
     Calibrate {
-        /// Bed leveling.
-        #[arg(long)]
-        bed_level: bool,
-        /// Vibration compensation.
-        #[arg(long)]
-        vibration: bool,
-        /// Motor-noise calibration.
-        #[arg(long)]
-        motor_noise: bool,
-        /// Show the resolved command JSON without sending it (safe).
-        #[arg(long)]
-        dry_run: bool,
-        /// Required to actually run calibration (it moves the hardware).
-        #[arg(long)]
-        confirm: bool,
+        #[command(subcommand)]
+        what: CalibrateAction,
     },
     /// Send a raw G-code line and watch the report (control; needs --confirm).
     Gcode {
@@ -295,6 +282,41 @@ enum JobAction {
         #[arg(long)]
         confirm: bool,
     },
+}
+
+/// Which calibration routine to run. Each is a separate subcommand so the choice
+/// is explicit (e.g. `bambu calibrate bed-level`).
+#[derive(Subcommand)]
+enum CalibrateAction {
+    /// Auto-level the heated bed.
+    BedLevel(CalibrateArgs),
+    /// Vibration / resonance compensation.
+    Vibration(CalibrateArgs),
+    /// Motor-noise (current) calibration.
+    MotorNoise(CalibrateArgs),
+    /// The usual A1 set: bed level + vibration.
+    Auto(CalibrateArgs),
+}
+
+/// Flags shared by every `calibrate` subcommand.
+#[derive(clap::Args)]
+struct CalibrateArgs {
+    /// Show what would run, without sending it (safe).
+    #[arg(long)]
+    dry_run: bool,
+    /// Required to actually run calibration (it moves the hardware).
+    #[arg(long)]
+    confirm: bool,
+    /// After starting, watch the printer report until calibration finishes.
+    #[arg(long)]
+    watch: bool,
+    /// With --watch, give up watching after this many seconds (default 1h).
+    #[arg(long, default_value_t = 3600)]
+    watch_timeout: u64,
+    /// With --watch, poll every N seconds (sends `pushall`) for a higher data
+    /// rate. Default: passive (wait for the printer's own pushes).
+    #[arg(long)]
+    interval: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -554,20 +576,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             timeout,
         } => run_light(cli, state == "on", node, *timeout),
         Command::Speed { level, timeout } => run_speed(cli, level, *timeout),
-        Command::Calibrate {
-            bed_level,
-            vibration,
-            motor_noise,
-            dry_run,
-            confirm,
-        } => run_calibrate(
-            cli,
-            *bed_level,
-            *vibration,
-            *motor_noise,
-            *dry_run,
-            *confirm,
-        ),
+        Command::Calibrate { what } => run_calibrate(cli, what),
         Command::Gcode {
             line,
             confirm,
@@ -1759,31 +1768,39 @@ fn run_ams(cli: &Cli, action: &AmsAction) -> Result<(), CliError> {
     }
 }
 
-fn run_calibrate(
-    cli: &Cli,
-    bed_level: bool,
-    vibration: bool,
-    motor_noise: bool,
-    dry_run: bool,
-    confirm: bool,
-) -> Result<(), CliError> {
-    // Default to the common A1 calibration (bed leveling + vibration) when no
-    // step is requested.
-    let (bed_level, vibration) = if !bed_level && !vibration && !motor_noise {
-        (true, true)
-    } else {
-        (bed_level, vibration)
+fn run_calibrate(cli: &Cli, action: &CalibrateAction) -> Result<(), CliError> {
+    let (bed_level, vibration, motor_noise, args) = match action {
+        CalibrateAction::BedLevel(a) => (true, false, false, a),
+        CalibrateAction::Vibration(a) => (false, true, false, a),
+        CalibrateAction::MotorNoise(a) => (false, false, true, a),
+        CalibrateAction::Auto(a) => (true, true, false, a),
     };
     let cmd = ProtoCommand::Calibration {
         bed_level,
         vibration,
         motor_noise,
     };
-    if dry_run {
-        print_json(&cmd.to_payload("1"));
+    let what = describe_calibration(bed_level, vibration, motor_noise);
+
+    if args.dry_run {
+        // Human-readable by default; JSON only with --json (matches the contract).
+        if want_json(cli) {
+            print_json(&serde_json::json!({
+                "plan": {
+                    "bed_level": bed_level,
+                    "vibration": vibration,
+                    "motor_noise": motor_noise,
+                    "what": what,
+                },
+                "payload": cmd.to_payload("1"),
+            }));
+        } else {
+            eprintln!("dry run — would run calibration: {what}");
+            eprintln!("(nothing sent; re-run with --confirm to start)");
+        }
         return Ok(());
     }
-    if !confirm {
+    if !args.confirm {
         return Err(CliError::new(
             exit::CONFIRM_REQUIRED,
             "calibration moves the hardware; needs --confirm (try --dry-run first)",
@@ -1791,10 +1808,46 @@ fn run_calibrate(
     }
     ensure_idle(cli)?;
     let client = connect_client(cli, 20)?;
-    eprintln!(
-        "starting calibration (bed_level={bed_level} vibration={vibration} motor_noise={motor_noise}) …"
-    );
-    report_command_outcome(cli, client.send_and_verify(&cmd)?)
+    eprintln!("starting calibration: {what} …");
+    let outcome = client.send_and_verify(&cmd)?;
+    // With --watch, follow the report to completion (like `job start --watch`);
+    // otherwise the accept/verify verdict is the result.
+    if args.watch && outcome == CommandOutcome::Verified {
+        eprintln!("calibration started; watching until it finishes …");
+        let (model, profile_name) = watch_identity(cli)?;
+        let watcher = connect_client(cli, args.watch_timeout)?;
+        let watch_interval = args.interval.map(Duration::from_secs);
+        watch_to_terminal(
+            &watcher,
+            cli,
+            model,
+            profile_name,
+            false,
+            watch_interval,
+            false,
+        )
+    } else {
+        report_command_outcome(cli, outcome)
+    }
+}
+
+/// A human label for the calibration steps that are enabled.
+fn describe_calibration(bed_level: bool, vibration: bool, motor_noise: bool) -> String {
+    let mut parts = Vec::new();
+    if bed_level {
+        parts.push("bed level");
+    }
+    if vibration {
+        parts.push("vibration");
+    }
+    if motor_noise {
+        parts.push("motor noise");
+    }
+    if parts.is_empty() {
+        "nothing".to_string()
+    } else {
+        parts.join(" + ")
+    }
 }
 
 fn job_control(cli: &Cli, cmd: ProtoCommand, confirm: bool) -> Result<(), CliError> {
