@@ -8,7 +8,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "gen:types": "rm -rf src/bindings && TS_RS_LARGE_INT=number TS_RS_EXPORT_DIR=web/src/bindings cargo test --manifest-path ../Cargo.toml --features ts-rs export_bindings"
   },
   "dependencies": {
     "react": "^19.2.7",

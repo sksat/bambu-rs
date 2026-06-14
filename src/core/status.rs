@@ -17,6 +17,7 @@ use serde_json::Value;
 
 /// The fields of a printer `print` report that matter for monitoring.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts-rs", derive(ts_rs::TS), ts(export))]
 pub struct PrinterStatus {
     /// Coarse job state, e.g. `IDLE`, `RUNNING`, `PAUSE`, `FINISH`, `FAILED`.
     pub gcode_state: Option<String>,
@@ -192,6 +193,7 @@ pub struct PrinterStatus {
 
 /// One `lights_report` entry: an LED node and its mode (`on`/`off`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts-rs", derive(ts_rs::TS), ts(export))]
 pub struct LightReport {
     pub node: String,
     pub mode: String,
@@ -202,6 +204,7 @@ pub struct LightReport {
 /// which is how an `ipcam_timelapse` command is verified (the ACK alone only
 /// says it was accepted — same caveat as the chamber light).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts-rs", derive(ts_rs::TS), ts(export))]
 pub struct Ipcam {
     /// `timelapse` mode (`enable`/`disable`) — whether a timelapse is recorded
     /// during prints.
@@ -214,6 +217,7 @@ pub struct Ipcam {
 
 /// The loaded filament a print draws from (resolved from `ams.tray_now`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts-rs", derive(ts_rs::TS), ts(export))]
 pub struct Filament {
     /// `ams0`..`amsN` for an AMS tray, or `external` for the external spool.
     pub location: String,
@@ -229,6 +233,7 @@ pub struct Filament {
 /// `severity` is the **raw** bits — label conventions conflict across sources,
 /// so we expose the number and link to the wiki rather than bundling a table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts-rs", derive(ts_rs::TS), ts(export))]
 pub struct HmsAlert {
     /// Canonical underscore form, e.g. `HMS_0300_0100_0001_0007`.
     pub code: String,
@@ -268,6 +273,7 @@ impl HmsAlert {
 /// active/target/previous tray pointers (the live colour-swap signal — the tray
 /// *array* only arrives in full pushalls, the pointers in deltas).
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts-rs", derive(ts_rs::TS), ts(export))]
 pub struct Ams {
     /// Attached AMS units (`ams.ams[]`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -297,6 +303,7 @@ pub struct Ams {
 
 /// One AMS unit (`ams.ams[]`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts-rs", derive(ts_rs::TS), ts(export))]
 pub struct AmsUnit {
     /// Physical unit id (`id`).
     pub id: String,
@@ -319,6 +326,7 @@ pub struct AmsUnit {
 
 /// One AMS tray/slot (`ams.ams[].tray[]` or `vt_tray`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts-rs", derive(ts_rs::TS), ts(export))]
 pub struct AmsTray {
     /// Tray id (`id`); what `tray_now`/`tray_pre`/`tray_tar` point at.
     pub id: String,
@@ -363,6 +371,7 @@ pub struct AmsTray {
 
 /// Firmware-update availability/progress (`upgrade_state`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts-rs", derive(ts_rs::TS), ts(export))]
 pub struct Upgrade {
     /// Whether an update is available/pending (`new_version_state`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -380,6 +389,7 @@ pub struct Upgrade {
 
 /// Peripheral online state (`online`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts-rs", derive(ts_rs::TS), ts(export))]
 pub struct Online {
     /// AHB bus present (`ahb`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -394,6 +404,7 @@ pub struct Online {
 
 /// In-progress file upload/transfer (`upload`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts-rs", derive(ts_rs::TS), ts(export))]
 pub struct Upload {
     /// Transfer status (`status`, e.g. `idle`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -554,6 +565,7 @@ impl PrinterStatus {
 /// We deliberately don't bundle a code→text table (sources conflict; same
 /// rationale as [`crate::core::hms`]); the hex code is emitted for lookup.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts-rs", derive(ts_rs::TS), ts(export))]
 pub struct DeviceError {
     /// Raw `print_error` value.
     pub code: i64,

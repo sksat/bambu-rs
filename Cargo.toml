@@ -44,6 +44,7 @@ server = [
 # The embedded web dashboard SPA, served by `bambu serve` when enabled. Builds on
 # the API server and embeds `web/dist/` via rust-embed.
 dashboard = ["server", "dep:rust-embed"]
+ts-rs = ["dep:ts-rs"]
 
 [dependencies]
 anyhow = "1.0.102"
@@ -67,6 +68,7 @@ tokio = { version = "1.52.3", default-features = false, features = ["rt", "time"
 toml = "1.1.2"
 tower = { version = "0.5.3", optional = true }
 tower-http = { version = "0.6.11", features = ["cors", "trace", "compression-gzip"], optional = true }
+ts-rs = { version = "12", optional = true }
 zip = { version = "7.2.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
