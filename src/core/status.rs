@@ -10,6 +10,7 @@
 //! speeds arrive as strings and are parsed here.
 
 use crate::core::capability::{ChamberTemperature, HardwareFeatures};
+use crate::core::hms::{HmsEntry, Module, decode_report_hms};
 use crate::core::stage::Stage;
 use serde::Serialize;
 use serde_json::Value;
@@ -70,6 +71,123 @@ pub struct PrinterStatus {
     /// Camera/timelapse settings from the `ipcam` report node. `None` when the
     /// report carries no `ipcam` object.
     pub ipcam: Option<Ipcam>,
+
+    // ── Enriched fields ───────────────────────────────────────────────────
+    // Mirror the device report's own shape: flat scalars where `print.*` is
+    // flat, nested structs only where the report nests an object. All optional
+    // and `skip_serializing_if`-elided so an idle frame stays compact.
+
+    // Fans (besides the part-cooling fan above). A fan reading 0 while RUNNING
+    // is a clog / heat-creep symptom worth surfacing.
+    /// Aux/part fan #1 (`big_fan1_speed`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub big_fan1_speed: Option<i64>,
+    /// Chamber/second big fan (`big_fan2_speed`; 0 on the fanless-chamber A1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub big_fan2_speed: Option<i64>,
+    /// Hotend/heatbreak fan (`heatbreak_fan_speed`). Dead → heat creep / jams.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heatbreak_fan_speed: Option<i64>,
+    /// Packed per-fan gear bitfield (`fan_gear`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fan_gear: Option<i64>,
+
+    // Finer progress / print-phase detail.
+    /// Feed-rate override percent (`spd_mag`, 100 = nominal); distinct from the
+    /// named `spd_lvl` tier and what actually moves the ETA.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spd_mag: Option<i64>,
+    /// Filename currently loaded/printing (`gcode_file`); `None` when idle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gcode_file: Option<String>,
+    /// Pre-print file preparation/download progress (`gcode_file_prepare_percent`).
+    /// Lets a viewer tell "preparing" from a stalled `mc_percent == 0`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gcode_file_prepare_percent: Option<i64>,
+    /// Coarse motion-controller phase (`mc_print_stage`), cross-checks `stg_cur`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mc_print_stage: Option<i64>,
+    /// Finer sub-phase within `mc_print_stage` (`mc_print_sub_stage`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mc_print_sub_stage: Option<i64>,
+    /// Current gcode line number (`mc_print_line_number`); increments within a
+    /// layer, so it is a fine-grained liveness/stall signal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mc_print_line_number: Option<i64>,
+    /// Job source/type (`print_type`), e.g. `idle` / `local` / `cloud`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub print_type: Option<String>,
+    /// Queue of upcoming stage ids (`stg`); `stg_cur` is the current one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stg: Vec<i64>,
+
+    // Machine configuration / peripherals.
+    /// Installed nozzle diameter in mm (`nozzle_diameter`, e.g. `0.4`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nozzle_diameter: Option<String>,
+    /// Nozzle material (`nozzle_type`, e.g. `stainless_steel` / `hardened`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nozzle_type: Option<String>,
+    /// Whether an SD card is present/mounted (`sdcard`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sdcard: Option<bool>,
+    /// Top-level AMS state machine (`ams_status`): idle/loading/unloading code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ams_status: Option<i64>,
+    /// Top-level AMS RFID read state (`ams_rfid_status`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ams_rfid_status: Option<i64>,
+    /// Hardware switch / filament-presence / door sensor bits (`hw_switch_state`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hw_switch_state: Option<i64>,
+
+    // Connectivity. (`net`/`net.ip` is deliberately NOT surfaced — it exposes
+    // the device address; only the non-identifying RSSI is.)
+    /// Wi-Fi signal strength (`wifi_signal`, e.g. `-50dBm`). The capture's
+    /// `<redacted>` sentinel is filtered to `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wifi_signal: Option<String>,
+
+    // Job/device identity (for correlating live status with a queued job).
+    /// Cloud/print task id (`task_id`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// Subtask id (`subtask_id`), pairs with `subtask_name`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtask_id: Option<String>,
+    /// Project id (`project_id`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// Slicing/print profile id (`profile_id`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    /// The printer's own report counter (`sequence_id`); detects dropped/reordered
+    /// reports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequence_id: Option<String>,
+    /// Device lifecycle/build channel (`lifecycle`, e.g. `product`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<String>,
+
+    // Nested objects — these mirror objects the report itself nests.
+    /// Full AMS inventory (all units & trays), built from `ams` + `vt_tray`.
+    /// `filament` above remains a convenience pointer to the loaded tray.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ams: Option<Ams>,
+    /// Firmware-update availability/progress (`upgrade_state`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upgrade: Option<Upgrade>,
+    /// Peripheral online state (`online`: AHB / RFID bus presence).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub online: Option<Online>,
+    /// In-progress file upload/transfer (`upload`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload: Option<Upload>,
+
+    /// Decoded HMS alerts (the device's primary fault/warning channel). Empty
+    /// when healthy; separate from `error`/`print_error`. See [`crate::core::hms`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hms: Vec<HmsAlert>,
 }
 
 /// One `lights_report` entry: an LED node and its mode (`on`/`off`).
@@ -105,6 +223,187 @@ pub struct Filament {
     pub name: Option<String>,
     /// Colour as reported (`tray_color`), e.g. `000000FF` (RGBA hex).
     pub color: Option<String>,
+}
+
+/// A decoded HMS alert (the wire view of [`crate::core::hms::HmsEntry`]).
+/// `severity` is the **raw** bits — label conventions conflict across sources,
+/// so we expose the number and link to the wiki rather than bundling a table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HmsAlert {
+    /// Canonical underscore form, e.g. `HMS_0300_0100_0001_0007`.
+    pub code: String,
+    /// Hyphen form Bambu shows on-screen, e.g. `0300-0100-0001-0007`.
+    pub code_hyphen: String,
+    /// Raw severity bits (`code >> 16`); not mapped to a label.
+    pub severity: u16,
+    /// Originating subsystem: `motion_controller` / `mainboard` / `ams` /
+    /// `toolhead` / `xcam` / `unknown:0xNN`.
+    pub module: String,
+    /// XCAM/micro-LiDAR code (only on X1-class hardware).
+    pub is_lidar: bool,
+    /// Deep link to Bambu's per-code troubleshooting page.
+    pub wiki: String,
+    /// Raw `attr` int (escape hatch for re-deriving fields).
+    pub attr: u32,
+    /// Raw `code` int.
+    pub raw_code: u32,
+}
+
+impl HmsAlert {
+    fn from_entry(e: HmsEntry) -> Self {
+        HmsAlert {
+            code: e.code_string(),
+            code_hyphen: e.code_hyphen(),
+            severity: e.severity_raw(),
+            module: hms_module_str(e.module()),
+            is_lidar: e.is_lidar(),
+            wiki: e.wiki_url(),
+            attr: e.attr,
+            raw_code: e.code,
+        }
+    }
+}
+
+/// The full AMS picture: every unit and tray, the external spool, and the
+/// active/target/previous tray pointers (the live colour-swap signal — the tray
+/// *array* only arrives in full pushalls, the pointers in deltas).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Ams {
+    /// Attached AMS units (`ams.ams[]`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub units: Vec<AmsUnit>,
+    /// The external/virtual spool (`vt_tray`), surfaced even when not loaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external: Option<AmsTray>,
+    /// Active tray id (`ams.tray_now`): `255` none, `254` external, else a tray id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_tray: Option<String>,
+    /// Target tray during a swap (`ams.tray_tar`); `!= active_tray` ⇒ swapping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_tray: Option<String>,
+    /// Previous tray (`ams.tray_pre`); reconstructs swap timelines.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_tray: Option<String>,
+    /// Hex bitfield of attached units (`ams.ams_exist_bits`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ams_exist_bits: Option<String>,
+    /// Hex bitfield of occupied slots (`ams.tray_exist_bits`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tray_exist_bits: Option<String>,
+    /// Hex bitfield of genuine-Bambu (RFID) trays (`ams.tray_is_bbl_bits`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tray_is_bbl_bits: Option<String>,
+}
+
+/// One AMS unit (`ams.ams[]`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct AmsUnit {
+    /// Physical unit id (`id`).
+    pub id: String,
+    /// Coarse dryness bucket 1–5 (`humidity`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub humidity: Option<i64>,
+    /// Finer raw humidity reading (`humidity_raw`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub humidity_raw: Option<i64>,
+    /// Internal temperature °C (`temp`, drying-capable units).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temp: Option<f64>,
+    /// Remaining/active drying time (`dry_time`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dry_time: Option<i64>,
+    /// The unit's trays/slots (`tray[]`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub trays: Vec<AmsTray>,
+}
+
+/// One AMS tray/slot (`ams.ams[].tray[]` or `vt_tray`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct AmsTray {
+    /// Tray id (`id`); what `tray_now`/`tray_pre`/`tray_tar` point at.
+    pub id: String,
+    /// Material (`tray_type`, e.g. `PLA`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub material: Option<String>,
+    /// Display name (`tray_sub_brands`, e.g. `PLA Matte`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Primary colour as RGBA hex (`tray_color`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// All colour segments (`cols`); single-colour spools mirror `color`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cols: Vec<String>,
+    /// Remaining filament percent (`remain`); `0`/`-1` mean unknown on the A1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remain: Option<i64>,
+    /// Per-tray RFID/load status code (`state`); raw (no verified label table).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<i64>,
+    /// Bambu filament-preset id (`tray_info_idx`, e.g. `GFA01`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub info_idx: Option<String>,
+    /// Short SKU/colour code (`tray_id_name`, e.g. `A01-R1`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id_name: Option<String>,
+    /// Stable physical-spool id (`tray_uuid`); all-zero ⇒ `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+    /// Recommended min nozzle temp (`nozzle_temp_min`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nozzle_temp_min: Option<i64>,
+    /// Recommended max nozzle temp (`nozzle_temp_max`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nozzle_temp_max: Option<i64>,
+    /// `true` when this tray is the active one (`id == tray_now`).
+    pub is_active: bool,
+    /// `true` when this tray is the swap target (`id == tray_tar`).
+    pub is_target: bool,
+}
+
+/// Firmware-update availability/progress (`upgrade_state`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Upgrade {
+    /// Whether an update is available/pending (`new_version_state`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_version_state: Option<i64>,
+    /// Non-zero ⇒ a flash is in progress (`cur_state_code`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cur_state_code: Option<i64>,
+    /// Activity status (`status`, e.g. `IDLE`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Failed-update error code (`err_code`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub err_code: Option<i64>,
+}
+
+/// Peripheral online state (`online`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Online {
+    /// AHB bus present (`ahb`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ahb: Option<bool>,
+    /// RFID reader present (`rfid`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rfid: Option<bool>,
+    /// Reported version counter (`version`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<i64>,
+}
+
+/// In-progress file upload/transfer (`upload`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Upload {
+    /// Transfer status (`status`, e.g. `idle`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Transfer progress percent (`progress`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<i64>,
+    /// Status message (`message`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 impl PrinterStatus {
@@ -154,6 +453,65 @@ impl PrinterStatus {
                 record: ic.get("ipcam_record").and_then(as_string),
                 resolution: ic.get("resolution").and_then(as_string),
             }),
+
+            // ── Enriched fields ───────────────────────────────────────────
+            big_fan1_speed: get("big_fan1_speed").and_then(as_i64_loose),
+            big_fan2_speed: get("big_fan2_speed").and_then(as_i64_loose),
+            heatbreak_fan_speed: get("heatbreak_fan_speed").and_then(as_i64_loose),
+            fan_gear: get("fan_gear").and_then(as_i64_loose),
+
+            spd_mag: get("spd_mag").and_then(as_i64_loose),
+            gcode_file: get("gcode_file").and_then(as_nonempty_string),
+            gcode_file_prepare_percent: get("gcode_file_prepare_percent").and_then(as_i64_loose),
+            mc_print_stage: get("mc_print_stage").and_then(as_i64_loose),
+            mc_print_sub_stage: get("mc_print_sub_stage").and_then(as_i64_loose),
+            mc_print_line_number: get("mc_print_line_number").and_then(as_i64_loose),
+            print_type: get("print_type").and_then(as_string),
+            stg: get("stg")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(as_i64_loose).collect())
+                .unwrap_or_default(),
+
+            nozzle_diameter: get("nozzle_diameter").and_then(as_string),
+            nozzle_type: get("nozzle_type").and_then(as_string),
+            sdcard: get("sdcard").and_then(Value::as_bool),
+            ams_status: get("ams_status").and_then(as_i64_loose),
+            ams_rfid_status: get("ams_rfid_status").and_then(as_i64_loose),
+            hw_switch_state: get("hw_switch_state").and_then(as_i64_loose),
+
+            wifi_signal: get("wifi_signal")
+                .and_then(as_nonempty_string)
+                .filter(|s| s != "<redacted>"),
+
+            task_id: get("task_id").and_then(as_nonempty_string),
+            subtask_id: get("subtask_id").and_then(as_nonempty_string),
+            project_id: get("project_id").and_then(as_nonempty_string),
+            profile_id: get("profile_id").and_then(as_nonempty_string),
+            sequence_id: get("sequence_id").and_then(as_string),
+            lifecycle: get("lifecycle").and_then(as_string),
+
+            ams: print.and_then(build_ams),
+            upgrade: get("upgrade_state").map(|u| Upgrade {
+                new_version_state: u.get("new_version_state").and_then(as_i64_loose),
+                cur_state_code: u.get("cur_state_code").and_then(as_i64_loose),
+                status: u.get("status").and_then(as_string),
+                err_code: u.get("err_code").and_then(as_i64_loose),
+            }),
+            online: get("online").map(|o| Online {
+                ahb: o.get("ahb").and_then(Value::as_bool),
+                rfid: o.get("rfid").and_then(Value::as_bool),
+                version: o.get("version").and_then(as_i64_loose),
+            }),
+            upload: get("upload").map(|u| Upload {
+                status: u.get("status").and_then(as_string),
+                progress: u.get("progress").and_then(as_i64_loose),
+                message: u.get("message").and_then(as_nonempty_string),
+            }),
+
+            hms: decode_report_hms(state)
+                .into_iter()
+                .map(HmsAlert::from_entry)
+                .collect(),
         }
     }
 
@@ -315,6 +673,110 @@ fn as_i64_loose(v: &Value) -> Option<i64> {
     }
 }
 
+/// Like [`as_i64_loose`] but for floats — the device sends some real-valued
+/// fields (e.g. AMS unit temperature, `"0.0"`) as strings.
+fn as_f64_loose(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// Wire string for an HMS [`Module`]; unknown ids keep their hex so nothing is
+/// silently mislabelled (the enum's Rust variant names stay off the wire).
+fn hms_module_str(m: Module) -> String {
+    match m {
+        Module::MotionController => "motion_controller".to_string(),
+        Module::Mainboard => "mainboard".to_string(),
+        Module::Ams => "ams".to_string(),
+        Module::Toolhead => "toolhead".to_string(),
+        Module::Xcam => "xcam".to_string(),
+        Module::Unknown(n) => format!("unknown:0x{n:02X}"),
+    }
+}
+
+/// Build the full [`Ams`] view from the `print` object (`ams` + `vt_tray`).
+/// `None` only when the report carries neither.
+fn build_ams(print: &Value) -> Option<Ams> {
+    let ams = print.get("ams");
+    let vt = print.get("vt_tray");
+    if ams.is_none() && vt.is_none() {
+        return None;
+    }
+    let active = ams.and_then(|a| a.get("tray_now")).and_then(as_string);
+    let target = ams.and_then(|a| a.get("tray_tar")).and_then(as_string);
+    let previous = ams.and_then(|a| a.get("tray_pre")).and_then(as_string);
+    let (act, tar) = (active.as_deref(), target.as_deref());
+
+    let units = ams
+        .and_then(|a| a.get("ams"))
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().map(|u| build_unit(u, act, tar)).collect())
+        .unwrap_or_default();
+
+    // Keep the external spool only when it actually carries filament info.
+    let external = vt.map(|v| build_tray(v, act, tar)).filter(|t| {
+        t.material.is_some() || t.color.is_some() || t.name.is_some() || !t.cols.is_empty()
+    });
+
+    let bits = |k: &str| ams.and_then(|a| a.get(k)).and_then(as_nonempty_string);
+    Some(Ams {
+        units,
+        external,
+        active_tray: active,
+        target_tray: target,
+        previous_tray: previous,
+        ams_exist_bits: bits("ams_exist_bits"),
+        tray_exist_bits: bits("tray_exist_bits"),
+        tray_is_bbl_bits: bits("tray_is_bbl_bits"),
+    })
+}
+
+fn build_unit(u: &Value, active: Option<&str>, target: Option<&str>) -> AmsUnit {
+    AmsUnit {
+        id: u.get("id").and_then(as_string).unwrap_or_default(),
+        humidity: u.get("humidity").and_then(as_i64_loose),
+        humidity_raw: u.get("humidity_raw").and_then(as_i64_loose),
+        temp: u.get("temp").and_then(as_f64_loose),
+        dry_time: u.get("dry_time").and_then(as_i64_loose),
+        trays: u
+            .get("tray")
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().map(|t| build_tray(t, active, target)).collect())
+            .unwrap_or_default(),
+    }
+}
+
+fn build_tray(t: &Value, active: Option<&str>, target: Option<&str>) -> AmsTray {
+    let id = t.get("id").and_then(as_string).unwrap_or_default();
+    let matches = |p: Option<&str>| !id.is_empty() && p == Some(id.as_str());
+    AmsTray {
+        is_active: matches(active),
+        is_target: matches(target),
+        material: t.get("tray_type").and_then(as_nonempty_string),
+        name: t.get("tray_sub_brands").and_then(as_nonempty_string),
+        color: t.get("tray_color").and_then(as_nonempty_string),
+        cols: t
+            .get("cols")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(as_nonempty_string).collect())
+            .unwrap_or_default(),
+        remain: t.get("remain").and_then(as_i64_loose),
+        state: t.get("state").and_then(as_i64_loose),
+        info_idx: t.get("tray_info_idx").and_then(as_nonempty_string),
+        id_name: t.get("tray_id_name").and_then(as_nonempty_string),
+        // A `tray_uuid` of all-zeros means "no spool tag" → None.
+        uuid: t
+            .get("tray_uuid")
+            .and_then(as_nonempty_string)
+            .filter(|s| s.bytes().any(|b| b != b'0')),
+        nozzle_temp_min: t.get("nozzle_temp_min").and_then(as_i64_loose),
+        nozzle_temp_max: t.get("nozzle_temp_max").and_then(as_i64_loose),
+        id,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +869,70 @@ mod tests {
         assert_eq!(st.bed_target, Some(0.0));
         // Raw chamber value is present (5.0) but the A1 mini has no real sensor.
         assert_eq!(st.chamber_temper_raw, Some(5.0));
+
+        // ── Enriched scalars (all string "0"s parse to numbers) ──
+        assert_eq!(st.big_fan1_speed, Some(0));
+        assert_eq!(st.big_fan2_speed, Some(0));
+        assert_eq!(st.heatbreak_fan_speed, Some(0));
+        assert_eq!(st.fan_gear, Some(0));
+        assert_eq!(st.spd_mag, Some(100));
+        assert_eq!(st.mc_print_stage, Some(1)); // string "1"
+        assert_eq!(st.print_type.as_deref(), Some("idle"));
+        assert_eq!(st.gcode_file, None); // empty "" -> None
+        assert_eq!(st.nozzle_diameter.as_deref(), Some("0.4"));
+        assert_eq!(st.nozzle_type.as_deref(), Some("stainless_steel"));
+        assert_eq!(st.sdcard, Some(true));
+        assert_eq!(st.sequence_id.as_deref(), Some("5"));
+        assert_eq!(st.lifecycle.as_deref(), Some("product"));
+        // wifi_signal is "<redacted>" in the scrubbed fixture -> filtered to None.
+        assert_eq!(st.wifi_signal, None);
+        assert!(st.hms.is_empty()); // healthy idle device
+
+        // ── Nested objects ──
+        let online = st.online.as_ref().unwrap();
+        assert_eq!(online.ahb, Some(false));
+        assert_eq!(online.rfid, Some(false));
+        assert_eq!(online.version, Some(816539411));
+        let up = st.upgrade.as_ref().unwrap();
+        assert_eq!(up.new_version_state, Some(2));
+        assert_eq!(up.status.as_deref(), Some("IDLE"));
+        let upload = st.upload.as_ref().unwrap();
+        assert_eq!(upload.status.as_deref(), Some("idle"));
+        assert_eq!(upload.message, None); // empty -> None
+
+        // ── Full AMS inventory: 1 unit, 4 trays, idle (nothing loaded) ──
+        let ams = st.ams.as_ref().unwrap();
+        assert_eq!(ams.active_tray.as_deref(), Some("255")); // none loaded
+        assert_eq!(ams.tray_exist_bits.as_deref(), Some("f")); // all 4 slots full
+        assert_eq!(ams.units.len(), 1);
+        let unit = &ams.units[0];
+        assert_eq!(unit.id, "0");
+        assert_eq!(unit.humidity, Some(5)); // string "5"
+        assert_eq!(unit.temp, Some(0.0)); // string "0.0" via as_f64_loose
+        assert_eq!(unit.trays.len(), 4);
+        let t0 = &unit.trays[0];
+        assert_eq!(t0.id, "0");
+        assert_eq!(t0.material.as_deref(), Some("PLA"));
+        assert_eq!(t0.name.as_deref(), Some("PLA Matte"));
+        assert_eq!(t0.color.as_deref(), Some("DE4343FF"));
+        assert_eq!(t0.cols, vec!["DE4343FF".to_string()]);
+        assert_eq!(t0.info_idx.as_deref(), Some("GFA01"));
+        assert_eq!(t0.nozzle_temp_min, Some(190));
+        assert_eq!(t0.nozzle_temp_max, Some(230));
+        assert!(t0.uuid.is_some()); // real spool tag present
+        assert!(!t0.is_active); // nothing loaded (tray_now == 255)
+        // The PETG tray keeps its distinct temps.
+        assert_eq!(unit.trays[2].material.as_deref(), Some("PETG"));
+        assert_eq!(unit.trays[2].nozzle_temp_max, Some(260));
+        // External spool surfaced from vt_tray; empty sub_brands & all-zero uuid -> None.
+        let ext = ams.external.as_ref().unwrap();
+        assert_eq!(ext.id, "254");
+        assert_eq!(ext.material.as_deref(), Some("PLA"));
+        assert_eq!(ext.name, None);
+        assert_eq!(ext.uuid, None);
+
+        // The single-filament convenience pointer is None while idle (tray_now 255).
+        assert_eq!(st.filament, None);
     }
 
     #[test]
@@ -514,5 +1040,102 @@ mod tests {
         let st = PrinterStatus::from_state(rs.get());
         assert_eq!(st.gcode_state.as_deref(), Some("RUNNING"));
         assert_eq!(st.mc_percent, Some(55));
+    }
+
+    #[test]
+    fn hms_alerts_are_decoded_into_the_status() {
+        // attr=0x03000100, code=0x00010007 -> the wiki's heatbed-temp-abnormal code.
+        let st = PrinterStatus::from_state(&json!({ "print": { "hms": [
+            { "attr": 50331904, "code": 65543 },
+            { "attr": 0, "code": 0 } // zero padding -> skipped
+        ]}}));
+        assert_eq!(st.hms.len(), 1);
+        let a = &st.hms[0];
+        assert_eq!(a.code, "HMS_0300_0100_0001_0007");
+        assert_eq!(a.code_hyphen, "0300-0100-0001-0007");
+        assert_eq!(a.module, "motion_controller");
+        assert_eq!(a.severity, 1); // 0x0001
+        assert!(!a.is_lidar);
+        assert!(a.wiki.contains("0300_0100_0001_0007"));
+        assert_eq!(a.attr, 50331904);
+        // Healthy device -> empty list, and it is elided from the JSON.
+        let healthy = PrinterStatus::from_state(&json!({ "print": { "hms": [] } }));
+        assert!(healthy.hms.is_empty());
+        let v = serde_json::to_value(&healthy).unwrap();
+        assert!(v.get("hms").is_none(), "empty hms should be skipped");
+    }
+
+    #[test]
+    fn hms_unknown_module_keeps_its_hex() {
+        // attr module byte 0x11 is community-only / unverified -> unknown:0x11.
+        let st = PrinterStatus::from_state(&json!({ "print": { "hms": [
+            { "attr": 0x1100_0000u32, "code": 0x0002_0001u32 }
+        ]}}));
+        assert_eq!(st.hms[0].module, "unknown:0x11");
+    }
+
+    #[test]
+    fn ams_derives_active_and_target_during_a_swap() {
+        // tray_now=1, tray_tar=3 -> a colour swap from tray 1 to tray 3.
+        let st = PrinterStatus::from_state(&json!({ "print": { "ams": {
+            "tray_now": "1", "tray_tar": "3", "tray_pre": "1",
+            "ams": [{ "id": "0", "tray": [
+                { "id": "0", "tray_type": "PLA", "tray_color": "DE4343FF" },
+                { "id": "1", "tray_type": "PLA", "tray_color": "000000FF" },
+                { "id": "3", "tray_type": "PETG", "tray_color": "D6ABFF80" }
+            ]}]
+        }}}));
+        let ams = st.ams.as_ref().unwrap();
+        assert_eq!(ams.active_tray.as_deref(), Some("1"));
+        assert_eq!(ams.target_tray.as_deref(), Some("3"));
+        let trays = &ams.units[0].trays;
+        assert!(trays[1].is_active && !trays[1].is_target); // currently printing
+        assert!(trays[2].is_target && !trays[2].is_active); // swapping to it
+        assert!(!trays[0].is_active && !trays[0].is_target);
+        // The convenience pointer still resolves the loaded tray.
+        assert_eq!(st.filament.as_ref().unwrap().location, "ams1");
+    }
+
+    #[test]
+    fn ams_is_none_without_ams_or_vt_tray() {
+        let st = PrinterStatus::from_state(&json!({ "print": { "gcode_state": "IDLE" } }));
+        assert_eq!(st.ams, None);
+    }
+
+    #[test]
+    fn wifi_signal_real_value_passes_through_but_sentinel_is_dropped() {
+        let real = PrinterStatus::from_state(&json!({ "print": { "wifi_signal": "-50dBm" } }));
+        assert_eq!(real.wifi_signal.as_deref(), Some("-50dBm"));
+        let scrubbed =
+            PrinterStatus::from_state(&json!({ "print": { "wifi_signal": "<redacted>" } }));
+        assert_eq!(scrubbed.wifi_signal, None);
+    }
+
+    #[test]
+    fn loose_float_parsing_accepts_string_and_number() {
+        assert_eq!(as_f64_loose(&json!("0.0")), Some(0.0));
+        assert_eq!(as_f64_loose(&json!(28.5)), Some(28.5));
+        assert_eq!(as_f64_loose(&json!(true)), None);
+    }
+
+    #[test]
+    fn enriched_fields_are_elided_from_an_idle_payload() {
+        // A bare RUNNING status should not carry a wall of nulls for the new
+        // optional fields (skip_serializing_if keeps WS frames compact).
+        let st = PrinterStatus::from_state(&json!({ "print": { "gcode_state": "RUNNING" } }));
+        let v = serde_json::to_value(&st).unwrap();
+        for absent in [
+            "ams",
+            "upgrade",
+            "online",
+            "upload",
+            "wifi_signal",
+            "big_fan1_speed",
+        ] {
+            assert!(
+                v.get(absent).is_none(),
+                "{absent} should be skipped when absent"
+            );
+        }
     }
 }
