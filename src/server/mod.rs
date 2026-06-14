@@ -37,6 +37,10 @@ pub struct ServeOpts {
     pub fake: bool,
     pub interval: Option<Duration>,
     pub camera_rtsp: Option<String>,
+    /// External IP-camera snapshot URL (single-JPEG-per-GET). When set, the
+    /// server proxies it via `/api/camera/snapshot` so a browser that can't reach
+    /// the LAN cam (e.g. over Tailscale) still gets a live view.
+    pub camera_url: Option<String>,
 }
 
 /// Run the server (blocking; owns its own multi-thread runtime).
@@ -51,6 +55,7 @@ pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<
         fake,
         interval,
         camera_rtsp: _,
+        camera_url,
     } = opts;
     rt.block_on(async move {
         // Live mode bridges the real MQTT monitor (and controls the real device);
@@ -65,6 +70,7 @@ pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<
                     starter: Arc::new(LiveStarter::new(t)),
                     password,
                     start_lock: Arc::new(tokio::sync::Mutex::new(())),
+                    camera_url,
                 }
             }
             _ => {
@@ -81,6 +87,7 @@ pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<
                     starter: Arc::new(FakeStarter),
                     password,
                     start_lock: Arc::new(tokio::sync::Mutex::new(())),
+                    camera_url,
                 }
             }
         };

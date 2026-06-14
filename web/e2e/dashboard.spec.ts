@@ -164,6 +164,12 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("toast")).toContainText("verified");
   });
 
+  test("camera panel is absent when no camera is configured", async ({ page }) => {
+    // Fake mode runs without --camera-url, so /api/camera reports unavailable
+    // and the section renders nothing.
+    await expect(page.getByTestId("camera")).toHaveCount(0);
+  });
+
   test("renders on a phone viewport", async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 850 });
     await expect(page.getByTestId("state")).toBeVisible();

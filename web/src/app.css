@@ -930,6 +930,18 @@ body {
   margin-top: 0.55rem;
 }
 
+/* ── external camera (server-proxied IP cam) ─────────────────────────────── */
+.cam__view {
+  display: block;
+  width: 100%;
+  margin-top: 0.55rem;
+  aspect-ratio: 16 / 9;
+  object-fit: contain;
+  background: var(--hair-2);
+  border: 1px solid var(--hair);
+  border-radius: 8px;
+}
+
 /* ── thumbnails (embedded plate preview) ─────────────────────────────────── */
 .thumb {
   display: block;

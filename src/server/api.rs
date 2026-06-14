@@ -9,6 +9,7 @@
 //! real printer: tests and `--fake` use [`FakeSource`]/[`FakeController`]; live
 //! mode uses [`super::LiveSource`]/[`super::control::LiveController`].
 
+use std::io::Read;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,7 +18,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::{
     StatusCode,
-    header::{AUTHORIZATION, CONTENT_TYPE},
+    header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE},
 };
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -247,6 +248,11 @@ pub struct AppState {
     /// Held for the duration of a `job/start` so two concurrent starts can't both
     /// pass the idle check.
     pub start_lock: Arc<tokio::sync::Mutex<()>>,
+    /// External IP-camera snapshot URL (single-JPEG-per-GET). `None` ⇒ no camera
+    /// configured: `/api/camera` reports `available: false` and the snapshot
+    /// endpoint 404s. Proxied server-side so a browser that can't reach the LAN
+    /// cam (e.g. over Tailscale) still gets a live view.
+    pub camera_url: Option<String>,
 }
 
 /// A safe absolute path on the printer: starts with `/`, no traversal or scheme.
@@ -269,6 +275,7 @@ impl AppState {
             starter: Arc::new(FakeStarter),
             password: None,
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            camera_url: None,
         }
     }
 }
@@ -283,7 +290,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/files/thumbnail", get(file_thumbnail))
         .route("/api/files/raw", get(file_raw))
         .route("/api/files/gcode", get(file_gcode))
-        .route("/api/files/mesh", get(file_mesh));
+        .route("/api/files/mesh", get(file_mesh))
+        .route("/api/camera", get(camera_info))
+        .route("/api/camera/snapshot", get(camera_snapshot));
     let writes = Router::new()
         .route("/api/job/pause", post(job_pause))
         .route("/api/job/resume", post(job_resume))
@@ -972,6 +981,70 @@ async fn file_mesh(State(st): State<AppState>, Query(q): Query<MeshQuery>) -> Re
     }
 }
 
+// ── Camera (external IP-camera proxy) ────────────────────────────────────────
+
+/// Report whether an external camera is configured (open read). The browser uses
+/// this to decide whether to render a live view — the snapshot URL is never
+/// exposed to the client, only proxied.
+async fn camera_info(State(st): State<AppState>) -> Json<serde_json::Value> {
+    Json(json!({ "available": st.camera_url.is_some() }))
+}
+
+/// Cap a proxied camera frame to bound server memory (a single JPEG is well under
+/// this; a misbehaving upstream can't OOM us).
+const CAMERA_MAX_BYTES: u64 = 32 * 1024 * 1024;
+/// Upstream fetch timeout — a stalled camera shouldn't hang the request.
+const CAMERA_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Proxy a single JPEG from the configured external camera (open read). 404 when
+/// no camera is configured; 502 on any upstream/transport error. Runs the
+/// blocking `ureq` GET on the blocking pool and passes the upstream content-type
+/// through (defaulting to `image/jpeg`).
+async fn camera_snapshot(State(st): State<AppState>) -> Response {
+    let Some(url) = st.camera_url.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match tokio::task::spawn_blocking(move || fetch_camera_frame(&url)).await {
+        Ok(Ok((ctype, bytes))) => (
+            [
+                (CONTENT_TYPE, ctype),
+                (CACHE_CONTROL, "no-store".to_string()),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
+        Err(_) => server_error("camera task failed".to_string()),
+    }
+}
+
+/// Blocking single-shot GET of the camera URL. Returns `(content_type, bytes)` or
+/// an error string. The body is read with a hard byte cap so a bad upstream can't
+/// exhaust memory.
+fn fetch_camera_frame(url: &str) -> Result<(String, Vec<u8>), String> {
+    // A snapshot CGI never legitimately redirects; disallowing redirects keeps
+    // the server-side fetch from being bounced to an internal address (SSRF).
+    let agent = ureq::AgentBuilder::new()
+        .timeout(CAMERA_TIMEOUT)
+        .redirects(0)
+        .build();
+    let resp = agent.get(url).call().map_err(|e| e.to_string())?;
+    // Default to image/jpeg if the camera omits a content-type.
+    let ctype = resp
+        .header("content-type")
+        .map(str::to_string)
+        .unwrap_or_else(|| "image/jpeg".to_string());
+    let mut bytes = Vec::new();
+    resp.into_reader()
+        .take(CAMERA_MAX_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.is_empty() {
+        return Err("camera returned an empty body".to_string());
+    }
+    Ok((ctype, bytes))
+}
+
 #[derive(Deserialize)]
 struct UploadQuery {
     dir: Option<String>,
@@ -1120,6 +1193,7 @@ mod tests {
             starter: Arc::new(FakeStarter),
             password: password.map(str::to_owned),
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            camera_url: None,
         };
         TestServer::new(router(state))
     }
@@ -1361,6 +1435,25 @@ mod tests {
             .assert_status(StatusCode::BAD_REQUEST);
     }
 
+    // ── camera ──
+    #[tokio::test]
+    async fn camera_reports_unavailable_when_unconfigured() {
+        // The default test AppState has no camera_url.
+        let res = app(None, FakeController::verified())
+            .get("/api/camera")
+            .await;
+        res.assert_status_ok();
+        assert_eq!(res.json::<serde_json::Value>()["available"], false);
+    }
+
+    #[tokio::test]
+    async fn camera_snapshot_is_404_when_unconfigured() {
+        app(None, FakeController::verified())
+            .get("/api/camera/snapshot")
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn thumbnail_rejects_non_3mf() {
         app(None, FakeController::verified())
@@ -1479,6 +1572,7 @@ mod tests {
             starter: Arc::new(FakeStarter),
             password: None,
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            camera_url: None,
         };
         TestServer::new(router(state))
             .post("/api/job/start")
@@ -1498,6 +1592,7 @@ mod tests {
             starter: Arc::new(FakeStarter),
             password: None,
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            camera_url: None,
         };
         TestServer::new(router(state))
     }
@@ -1533,6 +1628,7 @@ mod tests {
             starter: Arc::new(FakeStarter),
             password: None,
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            camera_url: None,
         };
         TestServer::new(router(state))
     }
@@ -1908,6 +2004,7 @@ mod tests {
             starter: Arc::new(FakeStarter),
             password: None,
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            camera_url: None,
         };
         let mut ws = ws_server(state)
             .get_websocket("/api/ws")

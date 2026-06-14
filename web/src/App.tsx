@@ -6,6 +6,7 @@ import { TempSection } from "./components/TempSection";
 import { AmsSection } from "./components/AmsSection";
 import { Controls, ConfirmDialog } from "./components/Controls";
 import { MachineSection } from "./components/MachineSection";
+import { CameraSection } from "./components/CameraSection";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { FilesSection } from "./components/FilesSection";
 import { HealthSection } from "./components/HealthSection";
@@ -28,6 +29,7 @@ export function App() {
             <TempSection s={status} history={history} />
             {status.ams && <AmsSection ams={status.ams} />}
             <Controls control={control} status={status} />
+            <CameraSection />
             <MachineSection s={status} control={control} />
             <FilesSection sdcard={status.sdcard} />
             <HealthSection s={status} />

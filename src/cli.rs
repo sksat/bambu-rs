@@ -197,6 +197,12 @@ enum Command {
         /// External RTSP camera URL to bridge to the browser.
         #[arg(long)]
         camera_rtsp: Option<String>,
+        /// External IP-camera snapshot URL (single JPEG per GET, e.g. an ATOM Cam
+        /// `http://HOST/cgi-bin/get_jpeg.cgi`). The server proxies it so a browser
+        /// that can't reach the LAN cam still gets a live view. May also be set via
+        /// $BAMBU_CAMERA_URL.
+        #[arg(long, env = "BAMBU_CAMERA_URL")]
+        camera_url: Option<String>,
     },
 }
 
@@ -600,6 +606,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             fake,
             interval,
             camera_rtsp,
+            camera_url,
         } => run_serve(
             cli,
             host,
@@ -608,6 +615,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             *fake,
             *interval,
             camera_rtsp.clone(),
+            camera_url.clone(),
         ),
     }
 }
@@ -1177,6 +1185,7 @@ fn run_serve(
     fake: bool,
     interval: Option<u64>,
     camera_rtsp: Option<String>,
+    camera_url: Option<String>,
 ) -> Result<(), CliError> {
     // Live mode needs a connection target; fake mode doesn't touch the printer.
     let target = if fake {
@@ -1191,6 +1200,7 @@ fn run_serve(
         fake,
         interval: interval.map(Duration::from_secs),
         camera_rtsp,
+        camera_url,
     };
     crate::server::serve(target, opts).map_err(|e| CliError::new(exit::GENERAL, e.to_string()))
 }
