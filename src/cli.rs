@@ -27,6 +27,7 @@ use crate::core::report::ReportState;
 use crate::core::safety::{self, GcodeVerdict, TempLimits};
 use crate::core::stage::Stage;
 use crate::core::status::{GcodeState, PrinterStatus};
+use crate::core::timelapse::{CaptureAction, CaptureSession};
 use crate::core::version::Module;
 use crate::ftp::{FtpError, FtpsClient};
 
@@ -2062,41 +2063,25 @@ fn run_timelapse_capture(
         })
     };
 
-    // Only capture while a print is actually progressing — otherwise an idle
-    // printer's stale `layer_num` (often 0) would trigger a spurious frame.
-    let is_active = |s: Option<GcodeState>| {
-        matches!(
-            s,
-            Some(GcodeState::Running | GcodeState::Prepare | GcodeState::Pause)
-        )
-    };
+    // The pure `CaptureSession` (core) decides per status snapshot whether to
+    // grab a frame or stop; here we only turn a `Capture` into a queued frame.
     // Scope the callback so its borrow of `tx` ends before we drop `tx` (which
     // signals the worker to finish and lets us join it for the final counts).
     let watch_result = {
-        let mut last_layer: Option<i64> = None;
-        let mut frame_no: u64 = 0;
-        // `--wait` keys off this: until the print has been active at least once,
-        // an idle/finished/error state must not end the watch.
-        let mut seen_active = false;
+        let mut session = CaptureSession::new(every, wait);
         let mut on_update = |state: &ReportState| -> WatchStep {
             let st = PrinterStatus::from_state(state.get());
-            if is_active(st.state()) {
-                seen_active = true;
-                if let Some(layer) = st.layer_num
-                    && last_layer != Some(layer)
-                {
-                    last_layer = Some(layer);
-                    // Capture on every Nth layer (layer 0 = the first reported layer).
-                    if layer >= 0 && (layer as u64).is_multiple_of(every) {
-                        frame_no += 1;
-                        let frame = out_dir.join(format!("frame_{frame_no:06}_layer_{layer:05}.{ext}"));
-                        // Enqueue; the worker captures. send fails only if the worker
-                        // died, which we surface via the join below.
-                        let _ = tx.send((frame, layer));
-                    }
+            match session.observe(&st) {
+                CaptureAction::Capture { frame_no, layer } => {
+                    let frame = out_dir.join(format!("frame_{frame_no:06}_layer_{layer:05}.{ext}"));
+                    // Enqueue; the worker captures. send fails only if the worker
+                    // died, which we surface via the join below.
+                    let _ = tx.send((frame, layer));
+                    WatchStep::Continue
                 }
+                CaptureAction::Continue => WatchStep::Continue,
+                CaptureAction::Stop => WatchStep::Stop,
             }
-            capture_watch_step(wait, seen_active, st.state(), st.error.is_some())
         };
         client.watch(interval, &mut on_update)
     };
@@ -2142,34 +2127,6 @@ fn run_timelapse_capture(
         println!("to build a video:\n  {suggested}");
     }
     Ok(())
-}
-
-/// Decide whether the capture watch should stop. Pure so the (otherwise
-/// closure-embedded) end-of-watch logic is table-testable.
-///
-/// With `--wait`, the watch sits through idle / finished-from-last-print / even a
-/// stale error state until the print has actually been active at least once — so
-/// you can launch the capture *before* starting the print and it just waits. Once
-/// a print has been seen active, a terminal state or an error ends the watch, as
-/// it always did. Without `--wait`, the print must already be running: any
-/// terminal/error stops immediately.
-fn capture_watch_step(
-    wait: bool,
-    seen_active: bool,
-    state: Option<GcodeState>,
-    has_error: bool,
-) -> WatchStep {
-    // While waiting for the print to start, nothing ends the watch.
-    if wait && !seen_active {
-        return WatchStep::Continue;
-    }
-    if has_error {
-        return WatchStep::Stop;
-    }
-    match state {
-        Some(s) if is_watch_terminal(s) => WatchStep::Stop,
-        _ => WatchStep::Continue,
-    }
 }
 
 /// A suggested `ffmpeg` line to stitch the frames (glob handles the layer suffix
@@ -2392,31 +2349,6 @@ fn fmt_eta(min: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{ams_mapping_preview, fmt_eta, subst_capture_tokens, validate_ams_map};
-
-    #[test]
-    fn capture_watch_waits_for_print_then_ends_at_terminal() {
-        use super::{capture_watch_step, GcodeState, WatchStep};
-        let stop = |s: WatchStep| matches!(s, WatchStep::Stop);
-        let go = |s: WatchStep| matches!(s, WatchStep::Continue);
-
-        // Without --wait: legacy behaviour — any terminal/idle state ends the
-        // watch at once; an active print keeps it going.
-        assert!(stop(capture_watch_step(false, false, Some(GcodeState::Idle), false)));
-        assert!(stop(capture_watch_step(false, false, Some(GcodeState::Finish), false)));
-        assert!(go(capture_watch_step(false, false, Some(GcodeState::Running), false)));
-
-        // With --wait, before any active state: nothing ends the watch — not idle,
-        // not a finished-from-last-print state, not even a stale print error.
-        assert!(go(capture_watch_step(true, false, Some(GcodeState::Idle), false)));
-        assert!(go(capture_watch_step(true, false, Some(GcodeState::Finish), false)));
-        assert!(go(capture_watch_step(true, false, Some(GcodeState::Finish), true)));
-
-        // With --wait, once the print has been active: a terminal state or an
-        // error ends it, exactly like the legacy path.
-        assert!(go(capture_watch_step(true, true, Some(GcodeState::Running), false)));
-        assert!(stop(capture_watch_step(true, true, Some(GcodeState::Finish), false)));
-        assert!(stop(capture_watch_step(true, true, Some(GcodeState::Running), true)));
-    }
 
     #[test]
     fn eta_formats_minutes_and_hours() {
