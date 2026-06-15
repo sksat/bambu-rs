@@ -13,7 +13,7 @@ use std::io::Read;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{
@@ -300,7 +300,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/files/gcode", get(file_gcode))
         .route("/api/files/mesh", get(file_mesh))
         .route("/api/cameras", get(cameras_list))
-        .route("/api/cameras/{id}/snapshot", get(camera_snapshot));
+        .route("/api/cameras/{id}/snapshot", get(camera_snapshot))
+        .route("/api/cameras/{id}/stream", get(camera_stream));
     let writes = Router::new()
         .route("/api/job/pause", post(job_pause))
         .route("/api/job/resume", post(job_resume))
@@ -1015,7 +1016,14 @@ async fn cameras_list(State(st): State<AppState>) -> Json<serde_json::Value> {
         cameras.push(json!({ "id": "internal", "kind": "internal", "label": "built-in camera" }));
     }
     for (i, c) in st.external_cameras.read().unwrap().iter().enumerate() {
-        cameras.push(json!({ "id": format!("ext-{i}"), "kind": "external", "label": c.label }));
+        cameras.push(json!({
+            "id": format!("ext-{i}"),
+            "kind": "external",
+            "label": c.label,
+            // Whether a live MJPEG stream is proxiable for this camera (so the
+            // frontend uses `/stream` instead of snapshot polling).
+            "stream": c.stream_url.is_some(),
+        }));
     }
     Json(json!({ "cameras": cameras }))
 }
@@ -1069,6 +1077,82 @@ async fn camera_snapshot(State(st): State<AppState>, Path(id): Path<String>) -> 
     }
 }
 
+/// Resolve the live-stream URL for a camera id. Only `ext-{i}` cameras that have
+/// a configured `stream_url` stream; `internal` and unknown ids yield `None` (the
+/// built-in TCP:6000 cam has no MJPEG stream). Pure, so the routing is testable.
+fn resolve_stream_url(id: &str, externals: &[ExternalCamera]) -> Option<String> {
+    id.strip_prefix("ext-")
+        .and_then(|n| n.parse::<usize>().ok())
+        .and_then(|i| externals.get(i))
+        .and_then(|c| c.stream_url.clone())
+}
+
+/// Reverse-proxy a camera's live MJPEG stream (open read). `ext-{i}` with a
+/// configured stream URL only; otherwise 404. The endless upstream multipart body
+/// is relayed chunk-by-chunk through a bounded channel, so a fast camera can't
+/// outrun a slow client into unbounded memory (the reader blocks when the channel
+/// is full; a dropped receiver — client gone — ends it). 502 if the connect fails.
+async fn camera_stream(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+    let Some(url) = resolve_stream_url(&id, &st.external_cameras.read().unwrap()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    // Connect first (blocking) to learn the upstream content-type — we need the
+    // multipart boundary before we can set our own response headers.
+    let opened = tokio::task::spawn_blocking(move || open_camera_stream(&url)).await;
+    let (ctype, reader) = match opened {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
+        Err(_) => return server_error("camera stream task failed".to_string()),
+    };
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    tokio::task::spawn_blocking(move || {
+        let mut reader = reader;
+        let mut buf = vec![0u8; 32 * 1024];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    // blocking_send applies backpressure and fails once the client
+                    // (receiver) is gone — either way we then stop reading upstream.
+                    if tx.blocking_send(Ok(Bytes::copy_from_slice(&buf[..n]))).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    break;
+                }
+            }
+        }
+    });
+    let body = Body::from_stream(futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }));
+    Response::builder()
+        .header(CONTENT_TYPE, ctype)
+        .header(CACHE_CONTROL, "no-store")
+        .body(body)
+        .unwrap()
+}
+
+/// Open a camera's MJPEG stream (blocking): connect and hand back the upstream
+/// content-type plus a reader over the long-lived multipart body. A connect
+/// timeout bounds the handshake and a per-read timeout ends a stalled stream, but
+/// there is deliberately no overall timeout — the stream is meant to be endless.
+fn open_camera_stream(url: &str) -> Result<(String, Box<dyn Read + Send + Sync + 'static>), String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(CAMERA_TIMEOUT)
+        .timeout_read(Duration::from_secs(30))
+        .redirects(0)
+        .build();
+    let resp = agent.get(url).call().map_err(|e| e.to_string())?;
+    let ctype = resp
+        .header("content-type")
+        .map(str::to_string)
+        .unwrap_or_else(|| "multipart/x-mixed-replace".to_string());
+    Ok((ctype, resp.into_reader()))
+}
+
 /// Serialise the external list (with URLs) for the gated config endpoints.
 fn external_json(st: &AppState) -> Vec<serde_json::Value> {
     st.external_cameras
@@ -1076,7 +1160,9 @@ fn external_json(st: &AppState) -> Vec<serde_json::Value> {
         .unwrap()
         .iter()
         .enumerate()
-        .map(|(i, c)| json!({ "id": format!("ext-{i}"), "label": c.label, "url": c.url }))
+        .map(|(i, c)| {
+            json!({ "id": format!("ext-{i}"), "label": c.label, "url": c.url, "stream_url": c.stream_url })
+        })
         .collect()
 }
 
@@ -1091,6 +1177,16 @@ async fn cameras_config_get(State(st): State<AppState>) -> Json<serde_json::Valu
 struct ExternalCameraInput {
     label: Option<String>,
     url: String,
+    /// Optional live MJPEG stream URL (reverse-proxied at `/stream`).
+    #[serde(default)]
+    stream_url: Option<String>,
+}
+
+/// Both proxied URLs (snapshot + stream) must be `http://` — the proxy's `ureq`
+/// is built without TLS (LAN IP cameras are plain HTTP), so `https://` would only
+/// 502 at fetch time; rejecting it here also blocks `file:`/`gopher:` SSRF.
+fn is_http_url(u: &str) -> bool {
+    u.starts_with("http://")
 }
 
 #[derive(Deserialize)]
@@ -1109,14 +1205,25 @@ async fn cameras_config_set(
     let mut next = Vec::with_capacity(b.external.len());
     for (i, e) in b.external.into_iter().enumerate() {
         let url = e.url.trim().to_string();
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
+        if !is_http_url(&url) {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "camera URL must start with http:// or https://" })),
+                Json(json!({ "error": "camera URL must start with http:// (the proxy is plain-HTTP; no TLS)" })),
             )
                 .into_response();
         }
-        next.push(ExternalCamera::new(e.label, url, i));
+        // A stream URL, if given, is proxied too — apply the same scheme guard.
+        let stream_url = e.stream_url.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        if let Some(s) = &stream_url
+            && !is_http_url(s)
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "camera stream URL must start with http:// (the proxy is plain-HTTP; no TLS)" })),
+            )
+                .into_response();
+        }
+        next.push(ExternalCamera::new(e.label, url, stream_url, i));
     }
     *st.external_cameras.write().unwrap() = next;
     Json(json!({ "external": external_json(&st) })).into_response()
@@ -1609,11 +1716,141 @@ mod tests {
 
     #[tokio::test]
     async fn camera_config_rejects_non_http_url() {
-        app(None, FakeController::verified())
+        let server = app(None, FakeController::verified());
+        server
             .post("/api/cameras/config")
             .json(&json!({ "external": [{ "url": "file:///etc/passwd" }] }))
             .await
             .assert_status(StatusCode::BAD_REQUEST);
+        // The proxy's ureq is built without TLS, so an https camera would only
+        // fail later with a 502 — reject it up front rather than advertise it.
+        server
+            .post("/api/cameras/config")
+            .json(&json!({ "external": [{ "url": "https://cam.local/a.jpg" }] }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn external_camera_stream_url_round_trips_and_flags_the_list() {
+        let server = app(None, FakeController::verified());
+        server
+            .post("/api/cameras/config")
+            .json(&json!({
+                "external": [
+                    { "label": "front", "url": "http://cam.local/snapshot",
+                      "stream_url": "http://cam.local/stream" },
+                    { "url": "http://cam.local/b.jpg" }
+                ]
+            }))
+            .await
+            .assert_status_ok();
+        // The open list flags whether a live MJPEG stream is available, so the
+        // frontend can pick stream vs snapshot-poll — still without leaking URLs.
+        let list = server.get("/api/cameras").await.json::<serde_json::Value>();
+        let cams = list["cameras"].as_array().unwrap();
+        assert_eq!(cams[0]["stream"], true);
+        assert_eq!(cams[1]["stream"], false);
+        assert!(cams[0].get("url").is_none());
+        // The gated config read echoes the stream URL for the manage form.
+        let cfg = server
+            .get("/api/cameras/config")
+            .await
+            .json::<serde_json::Value>();
+        assert_eq!(cfg["external"][0]["stream_url"], "http://cam.local/stream");
+        assert!(cfg["external"][1]["stream_url"].is_null());
+    }
+
+    #[tokio::test]
+    async fn camera_config_rejects_non_http_stream_url() {
+        let server = app(None, FakeController::verified());
+        server
+            .post("/api/cameras/config")
+            .json(&json!({
+                "external": [
+                    { "url": "http://cam.local/a.jpg", "stream_url": "file:///etc/passwd" }
+                ]
+            }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+        // Same TLS-less reason as the snapshot URL: no https streams.
+        server
+            .post("/api/cameras/config")
+            .json(&json!({
+                "external": [
+                    { "url": "http://cam.local/a.jpg", "stream_url": "https://cam.local/stream" }
+                ]
+            }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn resolve_stream_url_only_for_ext_with_a_stream() {
+        use super::{resolve_stream_url, ExternalCamera};
+        let cams = vec![
+            ExternalCamera::new(
+                Some("a".into()),
+                "http://x/snap".into(),
+                Some("http://x/stream".into()),
+                0,
+            ),
+            ExternalCamera::new(None, "http://y/snap".into(), None, 1),
+        ];
+        assert_eq!(
+            resolve_stream_url("ext-0", &cams).as_deref(),
+            Some("http://x/stream")
+        );
+        assert_eq!(resolve_stream_url("ext-1", &cams), None); // snapshot-only
+        assert_eq!(resolve_stream_url("ext-9", &cams), None); // out of range
+        assert_eq!(resolve_stream_url("internal", &cams), None);
+        assert_eq!(resolve_stream_url("bogus", &cams), None);
+    }
+
+    #[tokio::test]
+    async fn camera_stream_relays_the_upstream_multipart_body() {
+        use std::io::{Read as _, Write as _};
+        // Throwaway upstream: answer one request with a short multipart MJPEG body
+        // (including a non-UTF8 JPEG start marker), then close so the relayed
+        // stream ends and the test can read it in full.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf); // drain the request line/headers
+                let mut body = Vec::new();
+                body.extend_from_slice(b"--FRAME\r\nContent-Type: image/jpeg\r\n\r\n");
+                body.extend_from_slice(&[0xff, 0xd8, 0xff, b'D', b'A', b'T', b'A']);
+                body.extend_from_slice(b"\r\n--FRAME--\r\n");
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; \
+                            boundary=FRAME\r\nConnection: close\r\n\r\n";
+                let _ = sock.write_all(head.as_bytes());
+                let _ = sock.write_all(&body);
+            }
+        });
+        let server = app(None, FakeController::verified());
+        server
+            .post("/api/cameras/config")
+            .json(&json!({ "external": [
+                { "url": format!("http://{addr}/snap"),
+                  "stream_url": format!("http://{addr}/stream") }
+            ] }))
+            .await
+            .assert_status_ok();
+        let res = server.get("/api/cameras/ext-0/stream").await;
+        res.assert_status_ok();
+        assert!(
+            res.header("content-type")
+                .to_str()
+                .unwrap()
+                .starts_with("multipart/x-mixed-replace")
+        );
+        // The upstream body is relayed through verbatim (incl. the binary marker).
+        let bytes = res.as_bytes();
+        assert!(bytes.windows(7).any(|w| w == b"--FRAME"));
+        assert!(bytes.windows(4).any(|w| w == b"DATA"));
+        upstream.join().unwrap();
     }
 
     #[tokio::test]

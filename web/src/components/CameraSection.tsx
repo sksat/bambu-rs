@@ -15,11 +15,16 @@ import {
 const FAST_MS = 800;
 const SLOW_MS = 5000;
 
-// A live view of ONE camera by id: an <img> pointed at the proxied snapshot,
-// cache-busted each cycle. A configured-but-not-streaming source (e.g. the A1
-// built-in cam is off) shows an "offline" message and polls slowly. Re-mount it
-// (key by id) when the active tab changes to reset the loop cleanly.
-function CameraView({ id, label }: { id: string; label: string }) {
+// A live view of ONE camera by id. Two modes:
+//   - stream: a single long-lived <img> on the MJPEG `/stream` endpoint — the
+//     browser renders frames continuously, so there's NO re-fetch loop; on error
+//     we bump the cache-buster to reconnect after a back-off.
+//   - snapshot: poll one JPEG per cycle, driven off the <img> load/error so a
+//     slow source (e.g. the A1 built-in cam taking seconds to fail) is never
+//     re-requested before the current grab finishes.
+// A configured-but-not-streaming source shows an "offline" message. Re-mount it
+// (key by id) when the active tab changes to reset cleanly.
+function CameraView({ id, label, stream }: { id: string; label: string; stream?: boolean }) {
   const [ts, setTs] = useState(() => Date.now());
   const [offline, setOffline] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -31,20 +36,24 @@ function CameraView({ id, label }: { id: string; label: string }) {
     timer.current = setTimeout(() => setTs(Date.now()), delay);
   };
 
+  const kind = stream ? "stream" : "snapshot";
+
   return (
     <div className="cam__frame">
       <img
         className={offline ? "cam__view cam__view--off" : "cam__view"}
         alt={label}
-        src={`/api/cameras/${id}/snapshot?t=${ts}`}
+        src={`/api/cameras/${id}/${kind}?t=${ts}`}
         data-testid="camera-view"
+        data-mode={kind}
         onLoad={() => {
           if (offline) setOffline(false);
-          scheduleNext(FAST_MS);
+          // Stream is continuous — don't re-request it; only snapshots poll.
+          if (!stream) scheduleNext(FAST_MS);
         }}
         onError={() => {
           if (!offline) setOffline(true);
-          scheduleNext(SLOW_MS);
+          scheduleNext(SLOW_MS); // reconnect (stream) / retry (snapshot)
         }}
       />
       {offline && (
@@ -112,7 +121,14 @@ export function CamerasSection({ password }: { password: string | null }) {
                 ))}
               </div>
             )}
-            {activeCam && <CameraView key={activeCam.id} id={activeCam.id} label={activeCam.label} />}
+            {activeCam && (
+              <CameraView
+                key={activeCam.id}
+                id={activeCam.id}
+                label={activeCam.label}
+                stream={activeCam.stream}
+              />
+            )}
           </>
         )}
       </section>
@@ -134,6 +150,7 @@ export function CamerasSection({ password }: { password: string | null }) {
 interface Row {
   label: string;
   url: string;
+  stream_url: string;
 }
 
 // The manage dialog: a floating modal for editing the external-camera list (the
@@ -156,13 +173,17 @@ function CameraManageModal({
       const cfg = await getCamerasConfig(password);
       if (cfg === "needPassword") setStatus("needs the control password (set it in Controls)");
       else if (cfg === "error") setStatus("couldn't load camera config");
-      else setRows(cfg.map((e) => ({ label: e.label, url: e.url })));
+      else setRows(cfg.map((e) => ({ label: e.label, url: e.url, stream_url: e.stream_url ?? "" })));
     })();
   }, [password]);
 
   const save = async () => {
     const external = rows
-      .map((r) => ({ label: r.label.trim() || undefined, url: r.url.trim() }))
+      .map((r) => ({
+        label: r.label.trim() || undefined,
+        url: r.url.trim(),
+        stream_url: r.stream_url.trim() || undefined,
+      }))
       .filter((r) => r.url);
     setStatus("saving…");
     const res = await setCamerasConfig(external, password);
@@ -190,15 +211,18 @@ function CameraManageModal({
         </div>
         <div className="cam__form" data-testid="cameras-form">
           <p className="cam__hint">
-            External snapshot cameras the dashboard proxies — one row per camera, each a
-            name and a URL that returns a single JPEG (e.g. <code>http://cam/snapshot.jpg</code>).
-            The built-in printer camera is added automatically and isn&apos;t listed here.
+            External cameras the dashboard proxies — one row per camera, each a name and a
+            URL that returns a single JPEG (e.g. <code>http://cam/snapshot.jpg</code>). Add an
+            optional <strong>stream URL</strong> (an MJPEG <code>/stream</code> endpoint) for
+            smooth live video instead of snapshot polling. The built-in printer camera is added
+            automatically and isn&apos;t listed here.
           </p>
           {rows.length > 0 ? (
             <>
               <div className="cam__row cam__row--head">
                 <span className="cam__col cam__col--label">name</span>
                 <span className="cam__col">snapshot URL</span>
+                <span className="cam__col">stream URL (optional)</span>
                 <span className="cam__col--rm" aria-hidden="true" />
               </div>
               {rows.map((r, i) => (
@@ -215,11 +239,21 @@ function CameraManageModal({
                   <input
                     className="cam__in"
                     placeholder="http://host/snapshot.jpg"
-                    aria-label={`camera ${i + 1} URL`}
+                    aria-label={`camera ${i + 1} snapshot URL`}
                     value={r.url}
                     data-testid={`camera-url-${i}`}
                     onChange={(e) =>
                       setRows((rs) => rs.map((x, j) => (j === i ? { ...x, url: e.target.value } : x)))
+                    }
+                  />
+                  <input
+                    className="cam__in"
+                    placeholder="http://host/stream (optional)"
+                    aria-label={`camera ${i + 1} stream URL`}
+                    value={r.stream_url}
+                    data-testid={`camera-stream-${i}`}
+                    onChange={(e) =>
+                      setRows((rs) => rs.map((x, j) => (j === i ? { ...x, stream_url: e.target.value } : x)))
                     }
                   />
                   <button
@@ -243,7 +277,7 @@ function CameraManageModal({
             <button
               className="cam__btn"
               data-testid="camera-add"
-              onClick={() => setRows((rs) => [...rs, { label: "", url: "" }])}
+              onClick={() => setRows((rs) => [...rs, { label: "", url: "", stream_url: "" }])}
             >
               + add camera
             </button>

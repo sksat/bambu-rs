@@ -69,19 +69,33 @@ impl CameraSource for NoCamera {
 pub struct ExternalCamera {
     pub label: String,
     pub url: String,
+    /// Optional live MJPEG stream URL (e.g. an MJPEG `/stream` endpoint). When
+    /// present the server can reverse-proxy a continuous multipart stream instead
+    /// of polling `url` for single JPEGs. `None` = snapshot-only.
+    pub stream_url: Option<String>,
 }
 
 impl ExternalCamera {
-    /// Build from an optional label + URL, filling a blank label with a stable
-    /// `external N` (1-based `index`).
-    pub fn new(label: Option<String>, url: String, index: usize) -> Self {
+    /// Build from an optional label + snapshot URL + optional stream URL, filling
+    /// a blank label with a stable `external N` (1-based `index`). A blank stream
+    /// URL normalises to `None`.
+    pub fn new(
+        label: Option<String>,
+        url: String,
+        stream_url: Option<String>,
+        index: usize,
+    ) -> Self {
         let label = label
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty())
             .unwrap_or_else(|| format!("external {}", index + 1));
+        let stream_url = stream_url
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         Self {
             label,
             url: url.trim().to_string(),
+            stream_url,
         }
     }
 
@@ -100,6 +114,6 @@ impl ExternalCamera {
         } else {
             (None, entry.to_string())
         };
-        Some(Self::new(label, url, index))
+        Some(Self::new(label, url, None, index))
     }
 }

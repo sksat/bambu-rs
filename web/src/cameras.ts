@@ -6,12 +6,17 @@ export interface Camera {
   id: string;
   kind: "internal" | "external";
   label: string;
+  // True when the server can proxy a live MJPEG stream for this camera, so the
+  // view uses `/stream` (continuous video) instead of polling `/snapshot`.
+  stream?: boolean;
 }
 
 export interface ExternalCfg {
   id: string;
   label: string;
   url: string;
+  // Optional live MJPEG stream URL (null/absent = snapshot-only).
+  stream_url?: string | null;
 }
 
 // The list of currently-available cameras (open read); tolerate failure as none.
@@ -45,7 +50,7 @@ export async function getCamerasConfig(
 
 // Replace the external-camera list (gated write).
 export async function setCamerasConfig(
-  external: { label?: string; url: string }[],
+  external: { label?: string; url: string; stream_url?: string }[],
   password: string | null,
 ): Promise<{ ok: true } | { error: string } | "needPassword"> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
