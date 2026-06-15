@@ -7,10 +7,12 @@ export interface Toast {
 }
 
 /** A queued confirm-gated action: a human-readable message + the work to run
- *  once the operator confirms it in the shared ConfirmDialog. */
+ *  once the operator confirms it in the shared ConfirmDialog. `label` names the
+ *  affirmative button (e.g. "calibrate") so it says what it does, not "confirm". */
 export interface ConfirmReq {
   message: string;
   run: () => void;
+  label?: string;
 }
 
 export type Axis = "x" | "y" | "z";
@@ -68,8 +70,8 @@ export function useControl() {
 
   // Queue a confirm-gated action: shows the shared dialog, then runs `work` on
   // confirm. Mirrors the requestStop/confirmAndStop flow for arbitrary writes.
-  const requestConfirm = (message: string, work: () => void) =>
-    setConfirm({ message, run: work });
+  const requestConfirm = (message: string, work: () => void, label?: string) =>
+    setConfirm({ message, run: work, label });
 
   return {
     password,
@@ -132,24 +134,40 @@ export function useControl() {
         .filter(([, on]) => on)
         .map(([n]) => n)
         .join(", ");
-      requestConfirm(`Run calibration (${picked})? The printer will move on its own.`, () => {
-        void act("calibrate", "/api/calibrate", { ...opts, confirm: true });
-      });
+      requestConfirm(
+        `Run calibration (${picked})? The printer will move on its own.`,
+        () => {
+          void act("calibrate", "/api/calibrate", { ...opts, confirm: true });
+        },
+        "calibrate",
+      );
     },
     ams: (action: AmsAction, confirm: boolean) => {
       if (!confirm) return act(`ams ${action}`, "/api/ams", { action, confirm: false });
-      requestConfirm(`AMS ${action}? This interrupts the current spool state.`, () => {
-        void act(`ams ${action}`, "/api/ams", { action, confirm: true });
-      });
+      requestConfirm(
+        `AMS ${action}? This interrupts the current spool state.`,
+        () => {
+          void act(`ams ${action}`, "/api/ams", { action, confirm: true });
+        },
+        action,
+      );
     },
     reboot: () =>
-      requestConfirm("Reboot the printer? It will disconnect while it restarts.", () => {
-        void act("reboot", "/api/reboot", { confirm: true });
-      }),
+      requestConfirm(
+        "Reboot the printer? It will disconnect while it restarts.",
+        () => {
+          void act("reboot", "/api/reboot", { confirm: true });
+        },
+        "reboot",
+      ),
     steppers: () =>
-      requestConfirm("Disable the steppers? The axes will be free to move by hand.", () => {
-        void act("disable steppers", "/api/steppers", { confirm: true });
-      }),
+      requestConfirm(
+        "Disable the steppers? The axes will be free to move by hand.",
+        () => {
+          void act("disable steppers", "/api/steppers", { confirm: true });
+        },
+        "disable steppers",
+      ),
   };
 }
 

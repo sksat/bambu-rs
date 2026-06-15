@@ -761,6 +761,31 @@ div.lbl,
 .btn--danger:hover:not(:disabled) {
   border-color: var(--err);
 }
+/* Dialog primary actions are FILLED so the affirmative choice reads by weight/
+   fill, not colour alone — cancel stays a quiet outline beside it, so which
+   button executes is unmistakable (and CUD-safe). Ink is a fixed near-black:
+   it clears AA on both the dark and light accent/err fills. */
+.btn--primary,
+.btn--danger-solid {
+  color: #14110a;
+  font-weight: 650;
+}
+.btn--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.btn--primary:hover:not(:disabled) {
+  background: var(--accent-2);
+  border-color: var(--accent-2);
+}
+.btn--danger-solid {
+  background: var(--err);
+  border-color: var(--err);
+}
+.btn--danger-solid:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--err) 88%, #fff);
+  border-color: color-mix(in srgb, var(--err) 88%, #fff);
+}
 /* Active state for the speed segmented control: accent border + text and a
    touch more weight — never color-only, so it reads without hue too. */
 .btn.is-active {

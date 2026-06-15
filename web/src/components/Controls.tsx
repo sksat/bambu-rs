@@ -191,7 +191,7 @@ export function ConfirmDialog({
             cancel
           </button>
           <button
-            className="btn btn--danger"
+            className={`btn ${isStop ? "btn--danger-solid" : "btn--primary"}`}
             onClick={onConfirm}
             data-testid={isStop ? "confirm-stop" : "confirm-ok"}
           >

@@ -77,7 +77,7 @@ export function App() {
       {control.confirm && (
         <ConfirmDialog
           message={control.confirm.message}
-          confirmLabel="confirm"
+          confirmLabel={control.confirm.label ?? "confirm"}
           onConfirm={() => control.runConfirm()}
           onCancel={() => control.cancelConfirm()}
         />
