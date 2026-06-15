@@ -96,3 +96,58 @@ curl -X POST "$B/api/job/start" -H 'content-type: application/json' -d '{"file":
   `print_error=0`. (`-1` in the map = external spool, if you load one and prefer that.)
   Always `--dry-run` first and watch the first layer; the printer screen also shows
   the plain-language cause.
+
+## Timelapse with an EXTERNAL camera (per-layer park gcode)
+
+For the smooth "object grows, nozzle out of the way" look, the head parks off to
+the side once per layer and a frame is snapped there. Bambu's built-in timelapse
+(`time_lapse_gcode`) parks at ~X-13 and dwells only **~300 ms** — it gets away
+with that because the *printer's own camera* fires a synchronized shutter and
+smooth mode auto-adds a prime tower to catch ooze. An EXTERNAL camera triggered
+by the host (off the MQTT/serve layer event, ~1–2 s latency) has neither, so you
+add the park yourself in a custom `layer_change_gcode` **and** must handle
+ooze/heat.
+
+⚠️ **VERIFIED failure (don't do this):** a long dwell (**2.5 s**) with **no
+retraction** clogged the nozzle within ~50 layers — cumulative hot, un-retracted
+stalls cause heat-creep + ooze and extrusion stops entirely. The single 2.5 s
+pause isn't the problem; *un-retracted and repeated* is.
+
+**Recommended park (community-proven — Octolapse / moonraker-timelapse — NOT yet
+re-verified on this unit):**
+- **Retract ~1.0 mm before parking; unretract ~1.0 mm on return** (add a small
+  ~0.2–0.3 mm extra prime only if you see under-extrusion at layer starts). Do
+  NOT use a big 5–6 mm retract — on the A1's short direct-ish path it pulls soft
+  filament into the heatbreak and *causes* heat-creep.
+- **Small Z-hop ~0.3 mm** before the park travel (clear the printed layer).
+- **Park off the left X edge at a fixed Y** (mirror the firmware's X-13) so ooze
+  drops off-bed and the park is independent of the bedslinger's Y.
+- **Keep both fans running.** Leave the part-cooling fan (`M106 P1`) on, and NEVER
+  disable the A1's always-on hotend/heatbreak fan — it's the main heat-creep
+  defense.
+- **Do NOT lower nozzle temp per layer** (re-heat is far slower than a layer).
+- **Dwell as short as the trigger latency allows** (~1.2–1.5 s with a low-latency
+  feed). `bambu serve`'s built-in capture (`POST /api/timelapse/start` / the
+  dashboard button) reads the printer's status feed in-process — low latency — so
+  a short dwell suffices.
+- **Skip the park on layers 1–2** (don't disturb the un-adhered first layer).
+
+`layer_change_gcode` sketch (keep the stock progress + `M991` notify lines first;
+mid-print E is relative / `M83`):
+```
+G1 E-1.0 F2100      ; retract (depressurize the tip; stops ooze during the park)
+G91
+G1 Z0.3 F900        ; z-hop
+G90
+G1 X-13 Y90 F18000  ; park off the left edge, fixed Y (off-bed; ooze drops away)
+G4 P1200            ; SHORT dwell for the external snapshot — tune to your latency
+G1 X0 F18000        ; return toward the bed
+G91
+G1 Z-0.3 F900
+G90
+G1 E1.0 F2100       ; unretract (+ optional tiny extra prime if under-extruding)
+```
+Note: OrcaSlicer rejects `layer_change_gcode` that references placeholders like
+`max_layer_z` / `first_layer_center_no_wipe_tower` ("Please check the custom
+G-code") — use literal coords + a relative `G91`/`G1 Z…`/`G90` hop as above.
+Minimise the dwell to minimise cumulative ooze/heat, and verify the first layers.
