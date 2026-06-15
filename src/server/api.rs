@@ -35,6 +35,7 @@ use super::assets::static_handler;
 #[cfg(test)]
 use super::camera::NoCamera;
 use super::camera::{CameraSource, ExternalCamera};
+use super::timelapse::{FrameGrab, TimelapseManager};
 #[cfg(test)]
 use super::control::FakeController;
 use super::control::{
@@ -260,6 +261,9 @@ pub struct AppState {
     /// The **built-in** (printer chamber) camera, grabbed over TCP:6000 in live
     /// mode; [`NoCamera`](super::camera::NoCamera) in fake / no-target mode.
     pub internal_camera: Arc<dyn CameraSource>,
+    /// Serve-internal per-layer timelapse capture, driven off `source`'s status
+    /// feed and controlled at runtime by camera id. At most one runs at a time.
+    pub timelapse: Arc<TimelapseManager>,
 }
 
 /// A safe absolute path on the printer: starts with `/`, no traversal or scheme.
@@ -284,6 +288,7 @@ impl AppState {
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
             external_cameras: Arc::new(RwLock::new(Vec::new())),
             internal_camera: Arc::new(NoCamera),
+            timelapse: Default::default(),
         }
     }
 }
@@ -301,7 +306,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/files/mesh", get(file_mesh))
         .route("/api/cameras", get(cameras_list))
         .route("/api/cameras/{id}/snapshot", get(camera_snapshot))
-        .route("/api/cameras/{id}/stream", get(camera_stream));
+        .route("/api/cameras/{id}/stream", get(camera_stream))
+        .route("/api/timelapse", get(timelapse_status));
     let writes = Router::new()
         .route("/api/job/pause", post(job_pause))
         .route("/api/job/resume", post(job_resume))
@@ -322,6 +328,8 @@ pub fn router(state: AppState) -> Router {
             "/api/cameras/config",
             get(cameras_config_get).post(cameras_config_set),
         )
+        .route("/api/timelapse/start", post(timelapse_start))
+        .route("/api/timelapse/stop", post(timelapse_stop))
         // Uploads stream to a temp file, so the cap bounds disk, not memory.
         .route(
             "/api/files/upload",
@@ -1257,6 +1265,90 @@ fn fetch_camera_frame(url: &str) -> Result<(String, Vec<u8>), String> {
 }
 
 #[derive(Deserialize)]
+struct TimelapseStartBody {
+    /// Camera id to capture from: `internal` or `ext-{i}`.
+    camera: String,
+    #[serde(default = "default_every")]
+    every: u64,
+}
+fn default_every() -> u64 {
+    1
+}
+
+/// Resolve a camera id to a blocking frame-grabber + a stable label, captured at
+/// start so a later `/api/cameras/config` edit can't repoint a running capture.
+fn resolve_grab(st: &AppState, camera: &str) -> Option<(String, FrameGrab)> {
+    if camera == "internal" {
+        if !st.internal_camera.configured() {
+            return None;
+        }
+        let cam = st.internal_camera.clone();
+        return Some((camera.to_string(), Arc::new(move || cam.snapshot())));
+    }
+    let idx = camera.strip_prefix("ext-")?.parse::<usize>().ok()?;
+    let url = st.external_cameras.read().unwrap().get(idx)?.url.clone();
+    Some((
+        camera.to_string(),
+        Arc::new(move || fetch_camera_frame(&url).map(|(_, bytes)| bytes)),
+    ))
+}
+
+/// Sanitise a print name into a filesystem-safe run-dir suffix.
+fn sanitize_hint(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .take(40)
+        .collect();
+    let trimmed = cleaned.trim_matches('_');
+    if trimmed.is_empty() {
+        "print".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Start a per-layer timelapse capture from a configured camera (gated write).
+/// 409 if one is already running; 404 for an unknown/unconfigured camera. Frames
+/// land in `./captures/<epoch>_<print-hint>/`.
+async fn timelapse_start(State(st): State<AppState>, Json(b): Json<TimelapseStartBody>) -> Response {
+    if b.every < 1 {
+        return bad_request("every must be >= 1".to_string());
+    }
+    let Some((label, grab)) = resolve_grab(&st, &b.camera) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "unknown or unconfigured camera" })),
+        )
+            .into_response();
+    };
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let hint = sanitize_hint(st.source.current().subtask_name.as_deref().unwrap_or("print"));
+    let out_dir = std::path::PathBuf::from("captures").join(format!("{epoch}_{hint}"));
+    match st
+        .timelapse
+        .start(label, b.every, st.source.subscribe(), grab, out_dir)
+    {
+        Ok(()) => Json(st.timelapse.status().to_json()).into_response(),
+        Err(e) => (StatusCode::CONFLICT, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+/// Stop the running capture (gated write; idempotent).
+async fn timelapse_stop(State(st): State<AppState>) -> Response {
+    st.timelapse.stop();
+    Json(st.timelapse.status().to_json()).into_response()
+}
+
+/// Current capture status (open read).
+async fn timelapse_status(State(st): State<AppState>) -> Json<serde_json::Value> {
+    Json(st.timelapse.status().to_json())
+}
+
+#[derive(Deserialize)]
 struct UploadQuery {
     dir: Option<String>,
     name: String,
@@ -1406,6 +1498,7 @@ mod tests {
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
             external_cameras: Arc::new(RwLock::new(Vec::new())),
             internal_camera: Arc::new(NoCamera),
+            timelapse: Default::default(),
         };
         TestServer::new(router(state))
     }
@@ -1854,6 +1947,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timelapse_status_is_open_and_initially_idle() {
+        let res = app(None, FakeController::verified()).get("/api/timelapse").await;
+        res.assert_status_ok();
+        assert_eq!(res.json::<serde_json::Value>()["running"], false);
+    }
+
+    #[tokio::test]
+    async fn timelapse_start_rejects_unknown_camera() {
+        app(None, FakeController::verified())
+            .post("/api/timelapse/start")
+            .json(&json!({ "camera": "ext-9" }))
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn timelapse_start_rejects_every_zero() {
+        app(None, FakeController::verified())
+            .post("/api/timelapse/start")
+            .json(&json!({ "camera": "ext-0", "every": 0 }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn timelapse_start_stop_are_gated_by_password() {
+        let server = app(Some("hunter2"), FakeController::verified());
+        server
+            .post("/api/timelapse/start")
+            .json(&json!({ "camera": "ext-0" }))
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
+        server
+            .post("/api/timelapse/stop")
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
+        // ...but status stays an open read.
+        server.get("/api/timelapse").await.assert_status_ok();
+    }
+
+    #[tokio::test]
     async fn camera_config_is_gated_by_password() {
         app(Some("hunter2"), FakeController::verified())
             .post("/api/cameras/config")
@@ -1982,6 +2116,7 @@ mod tests {
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
             external_cameras: Arc::new(RwLock::new(Vec::new())),
             internal_camera: Arc::new(NoCamera),
+            timelapse: Default::default(),
         };
         TestServer::new(router(state))
             .post("/api/job/start")
@@ -2003,6 +2138,7 @@ mod tests {
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
             external_cameras: Arc::new(RwLock::new(Vec::new())),
             internal_camera: Arc::new(NoCamera),
+            timelapse: Default::default(),
         };
         TestServer::new(router(state))
     }
@@ -2040,6 +2176,7 @@ mod tests {
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
             external_cameras: Arc::new(RwLock::new(Vec::new())),
             internal_camera: Arc::new(NoCamera),
+            timelapse: Default::default(),
         };
         TestServer::new(router(state))
     }
@@ -2417,6 +2554,7 @@ mod tests {
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
             external_cameras: Arc::new(RwLock::new(Vec::new())),
             internal_camera: Arc::new(NoCamera),
+            timelapse: Default::default(),
         };
         let mut ws = ws_server(state)
             .get_websocket("/api/ws")

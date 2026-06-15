@@ -1287,6 +1287,22 @@ div.lbl,
 .cam__col--rm {
   flex: 0 0 1.7rem;
 }
+/* timelapse start/stop bar under the camera view */
+.cam__tl {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-top: 0.45rem;
+  font-size: 0.72rem;
+}
+.cam__tl-rec {
+  color: var(--accent);
+  font-weight: 600;
+}
+.cam__tl-msg {
+  flex-basis: 100%;
+}
 /* manage dialog (floating) — wider than the default confirm box for URL inputs */
 .modal__box--cam {
   max-width: 34rem;

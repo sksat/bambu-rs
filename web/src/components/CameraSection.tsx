@@ -5,6 +5,12 @@ import {
   setCamerasConfig,
   type Camera,
 } from "../cameras";
+import {
+  getTimelapse,
+  startTimelapse,
+  stopTimelapse,
+  type TimelapseState,
+} from "../timelapse";
 
 // Refresh cadence (the delay AFTER a frame settles before fetching the next). We
 // drive the loop off the <img>'s load/error rather than a fixed timer so a slow
@@ -60,6 +66,88 @@ function CameraView({ id, label, stream }: { id: string; label: string; stream?:
         <div className="cam__msg" data-testid="camera-offline">
           no frame — camera offline
         </div>
+      )}
+    </div>
+  );
+}
+
+// Start/stop the serve-internal per-layer timelapse, capturing from whichever
+// camera tab is active. Polls `/api/timelapse` so the button + frame count
+// reflect a capture started from any tab (or that auto-stopped at print end).
+function TimelapseBar({ activeCamera, password }: { activeCamera: string; password: string | null }) {
+  const [tl, setTl] = useState<TimelapseState | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    const poll = async () => {
+      const s = await getTimelapse();
+      if (live) setTl(s);
+    };
+    void poll();
+    const id = setInterval(() => void poll(), 2000);
+    return () => {
+      live = false;
+      clearInterval(id);
+    };
+  }, []);
+
+  const running = tl?.running ?? false;
+
+  const start = async () => {
+    setBusy(true);
+    setMsg(null);
+    const r = await startTimelapse(activeCamera, 1, password);
+    if (r === "needPassword") setMsg("needs the control password (set it in Controls)");
+    else if ("error" in r) setMsg(r.error);
+    else setTl(await getTimelapse());
+    setBusy(false);
+  };
+  const stop = async () => {
+    setBusy(true);
+    setMsg(null);
+    await stopTimelapse(password);
+    setTl(await getTimelapse());
+    setBusy(false);
+  };
+
+  return (
+    <div className="cam__tl" data-testid="timelapse-bar">
+      {running ? (
+        <>
+          <span className="cam__tl-rec" data-testid="timelapse-running">
+            ● recording — {tl?.frames ?? 0} frames
+            {tl?.current_layer != null ? ` · layer ${tl.current_layer}` : ""}
+            {tl?.failures ? ` · ${tl.failures} failed` : ""}
+          </span>
+          <button
+            className="cam__manage"
+            data-testid="timelapse-stop"
+            disabled={busy}
+            onClick={() => void stop()}
+          >
+            stop
+          </button>
+        </>
+      ) : (
+        <>
+          <span className="cam__tl-idle dim">timelapse → {activeCamera}</span>
+          <button
+            className="cam__manage"
+            data-testid="timelapse-start"
+            disabled={busy}
+            title="capture one frame per print layer from this camera"
+            onClick={() => void start()}
+          >
+            ● start timelapse
+          </button>
+        </>
+      )}
+      {msg && (
+        <span className="cam__tl-msg dim" data-testid="timelapse-msg">
+          {msg}
+        </span>
       )}
     </div>
   );
@@ -129,6 +217,7 @@ export function CamerasSection({ password }: { password: string | null }) {
                 stream={activeCam.stream}
               />
             )}
+            {activeCam && <TimelapseBar activeCamera={activeCam.id} password={password} />}
           </>
         )}
       </section>

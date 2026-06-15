@@ -14,6 +14,7 @@ pub mod control;
 pub mod files;
 pub mod live;
 pub mod start;
+pub mod timelapse;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,6 +75,7 @@ pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<
                     start_lock: Arc::new(tokio::sync::Mutex::new(())),
                     external_cameras: external_cameras.clone(),
                     internal_camera: Arc::new(LiveCamera::new(t)),
+                    timelapse: Default::default(),
                 }
             }
             _ => {
@@ -92,6 +94,7 @@ pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<
                     start_lock: Arc::new(tokio::sync::Mutex::new(())),
                     external_cameras,
                     internal_camera: Arc::new(NoCamera),
+                    timelapse: Default::default(),
                 }
             }
         };
