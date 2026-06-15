@@ -12,7 +12,13 @@ export function HealthSection({ s }: { s: PrinterStatus }) {
         <div className="arow sev-err">
           <span className="sev-tag sev-tag--err">error</span>
           <span className="acode">{s.error.hex}</span>
-          <span className="chip">device error</span>
+          {/* Show the plain-language cause for codes we've verified on the real
+              device; otherwise just label it and rely on the lookup link. */}
+          {s.error.message ? (
+            <span className="emsg">{s.error.message}</span>
+          ) : (
+            <span className="chip">device error</span>
+          )}
           <a href={s.error.lookup_url} target="_blank" rel="noreferrer">
             troubleshoot ↗
           </a>

@@ -688,6 +688,11 @@ div.lbl,
   font-family: var(--mono);
   font-weight: 600;
 }
+/* verified plain-language cause shown next to a device error code */
+.emsg {
+  font-size: 0.78rem;
+  color: var(--fg);
+}
 .arow a {
   margin-left: auto;
   color: var(--accent);

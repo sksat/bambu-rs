@@ -6,8 +6,10 @@
  * `print_error = 0x0500C010` while `hms` stayed empty, so a status view must
  * surface `print_error` in its own right.
  *
- * We deliberately don't bundle a code→text table (sources conflict; same
- * rationale as [`crate::core::hms`]); the hex code is emitted for lookup.
+ * We don't bundle the full third-party code→text table (sources conflict; same
+ * rationale as [`crate::core::hms`]) — but we DO attach a plain-language
+ * [`message`](DeviceError::message) for the handful of codes verified on the
+ * real device, and always emit the hex + a lookup link.
  */
 export type DeviceError = { 
 /**
@@ -19,8 +21,14 @@ code: number,
  */
 hex: string, 
 /**
+ * Plain-language cause — present ONLY for codes we've **verified on the real
+ * device** (the printer's own on-screen message). Unverified codes leave
+ * this `None` and rely on `lookup_url`, so we never surface a guessed cause.
+ */
+message: string | null, 
+/**
  * Link to Bambu's official error-code resolver for this code (we don't
- * bundle a code→text table — sources conflict — so we point at the
+ * bundle the full code→text table — sources conflict — so we point at the
  * authority instead, the same way [`crate::core::hms`] links to the wiki).
  */
 lookup_url: string, };

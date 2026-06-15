@@ -562,8 +562,10 @@ impl PrinterStatus {
 /// `print_error = 0x0500C010` while `hms` stayed empty, so a status view must
 /// surface `print_error` in its own right.
 ///
-/// We deliberately don't bundle a code→text table (sources conflict; same
-/// rationale as [`crate::core::hms`]); the hex code is emitted for lookup.
+/// We don't bundle the full third-party code→text table (sources conflict; same
+/// rationale as [`crate::core::hms`]) — but we DO attach a plain-language
+/// [`message`](DeviceError::message) for the handful of codes verified on the
+/// real device, and always emit the hex + a lookup link.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "ts-rs", derive(ts_rs::TS), ts(export))]
 pub struct DeviceError {
@@ -571,10 +573,27 @@ pub struct DeviceError {
     pub code: i64,
     /// Conventional hex rendering, e.g. `0x0500C010`.
     pub hex: String,
+    /// Plain-language cause — present ONLY for codes we've **verified on the real
+    /// device** (the printer's own on-screen message). Unverified codes leave
+    /// this `None` and rely on `lookup_url`, so we never surface a guessed cause.
+    pub message: Option<String>,
     /// Link to Bambu's official error-code resolver for this code (we don't
-    /// bundle a code→text table — sources conflict — so we point at the
+    /// bundle the full code→text table — sources conflict — so we point at the
     /// authority instead, the same way [`crate::core::hms`] links to the wiki).
     pub lookup_url: String,
+}
+
+/// On-screen text for the `print_error` codes we've confirmed on the real A1
+/// mini. Tiny and device-sourced on purpose; grow it only as codes are actually
+/// verified (the printer's own wording), never from guesswork.
+fn verified_error_message(code: i64) -> Option<&'static str> {
+    match code {
+        // Both verified on the A1 mini screen (2026-06-16) during AMS filament
+        // operations (an end-of-print pullback and a tray-change, respectively).
+        0x1200_8014 => Some("couldn't find the filament position in the toolhead"),
+        0x1200_8015 => Some("couldn't pull the filament out of the toolhead"),
+        _ => None,
+    }
 }
 
 impl DeviceError {
@@ -583,6 +602,7 @@ impl DeviceError {
         (code != 0).then(|| DeviceError {
             code,
             hex: format!("0x{:08X}", code as u32),
+            message: verified_error_message(code).map(str::to_string),
             lookup_url: format!(
                 "https://e.bambulab.com/query.php?lang=en&e={:08X}",
                 code as u32
@@ -850,6 +870,23 @@ mod tests {
         );
         // Zero is "no error".
         assert_eq!(DeviceError::from_code(0), None);
+    }
+
+    #[test]
+    fn device_error_attaches_a_message_only_for_device_verified_codes() {
+        // Verified on the real A1 mini screen (filament/toolhead faults).
+        assert_eq!(
+            DeviceError::from_code(0x1200_8015).unwrap().message.as_deref(),
+            Some("couldn't pull the filament out of the toolhead")
+        );
+        assert_eq!(
+            DeviceError::from_code(0x1200_8014).unwrap().message.as_deref(),
+            Some("couldn't find the filament position in the toolhead")
+        );
+        // An unverified code carries no fabricated message — just hex + the link.
+        let u = DeviceError::from_code(0x0500_C010).unwrap();
+        assert!(u.message.is_none());
+        assert_eq!(u.hex, "0x0500C010");
     }
 
     #[test]
