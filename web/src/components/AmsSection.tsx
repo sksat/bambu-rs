@@ -1,23 +1,22 @@
 import type { Ams } from "../types";
-import { trayLabel } from "../format";
+import { amsActivity } from "../format";
 import { Humidity, Tray } from "./widgets";
 
 export function AmsSection({ ams }: { ams: Ams }) {
   const units = ams.units ?? [];
-  const active = ams.active_tray;
-  const swapping = active != null && ams.target_tray != null && active !== ams.target_tray;
+  // Plain-words activity: "loading tray 3" / "unloading tray 3" / "tray 1 →
+  // tray 3" / "tray 3 loaded" / "idle" — never a raw 254/255 sentinel.
+  const { text, active } = amsActivity(ams.active_tray, ams.target_tray);
   return (
     <div className="cfold" data-testid="ams">
       <div className="secline">
         <span className="lbl">ams</span>
-        {swapping ? (
+        {active ? (
           <span className="swap" data-testid="ams-swap">
-            swapping {trayLabel(active)} → {trayLabel(ams.target_tray)}
+            {text}
           </span>
         ) : (
-          <span className="dim">
-            {active && active !== "255" ? `tray ${trayLabel(active)} loaded` : "idle"}
-          </span>
+          <span className="dim">{text}</span>
         )}
       </div>
       {units.map((u) => (

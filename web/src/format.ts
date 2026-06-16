@@ -42,6 +42,30 @@ export function trayLabel(id: string | number | null | undefined): string {
   return Number.isInteger(n) && n >= 0 && n < 254 ? String(n + 1) : String(id);
 }
 
+/** The AMS activity line, in plain words. The raw pointers (`tray_now` /
+ *  `tray_tar`) use 255 for "none" and 254 for the external spool, so the old
+ *  "swapping {now} → {tar}" rendered nonsense like "swapping 256 → 3" while
+ *  loading from empty. Resolve to what's actually happening — loading /
+ *  unloading / a tray-to-tray swap / idle — with 1-based tray numbers.
+ *  `active` is true while an operation is in flight (for styling). */
+export function amsActivity(
+  now: string | null,
+  tar: string | null,
+): { text: string; active: boolean } {
+  const name = (v: string | null): string | null =>
+    v == null || v === "255" ? null : v === "254" ? "ext" : `tray ${trayLabel(v)}`;
+  const nowName = name(now);
+  const tarName = name(tar);
+  // An operation is in flight when there's a target that differs from current.
+  if (tar != null && tar !== now) {
+    if (nowName == null && tarName != null) return { text: `loading ${tarName}`, active: true };
+    if (tarName == null && nowName != null) return { text: `unloading ${nowName}`, active: true };
+    if (nowName != null && tarName != null)
+      return { text: `${nowName} → ${tarName}`, active: true };
+  }
+  return { text: nowName ? `${nowName} loaded` : "idle", active: false };
+}
+
 export function remainText(remain?: number | null): string {
   // A1 spools report 0 (no RFID weight) and -1 means unknown — neither is "0%".
   return remain != null && remain > 0 ? `${remain}%` : "—";
