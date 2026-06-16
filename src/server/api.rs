@@ -838,6 +838,10 @@ struct StartBody {
     #[serde(default)]
     ams_map: Vec<i32>,
     bed_type: Option<String>,
+    /// Arm the printer-side timelapse (needed for Smooth-mode's per-layer park +
+    /// spiral Z-hop to actually run, not just to record the built-in camera).
+    #[serde(default)]
+    timelapse: bool,
     #[serde(default)]
     dry_run: bool,
 }
@@ -877,6 +881,7 @@ async fn job_start(State(st): State<AppState>, Json(b): Json<StartBody>) -> Resp
         use_ams: b.use_ams,
         ams_map: b.ams_map.clone(),
         bed_type: b.bed_type.clone().unwrap_or_else(|| "auto".to_string()),
+        timelapse: b.timelapse,
     };
 
     if b.dry_run {
@@ -886,6 +891,7 @@ async fn job_start(State(st): State<AppState>, Json(b): Json<StartBody>) -> Resp
             "use_ams": req.use_ams,
             "ams_map": req.ams_map,
             "bed_type": req.bed_type,
+            "timelapse": req.timelapse,
         }}))
         .into_response();
     }

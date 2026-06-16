@@ -22,6 +22,11 @@ pub struct StartRequest {
     pub use_ams: bool,
     pub ams_map: Vec<i32>,
     pub bed_type: String,
+    /// Enable the printer-side timelapse flag. Beyond recording the built-in
+    /// camera, this arms the sliced timelapse gcode — on Smooth mode that's the
+    /// per-layer park with a spiral Z-hop + prime-tower wipe, which is skipped
+    /// entirely when the flag is off (and the head then scrapes the print).
+    pub timelapse: bool,
 }
 
 impl StartRequest {
@@ -36,6 +41,7 @@ impl StartRequest {
         if self.file.to_ascii_lowercase().ends_with(".3mf") {
             let mut pf = ProjectFile::new(format!("ftp://{}", self.file), self.plate, name);
             pf.bed_type = self.bed_type.clone();
+            pf.timelapse = self.timelapse;
             if self.use_ams {
                 pf.use_ams = true;
                 pf.ams_mapping = self.ams_map.clone();
@@ -93,6 +99,7 @@ mod tests {
             use_ams: true,
             ams_map: vec![0, 3],
             bed_type: "auto".to_string(),
+            timelapse: false,
         };
         match req.to_command() {
             ProtoCommand::ProjectFile(pf) => {
@@ -101,7 +108,24 @@ mod tests {
                 assert_eq!(pf.subtask_name, "coin.gcode.3mf");
                 assert!(pf.use_ams);
                 assert_eq!(pf.ams_mapping, vec![0, 3]);
+                assert!(!pf.timelapse, "timelapse off unless requested");
             }
+            other => panic!("expected ProjectFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timelapse_flag_flows_into_the_project_file() {
+        let req = StartRequest {
+            file: "/cube.gcode.3mf".to_string(),
+            plate: 1,
+            use_ams: false,
+            ams_map: vec![],
+            bed_type: "auto".to_string(),
+            timelapse: true,
+        };
+        match req.to_command() {
+            ProtoCommand::ProjectFile(pf) => assert!(pf.timelapse, "arms the sliced timelapse gcode"),
             other => panic!("expected ProjectFile, got {other:?}"),
         }
     }
@@ -114,6 +138,7 @@ mod tests {
             use_ams: false,
             ams_map: vec![],
             bed_type: "auto".to_string(),
+            timelapse: false,
         };
         assert!(matches!(req.to_command(), ProtoCommand::GcodeFile(f) if f == "/test.gcode"));
     }
