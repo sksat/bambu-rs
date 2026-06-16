@@ -152,6 +152,29 @@ export function useControl() {
         action,
       );
     },
+    // AMS-coordinated filament change (full path back to the spool), unlike the
+    // extruder-only `extrude` retract. target 255 = unload, 254 = external spool,
+    // 0..3 = AMS tray. Always confirm-gated — it physically moves filament.
+    amsChange: (target: number, tarTemp: number) => {
+      const what =
+        target === 255
+          ? "Unload the filament"
+          : target === 254
+            ? "Load the external spool"
+            : `Change to tray ${target}`;
+      const label = target === 255 ? "unload" : "change";
+      requestConfirm(
+        `${what} at ${tarTemp}°C? The AMS will move filament along the whole path.`,
+        () => {
+          void act(`ams ${label}`, "/api/ams/change", {
+            target,
+            tar_temp: tarTemp,
+            confirm: true,
+          });
+        },
+        label,
+      );
+    },
     reboot: () =>
       requestConfirm(
         "Reboot the printer? It will disconnect while it restarts.",

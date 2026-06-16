@@ -46,6 +46,9 @@ export function MachineSection({ s, control }: { s: PrinterStatus; control: Cont
     void control.setTemp(part, v, true);
   };
 
+  // Temp the AMS unload heats to: honour an explicit nozzle setpoint, else a
+  // default that softens both PLA and PETG enough to retract cleanly.
+  const amsUnloadTemp = s.nozzle_target && s.nozzle_target > 0 ? s.nozzle_target : 240;
   const nozzleCold = (s.nozzle_temper ?? 0) < MIN_EXTRUDE_TEMP;
   const extrudeDisabled = !!b || busy || nozzleCold;
   const extrudeTitle = busy
@@ -272,6 +275,21 @@ export function MachineSection({ s, control }: { s: PrinterStatus; control: Cont
             onClick={() => void control.extrude(-extLen, FEED_EXTRUDE)}
           >
             unload
+          </button>
+        </div>
+        {/* AMS-coordinated unload: pulls filament the whole way back to the spool
+            (the extruder-only retract above just nudges it at the nozzle). The
+            firmware heats to the target itself, so it works from a cold nozzle —
+            unlike the extrude buttons, only the busy gate applies. */}
+        <div className="btns">
+          <button
+            className="btn btn--sm"
+            disabled={!!b || busy}
+            title={busy ? `unavailable while ${stateName}` : "AMS unload (whole path)"}
+            data-testid="ams-unload"
+            onClick={() => control.amsChange(255, amsUnloadTemp)}
+          >
+            AMS unload
           </button>
         </div>
       </div>
