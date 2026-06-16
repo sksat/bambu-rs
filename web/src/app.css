@@ -759,6 +759,30 @@ div.lbl,
   font-size: 0.74rem;
   padding: 0.3rem 0.5rem;
 }
+/* Primary job controls (pause / resume / stop) sit at the end of the telemetry
+   line, beside the progress/eta readouts — right where your eye already is on a
+   running print. Pushed to the far right, centred against the baseline-aligned
+   readouts, and don't-shrink so they stay hittable as the row tightens. */
+.jobctl {
+  display: flex;
+  gap: 0.4rem;
+  flex-shrink: 0;
+  margin-left: auto;
+  align-self: center;
+}
+.btn--job {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.45rem 0.7rem;
+}
+/* The glyph carries the meaning (pause/resume/stop), so size it up — the word
+   lives in title/aria-label for hover + assistive tech. line-height:1 keeps the
+   button from growing taller than the box. */
+.jobctl__icon {
+  font-size: 1.5rem;
+  line-height: 1;
+}
 .btn--danger:not(:disabled) {
   color: var(--err);
   border-color: color-mix(in srgb, var(--err) 45%, transparent);

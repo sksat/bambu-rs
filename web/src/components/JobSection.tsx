@@ -1,8 +1,10 @@
 import type { PrinterStatus } from "../types";
+import type { Control } from "../useControl";
 import { fmtEta, fmtFinishTime, speedName } from "../format";
+import { JobControls } from "./Controls";
 import { Bar, Field, Thumb } from "./widgets";
 
-export function JobSection({ s }: { s: PrinterStatus }) {
+export function JobSection({ s, control }: { s: PrinterStatus; control: Control }) {
   const state = s.gcode_state ?? "—";
   const pct = s.mc_percent ?? 0;
   const prepPct = s.gcode_file_prepare_percent ?? 0;
@@ -49,6 +51,9 @@ export function JobSection({ s }: { s: PrinterStatus }) {
             <Field label="done by" value={fmtFinishTime(s.remaining_time_min, new Date())} />
           </>
         )}
+        {/* Pause/resume/stop sit at the end of the telemetry line, beside the
+            progress/eta readouts you're already watching. */}
+        <JobControls control={control} status={s} />
       </div>
     </section>
   );

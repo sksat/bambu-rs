@@ -30,7 +30,7 @@ export function App() {
           <main className="dash">
             {/* Big status band across the top. */}
             <section className="dash__status">
-              <JobSection s={status} />
+              <JobSection s={status} control={control} />
             </section>
             {/* Left: camera(s) with temperatures beneath. Right: one controls
                 section with the machine/motion and AMS folded in. Stacks to a

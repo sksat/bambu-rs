@@ -46,38 +46,9 @@ export function Controls({
 
   const activeSpeed = SPEED_BY_LVL[status.spd_lvl ?? 0];
 
-  const { canPause, canResume, canStop } = jobAvail(status.gcode_state);
-  const stateName = status.gcode_state ?? "unknown";
-
   return (
     <section className="panel">
       <div className="lbl">controls</div>
-      <div className="btns">
-        <button
-          className="btn"
-          disabled={!!b || !canPause}
-          title={canPause ? undefined : `pause unavailable while ${stateName}`}
-          onClick={() => void control.pause()}
-        >
-          pause
-        </button>
-        <button
-          className="btn"
-          disabled={!!b || !canResume}
-          title={canResume ? undefined : `resume unavailable while ${stateName}`}
-          onClick={() => void control.resume()}
-        >
-          resume
-        </button>
-        <button
-          className="btn btn--danger"
-          disabled={!!b || !canStop}
-          title={canStop ? undefined : `stop unavailable while ${stateName}`}
-          onClick={() => control.requestStop()}
-        >
-          stop
-        </button>
-      </div>
       <div className="btns">
         <button
           className={`btn light-toggle${light === "on" ? " is-on" : ""}`}
@@ -157,6 +128,48 @@ export function Controls({
       )}
       {children}
     </section>
+  );
+}
+
+/** The primary job controls (pause/resume/stop), surfaced up in the status band
+ *  next to the big state word rather than buried in the controls panel — that's
+ *  where you look when a print is running and want to act on it. pause/resume is
+ *  ONE button that flips with the state (⏸ running ↔ ▶ paused, filled-accent
+ *  while paused so an error-paused job has an obvious "carry on"); ■ stops. The
+ *  word lives in title + aria-label since the face is an icon. */
+export function JobControls({ control, status }: { control: Control; status: PrinterStatus }) {
+  const b = control.busy;
+  const { canPause, canResume, canStop } = jobAvail(status.gcode_state);
+  const stateName = status.gcode_state ?? "unknown";
+  return (
+    <div className="jobctl">
+      <button
+        className={`btn btn--job${canResume ? " btn--primary" : ""}`}
+        disabled={!!b || !(canPause || canResume)}
+        title={
+          canResume ? "resume" : canPause ? "pause" : `pause/resume unavailable while ${stateName}`
+        }
+        aria-label={canResume ? "resume" : "pause"}
+        data-testid={canResume ? "job-resume" : "job-pause"}
+        onClick={() => void (canResume ? control.resume() : control.pause())}
+      >
+        <span className="jobctl__icon" aria-hidden="true">
+          {canResume ? "▶" : "⏸"}
+        </span>
+      </button>
+      <button
+        className="btn btn--job btn--danger"
+        disabled={!!b || !canStop}
+        title={canStop ? "stop" : `stop unavailable while ${stateName}`}
+        aria-label="stop"
+        data-testid="job-stop"
+        onClick={() => control.requestStop()}
+      >
+        <span className="jobctl__icon" aria-hidden="true">
+          ■
+        </span>
+      </button>
+    </div>
   );
 }
 
