@@ -87,6 +87,14 @@ pub enum ControlAction {
         motor_noise: bool,
     },
     Ams(AmsControl),
+    /// Change the loaded filament via the AMS (`ams_change_filament`). `target`
+    /// is a tray (0..3), `254` (external spool), or `255` (unload). Physically
+    /// moves filament, so the API gates it behind confirm + idle.
+    AmsChange {
+        target: u32,
+        curr_temp: i64,
+        tar_temp: i64,
+    },
     Reboot,
     DisableSteppers,
 }
@@ -136,6 +144,15 @@ impl ControlAction {
                 motor_noise,
             },
             ControlAction::Ams(action) => ProtoCommand::AmsControl(action),
+            ControlAction::AmsChange {
+                target,
+                curr_temp,
+                tar_temp,
+            } => ProtoCommand::AmsChangeFilament {
+                target,
+                curr_temp,
+                tar_temp,
+            },
             ControlAction::Reboot => ProtoCommand::Reboot,
             ControlAction::DisableSteppers => ProtoCommand::GcodeLine("M84".to_string()),
         }

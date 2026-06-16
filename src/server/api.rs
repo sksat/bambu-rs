@@ -322,6 +322,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/temp", post(temp))
         .route("/api/calibrate", post(calibrate))
         .route("/api/ams", post(ams))
+        .route("/api/ams/change", post(ams_change))
         .route("/api/reboot", post(reboot))
         .route("/api/steppers", post(steppers))
         .route(
@@ -735,6 +736,69 @@ async fn ams(State(st): State<AppState>, Json(b): Json<AmsBody>) -> Response {
         }
     }
     execute(st, ControlAction::Ams(action)).await
+}
+
+#[derive(Deserialize)]
+struct AmsChangeBody {
+    /// Tray to load (0..3), `254` (external spool), or `255` (unload).
+    target: u32,
+    /// Target nozzle temp for the new filament.
+    tar_temp: i64,
+    /// Temp to soften the *current* filament for retraction; defaults to
+    /// `tar_temp` when omitted.
+    curr_temp: Option<i64>,
+    #[serde(default)]
+    confirm: bool,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// Change/unload filament via the AMS (`ams_change_filament`). This physically
+/// moves filament, so it mirrors the CLI's `ams change`: nozzle temps are
+/// clamped to the safe ceiling (no force bypass — an AMS change should never
+/// command an unsafe temp), `dry_run` previews the resolved command without
+/// sending, and a real send needs confirm (428) + idle (409).
+async fn ams_change(State(st): State<AppState>, Json(b): Json<AmsChangeBody>) -> Response {
+    // Only meaningful targets: AMS trays, the external spool, or unload.
+    if !matches!(b.target, 0..=3 | 254 | 255) {
+        return bad_request(format!(
+            "target {} invalid (trays 0..3, 254 external spool, or 255 unload)",
+            b.target
+        ));
+    }
+    let curr = b.curr_temp.unwrap_or(b.tar_temp);
+    let max = TempLimits::default().max_nozzle as i64;
+    for (label, t) in [("tar_temp", b.tar_temp), ("curr_temp", curr)] {
+        if !(0..=max).contains(&t) {
+            return bad_request(format!("{label} {t}°C is out of range (0..={max})"));
+        }
+    }
+    // dry_run previews the resolved command without sending — no confirm/idle
+    // gate, so it works even on a busy printer.
+    if b.dry_run {
+        return Json(json!({ "plan": {
+            "command": "ams_change_filament",
+            "target": b.target,
+            "curr_temp": curr,
+            "tar_temp": b.tar_temp,
+        }}))
+        .into_response();
+    }
+    if let Some(unconfirmed) = need_confirm(b.confirm) {
+        return unconfirmed;
+    }
+    if let Some(busy) = require_idle(&st) {
+        return busy;
+    }
+    execute(
+        st,
+        ControlAction::AmsChange {
+            target: b.target,
+            curr_temp: curr,
+            tar_temp: b.tar_temp,
+        },
+    )
+    .await
 }
 
 /// Reboot the printer (`system.reboot`). Confirm (428) + idle (409). Fire-and-
@@ -2466,6 +2530,91 @@ mod tests {
             .json(&json!({ "action": "eject" }))
             .await
             .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    // ── machine control: ams change/unload ──
+    #[tokio::test]
+    async fn ams_change_needs_confirm() {
+        // Moving filament is physical — an unconfirmed request is a 428.
+        app(None, FakeController::verified())
+            .post("/api/ams/change")
+            .json(&json!({ "target": 255, "tar_temp": 220 }))
+            .await
+            .assert_status(StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn ams_change_confirmed_on_idle_runs() {
+        app(None, FakeController::verified())
+            .post("/api/ams/change")
+            .json(&json!({ "target": 1, "tar_temp": 220, "confirm": true }))
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn ams_unload_target_255_confirmed_runs() {
+        // 255 is the unload sentinel — the whole reason this endpoint exists.
+        app(None, FakeController::verified())
+            .post("/api/ams/change")
+            .json(&json!({ "target": 255, "tar_temp": 250, "confirm": true }))
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn ams_change_on_busy_printer_is_409() {
+        busy_app(FakeController::verified())
+            .post("/api/ams/change")
+            .json(&json!({ "target": 0, "tar_temp": 220, "confirm": true }))
+            .await
+            .assert_status(StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn ams_change_over_limit_temp_is_400() {
+        // An AMS change must not command an unsafe nozzle temp (no force here).
+        app(None, FakeController::verified())
+            .post("/api/ams/change")
+            .json(&json!({ "target": 1, "tar_temp": 999, "confirm": true }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn ams_change_curr_temp_is_also_clamped() {
+        app(None, FakeController::verified())
+            .post("/api/ams/change")
+            .json(&json!({ "target": 1, "tar_temp": 220, "curr_temp": 999, "confirm": true }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn ams_change_unknown_target_is_400() {
+        // Trays 0..3, 254 (external spool), 255 (unload) are meaningful; 7 isn't.
+        app(None, FakeController::verified())
+            .post("/api/ams/change")
+            .json(&json!({ "target": 7, "tar_temp": 220, "confirm": true }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn ams_change_dry_run_previews_without_confirm_or_idle() {
+        // dry_run echoes the resolved command without sending — usable even on a
+        // busy printer and with no confirm, mirroring job_start's preview.
+        let res = busy_app(FakeController::verified())
+            .post("/api/ams/change")
+            .json(&json!({ "target": 255, "tar_temp": 250, "dry_run": true }))
+            .await;
+        res.assert_status_ok();
+        let body: serde_json::Value = res.json();
+        assert_eq!(body["plan"]["command"], "ams_change_filament");
+        assert_eq!(body["plan"]["target"], 255);
+        assert_eq!(body["plan"]["tar_temp"], 250);
+        // curr_temp defaults to tar_temp when omitted.
+        assert_eq!(body["plan"]["curr_temp"], 250);
     }
 
     // ── machine control: reboot ──
