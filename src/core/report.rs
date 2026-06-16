@@ -65,6 +65,28 @@ pub fn merge_into(target: &mut Value, delta: &Value) {
     }
 }
 
+/// The fields that identify a print job (`task_id` / `subtask_id` / `gcode_file`)
+/// — stable for a job's life, so a change means a *different* print. Empty strings
+/// read as absent, matching the typed accessors.
+type PrintIdentity = (Option<String>, Option<String>, Option<String>);
+
+fn print_identity(state: &Value) -> PrintIdentity {
+    let field = |key: &str| {
+        state
+            .pointer(&format!("/print/{key}"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    (field("task_id"), field("subtask_id"), field("gcode_file"))
+}
+
+/// Whether an identity names an actual print (vs. the empty post-teardown state),
+/// so the progress reset fires when a new job *starts*, not when one ends.
+fn is_meaningful(id: &PrintIdentity) -> bool {
+    id.0.is_some() || id.1.is_some() || id.2.is_some()
+}
+
 /// The cached, merged printer state.
 ///
 /// Seed it with the `pushall` snapshot and feed every subsequent report message
@@ -90,8 +112,27 @@ impl ReportState {
     }
 
     /// Merge one report message (snapshot or delta) into the cached state.
+    ///
+    /// A new print inherits the just-finished job's `mc_percent`/`layer_num`:
+    /// the printer reports the new `task_id` well before the first fresh percent,
+    /// so a job in preheat/calibration would read 100% / the old layer count.
+    /// When the merge reveals a new (different, non-empty) print identity, zero
+    /// those carried-over fields — but only the ones this very message didn't set,
+    /// so a report that brings its own fresh progress is trusted.
     pub fn apply(&mut self, message: Value) {
+        let before = print_identity(&self.state);
         merge_into(&mut self.state, &message);
+        let after = print_identity(&self.state);
+        if after != before
+            && is_meaningful(&after)
+            && let Some(print) = self.state.get_mut("print").and_then(Value::as_object_mut)
+        {
+            for field in ["mc_percent", "layer_num"] {
+                if message.pointer(&format!("/print/{field}")).is_none() {
+                    print.insert(field.to_string(), Value::from(0));
+                }
+            }
+        }
     }
 
     /// The full merged state as JSON.
@@ -144,6 +185,55 @@ mod tests {
         merge_into(&mut state, &json!({ "k": null }));
         assert_eq!(state, json!({ "k": null }));
         assert!(state.as_object().unwrap().contains_key("k"));
+    }
+
+    // ── new-print progress reset ──
+    // A new print inherits the finished job's mc_percent/layer_num until the
+    // printer pushes fresh values — it reports the new task_id well before the
+    // first percent — so a just-started job reads 100%. Detect the new print by
+    // its identity and zero the stale carryover.
+
+    #[test]
+    fn a_new_print_zeroes_progress_carried_over_from_the_last_job() {
+        let mut rs = ReportState::new();
+        rs.apply(json!({ "print": {
+            "task_id": "A", "gcode_file": "a.3mf", "mc_percent": 100, "layer_num": 60,
+        }}));
+        // New print B arrives (preheat) with the new identity but no progress yet.
+        rs.apply(json!({ "print": {
+            "task_id": "B", "gcode_file": "b.3mf", "gcode_state": "PREPARE",
+        }}));
+        let p = rs.pointer("/print").unwrap();
+        assert_eq!(p.get("mc_percent"), Some(&json!(0)), "stale 100% must reset on a new print");
+        assert_eq!(p.get("layer_num"), Some(&json!(0)));
+    }
+
+    #[test]
+    fn a_progress_delta_within_the_same_print_is_kept() {
+        let mut rs = ReportState::new();
+        rs.apply(json!({ "print": { "task_id": "A", "mc_percent": 30, "layer_num": 5 } }));
+        rs.apply(json!({ "print": { "mc_percent": 31 } })); // same print, later delta
+        let p = rs.pointer("/print").unwrap();
+        assert_eq!(p.get("mc_percent"), Some(&json!(31)), "same-print progress must not be zeroed");
+        assert_eq!(p.get("layer_num"), Some(&json!(5)));
+    }
+
+    #[test]
+    fn a_new_print_that_brings_its_own_percent_keeps_it() {
+        let mut rs = ReportState::new();
+        rs.apply(json!({ "print": { "task_id": "A", "mc_percent": 100 } }));
+        rs.apply(json!({ "print": { "task_id": "B", "mc_percent": 7 } }));
+        assert_eq!(rs.pointer("/print/mc_percent"), Some(&json!(7)), "trust a fresh percent");
+    }
+
+    #[test]
+    fn finishing_a_print_keeps_its_final_progress() {
+        // Identity clears on teardown; the reset must only fire for a NEW print,
+        // so a finished job still reads 100%.
+        let mut rs = ReportState::new();
+        rs.apply(json!({ "print": { "task_id": "A", "mc_percent": 100, "layer_num": 60 } }));
+        rs.apply(json!({ "print": { "task_id": "", "gcode_state": "FINISH" } }));
+        assert_eq!(rs.pointer("/print/mc_percent"), Some(&json!(100)), "a finished print keeps 100%");
     }
 
     #[test]
