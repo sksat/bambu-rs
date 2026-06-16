@@ -1,5 +1,5 @@
 import type { PrinterStatus } from "../types";
-import { fmtEta, speedName } from "../format";
+import { fmtEta, fmtFinishTime, speedName } from "../format";
 import { Bar, Field, Thumb } from "./widgets";
 
 export function JobSection({ s }: { s: PrinterStatus }) {
@@ -41,7 +41,14 @@ export function JobSection({ s }: { s: PrinterStatus }) {
             value={`${s.layer_num}${s.total_layer_num ? ` / ${s.total_layer_num}` : ""}`}
           />
         )}
-        {s.remaining_time_min != null && <Field label="eta" value={fmtEta(s.remaining_time_min)} />}
+        {s.remaining_time_min != null && (
+          <>
+            <Field label="eta" value={fmtEta(s.remaining_time_min)} />
+            {/* Absolute clock time the job should finish, so you can plan around
+                it without doing now+eta math in your head. */}
+            <Field label="done by" value={fmtFinishTime(s.remaining_time_min, new Date())} />
+          </>
+        )}
       </div>
     </section>
   );
