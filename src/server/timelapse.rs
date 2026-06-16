@@ -26,8 +26,11 @@ pub type FrameGrab = Arc<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync>;
 #[derive(Clone, Default)]
 pub struct TimelapseStatus {
     pub running: bool,
-    pub camera: Option<String>,
+    /// The cameras captured in this run (one frame each, per layer). Empty when
+    /// idle. `camera` (singular) is kept in the JSON for the common one-cam case.
+    pub cameras: Vec<String>,
     pub every: u64,
+    /// Total frames written across all cameras (`layers × cameras`, minus skips).
     pub frames: u64,
     pub failures: u64,
     pub current_layer: Option<i64>,
@@ -39,7 +42,10 @@ impl TimelapseStatus {
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "running": self.running,
-            "camera": self.camera,
+            "cameras": self.cameras,
+            // Back-compat: surface the first camera as `camera` for the common
+            // single-camera case so older readers keep working.
+            "camera": self.cameras.first(),
             "every": self.every,
             "frames": self.frames,
             "failures": self.failures,
@@ -64,28 +70,35 @@ pub struct TimelapseManager {
 }
 
 impl TimelapseManager {
-    /// Start a capture. `out_dir` is created. Errors if one is already running.
+    /// Start a capture from one or more cameras (each gets a frame per layer,
+    /// written to `out_dir/<camera-id>/`). `out_dir` and the per-camera subdirs
+    /// are created. Errors if one is already running, or no cameras are given.
     pub fn start(
         &self,
-        camera: String,
+        cameras: Vec<(String, FrameGrab)>,
         every: u64,
         rx: watch::Receiver<PrinterStatus>,
-        grab: FrameGrab,
         out_dir: PathBuf,
     ) -> Result<(), String> {
         let mut inner = self.inner.lock().unwrap();
         if inner.status.lock().unwrap().running {
             return Err("a timelapse capture is already running".to_string());
         }
-        std::fs::create_dir_all(&out_dir).map_err(|e| format!("create {}: {e}", out_dir.display()))?;
+        if cameras.is_empty() {
+            return Err("no cameras to capture".to_string());
+        }
+        for (id, _) in &cameras {
+            let dir = out_dir.join(id);
+            std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        }
         let status = Arc::new(Mutex::new(TimelapseStatus {
             running: true,
-            camera: Some(camera),
+            cameras: cameras.iter().map(|(id, _)| id.clone()).collect(),
             every: every.max(1),
             out_dir: Some(out_dir.display().to_string()),
             ..Default::default()
         }));
-        let handle = tokio::spawn(run(status.clone(), rx, grab, out_dir, every.max(1)));
+        let handle = tokio::spawn(run(status.clone(), rx, cameras, out_dir, every.max(1)));
         inner.status = status;
         inner.handle = Some(handle);
         Ok(())
@@ -117,20 +130,22 @@ impl TimelapseManager {
 async fn run(
     status: Arc<Mutex<TimelapseStatus>>,
     mut rx: watch::Receiver<PrinterStatus>,
-    grab: FrameGrab,
+    cameras: Vec<(String, FrameGrab)>,
     out_dir: PathBuf,
     every: u64,
 ) {
     // wait=true: the capture may be started before the print is active; sit
     // through idle/finished until it runs, then stop when the print ends.
     let mut session = CaptureSession::new(every, true);
-    let (tx, mut jobs) = tokio::sync::mpsc::channel::<(u64, PathBuf)>(4);
+    // Each layer enqueues one job per camera, so scale the bound with the camera
+    // count to keep the same per-camera backpressure headroom as the single case.
+    let bound = (4 * cameras.len()).max(4);
+    let (tx, mut jobs) = tokio::sync::mpsc::channel::<(FrameGrab, PathBuf)>(bound);
 
     let wstatus = status.clone();
     let worker = tokio::spawn(async move {
-        while let Some((_frame_no, path)) = jobs.recv().await {
-            let g = grab.clone();
-            let res = tokio::task::spawn_blocking(move || g()).await;
+        while let Some((grab, path)) = jobs.recv().await {
+            let res = tokio::task::spawn_blocking(move || grab()).await;
             let mut s = wstatus.lock().unwrap();
             match res {
                 Ok(Ok(bytes)) => match std::fs::write(&path, &bytes) {
@@ -157,13 +172,16 @@ async fn run(
         status.lock().unwrap().current_layer = snap.layer_num;
         match session.observe(&snap) {
             CaptureAction::Capture { frame_no, layer } => {
-                let path = out_dir.join(format!("frame_{frame_no:06}_layer_{layer:05}.jpg"));
-                if tx.try_send((frame_no, path)).is_err() {
-                    // Worker busy/backlogged — skip this layer rather than block
-                    // observation (which would coalesce later layers too).
-                    let mut s = status.lock().unwrap();
-                    s.failures += 1;
-                    s.last_error = Some("capture fell behind — frame skipped".to_string());
+                let name = format!("frame_{frame_no:06}_layer_{layer:05}.jpg");
+                for (id, grab) in &cameras {
+                    let path = out_dir.join(id).join(&name);
+                    if tx.try_send((grab.clone(), path)).is_err() {
+                        // Worker busy/backlogged — skip this frame rather than
+                        // block observation (which would coalesce later layers).
+                        let mut s = status.lock().unwrap();
+                        s.failures += 1;
+                        s.last_error = Some("capture fell behind — frame skipped".to_string());
+                    }
                 }
             }
             CaptureAction::Stop => break,
@@ -191,6 +209,10 @@ mod tests {
         }
     }
 
+    fn one(id: &str, grab: FrameGrab) -> Vec<(String, FrameGrab)> {
+        vec![(id.to_string(), grab)]
+    }
+
     // A capture driven by a fake status channel + a fake in-memory camera, end to
     // end through the manager — no MQTT, no real camera, no network.
     #[tokio::test]
@@ -200,7 +222,7 @@ mod tests {
         let (tx, rx) = watch::channel(st("IDLE", None));
         let grab: FrameGrab = Arc::new(|| Ok(vec![0xff, 0xd8, 0xff, 0x42]));
         let mgr = TimelapseManager::default();
-        mgr.start("ext-0".into(), 1, rx, grab, dir.clone()).unwrap();
+        mgr.start(one("ext-0", grab), 1, rx, dir.clone()).unwrap();
 
         // Drive: print starts and advances three layers, then finishes.
         for s in [st("RUNNING", Some(1)), st("RUNNING", Some(2)), st("RUNNING", Some(3)), st("FINISH", Some(3))] {
@@ -213,8 +235,37 @@ mod tests {
         assert!(!s.running, "capture should auto-stop when the print finishes");
         assert_eq!(s.frames, 3, "one frame per advancing layer");
         assert_eq!(s.failures, 0);
-        let n = std::fs::read_dir(&dir).unwrap().count();
-        assert_eq!(n, 3, "three JPEG files written");
+        let n = std::fs::read_dir(dir.join("ext-0")).unwrap().count();
+        assert_eq!(n, 3, "three JPEG files written under the camera's subdir");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn captures_every_camera_once_per_layer_into_per_camera_subdirs() {
+        let dir = std::env::temp_dir().join(format!("bambu-tl-multi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tx, rx) = watch::channel(st("IDLE", None));
+        let g: FrameGrab = Arc::new(|| Ok(vec![0xff, 0xd8, 0xff, 0x01]));
+        let mgr = TimelapseManager::default();
+        mgr.start(
+            vec![("ext-0".into(), g.clone()), ("ext-1".into(), g)],
+            1,
+            rx,
+            dir.clone(),
+        )
+        .unwrap();
+        for s in [st("RUNNING", Some(1)), st("RUNNING", Some(2)), st("FINISH", Some(2))] {
+            tx.send(s).unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        let s = mgr.status();
+        assert_eq!(s.cameras, vec!["ext-0".to_string(), "ext-1".to_string()]);
+        assert_eq!(s.frames, 4, "2 layers × 2 cameras");
+        assert_eq!(s.failures, 0);
+        assert_eq!(std::fs::read_dir(dir.join("ext-0")).unwrap().count(), 2);
+        assert_eq!(std::fs::read_dir(dir.join("ext-1")).unwrap().count(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -224,10 +275,18 @@ mod tests {
         let (_tx, rx) = watch::channel(st("RUNNING", Some(0)));
         let grab: FrameGrab = Arc::new(|| Ok(vec![0xff, 0xd8, 0xff]));
         let mgr = TimelapseManager::default();
-        mgr.start("ext-0".into(), 1, rx.clone(), grab.clone(), dir.clone()).unwrap();
-        assert!(mgr.start("ext-1".into(), 1, rx, grab, dir.clone()).is_err());
+        mgr.start(one("ext-0", grab.clone()), 1, rx.clone(), dir.clone()).unwrap();
+        assert!(mgr.start(one("ext-1", grab), 1, rx, dir.clone()).is_err());
         assert!(mgr.stop());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn start_with_no_cameras_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("bambu-tl-empty-{}", std::process::id()));
+        let (_tx, rx) = watch::channel(st("RUNNING", Some(0)));
+        let mgr = TimelapseManager::default();
+        assert!(mgr.start(vec![], 1, rx, dir).is_err(), "need at least one camera");
     }
 
     #[tokio::test]
@@ -237,7 +296,7 @@ mod tests {
         let (tx, rx) = watch::channel(st("RUNNING", Some(0)));
         let grab: FrameGrab = Arc::new(|| Err("camera offline".to_string()));
         let mgr = TimelapseManager::default();
-        mgr.start("ext-0".into(), 1, rx, grab, dir.clone()).unwrap();
+        mgr.start(one("ext-0", grab), 1, rx, dir.clone()).unwrap();
         for s in [st("RUNNING", Some(1)), st("RUNNING", Some(2)), st("FINISH", Some(2))] {
             tx.send(s).unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(40)).await;

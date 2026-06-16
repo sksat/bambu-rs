@@ -1330,8 +1330,14 @@ fn fetch_camera_frame(url: &str) -> Result<(String, Vec<u8>), String> {
 
 #[derive(Deserialize)]
 struct TimelapseStartBody {
-    /// Camera id to capture from: `internal` or `ext-{i}`.
-    camera: String,
+    /// Single camera id to capture from: `internal` or `ext-{i}`. Convenience
+    /// for the common case; `cameras` takes precedence when both are given.
+    #[serde(default)]
+    camera: Option<String>,
+    /// Capture several cameras at once (multi-angle) — each gets a frame per
+    /// layer under its own subdir. Falls back to `camera` when empty.
+    #[serde(default)]
+    cameras: Vec<String>,
     #[serde(default = "default_every")]
     every: u64,
 }
@@ -1379,23 +1385,34 @@ async fn timelapse_start(State(st): State<AppState>, Json(b): Json<TimelapseStar
     if b.every < 1 {
         return bad_request("every must be >= 1".to_string());
     }
-    let Some((label, grab)) = resolve_grab(&st, &b.camera) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "unknown or unconfigured camera" })),
-        )
-            .into_response();
+    // `cameras` wins; fall back to the single `camera`. De-dupe but keep order.
+    let mut ids: Vec<String> = if !b.cameras.is_empty() {
+        b.cameras.clone()
+    } else {
+        b.camera.clone().into_iter().collect()
     };
+    ids.dedup();
+    if ids.is_empty() {
+        return bad_request("specify a camera or cameras to capture".to_string());
+    }
+    let mut grabs = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let Some(resolved) = resolve_grab(&st, id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("unknown or unconfigured camera: {id}") })),
+            )
+                .into_response();
+        };
+        grabs.push(resolved);
+    }
     let epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let hint = sanitize_hint(st.source.current().subtask_name.as_deref().unwrap_or("print"));
     let out_dir = std::path::PathBuf::from("captures").join(format!("{epoch}_{hint}"));
-    match st
-        .timelapse
-        .start(label, b.every, st.source.subscribe(), grab, out_dir)
-    {
+    match st.timelapse.start(grabs, b.every, st.source.subscribe(), out_dir) {
         Ok(()) => Json(st.timelapse.status().to_json()).into_response(),
         Err(e) => (StatusCode::CONFLICT, Json(json!({ "error": e }))).into_response(),
     }

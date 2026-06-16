@@ -1342,6 +1342,13 @@ div.lbl,
 .cam__tl-msg {
   flex-basis: 100%;
 }
+/* "all cams" multi-angle toggle, beside the start button */
+.cam__tl-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  cursor: pointer;
+}
 /* manage dialog (floating) — wider than the default confirm box for URL inputs */
 .modal__box--cam {
   max-width: 34rem;

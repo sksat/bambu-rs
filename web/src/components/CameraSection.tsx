@@ -71,13 +71,23 @@ function CameraView({ id, label, stream }: { id: string; label: string; stream?:
   );
 }
 
-// Start/stop the serve-internal per-layer timelapse, capturing from whichever
-// camera tab is active. Polls `/api/timelapse` so the button + frame count
+// Start/stop the serve-internal per-layer timelapse. Captures the active camera
+// tab, or — with "all cams" — every configured camera at once (multi-angle, one
+// frame each per layer). Polls `/api/timelapse` so the button + frame count
 // reflect a capture started from any tab (or that auto-stopped at print end).
-function TimelapseBar({ activeCamera, password }: { activeCamera: string; password: string | null }) {
+function TimelapseBar({
+  cameras,
+  activeCamera,
+  password,
+}: {
+  cameras: Camera[];
+  activeCamera: string;
+  password: string | null;
+}) {
   const [tl, setTl] = useState<TimelapseState | null>(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+  const [allCams, setAllCams] = useState(false);
 
   useEffect(() => {
     let live = true;
@@ -94,11 +104,13 @@ function TimelapseBar({ activeCamera, password }: { activeCamera: string; passwo
   }, []);
 
   const running = tl?.running ?? false;
+  const multi = cameras.length > 1;
+  const targets = allCams && multi ? cameras.map((c) => c.id) : [activeCamera];
 
   const start = async () => {
     setBusy(true);
     setMsg(null);
-    const r = await startTimelapse(activeCamera, 1, password);
+    const r = await startTimelapse(targets, 1, password);
     if (r === "needPassword") setMsg("needs the control password (set it in Controls)");
     else if ("error" in r) setMsg(r.error);
     else setTl(await getTimelapse());
@@ -118,6 +130,7 @@ function TimelapseBar({ activeCamera, password }: { activeCamera: string; passwo
         <>
           <span className="cam__tl-rec" data-testid="timelapse-running">
             ● recording — {tl?.frames ?? 0} frames
+            {tl && tl.cameras.length > 1 ? ` · ${tl.cameras.length} cams` : ""}
             {tl?.current_layer != null ? ` · layer ${tl.current_layer}` : ""}
             {tl?.failures ? ` · ${tl.failures} failed` : ""}
           </span>
@@ -132,12 +145,26 @@ function TimelapseBar({ activeCamera, password }: { activeCamera: string; passwo
         </>
       ) : (
         <>
-          <span className="cam__tl-idle dim">timelapse → {activeCamera}</span>
+          <span className="cam__tl-idle dim">
+            timelapse → {allCams && multi ? `all (${cameras.length})` : activeCamera}
+          </span>
+          {multi && (
+            <label className="cam__tl-all" title="capture every camera at once (multi-angle)">
+              <input
+                type="checkbox"
+                checked={allCams}
+                disabled={busy}
+                data-testid="timelapse-all"
+                onChange={(e) => setAllCams(e.target.checked)}
+              />
+              <span className="dim">all cams</span>
+            </label>
+          )}
           <button
             className="cam__manage"
             data-testid="timelapse-start"
             disabled={busy}
-            title="capture one frame per print layer from this camera"
+            title="capture one frame per print layer"
             onClick={() => void start()}
           >
             ● start timelapse
@@ -217,7 +244,9 @@ export function CamerasSection({ password }: { password: string | null }) {
                 stream={activeCam.stream}
               />
             )}
-            {activeCam && <TimelapseBar activeCamera={activeCam.id} password={password} />}
+            {activeCam && (
+              <TimelapseBar cameras={cameras} activeCamera={activeCam.id} password={password} />
+            )}
           </>
         )}
       </section>

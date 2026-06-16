@@ -4,6 +4,8 @@
 
 export interface TimelapseState {
   running: boolean;
+  cameras: string[];
+  /** First camera, for back-compat; prefer `cameras`. */
   camera: string | null;
   every: number;
   frames: number;
@@ -41,8 +43,12 @@ async function post(url: string, body: unknown, password: string | null): Promis
   }
 }
 
-export function startTimelapse(camera: string, every: number, password: string | null): Promise<Write> {
-  return post("/api/timelapse/start", { camera, every }, password);
+export function startTimelapse(
+  cameras: string[],
+  every: number,
+  password: string | null,
+): Promise<Write> {
+  return post("/api/timelapse/start", { cameras, every }, password);
 }
 
 export function stopTimelapse(password: string | null): Promise<Write> {
