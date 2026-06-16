@@ -828,13 +828,20 @@ div.lbl,
   align-items: center;
   gap: 0.45rem;
 }
+/* The indicator reads as a little lamp: a dim unlit bead when off, a warm bead
+   that glows (casts light via the box-shadow) when on — so "the light is on" is
+   unmistakable, not just an accent recolour. The warm hue is fixed, not themed:
+   a bulb is yellow regardless of the dashboard palette. */
 .light-toggle .dot {
-  width: 0.5rem;
-  height: 0.5rem;
+  width: 0.7rem;
+  height: 0.7rem;
   border-radius: 50%;
   background: var(--dim);
   border: 1px solid var(--hair);
   flex: none;
+  transition:
+    background 0.15s ease,
+    box-shadow 0.15s ease;
 }
 .light-toggle.is-on {
   color: var(--accent);
@@ -842,8 +849,11 @@ div.lbl,
   font-weight: 650;
 }
 .light-toggle.is-on .dot {
-  background: var(--accent);
-  border-color: var(--accent);
+  background: #ffd76b;
+  border-color: #ffcf52;
+  box-shadow:
+    0 0 6px 2px rgba(255, 206, 92, 0.7),
+    0 0 2px 1px rgba(255, 230, 160, 0.9);
 }
 .pwrow {
   display: flex;
