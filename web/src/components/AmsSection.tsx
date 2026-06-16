@@ -1,4 +1,5 @@
 import type { Ams } from "../types";
+import { trayLabel } from "../format";
 import { Humidity, Tray } from "./widgets";
 
 export function AmsSection({ ams }: { ams: Ams }) {
@@ -11,10 +12,12 @@ export function AmsSection({ ams }: { ams: Ams }) {
         <span className="lbl">ams</span>
         {swapping ? (
           <span className="swap" data-testid="ams-swap">
-            swapping {active} → {ams.target_tray}
+            swapping {trayLabel(active)} → {trayLabel(ams.target_tray)}
           </span>
         ) : (
-          <span className="dim">{active && active !== "255" ? `tray ${active} loaded` : "idle"}</span>
+          <span className="dim">
+            {active && active !== "255" ? `tray ${trayLabel(active)} loaded` : "idle"}
+          </span>
         )}
       </div>
       {units.map((u) => (

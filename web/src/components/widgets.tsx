@@ -2,7 +2,7 @@ import { useState } from "react";
 import type { CSSProperties } from "react";
 import type { TempPoint } from "../useStatus";
 import type { AmsTray } from "../types";
-import { remainText, swatch } from "../format";
+import { remainText, swatch, trayLabel } from "../format";
 
 /// The plate preview embedded in a sliced .3mf; renders nothing if absent or for
 /// non-.3mf files.
@@ -116,7 +116,9 @@ export function Tray({ t, ext }: { t: AmsTray; ext?: boolean }) {
       ? `${t.nozzle_temp_min}–${t.nozzle_temp_max}°C`
       : null;
   const title = [t.name ?? t.material ?? undefined, temps].filter(Boolean).join(" · ") || undefined;
-  const id = ext ? "EXT" : t.id;
+  // 1-based to match the number printed on the AMS; data-testid keeps the raw
+  // 0-based wire id so tests/automation address trays by the protocol value.
+  const id = ext ? "EXT" : trayLabel(t.id);
   const rem = remainText(t.remain);
   return (
     <div className={cls} data-testid={`tray-${ext ? "ext" : t.id}`} title={title}>

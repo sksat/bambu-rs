@@ -33,6 +33,15 @@ export function swatch(color?: string | null, cols?: string[]): string | null {
   return `#${c.length >= 6 ? c.slice(0, 6) : c}`;
 }
 
+/** Tray ids are 0-based on the wire, but the AMS unit is physically labelled
+ *  1-based — so show tray N as N+1 to match the number printed on the hardware.
+ *  The sentinels (255 none / 254 external) and anything non-numeric pass through
+ *  unchanged. Presentation only: the wire value (ams_map, commands) stays 0-based. */
+export function trayLabel(id: string | number | null | undefined): string {
+  const n = Number(id);
+  return Number.isInteger(n) && n >= 0 && n < 254 ? String(n + 1) : String(id);
+}
+
 export function remainText(remain?: number | null): string {
   // A1 spools report 0 (no RFID weight) and -1 means unknown — neither is "0%".
   return remain != null && remain > 0 ? `${remain}%` : "—";
