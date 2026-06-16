@@ -588,10 +588,12 @@ pub struct DeviceError {
 /// verified (the printer's own wording), never from guesswork.
 fn verified_error_message(code: i64) -> Option<&'static str> {
     match code {
-        // Both verified on the A1 mini screen (2026-06-16) during AMS filament
-        // operations (an end-of-print pullback and a tray-change, respectively).
+        // All verified on the A1 mini screen (2026-06-16) during AMS filament
+        // operations (an end-of-print pullback, a tray-change) and a print
+        // (an under-extrusion pause at the first layer), respectively.
         0x1200_8014 => Some("couldn't find the filament position in the toolhead"),
         0x1200_8015 => Some("couldn't pull the filament out of the toolhead"),
+        0x1200_8016 => Some("the extruder isn't pushing filament out properly"),
         _ => None,
     }
 }
@@ -882,6 +884,10 @@ mod tests {
         assert_eq!(
             DeviceError::from_code(0x1200_8014).unwrap().message.as_deref(),
             Some("couldn't find the filament position in the toolhead")
+        );
+        assert_eq!(
+            DeviceError::from_code(0x1200_8016).unwrap().message.as_deref(),
+            Some("the extruder isn't pushing filament out properly")
         );
         // An unverified code carries no fabricated message — just hex + the link.
         let u = DeviceError::from_code(0x0500_C010).unwrap();
