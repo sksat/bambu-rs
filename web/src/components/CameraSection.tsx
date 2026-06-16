@@ -107,6 +107,14 @@ function TimelapseBar({
   const multi = cameras.length > 1;
   const targets = allCams && multi ? cameras.map((c) => c.id) : [activeCamera];
 
+  // `frames` is the total across all cameras; report it per-camera (each camera
+  // gets one frame per layer) so the count reads as the timelapse length, not a
+  // figure you have to divide by the camera count in your head.
+  const nCams = tl?.cameras.length ?? 1;
+  const total = tl?.frames ?? 0;
+  const frameLabel =
+    nCams > 1 ? `${Math.floor(total / nCams)} frames/cam · ${nCams} cams` : `${total} frames`;
+
   const start = async () => {
     setBusy(true);
     setMsg(null);
@@ -129,8 +137,7 @@ function TimelapseBar({
       {running ? (
         <>
           <span className="cam__tl-rec" data-testid="timelapse-running">
-            ● recording — {tl?.frames ?? 0} frames
-            {tl && tl.cameras.length > 1 ? ` · ${tl.cameras.length} cams` : ""}
+            ● recording — {frameLabel}
             {tl?.current_layer != null ? ` · layer ${tl.current_layer}` : ""}
             {tl?.failures ? ` · ${tl.failures} failed` : ""}
           </span>
