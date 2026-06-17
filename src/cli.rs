@@ -726,7 +726,7 @@ fn run_status(
     // no ip/serial/access_code, only the (optional) display identity.
     #[cfg(feature = "server")]
     if let Some(base) = cli.via_serve.clone() {
-        return run_status_via_serve(cli, &base, watch);
+        return run_status_via_serve(cli, &base, watch, interval_secs);
     }
     let cfg = Config::load_or_default(&config_path()?)?;
     let profile_name = selected_profile_name(cli, &cfg)?;
@@ -764,16 +764,14 @@ fn run_status(
 /// touched — only the display identity (printer name + model) is resolved, and
 /// even that is best-effort (it may not match the serve's actual target).
 #[cfg(feature = "server")]
-fn run_status_via_serve(cli: &Cli, base: &str, watch: bool) -> Result<(), CliError> {
+fn run_status_via_serve(
+    cli: &Cli,
+    base: &str,
+    watch: bool,
+    interval_secs: Option<u64>,
+) -> Result<(), CliError> {
     if watch {
-        // Watch needs a polling loop + the render logic lifted out of
-        // watch_to_terminal; until that lands, fail clearly rather than silently
-        // falling back to a direct MQTT connection (which --via-serve opted out of).
-        return Err(CliError::new(
-            exit::VALIDATION,
-            "`--watch` with `--via-serve` isn't supported yet — run `bambu status \
-             --via-serve` for a one-shot read, or drop `--via-serve` to watch over MQTT",
-        ));
+        return watch_via_serve(cli, base, interval_secs);
     }
     let (printer, model) = serve_display_identity(cli);
     let status = fetch_serve_status(base)?;
@@ -788,6 +786,22 @@ fn run_status_via_serve(cli: &Cli, base: &str, watch: bool) -> Result<(), CliErr
         print_status_human(&output);
     }
     Ok(())
+}
+
+/// `status --watch --via-serve`: poll the serve's snapshot on an interval and
+/// print a line on every change (same renderer as the MQTT monitor). Continuous —
+/// runs until Ctrl-C; a failed poll is a hard transport error (exit 7) rather than
+/// silently repainting a stale snapshot. Default cadence 2s (serve's own update
+/// rate); `--interval` overrides.
+#[cfg(feature = "server")]
+fn watch_via_serve(cli: &Cli, base: &str, interval_secs: Option<u64>) -> Result<(), CliError> {
+    let interval = Duration::from_secs(interval_secs.unwrap_or(2).max(1));
+    let mut last: Option<WatchKey> = None;
+    loop {
+        let status = fetch_serve_status(base)?;
+        emit_watch_change(&status, &mut last, cli, true);
+        std::thread::sleep(interval);
+    }
 }
 
 /// Join a serve base URL with the status path. Trailing slashes on the base are
@@ -1090,6 +1104,76 @@ struct WatchKey {
     error: Option<i64>,
 }
 
+/// The change-trigger fields for `st`. Temperatures round to whole °C so each 1 °C
+/// step prints (visible heating/cooling) without sub-degree spam.
+fn watch_key(st: &PrinterStatus) -> WatchKey {
+    WatchKey {
+        gcode_state: st.gcode_state.clone(),
+        stg_cur: st.stg_cur,
+        mc_percent: st.mc_percent,
+        layer_num: st.layer_num,
+        nozzle: st.nozzle_temper.map(|v| v.round() as i64),
+        bed: st.bed_temper.map(|v| v.round() as i64),
+        error: st.error.as_ref().map(|e| e.code),
+    }
+}
+
+/// One human progress line: `STATE  pct%  layer a/b  N…/… B…/…  ETA…  [stage]  ⚠err`.
+fn format_watch_line(st: &PrinterStatus) -> String {
+    let stage = match (st.stg_cur, st.stage.as_deref()) {
+        (Some(id), Some(name)) if !Stage(id).is_no_stage() => format!("  [{name}]"),
+        _ => String::new(),
+    };
+    let err = match &st.error {
+        Some(e) => format!("  ⚠ {}", e.hex),
+        None => String::new(),
+    };
+    // Nozzle/bed as current°→target° (target omitted when off/unset).
+    let temp = |cur: Option<f64>, tgt: Option<f64>| match cur {
+        Some(c) => match tgt.filter(|t| *t > 0.0) {
+            Some(t) => format!("{c:.0}/{t:.0}"),
+            None => format!("{c:.0}"),
+        },
+        None => "-".to_string(),
+    };
+    let eta = match st.remaining_time_min.filter(|m| *m > 0) {
+        Some(m) => format!("  ETA {}", fmt_eta(m)),
+        None => String::new(),
+    };
+    format!(
+        "{:<8} {:>3}%  layer {}/{}  N{} B{}{eta}{stage}{err}",
+        st.gcode_state.as_deref().unwrap_or("?"),
+        st.mc_percent.unwrap_or(0),
+        st.layer_num.unwrap_or(0),
+        st.total_layer_num.unwrap_or(0),
+        temp(st.nozzle_temper, st.nozzle_target),
+        temp(st.bed_temper, st.bed_target),
+    )
+}
+
+/// Print a progress line for `st` IFF it changed from `last` (and update `last`).
+/// Shared by the MQTT monitor and the serve-polling watch. A continuous monitor's
+/// lines ARE its output → stdout (NDJSON under `--json`); a watch-to-completion
+/// keeps stdout for its final snapshot, so its progress goes to stderr.
+fn emit_watch_change(st: &PrinterStatus, last: &mut Option<WatchKey>, cli: &Cli, continuous: bool) {
+    let key = watch_key(st);
+    if last.as_ref() == Some(&key) {
+        return;
+    }
+    *last = Some(key);
+    if continuous {
+        if want_json(cli) {
+            if let Ok(j) = serde_json::to_string(st) {
+                println!("{j}");
+            }
+        } else {
+            println!("{}", format_watch_line(st));
+        }
+    } else {
+        eprintln!("{}", format_watch_line(st));
+    }
+}
+
 /// Watch the printer to a terminal state, **or until a device error appears**,
 /// printing a progress line (to stderr) on every change. Used by `watch` and by
 /// `job start --watch`. A `print_error` mid-job is treated as an anomaly: stop,
@@ -1107,61 +1191,7 @@ fn watch_to_terminal(
     let mut last: Option<WatchKey> = None;
     let mut on_update = |state: &ReportState| -> WatchStep {
         let st = PrinterStatus::from_state(state.get());
-        let key = WatchKey {
-            gcode_state: st.gcode_state.clone(),
-            stg_cur: st.stg_cur,
-            mc_percent: st.mc_percent,
-            layer_num: st.layer_num,
-            nozzle: st.nozzle_temper.map(|v| v.round() as i64),
-            bed: st.bed_temper.map(|v| v.round() as i64),
-            error: st.error.as_ref().map(|e| e.code),
-        };
-        if last.as_ref() != Some(&key) {
-            last = Some(key);
-            let stage = match (st.stg_cur, st.stage.as_deref()) {
-                (Some(id), Some(name)) if !Stage(id).is_no_stage() => format!("  [{name}]"),
-                _ => String::new(),
-            };
-            let err = match &st.error {
-                Some(e) => format!("  ⚠ {}", e.hex),
-                None => String::new(),
-            };
-            // Nozzle/bed as current°→target° (target omitted when off/unset).
-            let temp = |cur: Option<f64>, tgt: Option<f64>| match cur {
-                Some(c) => match tgt.filter(|t| *t > 0.0) {
-                    Some(t) => format!("{c:.0}/{t:.0}"),
-                    None => format!("{c:.0}"),
-                },
-                None => "-".to_string(),
-            };
-            let eta = match st.remaining_time_min.filter(|m| *m > 0) {
-                Some(m) => format!("  ETA {}", fmt_eta(m)),
-                None => String::new(),
-            };
-            let line = format!(
-                "{:<8} {:>3}%  layer {}/{}  N{} B{}{eta}{stage}{err}",
-                st.gcode_state.as_deref().unwrap_or("?"),
-                st.mc_percent.unwrap_or(0),
-                st.layer_num.unwrap_or(0),
-                st.total_layer_num.unwrap_or(0),
-                temp(st.nozzle_temper, st.nozzle_target),
-                temp(st.bed_temper, st.bed_target),
-            );
-            // Continuous monitor (`status --watch`) is the command's own output →
-            // stdout (NDJSON under --json). A to-terminal watch keeps stdout clean
-            // for the final snapshot, so its progress goes to stderr.
-            if continuous {
-                if want_json(cli) {
-                    if let Ok(j) = serde_json::to_string(&st) {
-                        println!("{j}");
-                    }
-                } else {
-                    println!("{line}");
-                }
-            } else {
-                eprintln!("{line}");
-            }
-        }
+        emit_watch_change(&st, &mut last, cli, continuous);
         // A continuous monitor never stops on its own (runs until timeout / Ctrl-C).
         if continuous {
             return WatchStep::Continue;
@@ -2486,6 +2516,34 @@ mod tests {
             serve_status_url("http://h:8088/"),
             "http://h:8088/api/status"
         );
+    }
+
+    #[test]
+    fn watch_line_formats_state_progress_and_temps() {
+        use super::format_watch_line;
+        use crate::core::status::PrinterStatus;
+        let st = PrinterStatus::from_state(&serde_json::json!({ "print": {
+            "gcode_state": "RUNNING", "mc_percent": 42, "layer_num": 10, "total_layer_num": 240,
+            "nozzle_temper": 215.0, "nozzle_target_temper": 245.0,
+            "bed_temper": 60.0, "bed_target_temper": 60.0,
+        }}));
+        let line = format_watch_line(&st);
+        for needle in ["RUNNING", "42%", "layer 10/240", "N215/245", "B60/60"] {
+            assert!(line.contains(needle), "{needle:?} missing from {line:?}");
+        }
+    }
+
+    #[test]
+    fn watch_key_rounds_temps_so_subdegree_jitter_is_one_line() {
+        use super::watch_key;
+        use crate::core::status::PrinterStatus;
+        let noz = |n: f64| {
+            PrinterStatus::from_state(&serde_json::json!({ "print": { "nozzle_temper": n } }))
+        };
+        // sub-degree jitter folds to the same key (no redundant line)
+        assert!(watch_key(&noz(215.1)) == watch_key(&noz(215.4)));
+        // a full-degree step is a new key (prints, so heating stays visible)
+        assert!(watch_key(&noz(215.0)) != watch_key(&noz(216.0)));
     }
 
     #[test]

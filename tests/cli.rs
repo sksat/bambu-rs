@@ -161,16 +161,22 @@ fn gcode_without_confirm_is_refused() {
 
 #[cfg(feature = "server")]
 #[test]
-fn watch_with_via_serve_is_rejected() {
-    // --watch over --via-serve isn't wired yet; it must fail fast (exit 3), not
-    // silently fall back to a direct MQTT connection. No network needed — the
-    // guard fires before any fetch.
-    let cfg = tmp_cfg("via-serve-watch");
-    bambu(&cfg)
-        .env_remove("BAMBU_SERVE_URL")
-        .args(["status", "--watch", "--via-serve", "http://127.0.0.1:8088"])
-        .assert()
-        .code(3); // VALIDATION
+fn via_serve_unreachable_is_a_transport_error() {
+    // --via-serve must NOT silently fall back to a direct MQTT connection when the
+    // serve is down: an unreachable serve is a hard transport error (exit 7). Port
+    // 1 has no listener, so the connection is refused immediately (no hang). This
+    // also exercises the --watch path, whose first poll fails the same way.
+    let cfg = tmp_cfg("via-serve-down");
+    for extra in [vec![], vec!["--watch"]] {
+        let mut args = vec!["status"];
+        args.extend(extra);
+        args.extend(["--via-serve", "http://127.0.0.1:1"]);
+        bambu(&cfg)
+            .env_remove("BAMBU_SERVE_URL")
+            .args(&args)
+            .assert()
+            .code(7); // TRANSPORT
+    }
     let _ = std::fs::remove_dir_all(&cfg);
 }
 
