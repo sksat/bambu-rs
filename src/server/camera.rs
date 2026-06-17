@@ -4,6 +4,8 @@
 //! no built-in camera. Abstracted as a trait so the server stays testable without
 //! a real printer.
 
+use std::io::Read;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::camera::CameraClient;
@@ -116,4 +118,47 @@ impl ExternalCamera {
         };
         Some(Self::new(label, url, None, index))
     }
+}
+
+/// Connect timeout for opening a camera's MJPEG stream — bounds the handshake;
+/// the body itself is meant to be endless (a per-read timeout ends a stall).
+const STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// An opened MJPEG stream: the upstream `content-type` (which carries the
+/// multipart boundary) plus a blocking reader over the long-lived body.
+pub struct OpenedCameraStream {
+    pub content_type: String,
+    pub reader: Box<dyn Read + Send + 'static>,
+}
+
+/// Opens a camera's MJPEG stream on demand. A closure, not a URL, so a recorder
+/// can reconnect (re-open) without knowing the source and tests can inject a fake
+/// that yields canned readers.
+pub type StreamOpen = Arc<dyn Fn() -> Result<OpenedCameraStream, String> + Send + Sync>;
+
+/// Open `url`'s MJPEG stream (blocking): connect and return the content-type plus
+/// a reader over the endless multipart body. A connect timeout bounds the
+/// handshake and a per-read timeout ends a stalled stream, but there is
+/// deliberately no overall timeout — the stream is meant to be endless. Shared by
+/// the HTTP reverse-proxy and the plain-timelapse stream recorder.
+pub fn open_mjpeg_stream(url: &str) -> Result<OpenedCameraStream, String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(STREAM_CONNECT_TIMEOUT)
+        .timeout_read(Duration::from_secs(30))
+        .redirects(0)
+        .build();
+    let resp = agent.get(url).call().map_err(|e| e.to_string())?;
+    let content_type = resp
+        .header("content-type")
+        .map(str::to_string)
+        .unwrap_or_else(|| "multipart/x-mixed-replace".to_string());
+    Ok(OpenedCameraStream {
+        content_type,
+        reader: resp.into_reader(),
+    })
+}
+
+/// A [`StreamOpen`] that re-opens `url` on each call.
+pub fn url_stream_opener(url: String) -> StreamOpen {
+    Arc::new(move || open_mjpeg_stream(&url))
 }

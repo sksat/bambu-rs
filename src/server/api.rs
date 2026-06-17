@@ -34,7 +34,7 @@ use tokio::sync::watch;
 use super::assets::static_handler;
 #[cfg(test)]
 use super::camera::NoCamera;
-use super::camera::{CameraSource, ExternalCamera};
+use super::camera::{CameraSource, ExternalCamera, open_mjpeg_stream};
 use super::timelapse::{FrameGrab, TimelapseManager};
 #[cfg(test)]
 use super::control::FakeController;
@@ -1190,9 +1190,9 @@ async fn camera_stream(State(st): State<AppState>, Path(id): Path<String>) -> Re
     };
     // Connect first (blocking) to learn the upstream content-type — we need the
     // multipart boundary before we can set our own response headers.
-    let opened = tokio::task::spawn_blocking(move || open_camera_stream(&url)).await;
+    let opened = tokio::task::spawn_blocking(move || open_mjpeg_stream(&url)).await;
     let (ctype, reader) = match opened {
-        Ok(Ok(v)) => v,
+        Ok(Ok(s)) => (s.content_type, s.reader),
         Ok(Err(e)) => return (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
         Err(_) => return server_error("camera stream task failed".to_string()),
     };
@@ -1227,23 +1227,8 @@ async fn camera_stream(State(st): State<AppState>, Path(id): Path<String>) -> Re
         .unwrap()
 }
 
-/// Open a camera's MJPEG stream (blocking): connect and hand back the upstream
-/// content-type plus a reader over the long-lived multipart body. A connect
-/// timeout bounds the handshake and a per-read timeout ends a stalled stream, but
-/// there is deliberately no overall timeout — the stream is meant to be endless.
-fn open_camera_stream(url: &str) -> Result<(String, Box<dyn Read + Send + Sync + 'static>), String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(CAMERA_TIMEOUT)
-        .timeout_read(Duration::from_secs(30))
-        .redirects(0)
-        .build();
-    let resp = agent.get(url).call().map_err(|e| e.to_string())?;
-    let ctype = resp
-        .header("content-type")
-        .map(str::to_string)
-        .unwrap_or_else(|| "multipart/x-mixed-replace".to_string());
-    Ok((ctype, resp.into_reader()))
-}
+// The MJPEG stream opener now lives in `super::camera` (open_mjpeg_stream), shared
+// with the plain-timelapse stream recorder.
 
 /// Serialise the external list (with URLs) for the gated config endpoints.
 fn external_json(st: &AppState) -> Vec<serde_json::Value> {

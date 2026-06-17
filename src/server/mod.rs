@@ -14,6 +14,7 @@ pub mod control;
 pub mod files;
 pub mod live;
 pub mod start;
+pub mod stream_record;
 pub mod timelapse;
 
 use std::sync::Arc;
