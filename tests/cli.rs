@@ -153,6 +153,54 @@ fn job_start_and_pause_need_confirm() {
 }
 
 #[test]
+fn upload_rejects_expect_guards() {
+    // --expect-md5/--expect-plate don't apply with --upload (the local md5 is used
+    // directly); reject up front (exit 3) rather than silently ignore. No file or
+    // network needed — it fails before any inspection.
+    let cfg = tmp_cfg("upload-expect");
+    bambu(&cfg)
+        .args([
+            "job", "start", "/tmp/whatever.3mf", "--upload", "--expect-plate", "1",
+        ])
+        .assert()
+        .code(3); // VALIDATION
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[test]
+fn upload_dest_must_keep_the_file_type() {
+    // A --dest that flips the .3mf-ness would start the wrong command type for the
+    // bytes uploaded; reject it (exit 3) before touching the file or network.
+    let cfg = tmp_cfg("upload-dest-type");
+    bambu(&cfg)
+        .args([
+            "job", "start", "/tmp/model.gcode.3mf", "--upload", "--dest",
+            "/cache/model.gcode", "--confirm",
+        ])
+        .assert()
+        .code(3); // VALIDATION
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[test]
+fn upload_missing_local_file_is_validation_error() {
+    // `--upload` reads + inspects the LOCAL file before anything else; a missing
+    // path is a clean validation error (exit 3), not a transport/confirm error.
+    let cfg = tmp_cfg("upload-missing");
+    bambu(&cfg)
+        .args([
+            "job",
+            "start",
+            "/no/such/file.gcode.3mf",
+            "--upload",
+            "--confirm",
+        ])
+        .assert()
+        .code(3); // VALIDATION
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[test]
 fn gcode_without_confirm_is_refused() {
     let cfg = tmp_cfg("gcode-noconfirm");
     bambu(&cfg).args(["gcode", "G28"]).assert().code(4); // CONFIRM_REQUIRED

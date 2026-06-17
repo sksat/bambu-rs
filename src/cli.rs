@@ -238,9 +238,23 @@ enum ConfigAction {
 #[derive(Subcommand)]
 enum JobAction {
     /// Start a print of a file already on the printer (.gcode or .gcode.3mf).
+    /// With --upload, FILE is instead a LOCAL path that's uploaded first.
     Start {
-        /// On-printer path, e.g. /cache/foo.gcode or /cache/foo.gcode.3mf.
+        /// On-printer path (e.g. /cache/foo.gcode.3mf), or — with --upload — a
+        /// LOCAL file to upload then print.
         file: String,
+        /// Upload FILE (a local path) to the printer, then print it. The remote
+        /// path defaults to /cache/<basename> (override with --dest).
+        #[arg(long)]
+        upload: bool,
+        /// With --upload, the on-printer destination path (default
+        /// /cache/<basename>).
+        #[arg(long)]
+        dest: Option<String>,
+        /// With --upload, replace the destination if it already exists (default:
+        /// refuse, to avoid clobbering a file mid-print).
+        #[arg(long)]
+        overwrite: bool,
         /// Plate number (for .3mf project files).
         #[arg(long, default_value_t = 1)]
         plate: u32,
@@ -1467,6 +1481,9 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
     match action {
         JobAction::Start {
             file,
+            upload,
+            dest,
+            overwrite,
             plate,
             ams_map,
             bed_type,
@@ -1479,6 +1496,33 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
             watch_timeout,
             interval,
         } => {
+            // --upload (FILE is a local path → upload then start) is a distinct
+            // enough flow to live on its own; the shared core::start builder keeps
+            // the command logic from duplicating.
+            if *upload {
+                if expect_md5.is_some() || expect_plate.is_some() {
+                    return Err(CliError::new(
+                        exit::VALIDATION,
+                        "--expect-md5 / --expect-plate don't apply with --upload \
+                         (you're providing the local file; its md5 is used directly)",
+                    ));
+                }
+                return run_job_start_upload(
+                    cli,
+                    file,
+                    *plate,
+                    dest.as_deref(),
+                    *overwrite,
+                    ams_map.as_deref(),
+                    bed_type,
+                    *timelapse,
+                    *dry_run,
+                    *confirm,
+                    *watch,
+                    *watch_timeout,
+                    *interval,
+                );
+            }
             let is_3mf = file.to_ascii_lowercase().ends_with(".3mf");
             // The expect-guards are 3mf-only (raw .gcode has no plate/md5 metadata):
             // reject them on a .gcode rather than silently ignore.
@@ -1603,6 +1647,144 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
             job_control(cli, ProtoCommand::CleanPrintError, *confirm)
         }
     }
+}
+
+/// `bambu job start --upload <local>`: FTPS-upload a local file, then start the
+/// print from its on-printer path. The command — including the plate-gcode md5,
+/// read from the LOCAL bytes so the printer verifies what we just sent — is built
+/// by the shared `core::start` builder (the same one the serve uses).
+#[allow(clippy::too_many_arguments)]
+fn run_job_start_upload(
+    cli: &Cli,
+    local: &str,
+    plate: u32,
+    dest: Option<&str>,
+    overwrite: bool,
+    ams_map: Option<&str>,
+    bed_type: &str,
+    timelapse: bool,
+    dry_run: bool,
+    confirm: bool,
+    watch: bool,
+    watch_timeout: u64,
+    interval: Option<u64>,
+) -> Result<(), CliError> {
+    let local_path = std::path::Path::new(local);
+    let basename = local_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| CliError::new(exit::VALIDATION, format!("invalid local file: {local:?}")))?;
+    let is_3mf = basename.to_ascii_lowercase().ends_with(".3mf");
+    let remote = match dest {
+        Some(d) => d.to_string(),
+        None => format!("/cache/{basename}"),
+    };
+    // The command type (project_file vs gcode_file) is derived from the REMOTE
+    // path, but inspection/md5 come from the LOCAL file — a --dest that flips the
+    // .3mf-ness would start the wrong command type for the bytes we uploaded.
+    if remote.to_ascii_lowercase().ends_with(".3mf") != is_3mf {
+        return Err(CliError::new(
+            exit::VALIDATION,
+            format!("--dest {remote:?} must keep {basename:?}'s type (both .3mf, or both raw .gcode)"),
+        ));
+    }
+
+    // Parse + range-check the AMS map up front (no I/O — fail fast).
+    let parsed_ams: Option<Vec<i32>> = match (is_3mf, ams_map) {
+        (true, Some(m)) => Some(parse_ams_map(m)?),
+        _ => None,
+    };
+    if let Some(m) = &parsed_ams {
+        validate_ams_map(m, None)?;
+    }
+
+    // Inspect the LOCAL bytes (the file we're about to upload) for the md5 the
+    // printer will verify, plus the filament count for the AMS-map check.
+    let inspection: Option<PlateInspection> = if is_3mf {
+        let bytes = std::fs::read(local_path)
+            .map_err(|e| CliError::new(exit::VALIDATION, format!("reading {local}: {e}")))?;
+        let insp = project::inspect_plate(&bytes, plate)
+            .map_err(|e| CliError::new(exit::VALIDATION, format!("3mf inspection: {e}")))?;
+        if let Some(m) = &parsed_ams {
+            for w in validate_ams_map(m, Some(insp.filament_colors.len()))? {
+                eprintln!("warning: {w}");
+            }
+        }
+        Some(insp)
+    } else {
+        None
+    };
+
+    // Build the wire command for the REMOTE path, stamping in the local md5.
+    let params = PrintStartParams {
+        file: remote.clone(),
+        plate,
+        use_ams: parsed_ams.is_some(),
+        ams_map: parsed_ams.clone().unwrap_or_default(),
+        bed_type: bed_type.to_string(),
+        timelapse,
+    };
+    let cmd = start::build_command(&params, inspection.as_ref());
+
+    if dry_run {
+        // Plan: the resolved command + what would be uploaded where (nothing is sent).
+        let mut plan = start_plan_json(&cmd, &remote, inspection.as_ref(), None, parsed_ams.as_deref());
+        plan["upload"] = serde_json::json!({ "local": local, "remote": remote, "overwrite": overwrite });
+        print_json(&plan);
+        return Ok(());
+    }
+    if !confirm {
+        return Err(CliError::new(
+            exit::CONFIRM_REQUIRED,
+            "refusing to upload + start without --confirm (try --dry-run first)",
+        ));
+    }
+    ensure_idle(cli)?;
+
+    // Upload (guarding an accidental clobber), then start from the remote path.
+    let ftps = FtpsClient::new(resolve_target(cli)?);
+    if !overwrite && remote_file_exists(&ftps, &remote) {
+        return Err(CliError::new(
+            exit::VALIDATION,
+            format!("{remote} already exists on the printer (pass --overwrite to replace it)"),
+        ));
+    }
+    let n = ftps.upload(local_path, &remote)?;
+    eprintln!("uploaded {n} bytes to {remote}");
+
+    let client = connect_client(cli, 30)?;
+    eprintln!("starting print: {remote}");
+    let outcome = client.send_and_verify(&cmd)?;
+    if watch && outcome == CommandOutcome::Verified {
+        eprintln!("print started; watching for completion / anomalies …");
+        let (model, profile_name) = watch_identity(cli)?;
+        let watcher = connect_client(cli, watch_timeout)?;
+        watch_to_terminal(
+            &watcher,
+            cli,
+            model,
+            profile_name,
+            true,
+            interval.map(Duration::from_secs),
+            false,
+        )
+    } else {
+        report_command_outcome(cli, outcome)
+    }
+}
+
+/// Best-effort "does `remote` already exist?" (list its parent dir, match the
+/// basename). A listing failure (dir absent, transport blip) is treated as "no":
+/// a flaky stat shouldn't block an upload, and the upload itself surfaces real
+/// transport errors.
+fn remote_file_exists(ftps: &FtpsClient, remote: &str) -> bool {
+    let (dir, name) = match remote.rsplit_once('/') {
+        Some((d, n)) => (if d.is_empty() { "/" } else { d }, n),
+        None => ("/", remote),
+    };
+    ftps.list(dir)
+        .map(|names| names.iter().any(|e| e.rsplit('/').next() == Some(name)))
+        .unwrap_or(false)
 }
 
 /// Build the start command, choosing project_file (.3mf) or gcode_file (.gcode).

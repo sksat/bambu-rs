@@ -337,6 +337,10 @@ pub fn router(state: AppState) -> Router {
             "/api/files/upload",
             post(upload_file).layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
         )
+        .route(
+            "/api/job/upload-start",
+            post(job_upload_start).layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_password,
@@ -1585,6 +1589,178 @@ fn server_error(msg: String) -> Response {
         .into_response()
 }
 
+/// Cap for a streamed upload body (DefaultBodyLimit can't bound a raw `Body`).
+const MAX_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
+
+#[derive(Deserialize)]
+struct UploadStartQuery {
+    name: String,
+    dir: Option<String>,
+    #[serde(default = "default_plate")]
+    plate: u32,
+    #[serde(default)]
+    timelapse: bool,
+    bed_type: Option<String>,
+    #[serde(default)]
+    confirm: bool,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+/// One-shot **upload + start**: stream the body to a temp file, (for a `.3mf`)
+/// inspect it for the plate-gcode md5, then FTPS-upload it and start the print —
+/// the dashboard's single request instead of `/files/upload` then `/job/start`.
+/// Reuses the upload guards (filename traversal, safe dir) and the start guards
+/// (confirm, idle, the held `start_lock`); the command is built by the shared
+/// `core::start` builder, with the md5 stamped in so the printer verifies the file.
+async fn job_upload_start(
+    State(st): State<AppState>,
+    Query(q): Query<UploadStartQuery>,
+    body: Body,
+) -> Response {
+    // Same filename/dir guards as the plain upload (single filename, safe dir).
+    if q.name.is_empty() || q.name.contains('/') || q.name.contains('\\') || q.name.contains("..") {
+        return bad_request(format!("invalid filename {:?}", q.name));
+    }
+    let dir = q.dir.clone().unwrap_or_else(|| "/cache".to_string());
+    if dir != "/" && !is_safe_remote_path(&dir) {
+        return bad_request(format!("invalid dir {dir:?}"));
+    }
+    let remote = format!("{}/{}", dir.trim_end_matches('/'), q.name);
+    let is_3mf = q.name.to_ascii_lowercase().ends_with(".3mf");
+
+    // Reject before reading the (possibly huge) body: an unconfirmed, non-dry-run
+    // request can't do anything, so don't stream it to disk first.
+    if !q.confirm && !q.dry_run {
+        return (
+            StatusCode::PRECONDITION_REQUIRED,
+            Json(json!({ "error": "confirm required: add &confirm=true (try &dry_run=true first)" })),
+        )
+            .into_response();
+    }
+
+    // Stream the body to a temp file (never buffered in memory). DefaultBodyLimit
+    // does NOT bound a raw `Body` we consume ourselves, so count bytes and cap.
+    let tmp = match tempfile::Builder::new().prefix("bambu-upload-").tempfile() {
+        Ok(t) => t,
+        Err(e) => return server_error(e.to_string()),
+    };
+    {
+        let mut file = match tokio::fs::File::create(tmp.path()).await {
+            Ok(f) => f,
+            Err(e) => return server_error(e.to_string()),
+        };
+        let mut stream = body.into_data_stream();
+        let mut written: u64 = 0;
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(_) => return bad_request("upload stream error".to_string()),
+            };
+            written += chunk.len() as u64;
+            if written > MAX_UPLOAD_BYTES {
+                return (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    Json(json!({ "error": "upload exceeds the 512 MiB limit" })),
+                )
+                    .into_response();
+            }
+            if file.write_all(&chunk).await.is_err() {
+                return server_error("writing upload".to_string());
+            }
+        }
+        if file.flush().await.is_err() {
+            return server_error("flushing upload".to_string());
+        }
+    }
+
+    // For a .3mf, read the plate-gcode md5 from the bytes we just staged.
+    let inspection = if is_3mf {
+        match std::fs::read(tmp.path())
+            .map_err(|e| e.to_string())
+            .and_then(|b| crate::core::project::inspect_plate(&b, q.plate).map_err(|e| e.to_string()))
+        {
+            Ok(insp) => Some(insp),
+            Err(e) => return bad_request(format!("3mf inspection: {e}")),
+        }
+    } else {
+        None
+    };
+    let bed_type = q.bed_type.clone().unwrap_or_else(|| "auto".to_string());
+    let md5 = inspection.as_ref().map(|i| i.gcode_md5.clone());
+
+    if q.dry_run {
+        return Json(json!({ "plan": {
+            "file": remote,
+            "plate": q.plate,
+            "use_ams": false,
+            "bed_type": bed_type,
+            "timelapse": q.timelapse,
+            "md5": md5,
+            "overwrite": q.overwrite,
+        }}))
+        .into_response();
+    }
+    // (confirm is guaranteed here — the early gate rejected !confirm && !dry_run,
+    // and dry_run returned above.)
+
+    // Hold the start lock across upload+start so two requests can't both pass idle.
+    let Ok(_guard) = st.start_lock.try_lock() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "a print start is already in progress" })),
+        )
+            .into_response();
+    };
+    if let Some(busy) = require_idle(&st) {
+        return busy;
+    }
+
+    // Conservative overwrite guard (list the dir; a listing error doesn't block).
+    if !q.overwrite {
+        let files = st.files.clone();
+        let dir_for_check = dir.clone();
+        let name = q.name.clone();
+        if let Ok(Ok(entries)) =
+            tokio::task::spawn_blocking(move || files.list(&dir_for_check)).await
+            && entries.iter().any(|e| e.name == name)
+        {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": format!("{remote} already exists (add &overwrite=true to replace it)") })),
+            )
+                .into_response();
+        }
+    }
+
+    // Upload the staged file, then start from its on-printer path.
+    let files = st.files.clone();
+    let path = tmp.path().to_path_buf();
+    let remote_for_upload = remote.clone();
+    let up = tokio::task::spawn_blocking(move || files.upload(&remote_for_upload, &path)).await;
+    drop(tmp); // remove the staged file once uploaded (or on error)
+    match up {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
+        Err(_) => return server_error("upload task failed".to_string()),
+    }
+
+    let req = StartRequest {
+        file: remote,
+        plate: q.plate,
+        use_ams: false,
+        ams_map: Vec::new(),
+        bed_type,
+        timelapse: q.timelapse,
+        inspection,
+    };
+    let starter = st.starter.clone();
+    let res = tokio::task::spawn_blocking(move || starter.start(&req)).await;
+    verify_response(res)
+}
+
 /// Upgrade to a WebSocket that pushes a `PrinterStatus` JSON frame on connect and
 /// on every subsequent change.
 async fn status_ws(State(st): State<AppState>, ws: WebSocketUpgrade) -> Response {
@@ -1726,6 +1902,57 @@ mod tests {
             .await;
         res.assert_status_ok();
         assert_eq!(res.json::<serde_json::Value>()["outcome"], "verified");
+    }
+
+    // ── upload-then-start (one-shot) ──
+    #[tokio::test]
+    async fn upload_start_needs_confirmation() {
+        app(None, FakeController::verified())
+            .post("/api/job/upload-start?name=x.gcode")
+            .bytes(b"G28\n".to_vec().into())
+            .await
+            .assert_status(StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn upload_start_confirmed_uploads_then_starts() {
+        // A raw .gcode skips 3mf inspection, so the fake files+starter carry it
+        // end to end: upload succeeds, the print verifies.
+        let res = app(None, FakeController::verified())
+            .post("/api/job/upload-start?name=x.gcode&confirm=true")
+            .bytes(b"G28\n".to_vec().into())
+            .await;
+        res.assert_status_ok();
+        assert_eq!(res.json::<serde_json::Value>()["outcome"], "verified");
+    }
+
+    #[tokio::test]
+    async fn upload_start_dry_run_plans_without_starting() {
+        let res = app(None, FakeController::verified())
+            .post("/api/job/upload-start?name=x.gcode&dry_run=true")
+            .bytes(b"G28\n".to_vec().into())
+            .await;
+        res.assert_status_ok();
+        let v = res.json::<serde_json::Value>();
+        assert_eq!(v["plan"]["file"], "/cache/x.gcode");
+    }
+
+    #[tokio::test]
+    async fn upload_start_rejects_a_traversal_name() {
+        app(None, FakeController::verified())
+            .post("/api/job/upload-start?name=../evil.gcode&confirm=true")
+            .bytes(b"x".to_vec().into())
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn upload_start_is_gated_by_password() {
+        app(Some("hunter2"), FakeController::verified())
+            .post("/api/job/upload-start?name=x.gcode&confirm=true")
+            .bytes(b"G28\n".to_vec().into())
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
     }
 
     // ── control: outcome → HTTP status ──
