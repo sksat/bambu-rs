@@ -67,6 +67,14 @@ struct Cli {
     /// Emit machine-readable JSON (default output is human-readable).
     #[arg(long, global = true)]
     json: bool,
+    /// Read through a running `bambu serve`'s HTTP API instead of opening a
+    /// direct MQTT connection — lower latency, since serve already holds a live
+    /// delta-merged snapshot (a cold connect+pushall costs seconds). Only the
+    /// open reads honor it (`status`, `status --watch`); writes still go direct.
+    /// e.g. `http://127.0.0.1:8088`. (Needs no access code — reads are open.)
+    #[cfg(feature = "server")]
+    #[arg(long, global = true, env = "BAMBU_SERVE_URL", value_name = "URL")]
+    via_serve: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -713,6 +721,13 @@ fn run_status(
     interval_secs: Option<u64>,
     timeout_secs: u64,
 ) -> Result<(), CliError> {
+    // `--via-serve`: read the snapshot off a running serve's HTTP API instead of
+    // a direct MQTT connect. Branch BEFORE config::resolve — the serve path needs
+    // no ip/serial/access_code, only the (optional) display identity.
+    #[cfg(feature = "server")]
+    if let Some(base) = cli.via_serve.clone() {
+        return run_status_via_serve(cli, &base, watch);
+    }
     let cfg = Config::load_or_default(&config_path()?)?;
     let profile_name = selected_profile_name(cli, &cfg)?;
     let profile = profile_name.as_deref().and_then(|n| cfg.profile(n));
@@ -741,6 +756,103 @@ fn run_status(
         print_status_human(&output);
     }
     Ok(())
+}
+
+/// `bambu status --via-serve <url>`: fetch the snapshot from a running serve and
+/// render it through the same `StatusOutput` paths as the MQTT version, so the
+/// output is byte-for-byte the same shape. Reads are open, so no credentials are
+/// touched — only the display identity (printer name + model) is resolved, and
+/// even that is best-effort (it may not match the serve's actual target).
+#[cfg(feature = "server")]
+fn run_status_via_serve(cli: &Cli, base: &str, watch: bool) -> Result<(), CliError> {
+    if watch {
+        // Watch needs a polling loop + the render logic lifted out of
+        // watch_to_terminal; until that lands, fail clearly rather than silently
+        // falling back to a direct MQTT connection (which --via-serve opted out of).
+        return Err(CliError::new(
+            exit::VALIDATION,
+            "`--watch` with `--via-serve` isn't supported yet — run `bambu status \
+             --via-serve` for a one-shot read, or drop `--via-serve` to watch over MQTT",
+        ));
+    }
+    let (printer, model) = serve_display_identity(cli);
+    let status = fetch_serve_status(base)?;
+    let output = StatusOutput {
+        printer,
+        model,
+        status,
+    };
+    if want_json(cli) {
+        print_json(&output);
+    } else {
+        print_status_human(&output);
+    }
+    Ok(())
+}
+
+/// Join a serve base URL with the status path. Trailing slashes on the base are
+/// trimmed so `http://h:8088` and `http://h:8088/` both work.
+#[cfg(feature = "server")]
+fn serve_status_url(base: &str) -> String {
+    format!("{}/api/status", base.trim_end_matches('/'))
+}
+
+/// GET the serve's `/api/status` and deserialize it into [`PrinterStatus`]. A
+/// short timeout keeps this on the "instant read" path; any failure is a
+/// transport error (exit 7) — never a silent fall-through to direct MQTT.
+#[cfg(feature = "server")]
+fn fetch_serve_status(base: &str) -> Result<PrinterStatus, CliError> {
+    let url = serve_status_url(base);
+    let resp = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .get(&url)
+        .call()
+        .map_err(|e| {
+            CliError::new(exit::TRANSPORT, format!("couldn't reach serve at {url}: {e}"))
+        })?;
+    // ureq is built without its `json` feature (no `into_json`), so read the body
+    // and parse with serde_json directly.
+    let body = resp.into_string().map_err(|e| {
+        CliError::new(exit::TRANSPORT, format!("couldn't read response from {url}: {e}"))
+    })?;
+    serde_json::from_str::<PrinterStatus>(&body).map_err(|e| {
+        CliError::new(
+            exit::TRANSPORT,
+            format!("unexpected status response from {url}: {e}"),
+        )
+    })
+}
+
+/// Resolve the printer name + model for display only (no credentials). This must
+/// NEVER block the serve read: `--via-serve` exists precisely so a caller without
+/// local config can read an open API, so a missing/corrupt config, no `HOME`, or a
+/// stale `default_printer` all degrade to best-effort (`None` / `"unknown"`)
+/// rather than erroring. The label may not match the serve's actual target — that
+/// is accepted, since the serve is the source of truth here.
+#[cfg(feature = "server")]
+fn serve_display_identity(cli: &Cli) -> (Option<String>, String) {
+    let cfg = config_path()
+        .ok()
+        .map(|p| Config::load_or_default(&p))
+        .and_then(Result::ok);
+    // The label is just what the caller asked for (or the configured default) — we
+    // do NOT require it to exist as a profile, so a stale name can't block the read.
+    let printer = cli
+        .printer
+        .clone()
+        .or_else(|| cfg.as_ref().and_then(|c| c.default_printer.clone()));
+    let profile = printer
+        .as_deref()
+        .zip(cfg.as_ref())
+        .and_then(|(n, c)| c.profile(n));
+    let overrides = flag_overrides(cli).over(Overrides::from_env());
+    let model = overrides
+        .model
+        .or_else(|| profile.map(|p| p.model.clone()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    (printer, model)
 }
 
 /// One decoded HMS alert, for output.
@@ -1006,7 +1118,7 @@ fn watch_to_terminal(
         };
         if last.as_ref() != Some(&key) {
             last = Some(key);
-            let stage = match (st.stg_cur, st.stage) {
+            let stage = match (st.stg_cur, st.stage.as_deref()) {
                 (Some(id), Some(name)) if !Stage(id).is_no_stage() => format!("  [{name}]"),
                 _ => String::new(),
             };
@@ -2311,7 +2423,7 @@ fn print_status_human(o: &StatusOutput) {
     }
     // Show the current activity only when it's a real special stage; the
     // no-stage markers (0 / 255) just echo idle-or-printing.
-    if let (Some(stage), Some(id)) = (s.stage, s.stg_cur)
+    if let (Some(stage), Some(id)) = (s.stage.as_deref(), s.stg_cur)
         && !Stage(id).is_no_stage()
     {
         println!("stage:   {stage} ({id})");
@@ -2360,6 +2472,21 @@ fn fmt_eta(min: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{ams_mapping_preview, fmt_eta, subst_capture_tokens, validate_ams_map};
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn serve_status_url_joins_and_trims_trailing_slash() {
+        use super::serve_status_url;
+        assert_eq!(
+            serve_status_url("http://127.0.0.1:8088"),
+            "http://127.0.0.1:8088/api/status"
+        );
+        // a trailing slash on the base must not double up
+        assert_eq!(
+            serve_status_url("http://h:8088/"),
+            "http://h:8088/api/status"
+        );
+    }
 
     #[test]
     fn eta_formats_minutes_and_hours() {

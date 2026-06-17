@@ -12,11 +12,11 @@
 use crate::core::capability::{ChamberTemperature, HardwareFeatures};
 use crate::core::hms::{HmsEntry, Module, decode_report_hms};
 use crate::core::stage::Stage;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// The fields of a printer `print` report that matter for monitoring.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-rs", derive(ts_rs::TS), ts(export))]
 pub struct PrinterStatus {
     /// Coarse job state, e.g. `IDLE`, `RUNNING`, `PAUSE`, `FINISH`, `FAILED`.
@@ -39,7 +39,7 @@ pub struct PrinterStatus {
     pub stg_cur: Option<i64>,
     /// Decoded name of `stg_cur` (e.g. `auto_bed_leveling`), or `None` for an
     /// unknown/future stage id. See [`crate::core::stage`].
-    pub stage: Option<&'static str>,
+    pub stage: Option<String>,
     /// `home_flag` bitfield (per-axis homed state); it changes during a home/move,
     /// so it's one of the few report signals that reflect ad-hoc motion.
     pub home_flag: Option<i64>,
@@ -119,7 +119,7 @@ pub struct PrinterStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub print_type: Option<String>,
     /// Queue of upcoming stage ids (`stg`); `stg_cur` is the current one.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stg: Vec<i64>,
 
     // Machine configuration / peripherals.
@@ -187,12 +187,12 @@ pub struct PrinterStatus {
 
     /// Decoded HMS alerts (the device's primary fault/warning channel). Empty
     /// when healthy; separate from `error`/`print_error`. See [`crate::core::hms`].
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hms: Vec<HmsAlert>,
 }
 
 /// One `lights_report` entry: an LED node and its mode (`on`/`off`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-rs", derive(ts_rs::TS), ts(export))]
 pub struct LightReport {
     pub node: String,
@@ -203,7 +203,7 @@ pub struct LightReport {
 /// camera). The `timelapse` field is the printer's *actual* timelapse setting,
 /// which is how an `ipcam_timelapse` command is verified (the ACK alone only
 /// says it was accepted — same caveat as the chamber light).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-rs", derive(ts_rs::TS), ts(export))]
 pub struct Ipcam {
     /// `timelapse` mode (`enable`/`disable`) — whether a timelapse is recorded
@@ -216,7 +216,7 @@ pub struct Ipcam {
 }
 
 /// The loaded filament a print draws from (resolved from `ams.tray_now`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-rs", derive(ts_rs::TS), ts(export))]
 pub struct Filament {
     /// `ams0`..`amsN` for an AMS tray, or `external` for the external spool.
@@ -232,7 +232,7 @@ pub struct Filament {
 /// A decoded HMS alert (the wire view of [`crate::core::hms::HmsEntry`]).
 /// `severity` is the **raw** bits — label conventions conflict across sources,
 /// so we expose the number and link to the wiki rather than bundling a table.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-rs", derive(ts_rs::TS), ts(export))]
 pub struct HmsAlert {
     /// Canonical underscore form, e.g. `HMS_0300_0100_0001_0007`.
@@ -272,11 +272,11 @@ impl HmsAlert {
 /// The full AMS picture: every unit and tray, the external spool, and the
 /// active/target/previous tray pointers (the live colour-swap signal — the tray
 /// *array* only arrives in full pushalls, the pointers in deltas).
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-rs", derive(ts_rs::TS), ts(export))]
 pub struct Ams {
     /// Attached AMS units (`ams.ams[]`).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub units: Vec<AmsUnit>,
     /// The external/virtual spool (`vt_tray`), surfaced even when not loaded.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -302,7 +302,7 @@ pub struct Ams {
 }
 
 /// One AMS unit (`ams.ams[]`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-rs", derive(ts_rs::TS), ts(export))]
 pub struct AmsUnit {
     /// Physical unit id (`id`).
@@ -320,12 +320,12 @@ pub struct AmsUnit {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dry_time: Option<i64>,
     /// The unit's trays/slots (`tray[]`).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trays: Vec<AmsTray>,
 }
 
 /// One AMS tray/slot (`ams.ams[].tray[]` or `vt_tray`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-rs", derive(ts_rs::TS), ts(export))]
 pub struct AmsTray {
     /// Tray id (`id`); what `tray_now`/`tray_pre`/`tray_tar` point at.
@@ -340,7 +340,7 @@ pub struct AmsTray {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
     /// All colour segments (`cols`); single-colour spools mirror `color`.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cols: Vec<String>,
     /// Remaining filament percent (`remain`); `0`/`-1` mean unknown on the A1.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -370,7 +370,7 @@ pub struct AmsTray {
 }
 
 /// Firmware-update availability/progress (`upgrade_state`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-rs", derive(ts_rs::TS), ts(export))]
 pub struct Upgrade {
     /// Whether an update is available/pending (`new_version_state`).
@@ -388,7 +388,7 @@ pub struct Upgrade {
 }
 
 /// Peripheral online state (`online`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-rs", derive(ts_rs::TS), ts(export))]
 pub struct Online {
     /// AHB bus present (`ahb`).
@@ -403,7 +403,7 @@ pub struct Online {
 }
 
 /// In-progress file upload/transfer (`upload`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-rs", derive(ts_rs::TS), ts(export))]
 pub struct Upload {
     /// Transfer status (`status`, e.g. `idle`).
@@ -435,7 +435,7 @@ impl PrinterStatus {
             total_layer_num: get("total_layer_num").and_then(as_i64_loose),
             remaining_time_min: get("mc_remaining_time").and_then(as_i64_loose),
             stg_cur,
-            stage: stg_cur.and_then(|id| Stage(id).name()),
+            stage: stg_cur.and_then(|id| Stage(id).name()).map(String::from),
             home_flag: get("home_flag").and_then(as_i64_loose),
             nozzle_temper: get("nozzle_temper").and_then(Value::as_f64),
             nozzle_target: get("nozzle_target_temper").and_then(Value::as_f64),
@@ -566,7 +566,7 @@ impl PrinterStatus {
 /// rationale as [`crate::core::hms`]) — but we DO attach a plain-language
 /// [`message`](DeviceError::message) for the handful of codes verified on the
 /// real device, and always emit the hex + a lookup link.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-rs", derive(ts_rs::TS), ts(export))]
 pub struct DeviceError {
     /// Raw `print_error` value.
@@ -1194,5 +1194,22 @@ mod tests {
                 "{absent} should be skipped when absent"
             );
         }
+    }
+
+    #[test]
+    fn round_trips_through_json() {
+        // `bambu --via-serve` deserializes a serve's /api/status response back into
+        // PrinterStatus, so the type must survive its own serialization — including
+        // the `skip_serializing_if`-elided fields (absent → default, not an error)
+        // and the decoded `stage` string.
+        let st = PrinterStatus::from_state(&json!({ "print": {
+            "gcode_state": "RUNNING", "stg_cur": 2, "mc_percent": 42,
+            "nozzle_temper": 215.0, "stg": [2, 0],
+            "lights_report": [{ "node": "chamber_light", "mode": "on" }],
+        }}));
+        assert_eq!(st.stage.as_deref(), Some("heatbed_preheating"));
+        let json = serde_json::to_string(&st).unwrap();
+        let back: PrinterStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(st, back);
     }
 }

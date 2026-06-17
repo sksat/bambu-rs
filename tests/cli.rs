@@ -159,6 +159,21 @@ fn gcode_without_confirm_is_refused() {
     let _ = std::fs::remove_dir_all(&cfg);
 }
 
+#[cfg(feature = "server")]
+#[test]
+fn watch_with_via_serve_is_rejected() {
+    // --watch over --via-serve isn't wired yet; it must fail fast (exit 3), not
+    // silently fall back to a direct MQTT connection. No network needed — the
+    // guard fires before any fetch.
+    let cfg = tmp_cfg("via-serve-watch");
+    bambu(&cfg)
+        .env_remove("BAMBU_SERVE_URL")
+        .args(["status", "--watch", "--via-serve", "http://127.0.0.1:8088"])
+        .assert()
+        .code(3); // VALIDATION
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
 #[test]
 fn file_ls_without_config_is_validation_error() {
     let cfg = tmp_cfg("file-noconf");
