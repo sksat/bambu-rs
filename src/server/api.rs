@@ -312,6 +312,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/job/pause", post(job_pause))
         .route("/api/job/resume", post(job_resume))
         .route("/api/job/stop", post(job_stop))
+        .route("/api/job/clear", post(job_clear))
         .route("/api/job/start", post(job_start))
         .route("/api/light", post(light))
         .route("/api/speed", post(speed))
@@ -379,6 +380,12 @@ async fn job_resume(State(st): State<AppState>, body: Option<Json<ConfirmBody>>)
 }
 async fn job_stop(State(st): State<AppState>, body: Option<Json<ConfirmBody>>) -> Response {
     run_confirmed(st, ControlAction::Stop, body).await
+}
+/// Clear a print error (`clean_print_error`) so the printer leaves `FAILED`
+/// without a reboot — re-enabling writes the error was blocking (e.g. filament
+/// change). Gated by confirm like the other job controls.
+async fn job_clear(State(st): State<AppState>, body: Option<Json<ConfirmBody>>) -> Response {
+    run_confirmed(st, ControlAction::ClearError, body).await
 }
 
 async fn light(State(st): State<AppState>, Json(b): Json<LightBody>) -> Response {
@@ -1694,6 +1701,24 @@ mod tests {
     async fn job_pause_confirmed_returns_verified() {
         let res = app(None, FakeController::verified())
             .post("/api/job/pause")
+            .json(&json!({ "confirm": true }))
+            .await;
+        res.assert_status_ok();
+        assert_eq!(res.json::<serde_json::Value>()["outcome"], "verified");
+    }
+
+    #[tokio::test]
+    async fn job_clear_needs_confirmation() {
+        app(None, FakeController::verified())
+            .post("/api/job/clear")
+            .await
+            .assert_status(StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn job_clear_confirmed_returns_verified() {
+        let res = app(None, FakeController::verified())
+            .post("/api/job/clear")
             .json(&json!({ "confirm": true }))
             .await;
         res.assert_status_ok();

@@ -170,6 +170,15 @@ pub enum Command {
     Resume,
     /// Stop (cancel) the current print — irreversible.
     Stop,
+    /// Clear a print error / dismiss the error popup (`print.clean_print_error`).
+    /// This is what Bambu Studio sends to acknowledge an error popup. Command name
+    /// is from vendor docs; the A1 mini **ACKs it `success`** (observed). What it
+    /// does NOT do, observed on this unit: it did not move `gcode_state` out of
+    /// `FAILED` (tested with `print_error` already 0), and `ams_change_filament`
+    /// stayed rejected while `FAILED`. So treat it as "dismiss the error", not
+    /// "return to idle". Sending it *while an error is active* is still
+    /// uncharacterised. **[spec]**
+    CleanPrintError,
     /// Send a single raw G-code line (`print.gcode_line`).
     GcodeLine(String),
     /// Print a raw G-code file already on the printer (`print.gcode_file`,
@@ -283,6 +292,7 @@ impl Command {
             Command::Pause
             | Command::Resume
             | Command::Stop
+            | Command::CleanPrintError
             | Command::GcodeLine(_)
             | Command::GcodeFile(_)
             | Command::PrintSpeed(_)
@@ -309,6 +319,13 @@ impl Command {
             Command::Pause => print_command(sequence_id, "pause", ""),
             Command::Resume => print_command(sequence_id, "resume", ""),
             Command::Stop => print_command(sequence_id, "stop", ""),
+            Command::CleanPrintError => json!({
+                "print": {
+                    "sequence_id": sequence_id,
+                    "command": "clean_print_error",
+                    "subtask_id": "0",
+                }
+            }),
             Command::GcodeLine(line) => print_command(sequence_id, "gcode_line", line),
             Command::GcodeFile(path) => print_command(sequence_id, "gcode_file", path),
             Command::PrintSpeed(level) => {
@@ -479,6 +496,15 @@ mod tests {
             .to_payload("1")["print"]["option"],
             8
         );
+    }
+
+    #[test]
+    fn clean_print_error_payload() {
+        let v = Command::CleanPrintError.to_payload("3");
+        assert_eq!(v["print"]["command"], "clean_print_error");
+        assert_eq!(v["print"]["sequence_id"], "3");
+        assert_eq!(v["print"]["subtask_id"], "0");
+        assert_eq!(Command::CleanPrintError.category(), "print");
     }
 
     #[test]

@@ -119,7 +119,11 @@ pub fn evaluate(
         | Command::AmsControl(_)
         | Command::AmsChangeFilament { .. }
         | Command::AmsUserSetting { .. }
-        | Command::AmsFilamentSetting(_) => false,
+        | Command::AmsFilamentSetting(_)
+        // Ack-only for now: the success ACK is the verdict. Whether the clear also
+        // drops print_error to 0 / leaves FAILED is being confirmed on-device; once
+        // that's verified, this can graduate to an observable-effect predicate.
+        | Command::CleanPrintError => false,
     };
 
     if observed {

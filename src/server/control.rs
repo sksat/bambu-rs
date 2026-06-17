@@ -61,6 +61,9 @@ pub enum ControlAction {
     Pause,
     Resume,
     Stop,
+    /// Clear a print error so the printer leaves `FAILED` without a reboot
+    /// (`clean_print_error`) — re-enables writes the error was blocking.
+    ClearError,
     Light {
         node: LedNode,
         on: bool,
@@ -105,6 +108,7 @@ impl ControlAction {
             ControlAction::Pause => ProtoCommand::Pause,
             ControlAction::Resume => ProtoCommand::Resume,
             ControlAction::Stop => ProtoCommand::Stop,
+            ControlAction::ClearError => ProtoCommand::CleanPrintError,
             ControlAction::Light { node, on } => ProtoCommand::Led { node, on },
             ControlAction::Speed(level) => ProtoCommand::PrintSpeed(level),
             ControlAction::Gcode(line) => ProtoCommand::GcodeLine(line),
