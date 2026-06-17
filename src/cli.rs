@@ -240,15 +240,14 @@ enum JobAction {
     /// Start a print of a file already on the printer (.gcode or .gcode.3mf).
     /// With --upload, FILE is instead a LOCAL path that's uploaded first.
     Start {
-        /// On-printer path (e.g. /cache/foo.gcode.3mf), or — with --upload — a
-        /// LOCAL file to upload then print.
+        /// On-printer path (e.g. /foo.gcode.3mf), or — with --upload — a LOCAL
+        /// file to upload then print.
         file: String,
         /// Upload FILE (a local path) to the printer, then print it. The remote
-        /// path defaults to /cache/<basename> (override with --dest).
+        /// path defaults to /<basename> (override with --dest).
         #[arg(long)]
         upload: bool,
-        /// With --upload, the on-printer destination path (default
-        /// /cache/<basename>).
+        /// With --upload, the on-printer destination path (default /<basename>).
         #[arg(long)]
         dest: Option<String>,
         /// With --upload, replace the destination if it already exists (default:
@@ -512,8 +511,9 @@ enum FileAction {
     Upload {
         /// Local file to upload.
         local: std::path::PathBuf,
-        /// Destination directory on the printer.
-        #[arg(long, default_value = "/cache")]
+        /// Destination directory on the printer (root by default — the A1 mini
+        /// prints from `/`; a file under `/cache` fails the print with 0x0500C010).
+        #[arg(long, default_value = "/")]
         dest: String,
     },
     /// Download a file from the printer (e.g. a timelapse video).
@@ -1675,9 +1675,11 @@ fn run_job_start_upload(
         .and_then(|s| s.to_str())
         .ok_or_else(|| CliError::new(exit::VALIDATION, format!("invalid local file: {local:?}")))?;
     let is_3mf = basename.to_ascii_lowercase().ends_with(".3mf");
+    // Default to the printer root: the A1 mini prints from `/`; an uploaded file
+    // under `/cache` fails the print start with 0x0500C010 (verified on-device).
     let remote = match dest {
         Some(d) => d.to_string(),
-        None => format!("/cache/{basename}"),
+        None => format!("/{basename}"),
     };
     // The command type (project_file vs gcode_file) is derived from the REMOTE
     // path, but inspection/md5 come from the LOCAL file — a --dest that flips the

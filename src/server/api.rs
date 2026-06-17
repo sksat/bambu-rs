@@ -1626,7 +1626,9 @@ async fn job_upload_start(
     if q.name.is_empty() || q.name.contains('/') || q.name.contains('\\') || q.name.contains("..") {
         return bad_request(format!("invalid filename {:?}", q.name));
     }
-    let dir = q.dir.clone().unwrap_or_else(|| "/cache".to_string());
+    // Default to the printer root: the A1 mini prints from `/`, and a print start
+    // that reads an uploaded file from `/cache` fails with 0x0500C010 (verified).
+    let dir = q.dir.clone().unwrap_or_else(|| "/".to_string());
     if dir != "/" && !is_safe_remote_path(&dir) {
         return bad_request(format!("invalid dir {dir:?}"));
     }
@@ -1936,7 +1938,9 @@ mod tests {
             .await;
         res.assert_status_ok();
         let v = res.json::<serde_json::Value>();
-        assert_eq!(v["plan"]["file"], "/cache/x.gcode");
+        // Default destination is the printer root — the A1 mini prints from `/`,
+        // and reading an uploaded file from `/cache` fails with 0x0500C010.
+        assert_eq!(v["plan"]["file"], "/x.gcode");
     }
 
     #[tokio::test]
