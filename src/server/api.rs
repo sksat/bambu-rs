@@ -312,7 +312,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/job/pause", post(job_pause))
         .route("/api/job/resume", post(job_resume))
         .route("/api/job/stop", post(job_stop))
-        .route("/api/job/clear", post(job_clear))
+        .route("/api/job/clear-error", post(job_clear_error))
         .route("/api/job/start", post(job_start))
         .route("/api/light", post(light))
         .route("/api/speed", post(speed))
@@ -381,10 +381,10 @@ async fn job_resume(State(st): State<AppState>, body: Option<Json<ConfirmBody>>)
 async fn job_stop(State(st): State<AppState>, body: Option<Json<ConfirmBody>>) -> Response {
     run_confirmed(st, ControlAction::Stop, body).await
 }
-/// Clear a print error (`clean_print_error`) so the printer leaves `FAILED`
-/// without a reboot — re-enabling writes the error was blocking (e.g. filament
-/// change). Gated by confirm like the other job controls.
-async fn job_clear(State(st): State<AppState>, body: Option<Json<ConfirmBody>>) -> Response {
+/// Dismiss a print error (`clean_print_error`) — narrow: it only acknowledges
+/// the error popup (the way Studio clears one), it does not stop/resume the job.
+/// Gated by confirm like the other job controls.
+async fn job_clear_error(State(st): State<AppState>, body: Option<Json<ConfirmBody>>) -> Response {
     run_confirmed(st, ControlAction::ClearError, body).await
 }
 
@@ -1708,17 +1708,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn job_clear_needs_confirmation() {
+    async fn job_clear_error_needs_confirmation() {
         app(None, FakeController::verified())
-            .post("/api/job/clear")
+            .post("/api/job/clear-error")
             .await
             .assert_status(StatusCode::PRECONDITION_REQUIRED);
     }
 
     #[tokio::test]
-    async fn job_clear_confirmed_returns_verified() {
+    async fn job_clear_error_confirmed_returns_verified() {
         let res = app(None, FakeController::verified())
-            .post("/api/job/clear")
+            .post("/api/job/clear-error")
             .json(&json!({ "confirm": true }))
             .await;
         res.assert_status_ok();

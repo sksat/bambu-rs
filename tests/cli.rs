@@ -148,6 +148,7 @@ fn job_start_and_pause_need_confirm() {
         .assert()
         .code(4);
     bambu(&cfg).args(["job", "pause"]).assert().code(4);
+    bambu(&cfg).args(["job", "clear-error"]).assert().code(4);
     let _ = std::fs::remove_dir_all(&cfg);
 }
 

@@ -98,7 +98,7 @@ enum Command {
     Info,
     /// Decode the active HMS (Health Management System) alerts.
     Hms,
-    /// Start, pause, resume or stop a print job.
+    /// Start, pause, resume, stop, or dismiss the error of a print job.
     Job {
         #[command(subcommand)]
         action: JobAction,
@@ -284,6 +284,14 @@ enum JobAction {
     },
     /// Stop (cancel) the current print — irreversible (needs --confirm).
     Stop {
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Dismiss a print error (`clean_print_error`) — the way Bambu Studio clears
+    /// an error popup so the printer can leave FAILED without a reboot. Narrow:
+    /// it only acknowledges the error, it does not stop/resume/clear the job or
+    /// the bed. Needs --confirm.
+    ClearError {
         #[arg(long)]
         confirm: bool,
     },
@@ -1449,6 +1457,9 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
         JobAction::Pause { confirm } => job_control(cli, ProtoCommand::Pause, *confirm),
         JobAction::Resume { confirm } => job_control(cli, ProtoCommand::Resume, *confirm),
         JobAction::Stop { confirm } => job_control(cli, ProtoCommand::Stop, *confirm),
+        JobAction::ClearError { confirm } => {
+            job_control(cli, ProtoCommand::CleanPrintError, *confirm)
+        }
     }
 }
 
