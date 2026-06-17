@@ -2,18 +2,30 @@
 // camera on each new print layer (no second printer connection). Status is an
 // open read; start/stop are gated writes (carry the control password).
 
-export interface TimelapseState {
+/** One capture run — `smooth` (per-layer, park-synced) or `plain` (time-sampled). */
+export interface RunState {
   running: boolean;
+  mode: string;
   cameras: string[];
   /** First camera, for back-compat; prefer `cameras`. */
   camera: string | null;
   every: number;
+  interval_ms: number | null;
   frames: number;
   failures: number;
   current_layer: number | null;
   out_dir: string | null;
   last_error: string | null;
 }
+
+/** The combined status: top-level mirrors the smooth run (back-compat) and
+ *  `running` is true if either run is active; `smooth`/`plain` give each run. */
+export interface TimelapseState extends RunState {
+  smooth: RunState;
+  plain: RunState;
+}
+
+export type TimelapseMode = "smooth" | "plain";
 
 export async function getTimelapse(): Promise<TimelapseState | null> {
   try {
@@ -44,13 +56,20 @@ async function post(url: string, body: unknown, password: string | null): Promis
 }
 
 export function startTimelapse(
+  mode: TimelapseMode,
   cameras: string[],
-  every: number,
+  opts: { every?: number; intervalMs?: number },
   password: string | null,
 ): Promise<Write> {
-  return post("/api/timelapse/start", { cameras, every }, password);
+  const body: Record<string, unknown> = { mode, cameras };
+  if (mode === "plain") body.interval_ms = opts.intervalMs ?? 3000;
+  else body.every = opts.every ?? 1;
+  return post("/api/timelapse/start", body, password);
 }
 
-export function stopTimelapse(password: string | null): Promise<Write> {
-  return post("/api/timelapse/stop", {}, password);
+export function stopTimelapse(
+  mode: TimelapseMode | "all",
+  password: string | null,
+): Promise<Write> {
+  return post("/api/timelapse/stop", { mode }, password);
 }

@@ -1341,14 +1341,45 @@ struct TimelapseStartBody {
     #[serde(default)]
     camera: Option<String>,
     /// Capture several cameras at once (multi-angle) — each gets a frame per
-    /// layer under its own subdir. Falls back to `camera` when empty.
+    /// trigger under its own subdir. Falls back to `camera` when empty.
     #[serde(default)]
     cameras: Vec<String>,
+    /// `"smooth"` (default): one frame per layer, synced to the printer's park.
+    /// `"plain"`: one frame every `interval_ms`, head in shot. They're separate
+    /// runs, so both can be on at once for the same print.
+    #[serde(default)]
+    mode: Option<String>,
+    /// Smooth: capture every Nth layer.
     #[serde(default = "default_every")]
     every: u64,
+    /// Plain: sampling period in ms (default 3000).
+    #[serde(default)]
+    interval_ms: Option<u64>,
 }
 fn default_every() -> u64 {
     1
+}
+
+#[derive(Deserialize, Default)]
+struct TimelapseStopBody {
+    /// Which run to stop: `"smooth"`, `"plain"`, or `"all"` (default).
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+/// Combined status for both runs: a back-compat flat view mirroring the smooth
+/// run (so older single-run readers keep working), plus nested `smooth`/`plain`.
+/// Top-level `running` is true if *either* run is active.
+fn timelapse_status_json(st: &AppState) -> serde_json::Value {
+    let smooth = st.timelapse.status_smooth();
+    let plain = st.timelapse.status_plain();
+    let mut out = smooth.to_json();
+    if let Some(o) = out.as_object_mut() {
+        o.insert("running".to_string(), json!(smooth.running || plain.running));
+        o.insert("smooth".to_string(), smooth.to_json());
+        o.insert("plain".to_string(), plain.to_json());
+    }
+    out
 }
 
 /// Resolve a camera id to a blocking frame-grabber + a stable label, captured at
@@ -1388,8 +1419,22 @@ fn sanitize_hint(s: &str) -> String {
 /// 409 if one is already running; 404 for an unknown/unconfigured camera. Frames
 /// land in `./captures/<epoch>_<print-hint>/`.
 async fn timelapse_start(State(st): State<AppState>, Json(b): Json<TimelapseStartBody>) -> Response {
-    if b.every < 1 {
-        return bad_request("every must be >= 1".to_string());
+    // Validate the mode's cadence up front (before resolving cameras), so a bad
+    // `every`/`interval_ms` is a clean 400 regardless of camera config.
+    let mode = b.mode.as_deref().unwrap_or("smooth");
+    let interval_ms = b.interval_ms.unwrap_or(3000);
+    match mode {
+        "smooth" => {
+            if b.every < 1 {
+                return bad_request("every must be >= 1".to_string());
+            }
+        }
+        "plain" => {
+            if interval_ms < 100 {
+                return bad_request("interval_ms must be >= 100".to_string());
+            }
+        }
+        other => return bad_request(format!("unknown mode {other:?} (use smooth or plain)")),
     }
     // `cameras` wins; fall back to the single `camera`. De-dupe but keep order.
     let mut ids: Vec<String> = if !b.cameras.is_empty() {
@@ -1417,22 +1462,47 @@ async fn timelapse_start(State(st): State<AppState>, Json(b): Json<TimelapseStar
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let hint = sanitize_hint(st.source.current().subtask_name.as_deref().unwrap_or("print"));
-    let out_dir = std::path::PathBuf::from("captures").join(format!("{epoch}_{hint}"));
-    match st.timelapse.start(grabs, b.every, st.source.subscribe(), out_dir) {
-        Ok(()) => Json(st.timelapse.status().to_json()).into_response(),
+    // Per-mode dir so a concurrent smooth + plain run never mix their frames.
+    let out_dir = std::path::PathBuf::from("captures").join(format!("{epoch}_{hint}_{mode}"));
+    let rx = st.source.subscribe();
+    let res = match mode {
+        "plain" => st.timelapse.start_plain(grabs, interval_ms, rx, out_dir),
+        _ => st.timelapse.start_smooth(grabs, b.every, rx, out_dir),
+    };
+    match res {
+        Ok(()) => Json(timelapse_status_json(&st)).into_response(),
         Err(e) => (StatusCode::CONFLICT, Json(json!({ "error": e }))).into_response(),
     }
 }
 
-/// Stop the running capture (gated write; idempotent).
-async fn timelapse_stop(State(st): State<AppState>) -> Response {
-    st.timelapse.stop();
-    Json(st.timelapse.status().to_json()).into_response()
+/// Stop a capture run (gated write; idempotent). `{"mode":"smooth"|"plain"}` stops
+/// just that one; no body / `"all"` stops both. An unrecognized mode is a 400
+/// rather than a silent "all" — a typo must not abort the run the caller meant
+/// to keep going (smooth and plain are independently controlled).
+async fn timelapse_stop(
+    State(st): State<AppState>,
+    body: Option<Json<TimelapseStopBody>>,
+) -> Response {
+    let mode = body.and_then(|b| b.0.mode).unwrap_or_else(|| "all".to_string());
+    match mode.as_str() {
+        "smooth" => {
+            st.timelapse.stop_smooth();
+        }
+        "plain" => {
+            st.timelapse.stop_plain();
+        }
+        "all" => {
+            st.timelapse.stop_smooth();
+            st.timelapse.stop_plain();
+        }
+        other => return bad_request(format!("unknown mode {other:?} (use smooth, plain, or all)")),
+    }
+    Json(timelapse_status_json(&st)).into_response()
 }
 
 /// Current capture status (open read).
 async fn timelapse_status(State(st): State<AppState>) -> Json<serde_json::Value> {
-    Json(st.timelapse.status().to_json())
+    Json(timelapse_status_json(&st))
 }
 
 #[derive(Deserialize)]
@@ -2056,6 +2126,46 @@ mod tests {
             .json(&json!({ "camera": "ext-0", "every": 0 }))
             .await
             .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn timelapse_start_rejects_unknown_mode() {
+        app(None, FakeController::verified())
+            .post("/api/timelapse/start")
+            .json(&json!({ "camera": "ext-0", "mode": "fancy" }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn timelapse_plain_rejects_too_fast_interval() {
+        // The cadence is validated before camera resolution, so this is a 400 even
+        // though ext-0 isn't configured in the fake app.
+        app(None, FakeController::verified())
+            .post("/api/timelapse/start")
+            .json(&json!({ "camera": "ext-0", "mode": "plain", "interval_ms": 10 }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn timelapse_stop_rejects_unknown_mode() {
+        // A typo like "plian" must NOT silently fall through to stopping both runs
+        // — that would abort the other capture the caller meant to keep going.
+        app(None, FakeController::verified())
+            .post("/api/timelapse/stop")
+            .json(&json!({ "mode": "plian" }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn timelapse_stop_without_a_mode_is_ok() {
+        // No body (or an explicit "all") stops both and is the documented default.
+        app(None, FakeController::verified())
+            .post("/api/timelapse/stop")
+            .await
+            .assert_status_ok();
     }
 
     #[tokio::test]

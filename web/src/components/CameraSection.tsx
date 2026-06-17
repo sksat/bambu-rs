@@ -10,6 +10,8 @@ import {
   startTimelapse,
   stopTimelapse,
   type TimelapseState,
+  type TimelapseMode,
+  type RunState,
 } from "../timelapse";
 
 // Refresh cadence (the delay AFTER a frame settles before fetching the next). We
@@ -71,10 +73,20 @@ function CameraView({ id, label, stream }: { id: string; label: string; stream?:
   );
 }
 
-// Start/stop the serve-internal per-layer timelapse. Captures the active camera
-// tab, or — with "all cams" — every configured camera at once (multi-angle, one
-// frame each per layer). Polls `/api/timelapse` so the button + frame count
-// reflect a capture started from any tab (or that auto-stopped at print end).
+// One frame count, reported per-camera (each camera gets one frame per trigger)
+// so the number reads as the timelapse length, not a total to divide in your head.
+function runLabel(run: RunState | undefined): string {
+  const n = run?.cameras.length ?? 1;
+  const per = Math.floor((run?.frames ?? 0) / Math.max(n, 1));
+  const failed = run?.failures ? ` · ${run.failures} failed` : "";
+  return (n > 1 ? `${per} frames/cam · ${n} cams` : `${run?.frames ?? 0} frames`) + failed;
+}
+
+// Start/stop the serve-internal timelapse. Two independent runs of the SAME print
+// (both can be on at once): "smooth" grabs one frame per layer, synced to the
+// printer's park (object-only); "plain" samples every few seconds, head in shot
+// (the "watch it print" look). Captures the active camera tab, or — with "all
+// cams" — every configured camera at once. Polls `/api/timelapse`.
 function TimelapseBar({
   cameras,
   activeCamera,
@@ -88,6 +100,7 @@ function TimelapseBar({
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const [allCams, setAllCams] = useState(false);
+  const [plainSecs, setPlainSecs] = useState(3);
 
   useEffect(() => {
     let live = true;
@@ -103,81 +116,119 @@ function TimelapseBar({
     };
   }, []);
 
-  const running = tl?.running ?? false;
   const multi = cameras.length > 1;
   const targets = allCams && multi ? cameras.map((c) => c.id) : [activeCamera];
 
-  // `frames` is the total across all cameras; report it per-camera (each camera
-  // gets one frame per layer) so the count reads as the timelapse length, not a
-  // figure you have to divide by the camera count in your head.
-  const nCams = tl?.cameras.length ?? 1;
-  const total = tl?.frames ?? 0;
-  const frameLabel =
-    nCams > 1 ? `${Math.floor(total / nCams)} frames/cam · ${nCams} cams` : `${total} frames`;
-
-  const start = async () => {
+  const startMode = async (mode: TimelapseMode) => {
     setBusy(true);
     setMsg(null);
-    const r = await startTimelapse(targets, 1, password);
+    const opts = mode === "plain" ? { intervalMs: Math.max(0.1, plainSecs) * 1000 } : { every: 1 };
+    const r = await startTimelapse(mode, targets, opts, password);
     if (r === "needPassword") setMsg("needs the control password (set it in Controls)");
     else if ("error" in r) setMsg(r.error);
     else setTl(await getTimelapse());
     setBusy(false);
   };
-  const stop = async () => {
+  const stopMode = async (mode: TimelapseMode) => {
     setBusy(true);
     setMsg(null);
-    await stopTimelapse(password);
+    await stopTimelapse(mode, password);
     setTl(await getTimelapse());
     setBusy(false);
   };
 
+  const target = allCams && multi ? `all (${cameras.length})` : activeCamera;
+
   return (
     <div className="cam__tl" data-testid="timelapse-bar">
-      {running ? (
-        <>
-          <span className="cam__tl-rec" data-testid="timelapse-running">
-            ● recording — {frameLabel}
-            {tl?.current_layer != null ? ` · layer ${tl.current_layer}` : ""}
-            {tl?.failures ? ` · ${tl.failures} failed` : ""}
-          </span>
-          <button
-            className="cam__manage"
-            data-testid="timelapse-stop"
-            disabled={busy}
-            onClick={() => void stop()}
-          >
-            stop
-          </button>
-        </>
-      ) : (
-        <>
-          <span className="cam__tl-idle dim">
-            timelapse → {allCams && multi ? `all (${cameras.length})` : activeCamera}
-          </span>
-          {multi && (
-            <label className="cam__tl-all" title="capture every camera at once (multi-angle)">
-              <input
-                type="checkbox"
-                checked={allCams}
-                disabled={busy}
-                data-testid="timelapse-all"
-                onChange={(e) => setAllCams(e.target.checked)}
-              />
-              <span className="dim">all cams</span>
-            </label>
-          )}
-          <button
-            className="cam__manage"
-            data-testid="timelapse-start"
-            disabled={busy}
-            title="capture one frame per print layer"
-            onClick={() => void start()}
-          >
-            ● start timelapse
-          </button>
-        </>
+      {multi && (
+        <div className="cam__tl-row">
+          <label className="cam__tl-all" title="capture every camera at once (multi-angle)">
+            <input
+              type="checkbox"
+              checked={allCams}
+              disabled={busy}
+              data-testid="timelapse-all"
+              onChange={(e) => setAllCams(e.target.checked)}
+            />
+            <span className="dim">all cams</span>
+          </label>
+          <span className="dim">→ {target}</span>
+        </div>
       )}
+
+      {/* smooth: one frame per layer, synced to the printer's park */}
+      <div className="cam__tl-row">
+        {tl?.smooth.running ? (
+          <>
+            <span className="cam__tl-rec" data-testid="timelapse-smooth-running">
+              ● smooth — {runLabel(tl.smooth)}
+            </span>
+            <button
+              className="cam__manage"
+              data-testid="timelapse-smooth-stop"
+              disabled={busy}
+              onClick={() => void stopMode("smooth")}
+            >
+              stop
+            </button>
+          </>
+        ) : (
+          <button
+            className="cam__manage"
+            data-testid="timelapse-smooth-start"
+            disabled={busy}
+            title="one frame per layer, synced to the printer's park (object-only)"
+            onClick={() => void startMode("smooth")}
+          >
+            ● smooth (per-layer)
+          </button>
+        )}
+      </div>
+
+      {/* plain: sample every N seconds, head in shot (the "watch it print" look) */}
+      <div className="cam__tl-row">
+        {tl?.plain.running ? (
+          <>
+            <span className="cam__tl-rec" data-testid="timelapse-plain-running">
+              ● plain — {runLabel(tl.plain)}
+            </span>
+            <button
+              className="cam__manage"
+              data-testid="timelapse-plain-stop"
+              disabled={busy}
+              onClick={() => void stopMode("plain")}
+            >
+              stop
+            </button>
+          </>
+        ) : (
+          <>
+            <label className="dim" title="sampling interval">
+              every{" "}
+              <input
+                className="pw cam__tl-secs"
+                inputMode="decimal"
+                value={plainSecs}
+                disabled={busy}
+                data-testid="timelapse-plain-secs"
+                onChange={(e) => setPlainSecs(Number(e.target.value) || 0)}
+              />{" "}
+              s
+            </label>
+            <button
+              className="cam__manage"
+              data-testid="timelapse-plain-start"
+              disabled={busy || plainSecs < 0.1}
+              title="sample a frame every N seconds, head in shot (a normal-looking video)"
+              onClick={() => void startMode("plain")}
+            >
+              ● plain (video)
+            </button>
+          </>
+        )}
+      </div>
+
       {msg && (
         <span className="cam__tl-msg dim" data-testid="timelapse-msg">
           {msg}

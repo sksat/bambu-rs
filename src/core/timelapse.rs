@@ -121,17 +121,7 @@ impl CaptureSession {
     }
 
     fn should_stop(&self, state: Option<GcodeState>, has_error: bool) -> bool {
-        // While waiting for a print to start, nothing ends the watch.
-        if self.wait && !self.seen_active {
-            return false;
-        }
-        if has_error {
-            return true;
-        }
-        matches!(
-            state,
-            Some(GcodeState::Finish | GcodeState::Failed | GcodeState::Idle)
-        )
+        should_stop(self.wait, self.seen_active, state, has_error)
     }
 }
 
@@ -142,6 +132,74 @@ fn is_active(state: Option<GcodeState>) -> bool {
         state,
         Some(GcodeState::Running | GcodeState::Prepare | GcodeState::Pause)
     )
+}
+
+/// Whether a watch should end: shared by the layer-driven [`CaptureSession`] and
+/// the time-driven [`PrintActivitySession`]. While `wait`ing for a print to start
+/// (not yet `seen_active`) nothing ends it; an error ends it; otherwise a terminal
+/// state (finish/failed/idle) does.
+fn should_stop(wait: bool, seen_active: bool, state: Option<GcodeState>, has_error: bool) -> bool {
+    if wait && !seen_active {
+        return false;
+    }
+    if has_error {
+        return true;
+    }
+    matches!(
+        state,
+        Some(GcodeState::Finish | GcodeState::Failed | GcodeState::Idle)
+    )
+}
+
+/// What a time-sampled ("plain") runner should do on a tick — capture only while
+/// the print is active, end when it finishes/errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivityAction {
+    /// The print is active — grab a frame now.
+    Capture,
+    /// Not active yet (idle/preparing-to-start while `wait`ing) — skip this tick.
+    Idle,
+    /// The print ended (or errored) — stop the runner.
+    Stop,
+}
+
+/// Tracks only a print's *lifecycle* (active → ended), no layer logic — for a
+/// runner that samples frames on its own clock (a wall-time interval) rather than
+/// per layer. Shares the active/stop rules with [`CaptureSession`] so both agree
+/// on when a print starts and ends.
+pub struct PrintActivitySession {
+    wait: bool,
+    seen_active: bool,
+}
+
+impl PrintActivitySession {
+    /// `wait` = sit through idle/finished until a print becomes active (so the
+    /// runner can be armed before the print starts), rather than stopping at once.
+    pub fn new(wait: bool) -> Self {
+        Self {
+            wait,
+            seen_active: false,
+        }
+    }
+
+    /// Feed the current status (call on each sampling tick). `Stop` takes priority
+    /// over `Capture` so a finishing print ends cleanly instead of grabbing once
+    /// more.
+    pub fn observe(&mut self, s: &PrinterStatus) -> ActivityAction {
+        let state = s.state();
+        let active = is_active(state);
+        if active {
+            self.seen_active = true;
+        }
+        if should_stop(self.wait, self.seen_active, state, s.error.is_some()) {
+            return ActivityAction::Stop;
+        }
+        if active {
+            ActivityAction::Capture
+        } else {
+            ActivityAction::Idle
+        }
+    }
 }
 
 #[cfg(test)]
@@ -259,5 +317,37 @@ mod tests {
             cap(s.observe(&b)).is_some(),
             "a new print at the same layer number must capture (identity reset)"
         );
+    }
+
+    // ── PrintActivitySession (time-sampled "plain" lifecycle) ──
+
+    #[test]
+    fn plain_waits_through_idle_then_captures_while_active() {
+        let mut a = PrintActivitySession::new(true);
+        assert_eq!(a.observe(&st("IDLE", None)), ActivityAction::Idle); // armed before print
+        assert_eq!(a.observe(&st("RUNNING", None)), ActivityAction::Capture);
+        assert_eq!(a.observe(&st("PAUSE", None)), ActivityAction::Capture); // pause still active
+    }
+
+    #[test]
+    fn plain_stops_when_the_print_finishes() {
+        let mut a = PrintActivitySession::new(true);
+        assert_eq!(a.observe(&st("RUNNING", None)), ActivityAction::Capture);
+        assert_eq!(a.observe(&st("FINISH", None)), ActivityAction::Stop);
+    }
+
+    #[test]
+    fn plain_stops_on_a_device_error() {
+        let mut a = PrintActivitySession::new(true);
+        a.observe(&st("RUNNING", None));
+        let mut e = st("RUNNING", None);
+        e.error = Some(DeviceError::from_code(0x1200_8016).unwrap());
+        assert_eq!(a.observe(&e), ActivityAction::Stop);
+    }
+
+    #[test]
+    fn plain_without_wait_stops_if_never_active() {
+        let mut a = PrintActivitySession::new(false);
+        assert_eq!(a.observe(&st("IDLE", None)), ActivityAction::Stop);
     }
 }

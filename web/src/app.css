@@ -1335,9 +1335,21 @@ div.lbl,
   margin-top: 0.45rem;
   font-size: 0.72rem;
 }
+/* each capture run (smooth / plain) gets its own full-width row so the two
+   stack instead of wrapping unpredictably */
+.cam__tl-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-basis: 100%;
+}
 .cam__tl-rec {
   color: var(--accent);
   font-weight: 600;
+}
+.cam__tl-secs {
+  width: 3.2rem;
+  text-align: right;
 }
 .cam__tl-msg {
   flex-basis: 100%;
