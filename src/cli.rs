@@ -412,6 +412,23 @@ enum TimelapseAction {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1.., value_name = "CMD")]
         on_layer_cmd: Vec<String>,
     },
+    /// Encode a captured timelapse to mp4 with ffmpeg (must be on PATH). INPUT is
+    /// either a directory of frame_*.jpg (the smooth per-layer or plain sampled
+    /// frames → an image-sequence timelapse) or a .mjpeg stream file (the plain
+    /// stream recording → real video). Output defaults to the input + `.mp4`.
+    Encode {
+        /// A directory of frame_*.jpg, or a .mjpeg stream file.
+        input: std::path::PathBuf,
+        /// Output mp4 path (default: the input path with a .mp4 suffix).
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Playback frame rate (frames/sec).
+        #[arg(long, default_value_t = 30)]
+        fps: u32,
+        /// Keep only every Nth frame to speed it up (1 = keep all).
+        #[arg(long, default_value_t = 1)]
+        speed: u32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2317,7 +2334,123 @@ fn run_timelapse(cli: &Cli, action: &TimelapseAction) -> Result<(), CliError> {
             *timeout,
             *wait,
         ),
+        TimelapseAction::Encode {
+            input,
+            out,
+            fps,
+            speed,
+        } => run_encode(input, out.as_deref(), *fps, *speed),
     }
+}
+
+/// Default mp4 path for an `encode` input: the input path with a `.mp4` suffix
+/// (a `frames/` dir → `frames.mp4`; `plain.mjpeg` → `plain.mp4`).
+fn default_mp4_out(input: &std::path::Path) -> std::path::PathBuf {
+    input.with_extension("mp4")
+}
+
+/// Whether `input` is a `.mjpeg` stream file (vs an image-sequence directory).
+fn is_mjpeg(input: &std::path::Path) -> bool {
+    input
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("mjpeg"))
+}
+
+/// Build the ffmpeg argument vector to encode `input` → `out`. A directory is an
+/// image sequence (`frame_*.jpg`, the smooth/sampled frames); a `.mjpeg` file is a
+/// multipart stream (the plain recording). Pure, so the command shape is tested
+/// without running ffmpeg.
+fn build_ffmpeg_args(
+    input: &std::path::Path,
+    out: &std::path::Path,
+    fps: u32,
+    speed: u32,
+) -> Result<Vec<String>, CliError> {
+    let fps = fps.max(1);
+    let speed = speed.max(1);
+    let mut args: Vec<String> = vec!["-y".into()];
+    if input.is_dir() {
+        // Image sequence: the input framerate sets the timelapse speed.
+        args.extend(["-framerate".into(), fps.to_string()]);
+        args.extend(["-pattern_type".into(), "glob".into()]);
+        args.extend(["-i".into(), format!("{}/frame_*.jpg", input.display())]);
+        if speed > 1 {
+            // framestep drops frames; setpts re-times the survivors to `fps` so it
+            // actually plays faster (not the original spacing with gaps).
+            args.extend([
+                "-vf".into(),
+                format!("framestep={speed},setpts=N/{fps}/TB"),
+                "-r".into(),
+                fps.to_string(),
+            ]);
+        }
+    } else if is_mjpeg(input) {
+        // Multipart MJPEG stream: re-time the frames to `fps` (keeping every
+        // `speed`-th to fast-forward).
+        args.extend(["-f".into(), "mpjpeg".into()]);
+        args.extend(["-i".into(), input.display().to_string()]);
+        let vf = if speed > 1 {
+            format!("framestep={speed},setpts=N/{fps}/TB")
+        } else {
+            format!("setpts=N/{fps}/TB")
+        };
+        args.extend(["-vf".into(), vf, "-r".into(), fps.to_string(), "-an".into()]);
+    } else {
+        return Err(CliError::new(
+            exit::VALIDATION,
+            format!(
+                "{}: encode input must be a directory of frame_*.jpg or a .mjpeg file",
+                input.display()
+            ),
+        ));
+    }
+    args.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart"].map(String::from));
+    args.push(out.display().to_string());
+    Ok(args)
+}
+
+/// `bambu timelapse encode`: run ffmpeg (if present) to turn a recording into mp4.
+fn run_encode(
+    input: &std::path::Path,
+    out: Option<&std::path::Path>,
+    fps: u32,
+    speed: u32,
+) -> Result<(), CliError> {
+    if !input.exists() {
+        return Err(CliError::new(
+            exit::VALIDATION,
+            format!("{}: no such file or directory", input.display()),
+        ));
+    }
+    let out = out
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| default_mp4_out(input));
+    let args = build_ffmpeg_args(input, &out, fps, speed)?;
+
+    // ffmpeg is an optional, runtime dependency — fail clearly if it's missing.
+    let status = std::process::Command::new("ffmpeg")
+        .args(&args)
+        .status()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                CliError::new(
+                    exit::VALIDATION,
+                    "ffmpeg not found on PATH — install ffmpeg to encode mp4",
+                )
+            } else {
+                CliError::new(exit::GENERAL, format!("running ffmpeg: {e}"))
+            }
+        })?;
+    if !status.success() {
+        return Err(CliError::new(
+            exit::GENERAL,
+            format!("ffmpeg exited with {status}"),
+        ));
+    }
+    eprintln!("encoded {}", out.display());
+    println!("{}", out.display());
+    Ok(())
 }
 
 fn timelapse_set(cli: &Cli, control: TimelapseControl, timeout_secs: u64) -> Result<(), CliError> {
@@ -2699,6 +2832,61 @@ mod tests {
             serve_status_url("http://h:8088/"),
             "http://h:8088/api/status"
         );
+    }
+
+    #[test]
+    fn encode_args_for_an_mjpeg_stream() {
+        use super::build_ffmpeg_args;
+        use std::path::Path;
+        let args =
+            build_ffmpeg_args(Path::new("/r/plain.mjpeg"), Path::new("/r/plain.mp4"), 30, 8).unwrap();
+        let joined = args.join(" ");
+        assert!(joined.contains("-f mpjpeg"), "{joined}");
+        assert!(joined.contains("-i /r/plain.mjpeg"));
+        assert!(joined.contains("framestep=8"), "speed>1 ⇒ framestep");
+        assert!(joined.contains("setpts=N/30/TB"));
+        assert!(joined.trim_end().ends_with("/r/plain.mp4"));
+    }
+
+    #[test]
+    fn encode_args_for_an_image_sequence_dir() {
+        use super::build_ffmpeg_args;
+        let dir = std::env::temp_dir().join(format!("bambu-enc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("x.mp4");
+        let args = build_ffmpeg_args(&dir, &out, 20, 1).unwrap();
+        let joined = args.join(" ");
+        assert!(joined.contains("-framerate 20"), "{joined}");
+        assert!(joined.contains("-pattern_type glob"));
+        assert!(joined.contains("frame_*.jpg"));
+        assert!(!joined.contains("framestep"), "speed=1 ⇒ no framestep");
+
+        // speed>1 must actually speed up: framestep AND a PTS reset (not just drop
+        // frames at the original spacing).
+        let fast = build_ffmpeg_args(&dir, &out, 20, 4).unwrap().join(" ");
+        assert!(fast.contains("framestep=4"), "{fast}");
+        assert!(fast.contains("setpts=N/20/TB"), "stepped frames must be re-timed: {fast}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn encode_rejects_a_non_dir_non_mjpeg_input() {
+        use super::build_ffmpeg_args;
+        use std::path::Path;
+        let e = build_ffmpeg_args(Path::new("/no/such/file.txt"), Path::new("/o.mp4"), 30, 1)
+            .unwrap_err();
+        assert_eq!(e.code, super::exit::VALIDATION);
+    }
+
+    #[test]
+    fn default_mp4_out_swaps_the_suffix() {
+        use super::default_mp4_out;
+        use std::path::Path;
+        assert_eq!(
+            default_mp4_out(Path::new("/r/plain.mjpeg")),
+            Path::new("/r/plain.mp4")
+        );
+        assert_eq!(default_mp4_out(Path::new("/r/ext-1")), Path::new("/r/ext-1.mp4"));
     }
 
     #[test]
