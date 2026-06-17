@@ -889,6 +889,9 @@ async fn job_start(State(st): State<AppState>, Json(b): Json<StartBody>) -> Resp
         ams_map: b.ams_map.clone(),
         bed_type: b.bed_type.clone().unwrap_or_else(|| "auto".to_string()),
         timelapse: b.timelapse,
+        // The file is already on the printer here; we don't have its bytes to
+        // inspect, so no md5 check (the upload-start path supplies one).
+        inspection: None,
     };
 
     if b.dry_run {

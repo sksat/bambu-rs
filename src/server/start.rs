@@ -6,14 +6,15 @@
 //! Safety lives in the HTTP handler (confirm gate, idle check, AMS-map range);
 //! this just builds the command and verifies it.
 
-use std::path::Path;
 use std::time::Duration;
 
 use super::control::ControlError;
 use crate::client::LanMqttClient;
 use crate::config::ResolvedTarget;
-use crate::core::command::{Command as ProtoCommand, ProjectFile};
+use crate::core::command::Command as ProtoCommand;
+use crate::core::project::PlateInspection;
 use crate::core::session::CommandOutcome;
+use crate::core::start::{self, PrintStartParams};
 
 /// A resolved print-start request.
 pub struct StartRequest {
@@ -27,29 +28,26 @@ pub struct StartRequest {
     /// per-layer park with a spiral Z-hop + prime-tower wipe, which is skipped
     /// entirely when the flag is off (and the head then scrapes the print).
     pub timelapse: bool,
+    /// Plate inspection (when we have the file's bytes, e.g. an upload-then-start):
+    /// its plate-gcode md5 is stamped into the `project_file` so the printer
+    /// verifies the file. `None` for "file already on the printer" starts.
+    pub inspection: Option<PlateInspection>,
 }
 
 impl StartRequest {
-    /// Build the MQTT command: `project_file` for a `.3mf`, `gcode_file` for raw
-    /// `.gcode`. The file path becomes `ftp://<path>` on the printer.
+    /// Build the MQTT command via the shared [`core::start`](crate::core::start)
+    /// builder: `project_file` for a `.3mf`, `gcode_file` for raw `.gcode`, with
+    /// the plate-gcode md5 folded in when an inspection is present.
     pub fn to_command(&self) -> ProtoCommand {
-        let name = Path::new(&self.file)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&self.file)
-            .to_string();
-        if self.file.to_ascii_lowercase().ends_with(".3mf") {
-            let mut pf = ProjectFile::new(format!("ftp://{}", self.file), self.plate, name);
-            pf.bed_type = self.bed_type.clone();
-            pf.timelapse = self.timelapse;
-            if self.use_ams {
-                pf.use_ams = true;
-                pf.ams_mapping = self.ams_map.clone();
-            }
-            ProtoCommand::ProjectFile(pf)
-        } else {
-            ProtoCommand::GcodeFile(self.file.clone())
-        }
+        let params = PrintStartParams {
+            file: self.file.clone(),
+            plate: self.plate,
+            use_ams: self.use_ams,
+            ams_map: self.ams_map.clone(),
+            bed_type: self.bed_type.clone(),
+            timelapse: self.timelapse,
+        };
+        start::build_command(&params, self.inspection.as_ref())
     }
 }
 
@@ -100,6 +98,7 @@ mod tests {
             ams_map: vec![0, 3],
             bed_type: "auto".to_string(),
             timelapse: false,
+            inspection: None,
         };
         match req.to_command() {
             ProtoCommand::ProjectFile(pf) => {
@@ -123,6 +122,7 @@ mod tests {
             ams_map: vec![],
             bed_type: "auto".to_string(),
             timelapse: true,
+            inspection: None,
         };
         match req.to_command() {
             ProtoCommand::ProjectFile(pf) => assert!(pf.timelapse, "arms the sliced timelapse gcode"),
@@ -139,6 +139,7 @@ mod tests {
             ams_map: vec![],
             bed_type: "auto".to_string(),
             timelapse: false,
+            inspection: None,
         };
         assert!(matches!(req.to_command(), ProtoCommand::GcodeFile(f) if f == "/test.gcode"));
     }

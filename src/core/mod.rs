@@ -15,6 +15,7 @@ pub mod report;
 pub mod safety;
 pub mod session;
 pub mod stage;
+pub mod start;
 pub mod status;
 pub mod timelapse;
 pub mod verify;

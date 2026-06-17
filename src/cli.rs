@@ -19,13 +19,13 @@ use crate::client::{
 use crate::config::{self, Config, ConfigError, Overrides, Profile, ResolvedTarget};
 use crate::core::capability::{self, ControlAssessment, ControlRefusal};
 use crate::core::command::{
-    AmsControl, AmsFilamentSetting, Command as ProtoCommand, LedNode, ProjectFile, SpeedLevel,
-    TimelapseControl,
+    AmsControl, AmsFilamentSetting, Command as ProtoCommand, LedNode, SpeedLevel, TimelapseControl,
 };
 use crate::core::project::{self, PlateInspection};
 use crate::core::report::ReportState;
 use crate::core::safety::{self, GcodeVerdict, TempLimits};
 use crate::core::stage::Stage;
+use crate::core::start::{self, PrintStartParams};
 use crate::core::status::{GcodeState, PrinterStatus};
 use crate::core::timelapse::{CaptureAction, CaptureSession};
 use crate::core::version::Module;
@@ -1613,24 +1613,23 @@ fn build_start_command(
     bed_type: &str,
     timelapse: bool,
 ) -> Result<ProtoCommand, CliError> {
-    let name = std::path::Path::new(file)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(file)
-        .to_string();
-    if file.to_ascii_lowercase().ends_with(".3mf") {
-        // FTP-uploaded files live under a path like /cache/x.gcode.3mf -> ftp:///cache/...
-        let mut pf = ProjectFile::new(format!("ftp://{file}"), plate, name);
-        pf.bed_type = bed_type.to_string();
-        pf.timelapse = timelapse;
-        if let Some(map) = ams_map {
-            pf.use_ams = true;
-            pf.ams_mapping = parse_ams_map(map)?;
-        }
-        Ok(ProtoCommand::ProjectFile(pf))
-    } else {
-        Ok(ProtoCommand::GcodeFile(file.to_string()))
-    }
+    // AMS mapping only applies to a .3mf; parse it (the one CLI-fallible bit) and
+    // hand the resolved params to the shared core builder. md5 is left unset here
+    // (we have no inspection at this point — `job start --upload` supplies one).
+    let is_3mf = file.to_ascii_lowercase().ends_with(".3mf");
+    let (use_ams, parsed_map) = match (is_3mf, ams_map) {
+        (true, Some(map)) => (true, parse_ams_map(map)?),
+        _ => (false, Vec::new()),
+    };
+    let params = PrintStartParams {
+        file: file.to_string(),
+        plate,
+        use_ams,
+        ams_map: parsed_map,
+        bed_type: bed_type.to_string(),
+        timelapse,
+    };
+    Ok(start::build_command(&params, None))
 }
 
 fn parse_ams_map(map: &str) -> Result<Vec<i32>, CliError> {
