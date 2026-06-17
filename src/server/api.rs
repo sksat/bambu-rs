@@ -34,8 +34,8 @@ use tokio::sync::watch;
 use super::assets::static_handler;
 #[cfg(test)]
 use super::camera::NoCamera;
-use super::camera::{CameraSource, ExternalCamera, open_mjpeg_stream};
-use super::timelapse::{FrameGrab, TimelapseManager};
+use super::camera::{CameraSource, ExternalCamera, open_mjpeg_stream, url_stream_opener};
+use super::timelapse::{FrameGrab, PlainCapture, TimelapseManager};
 #[cfg(test)]
 use super::control::FakeController;
 use super::control::{
@@ -1465,7 +1465,24 @@ async fn timelapse_start(State(st): State<AppState>, Json(b): Json<TimelapseStar
     let out_dir = std::path::PathBuf::from("captures").join(format!("{epoch}_{hint}_{mode}"));
     let rx = st.source.subscribe();
     let res = match mode {
-        "plain" => st.timelapse.start_plain(grabs, interval_ms, rx, out_dir),
+        "plain" => {
+            // A camera with a configured stream URL records its real MJPEG stream;
+            // a snapshot-only camera keeps time-sampling. Resolved once, at start.
+            let externals = st.external_cameras.read().unwrap();
+            let caps: Vec<PlainCapture> = ids
+                .iter()
+                .zip(grabs)
+                .map(|(id, (gid, grab))| match resolve_stream_url(id, &externals) {
+                    Some(url) => PlainCapture::Stream {
+                        id: gid,
+                        open: url_stream_opener(url),
+                    },
+                    None => PlainCapture::Sample { id: gid, grab },
+                })
+                .collect();
+            drop(externals);
+            st.timelapse.start_plain(caps, interval_ms, rx, out_dir)
+        }
         _ => st.timelapse.start_smooth(grabs, b.every, rx, out_dir),
     };
     match res {

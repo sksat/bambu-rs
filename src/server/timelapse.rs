@@ -8,12 +8,17 @@
 //! [`CaptureSession`] decides when to grab; this owns the I/O (fetching the
 //! frame and writing files) and the run lifecycle.
 
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use super::camera::StreamOpen;
+use super::stream_record::record_loop;
 use crate::core::status::PrinterStatus;
 use crate::core::timelapse::{ActivityAction, CaptureAction, CaptureSession, PrintActivitySession};
 
@@ -21,6 +26,28 @@ use crate::core::timelapse::{ActivityAction, CaptureAction, CaptureSession, Prin
 /// and held for the run's duration, so later `/api/cameras/config` edits can't
 /// repoint a running capture.
 pub type FrameGrab = Arc<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync>;
+
+/// Safety cap on a single stream recording's size — a backstop against unbounded
+/// disk, not a target. Raw MJPEG is large, so this is generous (a long print can
+/// still fill it; the recorder stops cleanly at the cap).
+const MAX_STREAM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// How a camera contributes to a `plain` run: `Sample` grabs a JPEG every tick
+/// (snapshot-only cameras); `Stream` records the camera's continuous MJPEG stream
+/// to one file (cameras that expose a real `/stream` — the actual video, not
+/// time-sampled frames).
+pub enum PlainCapture {
+    Sample { id: String, grab: FrameGrab },
+    Stream { id: String, open: StreamOpen },
+}
+
+impl PlainCapture {
+    fn id(&self) -> &str {
+        match self {
+            PlainCapture::Sample { id, .. } | PlainCapture::Stream { id, .. } => id,
+        }
+    }
+}
 
 /// Live capture status for one run (smooth or plain), surfaced by
 /// `GET /api/timelapse`.
@@ -69,6 +96,9 @@ struct Inner {
     /// Shared with the running task, which updates it; replaced on each `start`.
     status: Arc<Mutex<TimelapseStatus>>,
     handle: Option<JoinHandle<()>>,
+    /// Set on stop. The async run task is `abort`ed, but a `plain` run's blocking
+    /// stream-recorder workers can't be aborted — they watch this flag and exit.
+    cancel: Arc<AtomicBool>,
 }
 
 /// Owns up to two concurrent captures of the same print — a `smooth` one
@@ -92,16 +122,19 @@ impl TimelapseManager {
         out_dir: PathBuf,
     ) -> Result<(), String> {
         let every = every.max(1);
+        let ids = cameras.iter().map(|(id, _)| id.clone()).collect();
         start_slot(
             &self.smooth,
             cameras,
+            ids,
             out_dir,
             TimelapseStatus {
                 mode: "smooth",
                 every,
                 ..Default::default()
             },
-            move |status, cams, dir| tokio::spawn(run(status, rx, cams, dir, every)),
+            // Smooth has no long-lived blocking workers, so it ignores `cancel`.
+            move |status, cams, dir, _cancel| tokio::spawn(run(status, rx, cams, dir, every)),
         )
     }
 
@@ -109,22 +142,26 @@ impl TimelapseManager {
     /// `interval_ms`, while the print is active.
     pub fn start_plain(
         &self,
-        cameras: Vec<(String, FrameGrab)>,
+        cameras: Vec<PlainCapture>,
         interval_ms: u64,
         rx: watch::Receiver<PrinterStatus>,
         out_dir: PathBuf,
     ) -> Result<(), String> {
         let interval_ms = interval_ms.max(1);
+        let ids = cameras.iter().map(|c| c.id().to_string()).collect();
         start_slot(
             &self.plain,
             cameras,
+            ids,
             out_dir,
             TimelapseStatus {
                 mode: "plain",
                 interval_ms: Some(interval_ms),
                 ..Default::default()
             },
-            move |status, cams, dir| tokio::spawn(run_plain(status, rx, cams, dir, interval_ms)),
+            move |status, caps, dir, cancel| {
+                tokio::spawn(run_plain(status, rx, caps, dir, interval_ms, cancel))
+            },
         )
     }
 
@@ -148,40 +185,46 @@ impl TimelapseManager {
 /// Shared start path for either slot: refuse if that slot is already running or
 /// no cameras are given, create the per-camera dirs, install a fresh status, and
 /// spawn the runner (`spawn` builds the right one — smooth or plain).
-fn start_slot(
+fn start_slot<C>(
     inner: &Mutex<Inner>,
-    cameras: Vec<(String, FrameGrab)>,
+    cameras: Vec<C>,
+    ids: Vec<String>,
     out_dir: PathBuf,
     init: TimelapseStatus,
-    spawn: impl FnOnce(Arc<Mutex<TimelapseStatus>>, Vec<(String, FrameGrab)>, PathBuf) -> JoinHandle<()>,
+    spawn: impl FnOnce(Arc<Mutex<TimelapseStatus>>, Vec<C>, PathBuf, Arc<AtomicBool>) -> JoinHandle<()>,
 ) -> Result<(), String> {
     let mut g = inner.lock().unwrap();
     if g.status.lock().unwrap().running {
         return Err(format!("a {} timelapse is already running", init.mode));
     }
-    if cameras.is_empty() {
+    if ids.is_empty() {
         return Err("no cameras to capture".to_string());
     }
-    for (id, _) in &cameras {
+    for id in &ids {
         let dir = out_dir.join(id);
         std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     }
+    let cancel = Arc::new(AtomicBool::new(false));
     let status = Arc::new(Mutex::new(TimelapseStatus {
         running: true,
-        cameras: cameras.iter().map(|(id, _)| id.clone()).collect(),
+        cameras: ids,
         out_dir: Some(out_dir.display().to_string()),
         ..init
     }));
-    let handle = spawn(status.clone(), cameras, out_dir);
+    let handle = spawn(status.clone(), cameras, out_dir, cancel.clone());
     g.status = status;
     g.handle = Some(handle);
+    g.cancel = cancel;
     Ok(())
 }
 
 fn stop_slot(inner: &Mutex<Inner>) -> bool {
     let mut g = inner.lock().unwrap();
+    // Signal blocking stream workers first (abort can't reach them), then abort
+    // the async task (which drops any in-flight snapshot grab).
+    g.cancel.store(true, Ordering::Relaxed);
     if let Some(h) = g.handle.take() {
-        h.abort(); // cancels the await; any in-flight blocking grab is dropped
+        h.abort();
     }
     let mut s = g.status.lock().unwrap();
     let was = s.running;
@@ -268,15 +311,85 @@ async fn run(
 /// print is active (head wherever it is — the "watch it print" look), independent
 /// of layers/park. Same non-blocking grab path as [`run`]; reacts to status
 /// changes between ticks so it stops promptly when the print ends.
+/// Spawn one blocking MJPEG recorder per stream camera — each copies its stream to
+/// `<id>/plain.mjpeg`, reconnecting on drops (interruptible backoff), until
+/// `cancel` is set. Returns the workers' handles to await on shutdown.
+fn spawn_stream_recorders(
+    streams: Vec<(String, StreamOpen)>,
+    out_dir: &std::path::Path,
+    status: &Arc<Mutex<TimelapseStatus>>,
+    cancel: &Arc<AtomicBool>,
+) -> Vec<JoinHandle<()>> {
+    streams
+        .into_iter()
+        .map(|(id, open)| {
+            let path = out_dir.join(&id).join("plain.mjpeg");
+            let cancel = cancel.clone();
+            let wstatus = status.clone();
+            tokio::task::spawn_blocking(move || {
+                let file = match std::fs::File::create(&path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let mut s = wstatus.lock().unwrap();
+                        s.failures += 1;
+                        s.last_error = Some(format!("create {}: {e}", path.display()));
+                        return;
+                    }
+                };
+                let mut sink = std::io::BufWriter::new(file);
+                let cancel_fn = || cancel.load(Ordering::Relaxed);
+                // Interruptible reconnect backoff: sleep in small chunks so a stop
+                // is noticed within ~50ms rather than after the full (up to 5s) wait.
+                let backoff = |attempt: u32| {
+                    let total_ms = (500u64 * u64::from(attempt)).min(5_000);
+                    let mut slept = 0u64;
+                    while slept < total_ms && !cancel.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(50));
+                        slept += 50;
+                    }
+                };
+                let stats =
+                    record_loop(&open, &mut sink, &cancel_fn, MAX_STREAM_BYTES, 32 * 1024, &backoff);
+                let _ = sink.flush();
+                let mut s = wstatus.lock().unwrap();
+                s.failures += u64::from(stats.failures);
+                if stats.bytes == 0 {
+                    s.last_error = Some(format!("stream {id}: no data recorded"));
+                }
+            })
+        })
+        .collect()
+}
+
 async fn run_plain(
     status: Arc<Mutex<TimelapseStatus>>,
     mut rx: watch::Receiver<PrinterStatus>,
-    cameras: Vec<(String, FrameGrab)>,
+    cameras: Vec<PlainCapture>,
     out_dir: PathBuf,
     interval_ms: u64,
+    cancel: Arc<AtomicBool>,
 ) {
+    // Split by strategy: snapshot cameras tick on the interval; stream cameras get
+    // a long-lived blocking recorder each (the actual video, not samples).
+    let mut samples: Vec<(String, FrameGrab)> = Vec::new();
+    let mut streams: Vec<(String, StreamOpen)> = Vec::new();
+    for cap in cameras {
+        match cap {
+            PlainCapture::Sample { id, grab } => samples.push((id, grab)),
+            PlainCapture::Stream { id, open } => streams.push((id, open)),
+        }
+    }
+
+    // Stream recorders are spawned LAZILY — only once the print is actually active
+    // (the first `Capture`), like the sampled cameras — so we never record idle /
+    // pre-print video (or burn the byte cap on a print that never starts). Each
+    // then runs until `cancel` (print-end here, or stop_slot). They're blocking, so
+    // they watch the flag — they can't be `abort`ed like the async task.
+    let mut streams = streams;
+    let mut stream_workers: Vec<JoinHandle<()>> = Vec::new();
+
     let mut activity = PrintActivitySession::new(true);
-    let bound = (4 * cameras.len()).max(4);
+    let bound = (4 * samples.len()).max(4);
     let (tx, mut jobs) = tokio::sync::mpsc::channel::<(FrameGrab, PathBuf)>(bound);
 
     let wstatus = status.clone();
@@ -317,9 +430,20 @@ async fn run_plain(
                 status.lock().unwrap().current_layer = snap.layer_num;
                 match activity.observe(&snap) {
                     ActivityAction::Capture => {
+                        // First active tick → start the stream recorders (lazily, so
+                        // pre-print idle isn't recorded). `take` empties `streams`, so
+                        // this runs exactly once.
+                        if !streams.is_empty() {
+                            stream_workers = spawn_stream_recorders(
+                                std::mem::take(&mut streams),
+                                &out_dir,
+                                &status,
+                                &cancel,
+                            );
+                        }
                         frame_no += 1;
                         let name = format!("frame_{frame_no:06}.jpg");
-                        for (id, grab) in &cameras {
+                        for (id, grab) in &samples {
                             let path = out_dir.join(id).join(&name);
                             if tx.try_send((grab.clone(), path)).is_err() {
                                 let mut s = status.lock().unwrap();
@@ -347,6 +471,11 @@ async fn run_plain(
     }
     drop(tx);
     let _ = worker.await;
+    // Tell the stream recorders to stop (print ended), then let them flush + exit.
+    cancel.store(true, Ordering::Relaxed);
+    for w in stream_workers {
+        let _ = w.await;
+    }
     status.lock().unwrap().running = false;
 }
 
@@ -365,6 +494,14 @@ mod tests {
 
     fn one(id: &str, grab: FrameGrab) -> Vec<(String, FrameGrab)> {
         vec![(id.to_string(), grab)]
+    }
+
+    /// One snapshot-only camera for a plain run.
+    fn sample(id: &str, grab: FrameGrab) -> Vec<PlainCapture> {
+        vec![PlainCapture::Sample {
+            id: id.to_string(),
+            grab,
+        }]
     }
 
     // A capture driven by a fake status channel + a fake in-memory camera, end to
@@ -471,7 +608,7 @@ mod tests {
         let (tx, rx) = watch::channel(st("IDLE", None));
         let grab: FrameGrab = Arc::new(|| Ok(vec![0xff, 0xd8, 0xff, 0x09]));
         let mgr = TimelapseManager::default();
-        mgr.start_plain(one("ext-0", grab), 20, rx, dir.clone()).unwrap();
+        mgr.start_plain(sample("ext-0", grab), 20, rx, dir.clone()).unwrap();
 
         // Idle → nothing is sampled (it waits for the print like the smooth one).
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
@@ -492,6 +629,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plain_records_a_stream_camera_to_a_file() {
+        use crate::server::camera::{OpenedCameraStream, StreamOpen};
+        let dir = std::env::temp_dir().join(format!("bambu-tl-stream-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tx, rx) = watch::channel(st("RUNNING", Some(1)));
+        // A fake MJPEG stream that yields some bytes then EOF on each open.
+        let open: StreamOpen = Arc::new(|| {
+            Ok(OpenedCameraStream {
+                content_type: "multipart/x-mixed-replace".to_string(),
+                reader: Box::new(std::io::Cursor::new(b"JPEGDATA".to_vec())),
+            })
+        });
+        let caps = vec![PlainCapture::Stream {
+            id: "ext-1".to_string(),
+            open,
+        }];
+        let mgr = TimelapseManager::default();
+        mgr.start_plain(caps, 20, rx, dir.clone()).unwrap();
+
+        // Let the recorder capture, then finish the print to stop it.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        tx.send(st("FINISH", Some(1))).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(!mgr.status_plain().running, "stream recorder stops when the print finishes");
+
+        let data = std::fs::read(dir.join("ext-1").join("plain.mjpeg"))
+            .expect("plain.mjpeg was written");
+        assert!(
+            data.starts_with(b"JPEGDATA"),
+            "recorded the actual stream bytes (not time-sampled), got {} bytes",
+            data.len()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn smooth_and_plain_run_concurrently_and_stop_independently() {
         let dir = std::env::temp_dir().join(format!("bambu-tl-both-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -500,7 +673,7 @@ mod tests {
         let mgr = TimelapseManager::default();
         // Different slots → neither rejects the other (unlike start-twice).
         mgr.start_smooth(one("ext-0", g.clone()), 1, rx.clone(), dir.join("smooth")).unwrap();
-        mgr.start_plain(one("ext-0", g), 20, rx, dir.join("plain")).unwrap();
+        mgr.start_plain(sample("ext-0", g), 20, rx, dir.join("plain")).unwrap();
         assert!(mgr.status_smooth().running && mgr.status_plain().running);
 
         tx.send(st("RUNNING", Some(1))).unwrap();
