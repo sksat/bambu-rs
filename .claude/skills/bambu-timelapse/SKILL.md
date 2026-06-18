@@ -104,19 +104,26 @@ Start the capture right after the job (it waits through preheat/calibration and
 stops at FINISH). `frames` is the **total** written = layers × offsets × cameras.
 Re-register the cameras after any serve restart (config is in-memory).
 
-## Assemble the video
+## Select the parked frame per layer + assemble
 
-The burst leaves several frames per layer, so pick the offset whose `_tNNNN` frames
-show the head **parked at the far-left** — eyeball a few of one mid-print layer
-(`frame_*_layer_00050_t*.jpg`) — then glob just that offset:
+The burst leaves several frames per layer; **no single offset is the parked one** —
+the park's timing jitters layer-to-layer and drifts as the print rises (device-
+measured: early layers park ~1200 ms after the layer edge, upper layers <300 ms). So
+pick per layer with `scripts/select_smooth.py`: it isolates the moving toolhead
+(per-burst median subtraction) and keeps, per layer, the frame whose dark mass in the
+left park zone is a strong outlier; it **skips** a layer whose park fell outside the
+burst rather than emit a head-over-print frame. stdlib + ffmpeg only.
 
 ```bash
-cd captures/<run>/<cam-id>
-ffmpeg -y -framerate 12 -pattern_type glob -i '*_t0800.jpg' \
-  -vf "scale='min(1280,iw)':-2,format=yuv420p" -c:v libx264 -crf 23 timelapse.mp4
+scripts/select_smooth.py captures/<run>_smooth/ext-1 \
+    --out /tmp/sel --assemble timelapse.mp4 --fps 12 --report scores.json
+# prints {layers, selected, skipped, skip_reasons}; tune with --report + the _tNNNN tags
 ```
-If no offset reliably parks, shift/widen `burst_offsets_ms` and reprint — the tags
-are the calibration.
+
+If many layers are `park_not_captured`, the burst window missed them — shift it
+EARLIER for upper layers (the park keeps drifting earlier with height; `[300..1700]`
+caught only the lower layers). Per-camera framing knobs (rare): `left_frac`,
+`min_outlier`, `min_left_density` in `select_frame`.
 
 ## VERIFIED failures — don't repeat these
 
