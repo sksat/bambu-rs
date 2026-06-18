@@ -244,12 +244,14 @@ fn stop_slot(inner: &Mutex<Inner>) -> bool {
 }
 
 /// Default per-layer park-capture burst (ms after the MQTT layer edge). The A1's
-/// native `time_lapse_gcode` parks the head at the far-left X-min only ~0.4–1.2 s
-/// *after* `layer_num` increments and holds it ~300 ms, so a single grab at the
-/// edge catches the head still over the print (device-verified). The burst
-/// brackets the park window from several offsets; each frame is tagged with its
-/// offset so the parked one can be picked — and the offsets calibrated — on-device.
-pub const DEFAULT_SMOOTH_BURST_MS: &[u64] = &[400, 600, 800, 1000, 1200];
+/// native `time_lapse_gcode` parks the head at the far-left X-min *after*
+/// `layer_num` increments and holds it ~300 ms, so a single grab at the edge
+/// catches the head still over the print. Device calibration found the park lands
+/// at a widely VARIABLE delay — ~300 ms to ~1600 ms, jittering layer-to-layer and
+/// drifting with print height — so the burst spans that whole range; one offset
+/// per layer lands in the park, and `scripts/select_smooth.py` picks it (or skips
+/// the layer). Each frame is tagged with its offset; override via `burst_offsets_ms`.
+pub const DEFAULT_SMOOTH_BURST_MS: &[u64] = &[100, 300, 500, 700, 900, 1100, 1300, 1500];
 
 /// `frame_<n>_layer_<L>_t<offset>.jpg`. The offset tag distinguishes a layer's
 /// burst samples and records which delay produced each one (for calibration).
