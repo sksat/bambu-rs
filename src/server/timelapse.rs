@@ -122,10 +122,14 @@ impl TimelapseManager {
         &self,
         cameras: Vec<(String, FrameGrab)>,
         every: u64,
+        burst_offsets: Vec<u64>,
         rx: watch::Receiver<PrinterStatus>,
         out_dir: PathBuf,
     ) -> Result<(), String> {
         let every = every.max(1);
+        // Sort + de-dup so duplicate offsets can't clobber each other's frame (and
+        // an empty spec still grabs once at the layer edge).
+        let burst_offsets = normalize_burst_offsets(burst_offsets);
         let ids = cameras.iter().map(|(id, _)| id.clone()).collect();
         start_slot(
             &self.smooth,
@@ -137,8 +141,11 @@ impl TimelapseManager {
                 every,
                 ..Default::default()
             },
-            // Smooth has no long-lived blocking workers, so it ignores `cancel`.
-            move |status, cams, dir, _cancel| tokio::spawn(run(status, rx, cams, dir, every)),
+            // The per-layer burst spawns short-lived delayed grabs; they honor
+            // `cancel` so none fire after the run is stopped.
+            move |status, cams, dir, cancel| {
+                tokio::spawn(run(status, rx, cams, dir, every, burst_offsets, cancel))
+            },
         )
     }
 
@@ -236,25 +243,99 @@ fn stop_slot(inner: &Mutex<Inner>) -> bool {
     was
 }
 
+/// Default per-layer park-capture burst (ms after the MQTT layer edge). The A1's
+/// native `time_lapse_gcode` parks the head at the far-left X-min only ~0.4–1.2 s
+/// *after* `layer_num` increments and holds it ~300 ms, so a single grab at the
+/// edge catches the head still over the print (device-verified). The burst
+/// brackets the park window from several offsets; each frame is tagged with its
+/// offset so the parked one can be picked — and the offsets calibrated — on-device.
+pub const DEFAULT_SMOOTH_BURST_MS: &[u64] = &[400, 600, 800, 1000, 1200];
+
+/// `frame_<n>_layer_<L>_t<offset>.jpg`. The offset tag distinguishes a layer's
+/// burst samples and records which delay produced each one (for calibration).
+fn burst_frame_name(frame_no: u64, layer: i64, offset_ms: u64) -> String {
+    format!("frame_{frame_no:06}_layer_{layer:05}_t{offset_ms:04}.jpg")
+}
+
+/// Sanitize a burst spec before it drives filenames: sort and drop duplicate
+/// offsets. Two equal offsets map to the same `..._tNNNN.jpg` path, so the second
+/// grab would clobber the first while still counting a frame. An empty spec falls
+/// back to a single grab at the layer edge.
+fn normalize_burst_offsets(mut offsets: Vec<u64>) -> Vec<u64> {
+    offsets.sort_unstable();
+    offsets.dedup();
+    if offsets.is_empty() {
+        vec![0]
+    } else {
+        offsets
+    }
+}
+
+/// Where a burst's grabs go: the worker channel, the cameras, the status (for
+/// failure counts), the output dir, and the run's cancel flag. Built once per run
+/// and reused for every layer's burst; cheap to clone into each delayed task.
+#[derive(Clone)]
+struct BurstSink {
+    tx: tokio::sync::mpsc::Sender<(FrameGrab, PathBuf)>,
+    cameras: Arc<Vec<(String, FrameGrab)>>,
+    status: Arc<Mutex<TimelapseStatus>>,
+    out_dir: PathBuf,
+    cancel: Arc<AtomicBool>,
+}
+
+/// Schedule one layer's park-capture burst: for each `offset_ms`, spawn a delayed
+/// task that — unless `cancel` was set meanwhile — enqueues one grab per camera at
+/// that offset after the layer edge. Non-blocking: returns at once so the observe
+/// loop never stalls (the reason for the worker indirection). A full queue drops
+/// the late sample and counts a failure, exactly like the single-grab path. The
+/// spawned tasks outlive an `abort`, so they check `cancel` to stay quiet after stop.
+fn schedule_burst(sink: &BurstSink, frame_no: u64, layer: i64, offsets: &[u64]) {
+    for &offset_ms in offsets {
+        let sink = sink.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(offset_ms)).await;
+            if sink.cancel.load(Ordering::Relaxed) {
+                return; // the print stopped while this sample was pending
+            }
+            let name = burst_frame_name(frame_no, layer, offset_ms);
+            for (id, grab) in sink.cameras.iter() {
+                let path = sink.out_dir.join(id).join(&name);
+                if sink.tx.try_send((grab.clone(), path)).is_err() {
+                    // Worker busy/backlogged — skip this sample rather than block.
+                    let mut s = sink.status.lock().unwrap();
+                    s.failures += 1;
+                    s.last_error = Some("capture fell behind — frame skipped".to_string());
+                }
+            }
+        });
+    }
+}
+
 /// The capture task. The observe loop NEVER blocks on a frame grab: a slow or
 /// offline camera would otherwise stall it, and since `watch::Receiver` only
 /// keeps the latest value, intermediate layer updates would coalesce and be
-/// skipped. So observation just enqueues capture jobs (non-blocking, bounded —
+/// skipped. So observation just schedules capture jobs (non-blocking, bounded —
 /// dropped + counted if the grabbing worker can't keep up, rather than lagging
 /// the print or growing without bound); a worker grabs + writes off that path.
+/// Each layer fires a short [burst](schedule_burst) of grabs (one per offset)
+/// instead of a single one, to land a frame in the native park window.
 async fn run(
     status: Arc<Mutex<TimelapseStatus>>,
     mut rx: watch::Receiver<PrinterStatus>,
     cameras: Vec<(String, FrameGrab)>,
     out_dir: PathBuf,
     every: u64,
+    burst_offsets: Vec<u64>,
+    cancel: Arc<AtomicBool>,
 ) {
     // wait=true: the capture may be started before the print is active; sit
     // through idle/finished until it runs, then stop when the print ends.
     let mut session = CaptureSession::new(every, true);
-    // Each layer enqueues one job per camera, so scale the bound with the camera
-    // count to keep the same per-camera backpressure headroom as the single case.
-    let bound = (4 * cameras.len()).max(4);
+    let cameras = Arc::new(cameras);
+    // Each layer enqueues one job per camera per burst offset; scale the bound so
+    // a layer's whole burst has headroom (samples are spread over time, but keep
+    // the same per-(camera,offset) backpressure margin as the single-grab case).
+    let bound = (4 * cameras.len() * burst_offsets.len().max(1)).max(8);
     let (tx, mut jobs) = tokio::sync::mpsc::channel::<(FrameGrab, PathBuf)>(bound);
 
     let wstatus = status.clone();
@@ -282,22 +363,19 @@ async fn run(
         }
     });
 
+    let sink = BurstSink {
+        tx,
+        cameras,
+        status: status.clone(),
+        out_dir,
+        cancel,
+    };
     loop {
         let snap = rx.borrow_and_update().clone();
         status.lock().unwrap().current_layer = snap.layer_num;
         match session.observe(&snap) {
             CaptureAction::Capture { frame_no, layer } => {
-                let name = format!("frame_{frame_no:06}_layer_{layer:05}.jpg");
-                for (id, grab) in &cameras {
-                    let path = out_dir.join(id).join(&name);
-                    if tx.try_send((grab.clone(), path)).is_err() {
-                        // Worker busy/backlogged — skip this frame rather than
-                        // block observation (which would coalesce later layers).
-                        let mut s = status.lock().unwrap();
-                        s.failures += 1;
-                        s.last_error = Some("capture fell behind — frame skipped".to_string());
-                    }
-                }
+                schedule_burst(&sink, frame_no, layer, &burst_offsets);
             }
             CaptureAction::Stop => break,
             CaptureAction::Continue => {}
@@ -306,7 +384,9 @@ async fn run(
             break; // the source (and the whole server) is gone
         }
     }
-    drop(tx); // close the queue so the worker drains the backlog, then exits
+    // Drop our sender so the channel closes once the last pending burst task (each
+    // holds a clone) finishes — then the worker drains the backlog and exits.
+    drop(sink);
     let _ = worker.await;
     status.lock().unwrap().running = false;
 }
@@ -587,7 +667,7 @@ mod tests {
         let (tx, rx) = watch::channel(st("IDLE", None));
         let grab: FrameGrab = Arc::new(|| Ok(vec![0xff, 0xd8, 0xff, 0x42]));
         let mgr = TimelapseManager::default();
-        mgr.start_smooth(one("ext-0", grab), 1, rx, dir.clone()).unwrap();
+        mgr.start_smooth(one("ext-0", grab), 1, vec![0], rx, dir.clone()).unwrap();
 
         // Drive: print starts and advances three layers, then finishes.
         for s in [st("RUNNING", Some(1)), st("RUNNING", Some(2)), st("RUNNING", Some(3)), st("FINISH", Some(3))] {
@@ -615,6 +695,7 @@ mod tests {
         mgr.start_smooth(
             vec![("ext-0".into(), g.clone()), ("ext-1".into(), g)],
             1,
+            vec![0],
             rx,
             dir.clone(),
         )
@@ -640,8 +721,8 @@ mod tests {
         let (_tx, rx) = watch::channel(st("RUNNING", Some(0)));
         let grab: FrameGrab = Arc::new(|| Ok(vec![0xff, 0xd8, 0xff]));
         let mgr = TimelapseManager::default();
-        mgr.start_smooth(one("ext-0", grab.clone()), 1, rx.clone(), dir.clone()).unwrap();
-        assert!(mgr.start_smooth(one("ext-1", grab), 1, rx, dir.clone()).is_err());
+        mgr.start_smooth(one("ext-0", grab.clone()), 1, vec![0], rx.clone(), dir.clone()).unwrap();
+        assert!(mgr.start_smooth(one("ext-1", grab), 1, vec![0], rx, dir.clone()).is_err());
         assert!(mgr.stop_smooth());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -651,7 +732,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bambu-tl-empty-{}", std::process::id()));
         let (_tx, rx) = watch::channel(st("RUNNING", Some(0)));
         let mgr = TimelapseManager::default();
-        assert!(mgr.start_smooth(vec![], 1, rx, dir).is_err(), "need at least one camera");
+        assert!(mgr.start_smooth(vec![], 1, vec![0], rx, dir).is_err(), "need at least one camera");
     }
 
     #[tokio::test]
@@ -661,7 +742,7 @@ mod tests {
         let (tx, rx) = watch::channel(st("RUNNING", Some(0)));
         let grab: FrameGrab = Arc::new(|| Err("camera offline".to_string()));
         let mgr = TimelapseManager::default();
-        mgr.start_smooth(one("ext-0", grab), 1, rx, dir.clone()).unwrap();
+        mgr.start_smooth(one("ext-0", grab), 1, vec![0], rx, dir.clone()).unwrap();
         for s in [st("RUNNING", Some(1)), st("RUNNING", Some(2)), st("FINISH", Some(2))] {
             tx.send(s).unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(40)).await;
@@ -672,6 +753,77 @@ mod tests {
         assert_eq!(s.frames, 0, "no files on failure");
         assert!(s.last_error.is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── smooth park-capture burst ──
+    #[test]
+    fn burst_frame_name_tags_frame_layer_and_offset() {
+        assert_eq!(super::burst_frame_name(1, 5, 800), "frame_000001_layer_00005_t0800.jpg");
+        assert_eq!(super::burst_frame_name(12, 240, 0), "frame_000012_layer_00240_t0000.jpg");
+    }
+
+    #[test]
+    fn normalize_burst_offsets_sorts_dedups_and_defaults_empty() {
+        // Duplicates would collide on the same `_tNNNN.jpg` filename.
+        assert_eq!(super::normalize_burst_offsets(vec![800, 400, 800, 600]), vec![400, 600, 800]);
+        assert_eq!(super::normalize_burst_offsets(vec![500, 500]), vec![500]);
+        assert_eq!(super::normalize_burst_offsets(vec![]), vec![0]);
+    }
+
+    // The burst must enqueue one grab per offset, each at its own delay after the
+    // layer edge — never all at once at the edge (the bug). Paused time + advance
+    // checks the schedule without real sleeps or a camera.
+    #[tokio::test(start_paused = true)]
+    async fn burst_enqueues_one_grab_per_offset_at_its_due_time() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(FrameGrab, PathBuf)>(64);
+        let g: FrameGrab = Arc::new(|| Ok(vec![0xff, 0xd8, 0xff]));
+        let cameras = Arc::new(vec![("ext-0".to_string(), g)]);
+        let status = Arc::new(Mutex::new(TimelapseStatus::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let sink = super::BurstSink {
+            tx,
+            cameras,
+            status,
+            out_dir: std::path::PathBuf::from("/cap"),
+            cancel,
+        };
+        super::schedule_burst(&sink, 1, 5, &[10, 30]);
+        tokio::task::yield_now().await; // let the spawned tasks arm their timers at t=0
+
+        assert!(rx.try_recv().is_err(), "nothing is due before the first offset");
+        tokio::time::advance(Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+        let (_g, p) = rx.try_recv().expect("first sample due at 10ms");
+        assert!(p.ends_with("frame_000001_layer_00005_t0010.jpg"), "{}", p.display());
+        assert!(rx.try_recv().is_err(), "the 30ms sample is not due yet");
+
+        tokio::time::advance(Duration::from_millis(20)).await;
+        tokio::task::yield_now().await;
+        let (_g, p) = rx.try_recv().expect("second sample due at 30ms");
+        assert!(p.ends_with("frame_000001_layer_00005_t0030.jpg"), "{}", p.display());
+    }
+
+    // A burst scheduled before the run is stopped must not grab afterwards: the
+    // delayed tasks outlive the abort, so they honor `cancel`.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_burst_enqueues_nothing() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(FrameGrab, PathBuf)>(8);
+        let g: FrameGrab = Arc::new(|| Ok(vec![0xff, 0xd8, 0xff]));
+        let cameras = Arc::new(vec![("ext-0".to_string(), g)]);
+        let status = Arc::new(Mutex::new(TimelapseStatus::default()));
+        let cancel = Arc::new(AtomicBool::new(true)); // already stopped
+        let sink = super::BurstSink {
+            tx,
+            cameras,
+            status,
+            out_dir: std::path::PathBuf::from("/cap"),
+            cancel,
+        };
+        super::schedule_burst(&sink, 1, 5, &[10]);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(20)).await;
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err(), "a burst that fires after stop must not grab");
     }
 
     // ── plain (time-sampled) capture ──
@@ -755,7 +907,7 @@ mod tests {
         let g: FrameGrab = Arc::new(|| Ok(vec![0xff, 0xd8, 0xff, 0x01]));
         let mgr = TimelapseManager::default();
         // Different slots → neither rejects the other (unlike start-twice).
-        mgr.start_smooth(one("ext-0", g.clone()), 1, rx.clone(), dir.join("smooth")).unwrap();
+        mgr.start_smooth(one("ext-0", g.clone()), 1, vec![0], rx.clone(), dir.join("smooth")).unwrap();
         mgr.start_plain(sample("ext-0", g), 20, rx, dir.join("plain")).unwrap();
         assert!(mgr.status_smooth().running && mgr.status_plain().running);
 

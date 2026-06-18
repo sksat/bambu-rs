@@ -114,3 +114,6 @@ assert_cmd = "2.2.2"
 axum-test = { version = "20.1.0", features = ["ws"] }
 predicates = "3.1.4"
 proptest = "1.11.0"
+# `test-util` enables tokio's paused virtual clock (`start_paused` + `time::advance`)
+# so the smooth burst's delayed scheduling is tested deterministically — no real sleeps.
+tokio = { version = "1.52.3", default-features = false, features = ["test-util", "rt", "macros"] }

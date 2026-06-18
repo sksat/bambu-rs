@@ -35,7 +35,7 @@ use super::assets::static_handler;
 #[cfg(test)]
 use super::camera::NoCamera;
 use super::camera::{CameraSource, ExternalCamera, open_mjpeg_stream, url_stream_opener};
-use super::timelapse::{FrameGrab, PlainCapture, TimelapseManager};
+use super::timelapse::{DEFAULT_SMOOTH_BURST_MS, FrameGrab, PlainCapture, TimelapseManager};
 #[cfg(test)]
 use super::control::FakeController;
 use super::control::{
@@ -1354,6 +1354,12 @@ struct TimelapseStartBody {
     /// Plain: sampling period in ms (default 3000).
     #[serde(default)]
     interval_ms: Option<u64>,
+    /// Smooth: per-layer park-capture burst, ms after the layer edge (default
+    /// [`DEFAULT_SMOOTH_BURST_MS`]). The native park lands ~0.4–1.2 s after the
+    /// `layer_num` increment, so a burst brackets the window; each frame is tagged
+    /// with its offset. Exposed so the offsets can be calibrated without a rebuild.
+    #[serde(default)]
+    burst_offsets_ms: Option<Vec<u64>>,
 }
 fn default_every() -> u64 {
     1
@@ -1422,10 +1428,23 @@ async fn timelapse_start(State(st): State<AppState>, Json(b): Json<TimelapseStar
     // `every`/`interval_ms` is a clean 400 regardless of camera config.
     let mode = b.mode.as_deref().unwrap_or("smooth");
     let interval_ms = b.interval_ms.unwrap_or(3000);
+    let burst_offsets = b
+        .burst_offsets_ms
+        .clone()
+        .unwrap_or_else(|| DEFAULT_SMOOTH_BURST_MS.to_vec());
     match mode {
         "smooth" => {
             if b.every < 1 {
                 return bad_request("every must be >= 1".to_string());
+            }
+            if burst_offsets.is_empty() {
+                return bad_request("burst_offsets_ms must have at least one offset".to_string());
+            }
+            if burst_offsets.len() > 16 {
+                return bad_request("burst_offsets_ms: at most 16 offsets".to_string());
+            }
+            if let Some(&o) = burst_offsets.iter().find(|&&o| o > 10_000) {
+                return bad_request(format!("burst_offsets_ms: {o} ms exceeds the 10000 ms cap"));
             }
         }
         "plain" => {
@@ -1483,7 +1502,7 @@ async fn timelapse_start(State(st): State<AppState>, Json(b): Json<TimelapseStar
             drop(externals);
             st.timelapse.start_plain(caps, interval_ms, rx, out_dir)
         }
-        _ => st.timelapse.start_smooth(grabs, b.every, rx, out_dir),
+        _ => st.timelapse.start_smooth(grabs, b.every, burst_offsets, rx, out_dir),
     };
     match res {
         Ok(()) => Json(timelapse_status_json(&st)).into_response(),
@@ -2405,6 +2424,26 @@ mod tests {
         app(None, FakeController::verified())
             .post("/api/timelapse/start")
             .json(&json!({ "camera": "ext-0", "mode": "plain", "interval_ms": 10 }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn timelapse_smooth_rejects_an_out_of_range_burst_offset() {
+        // Burst offsets are validated up front (before camera resolution), like the
+        // cadence — so an offset past the 10s cap is a 400 even with no camera.
+        app(None, FakeController::verified())
+            .post("/api/timelapse/start")
+            .json(&json!({ "camera": "ext-0", "burst_offsets_ms": [800, 99999] }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn timelapse_smooth_rejects_an_empty_burst() {
+        app(None, FakeController::verified())
+            .post("/api/timelapse/start")
+            .json(&json!({ "camera": "ext-0", "burst_offsets_ms": [] }))
             .await
             .assert_status(StatusCode::BAD_REQUEST);
     }
