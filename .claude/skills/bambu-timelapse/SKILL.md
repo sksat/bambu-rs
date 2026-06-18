@@ -76,7 +76,14 @@ Why this is the answer:
 ## Capture from `bambu serve` (one or many cameras)
 
 The capture is in-process off the MQTT layer feed — no second printer connection,
-low latency — and writes one frame per layer to `captures/<epoch>_<name>/<cam-id>/`.
+low latency — and writes frames to `captures/<epoch>_<name>/<cam-id>/`.
+
+**Smooth fires a BURST per layer, not a single frame.** The native park reaches the
+far-left X-min only ~0.4–1.2 s *after* `layer_num` increments (and holds it
+~300 ms), so a lone grab at the layer edge catches the head still over the print
+(device-verified: 0/241 frames parked). So each layer grabs at several offsets
+after the edge — default `400,600,800,1000,1200` ms — saved as
+`frame_<n>_layer_<L>_t<offset>.jpg`. One offset lands the parked, object-only shot.
 
 ```bash
 # register the external cameras once (runtime only — never commit these URLs)
@@ -84,23 +91,32 @@ curl -X POST "$B/api/cameras/config" -H 'content-type: application/json' \
   -d '{"external":[{"label":"atom cam","url":"http://<ATOM_IP>/cgi-bin/get_jpeg.cgi"},
                    {"label":"ustreamer","url":"http://<USTREAMER_HOST>/snapshot","stream_url":"http://<USTREAMER_HOST>/stream"}]}'
 
-# multi-camera, one frame per layer from BOTH angles at once
-curl -X POST "$B/api/timelapse/start" -H 'content-type: application/json' -d '{"cameras":["ext-0","ext-1"],"every":1}'
-curl "$B/api/timelapse"          # {running, cameras, frames (TOTAL across cams), failures, current_layer}
+# multi-camera, per-layer burst from BOTH angles at once
+curl -X POST "$B/api/timelapse/start" -H 'content-type: application/json' \
+  -d '{"cameras":["ext-0","ext-1"],"every":1}'
+# narrow/shift the burst for calibration (ms after the edge; <=16 offsets, <=10000):
+#   -d '{"cameras":["ext-0"],"burst_offsets_ms":[700,800,900]}'
+curl "$B/api/timelapse"          # {running, cameras, frames, failures, current_layer}
 curl -X POST "$B/api/timelapse/stop"
 ```
 
 Start the capture right after the job (it waits through preheat/calibration and
-stops at FINISH). `frames` is the **total** across cameras — per-camera = frames /
-#cameras. Re-register the cameras after any serve restart (config is in-memory).
+stops at FINISH). `frames` is the **total** written = layers × offsets × cameras.
+Re-register the cameras after any serve restart (config is in-memory).
 
 ## Assemble the video
 
+The burst leaves several frames per layer, so pick the offset whose `_tNNNN` frames
+show the head **parked at the far-left** — eyeball a few of one mid-print layer
+(`frame_*_layer_00050_t*.jpg`) — then glob just that offset:
+
 ```bash
 cd captures/<run>/<cam-id>
-ffmpeg -y -framerate 12 -pattern_type glob -i '*.jpg' \
+ffmpeg -y -framerate 12 -pattern_type glob -i '*_t0800.jpg' \
   -vf "scale='min(1280,iw)':-2,format=yuv420p" -c:v libx264 -crf 23 timelapse.mp4
 ```
+If no offset reliably parks, shift/widen `burst_offsets_ms` and reprint — the tags
+are the calibration.
 
 ## VERIFIED failures — don't repeat these
 
