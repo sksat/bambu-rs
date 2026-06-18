@@ -1,0 +1,8 @@
+{"gcode_state":"IDLE","print_type":"idle","hw_switch_state":0,
+ "ams":{"active_tray":254,"target_tray":254,
+  "external":{"material":"PLA","color":"161616FF","nozzle_temp_min":190,"nozzle_temp_max":220},
+  "units":[{"id":0,"trays":[
+   {"id":"0","material":"PLA","name":"PLA Matte","nozzle_temp_min":190,"nozzle_temp_max":230},
+   {"id":"1","material":"PLA","name":"PLA Wood","nozzle_temp_min":190,"nozzle_temp_max":230},
+   {"id":"2","material":"PETG","name":"PETG Translucent","nozzle_temp_min":230,"nozzle_temp_max":260},
+   {"id":"3","material":"PLA","name":"PLA Matte","nozzle_temp_min":190,"nozzle_temp_max":230}]}]}}

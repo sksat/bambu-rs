@@ -1,0 +1,12 @@
+{"gcode_state":"PAUSE","print_type":"local","mc_percent":8,"layer_num":0,
+ "print_error":50364437,
+ "error":{"code":50364437,"hex":"0x03008015","message":null,
+          "lookup_url":"https://e.bambulab.com/query.php?lang=en&e=03008015"},
+ "hw_switch_state":0,
+ "ams":{"active_tray":254,"target_tray":254,
+  "external":{"material":"PLA","color":"161616FF","nozzle_temp_min":190,"nozzle_temp_max":220},
+  "units":[{"id":0,"trays":[
+   {"id":"0","material":"PLA","name":"PLA Matte","nozzle_temp_min":190,"nozzle_temp_max":230},
+   {"id":"1","material":"PLA","name":"PLA Wood","nozzle_temp_min":190,"nozzle_temp_max":230},
+   {"id":"2","material":"PETG","name":"PETG Translucent","nozzle_temp_min":230,"nozzle_temp_max":260},
+   {"id":"3","material":"PLA","name":"PLA Matte","nozzle_temp_min":190,"nozzle_temp_max":230}]}]}}

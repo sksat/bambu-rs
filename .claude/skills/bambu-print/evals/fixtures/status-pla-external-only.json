@@ -1,0 +1,5 @@
+{"gcode_state":"IDLE","print_type":"idle",
+ "ams":{"active_tray":254,
+  "external":{"material":"PLA","color":"DE4343FF","nozzle_temp_min":190,"nozzle_temp_max":220},
+  "units":[{"id":0,"trays":[
+   {"id":"0","material":"PETG","name":"PETG Basic","nozzle_temp_min":230,"nozzle_temp_max":260}]}]}}

@@ -1,0 +1,33 @@
+{
+  "skill_name": "bambu-print",
+  "evals": [
+    {
+      "id": 0,
+      "name": "petg-in-ams-slot-not-external",
+      "prompt": "I sliced a Benchy in PETG for my Bambu A1 mini (245C, the .gcode.3mf is ready to go). Last time it kept dying at layer 0 with some 'no source' thing and I wasted hours. I grabbed the printer's current state into status.json (attached). Before I start it again — what should I pass to `bambu job start`? Specifically use_ams and ams_map. Just tell me the exact values and why.",
+      "expected_output": "use_ams=true, ams_map=[2] — the PETG is in AMS slot 3 (tray id 2), NOT the external spool (which has PLA). Starting from the external spool is what no-sourced before.",
+      "files": ["fixtures/status-petg-in-slot3.json"]
+    },
+    {
+      "id": 1,
+      "name": "filament-in-external-spool",
+      "prompt": "Starting a PLA print on the A1 mini. I dumped the printer state to status.json (attached). What use_ams / ams_map should I give job start?",
+      "expected_output": "use_ams=false (the external spool), because the PLA is loaded on the external spool — the only AMS tray loaded has PETG, not PLA. Must NOT force an AMS slot here.",
+      "files": ["fixtures/status-pla-external-only.json"]
+    },
+    {
+      "id": 2,
+      "name": "no-matching-filament-refuse",
+      "prompt": "I want to print this bracket in ABS on my A1 mini, it's already sliced. Here's the printer's status.json. What's the right ams_map to start it with?",
+      "expected_output": "Refuse to start: no loaded source (AMS slots or external spool) has ABS — they have PLA and PETG. The user must load ABS first; picking any ams_map would just no-source. Do NOT invent a slot.",
+      "files": ["fixtures/status-no-abs.json"]
+    },
+    {
+      "id": 3,
+      "name": "no-source-recovery-dont-reboot",
+      "prompt": "Argh, my A1 mini keeps pausing my Benchy (PETG, 245C) right at layer 0 with error 0x03008015 'no source'. I've rebooted the printer TWICE already and it just resumes and pauses at the exact same spot. I'm about to reboot a third time. Here's the status.json I just pulled. What do I actually do to get this printing?",
+      "expected_output": "Do NOT reboot — power-loss recovery re-resumes the paused print so it re-pauses on the same no-source (that's why two reboots didn't help). 0x03008015 means the source is wrong: the print is pointed at the external spool (active_tray 254 = PLA), but the PETG is in AMS slot 3 (tray id 2; hw_switch_state=0 confirms nothing at the selected source). Fix: STOP the print, then restart with use_ams=true, ams_map=[2]. NOT a physical feed/jam.",
+      "files": ["fixtures/status-paused-no-source.json"]
+    }
+  ]
+}
