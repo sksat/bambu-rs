@@ -27,10 +27,14 @@ use crate::core::timelapse::{ActivityAction, CaptureAction, CaptureSession, Prin
 /// repoint a running capture.
 pub type FrameGrab = Arc<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync>;
 
-/// Safety cap on a single stream recording's size — a backstop against unbounded
-/// disk, not a target. Raw MJPEG is large, so this is generous (a long print can
-/// still fill it; the recorder stops cleanly at the cap).
+/// Disk cap for the raw-MJPEG fallback (no ffmpeg). Raw MJPEG is ~9 GB/hour, so
+/// this bounds a runaway recording; the recorder stops cleanly at the cap.
 const MAX_STREAM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Backstop for the ffmpeg (live-mp4) path. There the raw bytes stream *through*
+/// ffmpeg's stdin and are never stored — only the compact mp4 hits disk — so this
+/// is just a runaway guard (~6h of stream); a normal print ends (cancel) first.
+const MAX_STREAM_INPUT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 /// How a camera contributes to a `plain` run: `Sample` grabs a JPEG every tick
 /// (snapshot-only cameras); `Stream` records the camera's continuous MJPEG stream
@@ -311,9 +315,30 @@ async fn run(
 /// print is active (head wherever it is — the "watch it print" look), independent
 /// of layers/park. Same non-blocking grab path as [`run`]; reacts to status
 /// changes between ticks so it stops promptly when the print ends.
-/// Spawn one blocking MJPEG recorder per stream camera — each copies its stream to
-/// `<id>/plain.mjpeg`, reconnecting on drops (interruptible backoff), until
-/// `cancel` is set. Returns the workers' handles to await on shutdown.
+/// ffmpeg argv to encode the MJPEG stream (read from stdin as `mpjpeg`) into an
+/// h264 mp4 at `out`. Pure, so the command shape is unit-tested without ffmpeg.
+fn live_mp4_args(out: &std::path::Path) -> Vec<String> {
+    vec![
+        "-y".into(),
+        "-f".into(),
+        "mpjpeg".into(),
+        "-i".into(),
+        "-".into(),
+        "-c:v".into(),
+        "libx264".into(),
+        "-pix_fmt".into(),
+        "yuv420p".into(),
+        "-movflags".into(),
+        "+faststart".into(),
+        out.display().to_string(),
+    ]
+}
+
+/// Spawn one blocking recorder per stream camera. Each copies its MJPEG stream,
+/// reconnecting on drops (interruptible backoff), until `cancel` is set. When
+/// ffmpeg is on PATH it pipes the stream straight into ffmpeg → a compact h264
+/// `<id>/plain.mp4` (the whole print fits — the raw bytes are never stored); with
+/// no ffmpeg it falls back to the raw `<id>/plain.mjpeg` bounded by a disk cap.
 fn spawn_stream_recorders(
     streams: Vec<(String, StreamOpen)>,
     out_dir: &std::path::Path,
@@ -323,20 +348,12 @@ fn spawn_stream_recorders(
     streams
         .into_iter()
         .map(|(id, open)| {
-            let path = out_dir.join(&id).join("plain.mjpeg");
+            let dir = out_dir.join(&id);
+            let mp4 = dir.join("plain.mp4");
+            let mjpeg = dir.join("plain.mjpeg");
             let cancel = cancel.clone();
             let wstatus = status.clone();
             tokio::task::spawn_blocking(move || {
-                let file = match std::fs::File::create(&path) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        let mut s = wstatus.lock().unwrap();
-                        s.failures += 1;
-                        s.last_error = Some(format!("create {}: {e}", path.display()));
-                        return;
-                    }
-                };
-                let mut sink = std::io::BufWriter::new(file);
                 let cancel_fn = || cancel.load(Ordering::Relaxed);
                 // Interruptible reconnect backoff: sleep in small chunks so a stop
                 // is noticed within ~50ms rather than after the full (up to 5s) wait.
@@ -348,13 +365,70 @@ fn spawn_stream_recorders(
                         slept += 50;
                     }
                 };
-                let stats =
-                    record_loop(&open, &mut sink, &cancel_fn, MAX_STREAM_BYTES, 32 * 1024, &backoff);
-                let _ = sink.flush();
+
+                // Live mp4 (pipe through ffmpeg) when available; else raw mjpeg.
+                let ffmpeg = std::process::Command::new("ffmpeg")
+                    .args(live_mp4_args(&mp4))
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+                // (stats, output path, encode_ok). For the raw path encode_ok is
+                // vacuously true (write errors are already counted by record_loop);
+                // for the ffmpeg path it's ffmpeg's exit status.
+                let (stats, target, encode_ok) = match ffmpeg {
+                    Ok(mut child) => {
+                        let mut stdin = child.stdin.take().expect("piped stdin");
+                        let stats = record_loop(
+                            &open,
+                            &mut stdin,
+                            &cancel_fn,
+                            MAX_STREAM_INPUT_BYTES,
+                            32 * 1024,
+                            &backoff,
+                        );
+                        drop(stdin); // EOF → ffmpeg finalizes the mp4
+                        // If ffmpeg exits non-zero (no libx264, unsupported stream,
+                        // disk error) the mp4 is missing/corrupt — surface it rather
+                        // than report a silent success. The streamed bytes are gone,
+                        // so we can't retroactively fall back to raw .mjpeg.
+                        let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+                        (stats, mp4, ok)
+                    }
+                    Err(_) => {
+                        let file = match std::fs::File::create(&mjpeg) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                let mut s = wstatus.lock().unwrap();
+                                s.failures += 1;
+                                s.last_error = Some(format!("create {}: {e}", mjpeg.display()));
+                                return;
+                            }
+                        };
+                        let mut sink = std::io::BufWriter::new(file);
+                        let stats = record_loop(
+                            &open,
+                            &mut sink,
+                            &cancel_fn,
+                            MAX_STREAM_BYTES,
+                            32 * 1024,
+                            &backoff,
+                        );
+                        let _ = sink.flush();
+                        (stats, mjpeg, true)
+                    }
+                };
                 let mut s = wstatus.lock().unwrap();
                 s.failures += u64::from(stats.failures);
                 if stats.bytes == 0 {
-                    s.last_error = Some(format!("stream {id}: no data recorded"));
+                    s.last_error =
+                        Some(format!("stream {id}: no data recorded ({})", target.display()));
+                } else if !encode_ok {
+                    s.failures += 1;
+                    s.last_error = Some(format!(
+                        "stream {id}: ffmpeg failed to encode {} (missing libx264, or bad stream)",
+                        target.display()
+                    ));
                 }
             })
         })
@@ -629,12 +703,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plain_records_a_stream_camera_to_a_file() {
+    async fn plain_stream_recorder_starts_and_stops_with_the_print() {
+        // The recorder is a blocking worker driven by `cancel`; verify the
+        // lifecycle (spawns once active, exits cleanly when the print finishes).
+        // The output is ffmpeg-mp4 when ffmpeg is present, raw .mjpeg otherwise, so
+        // this asserts the cancellation, not the bytes (record_loop's copy is
+        // unit-tested in stream_record; the real encode is verified on-device).
         use crate::server::camera::{OpenedCameraStream, StreamOpen};
         let dir = std::env::temp_dir().join(format!("bambu-tl-stream-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (tx, rx) = watch::channel(st("RUNNING", Some(1)));
-        // A fake MJPEG stream that yields some bytes then EOF on each open.
         let open: StreamOpen = Arc::new(|| {
             Ok(OpenedCameraStream {
                 content_type: "multipart/x-mixed-replace".to_string(),
@@ -647,21 +725,26 @@ mod tests {
         }];
         let mgr = TimelapseManager::default();
         mgr.start_plain(caps, 20, rx, dir.clone()).unwrap();
+        assert!(dir.join("ext-1").is_dir(), "per-camera dir created");
 
-        // Let the recorder capture, then finish the print to stop it.
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         tx.send(st("FINISH", Some(1))).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        assert!(!mgr.status_plain().running, "stream recorder stops when the print finishes");
-
-        let data = std::fs::read(dir.join("ext-1").join("plain.mjpeg"))
-            .expect("plain.mjpeg was written");
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         assert!(
-            data.starts_with(b"JPEGDATA"),
-            "recorded the actual stream bytes (not time-sampled), got {} bytes",
-            data.len()
+            !mgr.status_plain().running,
+            "stream recorder stops cleanly when the print finishes"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_mp4_args_pipe_mpjpeg_stdin_to_h264() {
+        let args = super::live_mp4_args(std::path::Path::new("/cap/ext-1/plain.mp4"));
+        let joined = args.join(" ");
+        assert!(joined.contains("-f mpjpeg"), "{joined}");
+        assert!(joined.contains("-i -"), "reads the stream from stdin: {joined}");
+        assert!(joined.contains("libx264"));
+        assert!(joined.trim_end().ends_with("/cap/ext-1/plain.mp4"));
     }
 
     #[tokio::test]
