@@ -104,26 +104,37 @@ Start the capture right after the job (it waits through preheat/calibration and
 stops at FINISH). `frames` is the **total** written = layers × offsets × cameras.
 Re-register the cameras after any serve restart (config is in-memory).
 
-## Select the parked frame per layer + assemble
+## Make the smooth timelapse: MINE the continuous recording (best — ~100%)
 
-The burst leaves several frames per layer; **no single offset is the parked one** —
-the park's timing jitters layer-to-layer and drifts as the print rises (device-
-measured: early layers park ~1200 ms after the layer edge, upper layers <300 ms). So
-pick per layer with `scripts/select_smooth.py`: it isolates the moving toolhead
-(per-burst median subtraction) and keeps, per layer, the frame whose dark mass in the
-left park zone is a strong outlier; it **skips** a layer whose park fell outside the
-burst rather than emit a head-over-print frame. stdlib + ffmpeg only.
+The reactive burst catches the park on only **~20%** of layers — the park's delay
+after the layer edge jitters <100 ms..>1500 ms and drifts with height, so no fixed
+window catches most of them (device-measured). But for a **stream-capable camera**
+the `plain` run records the FULL stream to a live mp4 (`plain.mp4`), and **every**
+park is in it. Mine it for the parked frame per layer — this recovers ~100%
+(device-verified: 246 parks from a ~240-layer print, vs the burst's 49):
 
 ```bash
-scripts/select_smooth.py captures/<run>_smooth/ext-1 \
-    --out /tmp/sel --assemble timelapse.mp4 --fps 12 --report scores.json
-# prints {layers, selected, skipped, skip_reasons}; tune with --report + the _tNNNN tags
+scripts/mine_smooth.py captures/<run>_plain/ext-1/plain.mp4 \
+    --out /tmp/parks --assemble timelapse.mp4 --report parks.json --sample-fps 3
+# prints {sampled_frames, parks} — ~one park per layer
 ```
 
-If many layers are `park_not_captured`, the burst window missed them — shift it
-EARLIER for upper layers (the park keeps drifting earlier with height; `[300..1700]`
-caught only the lower layers). Per-camera framing knobs (rare): `left_frac`,
-`min_outlier`, `min_left_density` in `select_frame`.
+It decodes the mp4 to tiny grayscale (one ffmpeg pass), tracks a per-pixel EMA
+background (the recent typical scene), and finds the recurring left-edge dark spikes
+(each = one layer's park), rejecting implausible ones (a too-long island = a filament
+wipe, not a park). So run BOTH captures: `plain` on the stream camera (the source the
+miner needs) and, if you want other angles, `smooth` too. stdlib + ffmpeg only.
+
+### Reactive burst + select (fallback, ~20% — only for snapshot-only cameras)
+
+A camera with no `/stream` to mine can't use the miner; its per-layer `smooth` burst
+is picked by `scripts/select_smooth.py` (parked frame per layer, skips layers whose
+park fell outside the burst window). Tune `burst_offsets_ms` / `left_frac` /
+`min_left_density`. Expect to miss most layers — prefer the stream + miner where you can.
+
+```bash
+scripts/select_smooth.py captures/<run>_smooth/ext-0 --out /tmp/sel --assemble out.mp4
+```
 
 ## VERIFIED failures — don't repeat these
 
