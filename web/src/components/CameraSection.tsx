@@ -50,6 +50,12 @@ function CameraView({
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   useEffect(() => () => clearTimeout(timer.current), []);
+  // If this camera loses park capability while in the park view (e.g. its tuning was
+  // cleared in the manage form), fall back to live — the toggle hides, so otherwise it'd
+  // be stuck polling the now-gone /park endpoint with no way back.
+  useEffect(() => {
+    if (!park) setView("live");
+  }, [park]);
 
   const scheduleNext = (delay: number) => {
     clearTimeout(timer.current);
