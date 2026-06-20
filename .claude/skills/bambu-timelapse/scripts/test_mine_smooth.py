@@ -6,14 +6,18 @@ and an integration test feeding synthetic grayscale frame sequences through
 score_continuous_frames -> pick_park_peaks. No mp4 / ffmpeg.
 Run: python3 test_mine_smooth.py
 """
+import json
 import os
 import sys
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
 from mine_smooth import (  # noqa: E402
     pick_park_peaks, score_continuous_frames, should_remove_source)
 
+# The heuristics have no code defaults; tests source them from the example config too.
+EX = json.load(open(os.path.join(HERE, "tuning.example.json")))
 FPS = 3.0
 
 
@@ -25,11 +29,11 @@ def scores(left_masses, sharps=None):
 
 class PickParkPeaksTests(unittest.TestCase):
     def test_flat_signal_has_no_parks(self):
-        self.assertEqual(pick_park_peaks(scores([200] * 30), FPS), [])
+        self.assertEqual(pick_park_peaks(scores([200] * 30), FPS, EX), [])
 
     def test_single_park_is_one_peak(self):
         sig = [200] * 10 + [5000, 5000, 5000] + [200] * 10
-        p = pick_park_peaks(scores(sig), FPS)
+        p = pick_park_peaks(scores(sig), FPS, EX)
         self.assertEqual(len(p), 1, p)
         self.assertIn(p[0]["idx"], (10, 11, 12), p)
 
@@ -37,28 +41,28 @@ class PickParkPeaksTests(unittest.TestCase):
         # a 4-sample dwell must collapse to ONE park, choosing the sharpest frame
         sig = [200] * 5 + [4000, 5000, 4500, 5000] + [200] * 5
         sharp = [100] * 5 + [50, 90, 200, 60] + [100] * 5  # idx 7 sharpest
-        p = pick_park_peaks(scores(sig, sharp), FPS)
+        p = pick_park_peaks(scores(sig, sharp), FPS, EX)
         self.assertEqual(len(p), 1, p)
         self.assertEqual(p[0]["idx"], 7, p)
 
     def test_two_parks_far_apart_are_both_found(self):
         sig = [200] * 5 + [5000, 5000] + [200] * 20 + [5000, 5000] + [200] * 5
-        self.assertEqual(len(pick_park_peaks(scores(sig), FPS)), 2)
+        self.assertEqual(len(pick_park_peaks(scores(sig), FPS, EX)), 2)
 
     def test_two_close_events_collapse_to_one(self):
         # spikes ~1s apart (gap below merge/min-sep) → a single park
         sig = [200] * 5 + [5000, 5000] + [200, 200] + [5000, 5000] + [200] * 5
-        self.assertEqual(len(pick_park_peaks(scores(sig), FPS)), 1)
+        self.assertEqual(len(pick_park_peaks(scores(sig), FPS, EX)), 1)
 
     def test_long_event_is_rejected(self):
         # 12 samples = 4s > max_island_s → a wipe, not a park
         sig = [200] * 5 + [5000] * 12 + [200] * 5
-        self.assertEqual(pick_park_peaks(scores(sig), FPS), [])
+        self.assertEqual(pick_park_peaks(scores(sig), FPS, EX), [])
 
     def test_noisy_drifting_baseline_still_finds_the_park(self):
         base = [100 + (i % 5) * 40 + i * 2 for i in range(40)]  # noise + upward drift
         base[20:23] = [6000, 6000, 6000]                        # one clear park
-        p = pick_park_peaks(scores(base), FPS)
+        p = pick_park_peaks(scores(base), FPS, EX)
         self.assertEqual(len(p), 1, p)
         self.assertIn(p[0]["idx"], (20, 21, 22), p)
 
@@ -91,8 +95,8 @@ class ContinuousIntegrationTests(unittest.TestCase):
         park_frames = {15, 16, 35, 36, 55, 56}
         for i in range(70):
             seq.append(cframe(6 if i in park_frames else W // 2))
-        sc = score_continuous_frames(seq, W, H, {"fps": FPS, "ema_seconds": 6.0})
-        parks = pick_park_peaks(sc, FPS)
+        sc = score_continuous_frames(seq, W, H, {**EX, "fps": FPS, "ema_seconds": 6.0})
+        parks = pick_park_peaks(sc, FPS, EX)
         self.assertEqual(len(parks), 3, [p["idx"] for p in parks])
         for p in parks:  # each chosen frame sits in one of the park windows
             self.assertTrue(any(abs(p["idx"] - f) <= 2 for f in (15, 35, 55)), p)
@@ -100,8 +104,8 @@ class ContinuousIntegrationTests(unittest.TestCase):
     def test_static_left_fixture_is_not_a_park(self):
         # head never leaves center; the always-dark left fixture must not register.
         seq = [cframe(W // 2) for _ in range(40)]
-        sc = score_continuous_frames(seq, W, H, {"fps": FPS, "ema_seconds": 6.0})
-        self.assertEqual(pick_park_peaks(sc, FPS), [])
+        sc = score_continuous_frames(seq, W, H, {**EX, "fps": FPS, "ema_seconds": 6.0})
+        self.assertEqual(pick_park_peaks(sc, FPS, EX), [])
 
 
 class RemoveSourceGuardTests(unittest.TestCase):

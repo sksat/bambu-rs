@@ -114,8 +114,9 @@ park is in it. Mine it for the parked frame per layer — this recovers ~100%
 (device-verified: 246 parks from a ~240-layer print, vs the burst's 49):
 
 ```bash
-scripts/mine_smooth.py captures/<run>_plain/ext-1/plain.mp4 \
-    --out /tmp/parks --assemble timelapse.mp4 --report parks.json --sample-fps 3 --rm-source
+cp scripts/tuning.example.json my-setup.json   # then calibrate it for YOUR camera (see below)
+scripts/mine_smooth.py captures/<run>_plain/ext-1/plain.mp4 --config my-setup.json \
+    --out /tmp/parks --assemble timelapse.mp4 --report parks.json --rm-source
 # prints {sampled_frames, parks} — ~one park per layer
 ```
 
@@ -129,7 +130,41 @@ The `plain.mp4` is a big transient (~600 MB/h h264 — already ~17× smaller tha
 MJPEG, which `bambu serve` never writes to disk; it pipes the stream through ffmpeg).
 Once mined, the park JPEGs (~24 MB) and the assembled mp4 (~5 MB) are all you need, so
 **`--rm-source` deletes the recording after a successful mine** (refused if nothing was
-saved). Bump `--sample-fps 4` if picks include motion blur.
+saved). Bump `fps` to 4 in the config if picks include motion blur.
+
+### Tuning is per-setup — the code has NO baked defaults
+
+The park detector's heuristics (`left_frac`, `abs_floor`, `fps`, EMA window, island
+thresholds…) depend on **where the camera and printer sit and how the toolhead looks**,
+so they are NOT hardcoded and have no defaults — the printer and camera move, and a stale
+baked-in value is a silent trap. You pass them per run via `--config <json>` (copy
+`scripts/tuning.example.json` and calibrate) and/or `--<knob>` overrides; a missing knob
+is a loud error, never a silent fallback. `mine_smooth.py` and `live_mine_smooth.py` share
+this plumbing (`_tuning.py`). The two knobs most sensitive to framing: **`left_frac`** (how
+wide the left "park zone" is) and **`abs_floor`** (minimum left-mass for a real park —
+scales with lighting/zoom). Re-calibrate whenever the camera or printer moves.
+
+### Near-real-time: mine the stream LIVE during the print
+
+Same signal, run online: `live_mine_smooth.py` watches the camera's MJPEG `/stream` while
+the print runs and emits the parked frame for each layer with a **few-seconds lag** (it
+opens an island when the left-mass rises and emits the sharpest frame when the island
+closes), so you get a near-real-time park preview AND the frames accumulate for the final
+timelapse — no separate batch mine at the end. One ffmpeg tees a tiny gray rawvideo (for
+detection) and full-res JPEGs (for output) from the single stream, so the preview is
+full-res without Python decoding JPEGs.
+
+```bash
+scripts/live_mine_smooth.py http://<USTREAMER_HOST>/stream --config my-setup.json \
+    --out captures/live/ext-1 --assemble timelapse.mp4     # Ctrl-C (or --max-seconds) stops
+# updates captures/live/ext-1/latest_park.jpg atomically each layer (the live preview),
+# plus park_NNNNNN.jpg + parks.jsonl; --assemble renders the mp4 on stop.
+```
+
+Use it for the in-print sanity check and a ready-at-FINISH timelapse on a stream-capable
+camera. The batch `mine_smooth.py` stays the choice for post-print mining of a saved
+`plain.mp4` (e.g. for the highest-quality SNS render). Same `--config`; warns if it reads
+0 frames (bad URL / ffmpeg can't open the stream).
 
 ### Reactive burst + select (fallback, ~20% — only for snapshot-only cameras)
 

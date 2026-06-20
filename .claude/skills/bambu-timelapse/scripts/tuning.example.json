@@ -1,0 +1,14 @@
+{
+  "_comment": "EXAMPLE park-detection tuning for ONE specific setup: a Bambu A1 mini with a LEFT-mounted ustreamer camera, ~64x36 detection. These are NOT universal — they depend on where the camera and printer sit and how big/dark the toolhead looks. RE-CALIBRATE when the camera or printer moves (especially left_frac, abs_floor, min_left_density). Copy this file, edit for your setup, and pass it with --config. There are deliberately NO defaults in the code.",
+  "fps": 4,
+  "left_frac": 0.33,
+  "ema_seconds": 30.0,
+  "abs_floor": 1500.0,
+  "mad_k": 6.0,
+  "merge_gap_s": 1.2,
+  "max_island_s": 3.0,
+  "min_sep_s": 3.0,
+  "candidate_frac": 0.75,
+  "warmup_s": 4.0,
+  "baseline_s": 90.0
+}

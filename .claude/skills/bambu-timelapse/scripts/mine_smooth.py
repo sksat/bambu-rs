@@ -41,45 +41,47 @@ DECODE_W, DECODE_H = 64, 36
 
 # ── pure scoring core (no IO) ───────────────────────────────────────────────────
 
-def score_continuous_frames(frames, w, h, cfg=None):
+def ema_alpha(ema_seconds, fps):
+    """EMA smoothing factor for a ~`ema_seconds` background at sampling `fps`."""
+    return max(0.0, min(0.999, 1.0 - 1.0 / max(1.0, ema_seconds * fps)))
+
+
+def score_one_frame(gray, ema, alpha, w, h, park_hi):
+    """Update the causal per-pixel EMA background with one frame and score it.
+    Returns (ema, left_mass, sharpness, centroid_x). The park is the head appearing
+    dark in the LEFT zone where the background (recent typical scene) is bright, so
+    `left_mass` (dark-vs-background mass in the left strip) spikes once per layer.
+    Shared by the batch miner and the live detector so they score identically."""
+    if ema is None:
+        ema = list(gray)
+    else:
+        for i, v in enumerate(gray):
+            ema[i] = alpha * ema[i] + (1.0 - alpha) * v
+    left_mass = 0.0
+    sal = [0.0] * (w * h)
+    for y in range(h):
+        row = y * w
+        for x in range(w):
+            d = ema[row + x] - gray[row + x]
+            if d > 0:
+                sal[row + x] = d
+                if x < park_hi:
+                    left_mass += d
+    return ema, left_mass, _sharpness(gray, w, h), _centroid_x(sal, w, h)
+
+
+def score_continuous_frames(frames, w, h, cfg):
     """Per-frame left-park saliency over a continuous recording. `frames` is a list
     of grayscale [int]*(w*h). Returns [{idx, left_mass, sharpness, centroid_x}].
-
-    The background is a causal per-pixel EMA (the recent typical scene); the park is
-    the head appearing dark in the LEFT zone where the background is bright, so
-    `left_mass` (dark-vs-background mass in the left strip) spikes once per layer."""
-    cfg = cfg or {}
-    left_frac = cfg.get("left_frac", 0.33)
-    # EMA time-constant ~ ema_seconds; alpha derived from the sampling fps.
-    ema_seconds = cfg.get("ema_seconds", 30.0)
-    fps = cfg.get("fps", 3.0)
-    alpha = max(0.0, min(0.999, 1.0 - 1.0 / max(1.0, ema_seconds * fps)))
-    park_hi = max(1, int(left_frac * w))
-
+    `cfg` must carry left_frac/ema_seconds/fps (no defaults — they're setup-specific)."""
+    park_hi = max(1, int(cfg["left_frac"] * w))
+    alpha = ema_alpha(cfg["ema_seconds"], cfg["fps"])
     out = []
     ema = None
     for idx, g in enumerate(frames):
-        if ema is None:
-            ema = list(g)
-        else:
-            for i, v in enumerate(g):
-                ema[i] = alpha * ema[i] + (1.0 - alpha) * v
-        # dark-vs-background saliency, restricted to the left park zone
-        left_mass = 0.0
-        sal_full = [0.0] * (w * h)
-        for y in range(h):
-            row = y * w
-            for x in range(w):
-                d = ema[row + x] - g[row + x]
-                if d > 0:
-                    sal_full[row + x] = d
-                    if x < park_hi:
-                        left_mass += d
-        out.append({
-            "idx": idx, "left_mass": round(left_mass, 1),
-            "sharpness": round(_sharpness(g, w, h), 1),
-            "centroid_x": round(_centroid_x(sal_full, w, h), 2),
-        })
+        ema, lm, sh, cx = score_one_frame(g, ema, alpha, w, h, park_hi)
+        out.append({"idx": idx, "left_mass": round(lm, 1),
+                    "sharpness": round(sh, 1), "centroid_x": round(cx, 2)})
     return out
 
 
@@ -87,21 +89,20 @@ def _mad(vals, med):
     return median([abs(v - med) for v in vals]) if vals else 0.0
 
 
-def pick_park_peaks(scores, fps, cfg=None):
+def pick_park_peaks(scores, fps, cfg):
     """Find the parks: islands of high left-mass, each = one layer's park. Returns
     [{idx, t, confidence, left_mass}] for the chosen (sharpest) frame of each island.
 
     Robust threshold (median + k·MAD of left_mass, plus an absolute floor); samples
     above it within `merge_gap_s` form one island; islands that are implausibly long
     (a filament-change wipe, not a park) or too close to the previous one are dropped;
-    the sharpest frame of each island is kept."""
-    cfg = cfg or {}
-    k = cfg.get("mad_k", 6.0)
-    floor = cfg.get("abs_floor", 1500.0)        # min left_mass for a real park
-    merge_gap_s = cfg.get("merge_gap_s", 1.2)   # samples within this = one island
-    max_island_s = cfg.get("max_island_s", 3.0)  # longer = not a normal park
-    min_sep_s = cfg.get("min_sep_s", 3.0)       # parks closer than this → keep one
-    cand_frac = cfg.get("candidate_frac", 0.75)  # sharpest among >=75% of island max
+    the sharpest frame of each island is kept. `cfg` carries every knob (no defaults)."""
+    k = cfg["mad_k"]
+    floor = cfg["abs_floor"]                     # min left_mass for a real park
+    merge_gap_s = cfg["merge_gap_s"]             # samples within this = one island
+    max_island_s = cfg["max_island_s"]           # longer = not a normal park
+    min_sep_s = cfg["min_sep_s"]                 # parks closer than this → keep one
+    cand_frac = cfg["candidate_frac"]            # sharpest among >=cand_frac of island max
 
     lm = [s["left_mass"] for s in scores]
     if not lm:
@@ -191,27 +192,30 @@ def extract_full_frame(path, t, out_path):
 
 
 def main():
+    from _tuning import add_tuning_args, resolve_tuning
+    required = ["fps", "left_frac", "ema_seconds", "abs_floor", "mad_k",
+                "merge_gap_s", "max_island_s", "min_sep_s", "candidate_frac"]
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("mp4", help="a continuous plain recording, e.g. captures/<run>_plain/ext-1/plain.mp4")
     ap.add_argument("--out", help="extract the parked frames here (one per park)")
     ap.add_argument("--assemble", help="assemble the parked frames into this mp4 (needs --out)")
     ap.add_argument("--report", help="write the parks JSON here")
-    ap.add_argument("--sample-fps", type=float, default=3.0)
-    ap.add_argument("--fps", type=int, default=12, help="output timelapse fps")
-    ap.add_argument("--width", type=int, default=DECODE_W)
-    ap.add_argument("--height", type=int, default=DECODE_H)
+    ap.add_argument("--out-fps", type=int, default=12, help="output timelapse playback fps")
+    ap.add_argument("--width", type=int, default=DECODE_W, help="detection decode width")
+    ap.add_argument("--height", type=int, default=DECODE_H, help="detection decode height")
     ap.add_argument("--rm-source", action="store_true",
                     help="delete the source recording after a successful mine (keeps the "
                          "extracted park JPEGs in --out and the assembled mp4 — the recording "
                          "is just a big intermediate). Refused if nothing was saved.")
+    add_tuning_args(ap)
     args = ap.parse_args()
+    cfg = resolve_tuning(args, required)
 
-    frames = extract_gray_frames_from_mp4(args.mp4, args.sample_fps, args.width, args.height)
-    scores = score_continuous_frames(frames, args.width, args.height,
-                                      {"fps": args.sample_fps})
-    parks = pick_park_peaks(scores, args.sample_fps)
-    summary = {"sampled_frames": len(frames), "sample_fps": args.sample_fps,
+    frames = extract_gray_frames_from_mp4(args.mp4, cfg["fps"], args.width, args.height)
+    scores = score_continuous_frames(frames, args.width, args.height, cfg)
+    parks = pick_park_peaks(scores, cfg["fps"], cfg)
+    summary = {"sampled_frames": len(frames), "sample_fps": cfg["fps"],
                "parks": len(parks)}
     print(json.dumps(summary, indent=2))
 
@@ -232,7 +236,7 @@ def main():
                 kept += 1
         print(f"extracted {kept}/{len(parks)} parked frames -> {args.out}")
         if args.assemble:
-            cmd = ["ffmpeg", "-y", "-v", "error", "-framerate", str(args.fps),
+            cmd = ["ffmpeg", "-y", "-v", "error", "-framerate", str(args.out_fps),
                    "-i", os.path.join(args.out, "park_%06d.jpg"),
                    "-vf", "scale='min(1280,iw)':-2,format=yuv420p",
                    "-c:v", "libx264", "-crf", "23", args.assemble]
