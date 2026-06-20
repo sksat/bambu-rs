@@ -22,7 +22,7 @@ use axum::http::{
 };
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -354,10 +354,24 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             require_password,
         ));
-    let app = reads.merge(writes);
+    // Unknown `/api/*` paths 404 as JSON (a typo'd endpoint shouldn't fall through to the
+    // SPA and get HTML 200). Specific routes above are more specific than this catch-all,
+    // so they still win; only unmatched API paths land here.
+    let app = reads
+        .merge(writes)
+        .route("/api/{*rest}", any(api_not_found));
     #[cfg(feature = "dashboard")]
     let app = app.fallback(static_handler);
     app.with_state(state)
+}
+
+/// 404 for an unmatched `/api/*` path — JSON, not the SPA fallback's HTML.
+async fn api_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": "unknown API endpoint" })),
+    )
+        .into_response()
 }
 
 async fn status(State(st): State<AppState>) -> Json<PrinterStatus> {
@@ -3034,6 +3048,22 @@ mod tests {
             .await;
         res.assert_status_ok();
         assert!(res.json::<serde_json::Value>()["captures"].is_array());
+    }
+
+    #[tokio::test]
+    async fn unknown_api_path_404s_as_json() {
+        let server = app(None, FakeController::verified());
+        // A typo'd / unknown API path → JSON 404, not the SPA's HTML 200.
+        let res = server.get("/api/nope").await;
+        res.assert_status_not_found();
+        assert!(res.json::<serde_json::Value>()["error"].is_string());
+        // A deeper unmatched path under a real prefix, too.
+        server
+            .get("/api/camera/x/bogus")
+            .await
+            .assert_status_not_found();
+        // A real route is NOT shadowed by the catch-all.
+        server.get("/api/status").await.assert_status_ok();
     }
 
     #[test]
