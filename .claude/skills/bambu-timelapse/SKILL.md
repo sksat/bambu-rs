@@ -115,7 +115,7 @@ park is in it. Mine it for the parked frame per layer — this recovers ~100%
 
 ```bash
 scripts/mine_smooth.py captures/<run>_plain/ext-1/plain.mp4 \
-    --out /tmp/parks --assemble timelapse.mp4 --report parks.json --sample-fps 3
+    --out /tmp/parks --assemble timelapse.mp4 --report parks.json --sample-fps 3 --rm-source
 # prints {sampled_frames, parks} — ~one park per layer
 ```
 
@@ -124,6 +124,12 @@ background (the recent typical scene), and finds the recurring left-edge dark sp
 (each = one layer's park), rejecting implausible ones (a too-long island = a filament
 wipe, not a park). So run BOTH captures: `plain` on the stream camera (the source the
 miner needs) and, if you want other angles, `smooth` too. stdlib + ffmpeg only.
+
+The `plain.mp4` is a big transient (~600 MB/h h264 — already ~17× smaller than raw
+MJPEG, which `bambu serve` never writes to disk; it pipes the stream through ffmpeg).
+Once mined, the park JPEGs (~24 MB) and the assembled mp4 (~5 MB) are all you need, so
+**`--rm-source` deletes the recording after a successful mine** (refused if nothing was
+saved). Bump `--sample-fps 4` if picks include motion blur.
 
 ### Reactive burst + select (fallback, ~20% — only for snapshot-only cameras)
 

@@ -150,6 +150,22 @@ def pick_park_peaks(scores, fps, cfg=None):
     return parks
 
 
+def should_remove_source(rm_source, parks, kept, has_out):
+    """Whether to delete the source recording after mining. Only when the mine FULLY
+    succeeded — every detected park was extracted (`kept == parks`) and `--out` saved
+    them. A partial extraction keeps the recording, since the missing park frames can
+    only be recovered from it; likewise an empty run or a missing `--out`."""
+    if not rm_source:
+        return False, "not requested"
+    if not has_out:
+        return False, "refused: needs --out, or the recording would be the only copy"
+    if parks == 0:
+        return False, "refused: no parks found"
+    if kept < parks:
+        return False, f"refused: only {kept}/{parks} frames extracted"
+    return True, "ok"
+
+
 # ── IO: ffmpeg decode + extract + assemble ──────────────────────────────────────
 
 def extract_gray_frames_from_mp4(path, fps, w=DECODE_W, h=DECODE_H):
@@ -185,6 +201,10 @@ def main():
     ap.add_argument("--fps", type=int, default=12, help="output timelapse fps")
     ap.add_argument("--width", type=int, default=DECODE_W)
     ap.add_argument("--height", type=int, default=DECODE_H)
+    ap.add_argument("--rm-source", action="store_true",
+                    help="delete the source recording after a successful mine (keeps the "
+                         "extracted park JPEGs in --out and the assembled mp4 — the recording "
+                         "is just a big intermediate). Refused if nothing was saved.")
     args = ap.parse_args()
 
     frames = extract_gray_frames_from_mp4(args.mp4, args.sample_fps, args.width, args.height)
@@ -200,12 +220,12 @@ def main():
             json.dump({"summary": summary, "parks": parks}, fh, indent=2)
         print(f"wrote {args.report}")
 
+    kept = 0
     if args.out:
         os.makedirs(args.out, exist_ok=True)
         for old in os.listdir(args.out):
             if old.startswith("park_") and old.endswith(".jpg"):
                 os.remove(os.path.join(args.out, old))
-        kept = 0
         for n, p in enumerate(parks):
             dst = os.path.join(args.out, f"park_{n:06}.jpg")
             if extract_full_frame(args.mp4, p["t"], dst):
@@ -220,6 +240,15 @@ def main():
             if r.returncode:
                 sys.exit(f"ffmpeg assemble failed: {r.stderr[-400:]}")
             print(f"assembled {args.assemble}")
+
+    # The recording is a big transient; drop it once the parks are safely saved.
+    do_rm, reason = should_remove_source(args.rm_source, len(parks), kept, bool(args.out))
+    if do_rm:
+        freed = os.path.getsize(args.mp4) // 1_000_000
+        os.remove(args.mp4)
+        print(f"removed source {args.mp4} (freed ~{freed} MB)")
+    elif args.rm_source:
+        print(f"--rm-source skipped ({reason}); kept the recording")
 
 
 if __name__ == "__main__":

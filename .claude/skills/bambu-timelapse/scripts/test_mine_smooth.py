@@ -11,7 +11,8 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mine_smooth import pick_park_peaks, score_continuous_frames  # noqa: E402
+from mine_smooth import (  # noqa: E402
+    pick_park_peaks, score_continuous_frames, should_remove_source)
 
 FPS = 3.0
 
@@ -101,6 +102,31 @@ class ContinuousIntegrationTests(unittest.TestCase):
         seq = [cframe(W // 2) for _ in range(40)]
         sc = score_continuous_frames(seq, W, H, {"fps": FPS, "ema_seconds": 6.0})
         self.assertEqual(pick_park_peaks(sc, FPS), [])
+
+
+class RemoveSourceGuardTests(unittest.TestCase):
+    def test_not_deleted_unless_requested(self):
+        self.assertFalse(should_remove_source(False, 200, 200, True)[0])
+
+    def test_deleted_on_a_successful_save(self):
+        self.assertTrue(should_remove_source(True, 200, 200, True)[0])
+
+    def test_refused_without_out_so_a_copy_remains(self):
+        ok, why = should_remove_source(True, 200, 0, False)
+        self.assertFalse(ok)
+        self.assertIn("refused", why)
+
+    def test_refused_when_no_parks_found(self):
+        self.assertFalse(should_remove_source(True, 0, 0, True)[0])
+
+    def test_refused_when_nothing_was_extracted(self):
+        self.assertFalse(should_remove_source(True, 200, 0, True)[0])
+
+    def test_refused_on_partial_extraction(self):
+        # some park frames failed to extract — the recording is their only source
+        ok, why = should_remove_source(True, 200, 199, True)
+        self.assertFalse(ok)
+        self.assertIn("199/200", why)
 
 
 if __name__ == "__main__":
