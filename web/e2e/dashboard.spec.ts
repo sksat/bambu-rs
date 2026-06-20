@@ -286,22 +286,22 @@ test.describe("dashboard (fake mode)", () => {
     await expect(tabs.nth(0)).toHaveAttribute("aria-selected", "false");
   });
 
-  test("a park-capable camera offers the live↔park toggle and start control", async ({
-    page,
-  }) => {
-    // The seeded "park cam" (a stream + a calibrated park_tuning) is park-capable, so
-    // its view gains a toggle and the timelapse bar a park start control. The other
-    // (snapshot-only) cameras do not.
+  test("a park-capable camera offers the live↔captured toggle", async ({ page }) => {
+    // The seeded "park cam" (a stream + a calibrated park_tuning) is park-capable, so its
+    // view gains a live↔captured toggle (its clean timelapse is scrubbable). A snapshot-only
+    // camera does not. The "record" control itself is offered for any camera.
     await page.getByTestId("camera-tab-ext-0").click(); // a snapshot-only camera
     await expect(page.getByTestId("camera-view-toggle")).toHaveCount(0);
-    await expect(page.getByTestId("timelapse-park-start")).toHaveCount(0);
+    await expect(page.getByTestId("record-start")).toBeVisible();
 
     await page.getByTestId("camera-tab-ext-2").click(); // the park cam
     await expect(page.getByTestId("camera-view-toggle")).toBeVisible();
-    await expect(page.getByTestId("timelapse-park-start")).toBeVisible();
+    await expect(page.getByTestId("record-start")).toBeVisible();
+    // The record type can be switched between timelapse and video.
+    await expect(page.getByTestId("rec-type-timelapse")).toBeVisible();
+    await expect(page.getByTestId("rec-type-video")).toBeVisible();
 
-    // No park run is active, so there's nothing to show in the park view — the park
-    // toggle is disabled until a run is started (you can't switch to an empty preview).
+    // No run captured frames yet, so the captured view is disabled (nothing to scrub).
     await expect(page.getByTestId("camera-view-park")).toBeDisabled();
     await expect(page.getByTestId("camera-view-live")).toBeEnabled();
   });

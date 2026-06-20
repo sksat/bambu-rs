@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   listCameras,
   getCamerasConfig,
@@ -157,65 +157,40 @@ function captureStatus(run: RunState): { label: string; warn?: boolean; detail?:
   return { label: `rec · ${frames}` };
 }
 
-// One timelapse mode as a self-describing row: its name, a VISIBLE plain-language
-// description of what it captures (not a tooltip — so it's obvious what each does), and a
-// start button, or — while running — a recording readout + stop. Each mode is an
-// independent run (all can be on at once).
-function ModeRow({
-  name,
-  desc,
+// A compact "now recording" row: what's being recorded, the live readout (waiting /
+// rec · N / failing-in-red), and a stop. Shown only while that run is active.
+function RecRow({
+  label,
   testid,
   run,
   busy,
-  onStart,
   onStop,
-  startDisabled,
 }: {
-  name: string;
-  desc: ReactNode;
+  label: string;
   testid: string;
-  run: RunState | undefined;
+  run: RunState;
   busy: boolean;
-  onStart: () => void;
   onStop: () => void;
-  startDisabled?: boolean;
 }) {
-  const st = run?.running ? captureStatus(run) : null;
+  const st = captureStatus(run);
   return (
-    <div className="cam__mode" data-testid={`timelapse-${testid}`}>
-      <div className="cam__mode-info">
-        <span className="cam__mode-name">{name}</span>
-        <span className="cam__mode-desc dim">{desc}</span>
-      </div>
-      {st ? (
-        <div className="cam__mode-act">
-          <span
-            className={`cam__tl-rec${st.warn ? " cam__tl-rec--warn" : ""}`}
-            data-testid={`timelapse-${testid}-running`}
-            title={st.detail}
-          >
-            ● {st.label}
-          </span>
-          <button
-            className="cam__btn"
-            data-testid={`timelapse-${testid}-stop`}
-            disabled={busy}
-            onClick={onStop}
-          >
-            stop
-          </button>
-        </div>
-      ) : (
-        <button
-          className="cam__btn cam__btn--save cam__mode-start"
-          data-testid={`timelapse-${testid}-start`}
-          disabled={busy || startDisabled}
-          title="start any time — it records while the print runs and stops on its own when the print finishes"
-          onClick={onStart}
-        >
-          start
-        </button>
-      )}
+    <div className="cam__rec-row" data-testid={`timelapse-${testid}`}>
+      <span className="cam__rec-name">{label}</span>
+      <span
+        className={`cam__tl-rec${st.warn ? " cam__tl-rec--warn" : ""}`}
+        data-testid={`timelapse-${testid}-running`}
+        title={st.detail}
+      >
+        ● {st.label}
+      </span>
+      <button
+        className="cam__btn"
+        data-testid={`timelapse-${testid}-stop`}
+        disabled={busy}
+        onClick={onStop}
+      >
+        stop
+      </button>
     </div>
   );
 }
@@ -240,6 +215,8 @@ function TimelapseBar({
   const [msg, setMsg] = useState<string | null>(null);
   const [allCams, setAllCams] = useState(false);
   const [plainSecs, setPlainSecs] = useState(3);
+  // What a manual "record" captures: the object-only timelapse, or a head-in-shot video.
+  const [recType, setRecType] = useState<"timelapse" | "video">("timelapse");
 
   useEffect(() => {
     let live = true;
@@ -268,7 +245,20 @@ function TimelapseBar({
   const layerRun = activeIsPark ? tl?.park : tl?.smooth;
   const targetCams = allCams && multi ? cameras : active ? [active] : [];
   const anySnapshot = targetCams.some((c) => !c.stream);
-  const someStream = targetCams.some((c) => c.stream);
+  // What the selected record type maps to: clean timelapse → park (camera-detected) or
+  // smooth (printer-synced) by capability; video → plain (stream record or interval).
+  const recMode: TimelapseMode = recType === "timelapse" ? layerMode : "plain";
+  const recRun = recType === "timelapse" ? layerRun : tl?.plain;
+  // The interval input only matters for a sampled (snapshot-camera) video.
+  const showEvery = recType === "video" && anySnapshot;
+  const recHint =
+    recType === "timelapse"
+      ? activeIsPark
+        ? "object only — one parked frame per layer, detected from the camera; review in the “captured” view above"
+        : "object only — one parked frame per layer, printer-synced"
+      : anySnapshot
+        ? "head in shot — a sped-up video sampled from snapshots"
+        : "head in shot — records the live camera stream";
 
   const startMode = async (mode: TimelapseMode) => {
     setBusy(true);
@@ -323,65 +313,87 @@ function TimelapseBar({
           </div>
         )}
       </div>
-      {/* Frame the manual controls as secondary — recording is normally armed at print
-          start (one action). Only nag with this when nothing is recording yet. */}
+      {/* Frame the manual control as secondary — recording is normally armed at print
+          start (one action). Only show this when nothing is recording yet. */}
       {!anyRunning && (
         <p className="cam__tl-cap dim" data-testid="capture-hint">
-          starts automatically when you begin a print with “timelapse” on — or start one
-          here to record a print that's already running.
+          starts automatically when you begin a print with “timelapse” on — or record one
+          here for a print that's already running.
         </p>
       )}
 
-      {/* Purpose 1 — a clean, object-only timelapse: one parked frame per layer. Method
-          (park vs smooth) is auto-picked by the active camera. */}
-      <ModeRow
-        name="clean timelapse"
-        desc={
-          activeIsPark
-            ? "one parked frame per layer — review it in the “captured” view above"
-            : "one parked frame per layer — printer-synced"
-        }
-        testid={layerMode}
-        run={layerRun}
-        busy={busy}
-        onStart={() => void startMode(layerMode)}
-        onStop={() => void stopMode(layerMode)}
-      />
+      {/* What's recording now (each can run independently): a status + stop. */}
+      {layerRun?.running && (
+        <RecRow
+          label="timelapse"
+          testid={layerMode}
+          run={layerRun}
+          busy={busy}
+          onStop={() => void stopMode(layerMode)}
+        />
+      )}
+      {tl?.plain.running && (
+        <RecRow
+          label="video"
+          testid="plain"
+          run={tl.plain}
+          busy={busy}
+          onStop={() => void stopMode("plain")}
+        />
+      )}
 
-      {/* Purpose 2 — a video of the print (head in shot). Stream cameras record the real
-          stream; snapshot cameras sample every N s (the interval only applies to those). */}
-      <ModeRow
-        name="print video"
-        desc={
-          !anySnapshot ? (
-            <>records the live camera stream — head in shot (the real video)</>
-          ) : tl?.plain.running ? (
-            <>
-              a frame every {plainSecs}s, head in shot
-              {someStream ? " (stream cams record continuously)" : ""}
-            </>
-          ) : (
-            <>
-              {allCams && multi && someStream ? "snapshot cams: " : ""}a frame every{" "}
-              <input
-                className="pw cam__tl-secs"
-                inputMode="decimal"
-                value={plainSecs}
-                disabled={busy}
-                data-testid="timelapse-plain-secs"
-                onChange={(e) => setPlainSecs(Number(e.target.value) || 0)}
-              />{" "}
-              s, head in shot
-            </>
-          )
-        }
-        testid="plain"
-        run={tl?.plain}
-        busy={busy}
-        onStart={() => void startMode("plain")}
-        onStop={() => void stopMode("plain")}
-        startDisabled={anySnapshot && plainSecs < 0.1}
-      />
+      {/* Start a recording: pick WHAT (timelapse vs video) + details, then record. One
+          "record" action — the type and interval are options, not separate modes. */}
+      <div className="cam__rec">
+        <div className="seg seg--rectype" role="radiogroup" aria-label="what to record">
+          <button
+            className={`btn btn--sm seg__opt${recType === "timelapse" ? " is-active" : ""}`}
+            role="radio"
+            aria-checked={recType === "timelapse"}
+            disabled={busy}
+            data-testid="rec-type-timelapse"
+            onClick={() => setRecType("timelapse")}
+          >
+            timelapse
+          </button>
+          <button
+            className={`btn btn--sm seg__opt${recType === "video" ? " is-active" : ""}`}
+            role="radio"
+            aria-checked={recType === "video"}
+            disabled={busy}
+            data-testid="rec-type-video"
+            onClick={() => setRecType("video")}
+          >
+            video
+          </button>
+        </div>
+        {showEvery && (
+          <label className="dim cam__rec-every">
+            every{" "}
+            <input
+              className="pw cam__tl-secs"
+              inputMode="decimal"
+              value={plainSecs}
+              disabled={busy}
+              data-testid="timelapse-plain-secs"
+              onChange={(e) => setPlainSecs(Number(e.target.value) || 0)}
+            />{" "}
+            s
+          </label>
+        )}
+        <button
+          className="cam__btn cam__btn--save cam__rec-go"
+          data-testid="record-start"
+          disabled={busy || !!recRun?.running || (showEvery && plainSecs < 0.1)}
+          title="records while the print runs and stops on its own when the print finishes"
+          onClick={() => void startMode(recMode)}
+        >
+          {recRun?.running ? "recording…" : "record"}
+        </button>
+      </div>
+      <p className="cam__rec-hint dim" data-testid="rec-hint">
+        {recHint}
+      </p>
 
       {msg && (
         <span className="cam__tl-msg dim" data-testid="timelapse-msg">

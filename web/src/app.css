@@ -1666,31 +1666,6 @@ div.lbl,
 .seg--target {
   margin-top: 0;
 }
-.cam__mode {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.6rem;
-  padding: 0.4rem 0.55rem;
-  border: 1px solid var(--hair);
-  border-radius: 7px;
-  background: var(--hair-2);
-}
-.cam__mode-info {
-  display: flex;
-  flex-direction: column;
-  gap: 0.12rem;
-  min-width: 0;
-}
-.cam__mode-name {
-  font-weight: 600;
-  font-size: 0.76rem;
-  color: var(--fg);
-}
-.cam__mode-desc {
-  font-size: 0.66rem;
-  line-height: 1.3;
-}
 /* secondary framing under the "recording" header (manual controls are not the primary
    path — recording arms at print start). */
 .cam__tl-cap {
@@ -1698,14 +1673,42 @@ div.lbl,
   font-size: 0.66rem;
   line-height: 1.35;
 }
-.cam__mode-act {
+/* a "now recording" row: type label · live readout · stop */
+.cam__rec-row {
   display: flex;
   align-items: center;
-  gap: 0.45rem;
-  flex-shrink: 0;
+  gap: 0.5rem;
+  padding: 0.35rem 0.55rem;
+  border: 1px solid var(--hair);
+  border-radius: 7px;
+  background: var(--hair-2);
 }
-.cam__mode-start {
-  flex-shrink: 0;
+.cam__rec-name {
+  font-weight: 600;
+  font-size: 0.74rem;
+}
+.cam__rec-row .cam__tl-rec {
+  margin-left: auto; /* push the readout + stop to the right */
+}
+/* the unified record control: what-to-record segmented + optional interval + record */
+.cam__rec {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.seg--rectype {
+  margin-top: 0;
+}
+.cam__rec-every {
+  font-size: 0.72rem;
+}
+.cam__rec-go {
+  margin-left: auto;
+}
+.cam__rec-hint {
+  font-size: 0.66rem;
+  line-height: 1.3;
 }
 .cam__tl-rec {
   color: var(--accent);
