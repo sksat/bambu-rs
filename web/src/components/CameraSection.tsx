@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   listCameras,
   getCamerasConfig,
@@ -139,11 +139,69 @@ function runLabel(run: RunState | undefined): string {
   return (n > 1 ? `${per} frames/cam · ${n} cams` : `${run?.frames ?? 0} frames`) + failed;
 }
 
-// Start/stop the serve-internal timelapse. Two independent runs of the SAME print
-// (both can be on at once): "smooth" grabs one frame per layer, synced to the
-// printer's park (object-only); "plain" samples every few seconds, head in shot
-// (the "watch it print" look). Captures the active camera tab, or — with "all
-// cams" — every configured camera at once. Polls `/api/timelapse`.
+// One timelapse mode as a self-describing row: its name, a VISIBLE plain-language
+// description of what it captures (not a tooltip — so it's obvious what each does), and a
+// start button, or — while running — a recording readout + stop. Each mode is an
+// independent run (all can be on at once).
+function ModeRow({
+  name,
+  desc,
+  testid,
+  run,
+  busy,
+  onStart,
+  onStop,
+  startDisabled,
+}: {
+  name: string;
+  desc: ReactNode;
+  testid: string;
+  run: RunState | undefined;
+  busy: boolean;
+  onStart: () => void;
+  onStop: () => void;
+  startDisabled?: boolean;
+}) {
+  return (
+    <div className="cam__mode" data-testid={`timelapse-${testid}`}>
+      <div className="cam__mode-info">
+        <span className="cam__mode-name">{name}</span>
+        <span className="cam__mode-desc dim">{desc}</span>
+      </div>
+      {run?.running ? (
+        <div className="cam__mode-act">
+          <span className="cam__tl-rec" data-testid={`timelapse-${testid}-running`}>
+            ● rec · {runLabel(run)}
+          </span>
+          <button
+            className="cam__btn"
+            data-testid={`timelapse-${testid}-stop`}
+            disabled={busy}
+            onClick={onStop}
+          >
+            stop
+          </button>
+        </div>
+      ) : (
+        <button
+          className="cam__btn cam__btn--save cam__mode-start"
+          data-testid={`timelapse-${testid}-start`}
+          disabled={busy || startDisabled}
+          onClick={onStart}
+        >
+          start
+        </button>
+      )}
+    </div>
+  );
+}
+
+// Start/stop the serve-internal timelapse capture for this print. Three independent
+// modes (any can be on at once), each self-describing: "smooth" = one clean frame per
+// layer (head parked out of shot); "plain" = a frame every N seconds (head in shot, a
+// normal video); "park" = live per-layer frames detected from the camera (scrubbed in the
+// park view above). Captures the active camera, or — with the "all cams" target — every
+// configured camera at once. Polls `/api/timelapse`.
 function TimelapseBar({
   cameras,
   activeCamera,
@@ -195,75 +253,56 @@ function TimelapseBar({
     setBusy(false);
   };
 
-  const target = allCams && multi ? `all (${cameras.length})` : activeCamera;
-
   return (
     <div className="cam__tl" data-testid="timelapse-bar">
-      {multi && (
-        <div className="cam__tl-row">
-          <label className="cam__tl-all" title="capture every camera at once (multi-angle)">
-            <input
-              type="checkbox"
-              checked={allCams}
+      <div className="cam__tl-head">
+        <span className="lbl">timelapse</span>
+        {/* Target: which camera(s) a started mode captures. Only when there's a choice. */}
+        {multi && (
+          <div className="seg seg--target" role="radiogroup" aria-label="capture target">
+            <button
+              className={`btn btn--sm seg__opt${!allCams ? " is-active" : ""}`}
+              role="radio"
+              aria-checked={!allCams}
+              disabled={busy}
+              title="capture only the camera shown above"
+              onClick={() => setAllCams(false)}
+            >
+              this cam
+            </button>
+            <button
+              className={`btn btn--sm seg__opt${allCams ? " is-active" : ""}`}
+              role="radio"
+              aria-checked={allCams}
               disabled={busy}
               data-testid="timelapse-all"
-              onChange={(e) => setAllCams(e.target.checked)}
-            />
-            <span className="dim">all cams</span>
-          </label>
-          <span className="dim">→ {target}</span>
-        </div>
-      )}
-
-      {/* smooth: one frame per layer, synced to the printer's park */}
-      <div className="cam__tl-row">
-        {tl?.smooth.running ? (
-          <>
-            <span className="cam__tl-rec" data-testid="timelapse-smooth-running">
-              ● smooth — {runLabel(tl.smooth)}
-            </span>
-            <button
-              className="cam__manage"
-              data-testid="timelapse-smooth-stop"
-              disabled={busy}
-              onClick={() => void stopMode("smooth")}
+              title="capture every configured camera at once (multi-angle)"
+              onClick={() => setAllCams(true)}
             >
-              stop
+              all cams ({cameras.length})
             </button>
-          </>
-        ) : (
-          <button
-            className="cam__manage"
-            data-testid="timelapse-smooth-start"
-            disabled={busy}
-            title="one frame per layer, synced to the printer's park (object-only)"
-            onClick={() => void startMode("smooth")}
-          >
-            ● smooth (per-layer)
-          </button>
+          </div>
         )}
       </div>
 
-      {/* plain: sample every N seconds, head in shot (the "watch it print" look) */}
-      <div className="cam__tl-row">
-        {tl?.plain.running ? (
-          <>
-            <span className="cam__tl-rec" data-testid="timelapse-plain-running">
-              ● plain — {runLabel(tl.plain)}
-            </span>
-            <button
-              className="cam__manage"
-              data-testid="timelapse-plain-stop"
-              disabled={busy}
-              onClick={() => void stopMode("plain")}
-            >
-              stop
-            </button>
-          </>
-        ) : (
-          <>
-            <label className="dim" title="sampling interval">
-              every{" "}
+      <ModeRow
+        name="smooth"
+        desc="one clean frame per layer — head parked out of shot (the classic timelapse)"
+        testid="smooth"
+        run={tl?.smooth}
+        busy={busy}
+        onStart={() => void startMode("smooth")}
+        onStop={() => void stopMode("smooth")}
+      />
+
+      <ModeRow
+        name="plain"
+        desc={
+          tl?.plain.running ? (
+            <>a frame every {plainSecs}s — head in shot (a normal sped-up video)</>
+          ) : (
+            <>
+              a frame every{" "}
               <input
                 className="pw cam__tl-secs"
                 inputMode="decimal"
@@ -272,51 +311,29 @@ function TimelapseBar({
                 data-testid="timelapse-plain-secs"
                 onChange={(e) => setPlainSecs(Number(e.target.value) || 0)}
               />{" "}
-              s
-            </label>
-            <button
-              className="cam__manage"
-              data-testid="timelapse-plain-start"
-              disabled={busy || plainSecs < 0.1}
-              title="sample a frame every N seconds, head in shot (a normal-looking video)"
-              onClick={() => void startMode("plain")}
-            >
-              ● plain (video)
-            </button>
-          </>
-        )}
-      </div>
-
-      {/* park: live "parked frame per layer" preview — only for park-capable cameras
-          (a stream + a calibrated tuning). Shows in the camera's `park` toggle view. */}
-      {activeIsPark && (
-        <div className="cam__tl-row">
-          {tl?.park.running ? (
-            <>
-              <span className="cam__tl-rec" data-testid="timelapse-park-running">
-                ● park — {runLabel(tl.park)}
-              </span>
-              <button
-                className="cam__manage"
-                data-testid="timelapse-park-stop"
-                disabled={busy}
-                onClick={() => void stopMode("park")}
-              >
-                stop
-              </button>
+              s — head in shot (a normal sped-up video)
             </>
-          ) : (
-            <button
-              className="cam__manage"
-              data-testid="timelapse-park-start"
-              disabled={busy}
-              title="live parked-frame preview per layer — switch the view to “park” to watch it"
-              onClick={() => void startMode("park")}
-            >
-              ● park (live preview)
-            </button>
-          )}
-        </div>
+          )
+        }
+        testid="plain"
+        run={tl?.plain}
+        busy={busy}
+        onStart={() => void startMode("plain")}
+        onStop={() => void stopMode("plain")}
+        startDisabled={plainSecs < 0.1}
+      />
+
+      {/* park: only for park-capable cameras (a stream + a calibrated tuning). */}
+      {activeIsPark && (
+        <ModeRow
+          name="park"
+          desc="live per-layer frames detected from the camera — scrub them in the park view above"
+          testid="park"
+          run={tl?.park}
+          busy={busy}
+          onStart={() => void startMode("park")}
+          onStop={() => void stopMode("park")}
+        />
       )}
 
       {msg && (
