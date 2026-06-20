@@ -17,6 +17,7 @@
 //! telemetry is broadly available.
 
 pub mod camera;
+pub mod captures;
 #[cfg(feature = "cli")]
 pub mod cli;
 pub mod client;

@@ -314,7 +314,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/cameras/{id}/stream", get(camera_stream))
         .route("/api/cameras/{id}/park", get(park_index))
         .route("/api/cameras/{id}/park/{n}", get(camera_park_frame))
-        .route("/api/timelapse", get(timelapse_status));
+        .route("/api/timelapse", get(timelapse_status))
+        .route("/api/capture", get(captures_list));
     let writes = Router::new()
         .route("/api/job/pause", post(job_pause))
         .route("/api/job/resume", post(job_resume))
@@ -1605,6 +1606,12 @@ fn sanitize_hint(s: &str) -> String {
     }
 }
 
+/// The root all capture runs are written under (relative to the serve's CWD). One place,
+/// so the listing endpoint and the writers agree.
+fn captures_root() -> std::path::PathBuf {
+    std::path::PathBuf::from("captures")
+}
+
 /// `captures/<epoch>_<print-hint>_<mode>/` — the per-run output dir (per-mode so a
 /// concurrent smooth/plain/park run never mixes frames).
 fn run_out_dir(st: &AppState, mode: &str) -> std::path::PathBuf {
@@ -1619,7 +1626,17 @@ fn run_out_dir(st: &AppState, mode: &str) -> std::path::PathBuf {
             .as_deref()
             .unwrap_or("print"),
     );
-    std::path::PathBuf::from("captures").join(format!("{epoch}_{hint}_{mode}"))
+    captures_root().join(format!("{epoch}_{hint}_{mode}"))
+}
+
+/// List finished/in-progress capture runs on disk (open read): each run's recordings, so
+/// the dashboard can review and download them. Reads `captures/` lazily off the blocking
+/// pool. An absent root → an empty list, never an error.
+async fn captures_list(State(_st): State<AppState>) -> Response {
+    let runs = tokio::task::spawn_blocking(|| crate::captures::list_captures(&captures_root()))
+        .await
+        .unwrap_or_default();
+    Json(json!({ "captures": runs })).into_response()
 }
 
 /// Resolve the park-capable cameras among `ids` and start the live park slot. A camera is
@@ -2907,6 +2924,17 @@ mod tests {
             res.json::<serde_json::Value>()["plan"]["has_timelapse_blocks"].is_null(),
             "uninspectable file → unknown (null), gracefully"
         );
+    }
+
+    #[tokio::test]
+    async fn captures_list_is_open_and_returns_an_array() {
+        // Open read; shape is `{ captures: [...] }` (contents depend on ./captures, which
+        // may be empty). The listing logic itself is unit-tested in `crate::captures`.
+        let res = app(Some("secret"), FakeController::verified())
+            .get("/api/capture")
+            .await;
+        res.assert_status_ok();
+        assert!(res.json::<serde_json::Value>()["captures"].is_array());
     }
 
     #[tokio::test]
