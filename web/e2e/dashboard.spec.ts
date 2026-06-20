@@ -118,6 +118,43 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("files-path")).toHaveText("/");
   });
 
+  test("changing directory clears the old listing immediately (loading state)", async ({
+    page,
+  }) => {
+    // The printer's FTP listing can take seconds; the view must respond AT ONCE rather than
+    // showing the old dir's files until the slow fetch lands. Make the subdir slow and assert
+    // that on entry the old files are gone and a loading indicator shows.
+    await page.route(/\/api\/file\?dir=/, async (route) => {
+      const dir = new URL(route.request().url()).searchParams.get("dir");
+      if (dir === "/") {
+        await route.fulfill({
+          json: {
+            files: [
+              { name: "sub", is_dir: true, size: 0 },
+              { name: "ROOT_FILE.gcode.3mf", is_dir: false, size: 1 },
+            ],
+          },
+        });
+      } else if (dir === "/sub") {
+        await new Promise((r) => setTimeout(r, 1500));
+        await route.fulfill({ json: { files: [{ name: "SUB_FILE.gcode.3mf", is_dir: false, size: 2 }] } });
+      } else {
+        await route.fulfill({ json: { files: [] } });
+      }
+    });
+    await page.reload();
+    const sub = page.getByTestId("dir").filter({ hasText: "sub" });
+    await expect(sub).toBeVisible();
+    await sub.click();
+    // Immediately: path switched, the old listing is gone, and a loading indicator shows —
+    // not the stale root files lingering during the slow fetch.
+    await expect(page.getByTestId("files-path")).toHaveText("/sub");
+    await expect(page.getByTestId("files-loading")).toBeVisible();
+    expect(await page.getByText("ROOT_FILE.gcode.3mf").count()).toBe(0);
+    // Then the subdir's listing arrives.
+    await expect(page.getByText("SUB_FILE.gcode.3mf")).toBeVisible();
+  });
+
   test("changing directory drops a stale in-flight listing for the old dir", async ({ page }) => {
     // Reproduces the bug where the list lagged a CWD change: a slow listing for the dir we
     // just left lands AFTER the new one and reverts the view. Root is mocked slow on its

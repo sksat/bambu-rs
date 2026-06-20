@@ -75,9 +75,13 @@ export function FilesSection({ sdcard }: { sdcard?: boolean | null }) {
   }, []);
 
   // (Re)load on directory change, and auto-refresh on a timer. Point dirRef at the current
-  // dir synchronously here so in-flight fetches for the previous dir are recognised as stale.
+  // dir synchronously, and clear the listing to a loading state at once — the printer's FTP
+  // listing can take seconds, and showing the previous dir's files until it lands is the
+  // "the list doesn't change when I change directory" bug. Clearing happens only here (on a
+  // dir change), so the periodic auto-refresh updates in place without flashing "loading".
   useEffect(() => {
     dirRef.current = dir;
+    setEntries(null);
     void refresh(dir);
     const id = setInterval(() => void refresh(dir), REFRESH_MS);
     return () => clearInterval(id);
@@ -206,7 +210,14 @@ export function FilesSection({ sdcard }: { sdcard?: boolean | null }) {
             </li>
           ),
         )}
-        {sorted.length === 0 && <li className="filelist__empty dim">empty</li>}
+        {entries === null && (
+          <li className="filelist__empty dim" data-testid="files-loading">
+            loading…
+          </li>
+        )}
+        {entries !== null && sorted.length === 0 && (
+          <li className="filelist__empty dim">empty</li>
+        )}
       </ul>
       {printing && <StartDialog path={printing} onClose={() => setPrinting(null)} />}
       {detail && (
