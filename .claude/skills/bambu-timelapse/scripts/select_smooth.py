@@ -20,9 +20,13 @@ emitting a head-over-print frame — a bad frame is worse than a gap.
 stdlib only: JPEGs are decoded to tiny raw grayscale via ffmpeg (already required by
 the rest of the timelapse tooling); all scoring is pure Python. No numpy/Pillow.
 
+Heuristics have NO code defaults (camera/printer placement is setup-specific): pass them
+via --config (copy tuning.example.json) and/or --<knob> overrides; select needs only its
+own knobs (left_frac, min_outlier, min_left_density, min_confidence, select_candidate_frac).
+
 Usage:
-  select_smooth.py <capture_dir>/<cam-id> [--report scores.json]
-  select_smooth.py captures/<run>_smooth/ext-1 --out selected --assemble out.mp4 --fps 12
+  select_smooth.py <capture_dir>/<cam-id> --config tuning.json [--report scores.json]
+  select_smooth.py captures/<run>_smooth/ext-1 --config tuning.json --out selected --assemble out.mp4 --out-fps 12
 """
 import argparse
 import json
@@ -86,7 +90,7 @@ def _norm(v, lo, hi):
     return 0.0 if hi <= lo else (v - lo) / (hi - lo)
 
 
-def select_frame(frames, w, h, cfg=None):
+def select_frame(frames, w, h, cfg):
     """Pick the parked frame from one layer's burst, or skip. Pure: `frames` is a
     list of {"offset_ms", "gray"} already decoded to grayscale. Returns a dict with
     decision ("selected"/"skip"), selected_offset_ms, confidence, reason, per_frame.
@@ -97,13 +101,16 @@ def select_frame(frames, w, h, cfg=None):
     frame — where the X-min park appears for a left-mounted camera). The park frame's
     left-mass is a strong OUTLIER vs the burst median; the sharpest such frame wins.
     A layer whose park fell outside the burst shows no outlier and is SKIPPED
-    (a head-over-print frame would be worse than a gap)."""
-    cfg = cfg or {}
-    left_frac = cfg.get("left_frac", 0.33)           # park zone = left this fraction
-    min_outlier = cfg.get("min_outlier", 2.5)        # park left-mass vs burst median
-    min_left_density = cfg.get("min_left_density", 3.0)  # mean park-zone darkness (0-255)
-    cand_frac = cfg.get("candidate_frac", 0.6)       # frames within 60% of max left-mass
-    min_conf = cfg.get("min_confidence", 0.40)
+    (a head-over-print frame would be worse than a gap).
+
+    Every knob comes from `cfg` (see _tuning.py) — NO baked defaults, since they depend
+    on the camera/printer placement; a missing one is a KeyError surfaced loudly by the
+    caller's resolve_tuning rather than a silent stale value."""
+    left_frac = cfg["left_frac"]                      # park zone = left this fraction
+    min_outlier = cfg["min_outlier"]                  # park left-mass vs burst median
+    min_left_density = cfg["min_left_density"]        # mean park-zone darkness (0-255)
+    cand_frac = cfg["select_candidate_frac"]          # sharpest among frames >= this * max
+    min_conf = cfg["min_confidence"]
 
     grays = [f["gray"] for f in frames]
     med = _median_image(grays)
@@ -186,18 +193,23 @@ def group_bursts(cam_dir):
 
 
 def main():
+    from _tuning import add_tuning_args, resolve_tuning
+    required = ["left_frac", "min_outlier", "min_left_density",
+                "min_confidence", "select_candidate_frac"]
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cam_dir", help="a capture camera dir, e.g. captures/<run>_smooth/ext-1")
     ap.add_argument("--out", help="copy selected frames here (one per kept layer)")
     ap.add_argument("--report", help="write per-layer scores JSON here")
     ap.add_argument("--assemble", help="assemble selected frames into this mp4 (needs --out)")
-    ap.add_argument("--fps", type=int, default=12)
+    ap.add_argument("--out-fps", type=int, default=12, help="output timelapse playback fps")
     ap.add_argument("--width", type=int, default=DECODE_W)
     ap.add_argument("--height", type=int, default=DECODE_H)
     ap.add_argument("--hold-last", action="store_true",
                     help="on a skipped layer, repeat the previous kept frame instead of dropping it")
+    add_tuning_args(ap)
     args = ap.parse_args()
+    cfg = resolve_tuning(args, required)
 
     groups = group_bursts(args.cam_dir)
     if not groups:
@@ -210,7 +222,7 @@ def main():
         items = groups[layer]
         frames = [{"offset_ms": off, "gray": decode_gray(p, args.width, args.height),
                    "path": p} for off, p in items]
-        sel = select_frame(frames, args.width, args.height)
+        sel = select_frame(frames, args.width, args.height, cfg)
         by_off = {f["offset_ms"]: f["path"] for f in frames}
         chosen = by_off.get(sel["selected_offset_ms"]) if sel["decision"] == "selected" else None
         results.append({"layer": layer, **{k: sel[k] for k in
@@ -248,7 +260,7 @@ def main():
             shutil.copy(p, os.path.join(args.out, f"sel_{n:06}.jpg"))
         print(f"copied {len(selected_paths)} frames -> {args.out}")
         if args.assemble:
-            cmd = ["ffmpeg", "-y", "-framerate", str(args.fps), "-i",
+            cmd = ["ffmpeg", "-y", "-framerate", str(args.out_fps), "-i",
                    os.path.join(args.out, "sel_%06d.jpg"),
                    "-vf", "scale='min(1280,iw)':-2,format=yuv420p",
                    "-c:v", "libx264", "-crf", "23", args.assemble]

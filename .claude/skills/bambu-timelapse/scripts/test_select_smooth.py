@@ -7,12 +7,18 @@ that is over the print in the MAJORITY of the burst (so the per-burst median = t
 printing scene, as on the real printer) and parks far-left in a minority of frames.
 Run: python3 test_select_smooth.py
 """
+import json
 import os
 import sys
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
 from select_smooth import select_frame  # noqa: E402
+
+# The heuristics have no code defaults; source them from the example config (as a real
+# run would via --config). select reads only its own knobs out of the shared file.
+EX = json.load(open(os.path.join(HERE, "tuning.example.json")))
 
 W, H = 48, 24
 BG, OBJ, HEAD = 200, 110, 25
@@ -47,7 +53,7 @@ class SelectFrameTests(unittest.TestCase):
         # majority over-print; head parks far-left (sharp) for two frames
         b = burst([(300, CENTER, True), (500, CENTER, True), (700, 6, True),
                    (900, 6, True), (1100, CENTER, True), (1300, CENTER, True)])
-        r = select_frame(b, W, H)
+        r = select_frame(b, W, H, EX)
         self.assertEqual(r["decision"], "selected", r)
         self.assertIn(r["selected_offset_ms"], (700, 900), r)
 
@@ -55,7 +61,7 @@ class SelectFrameTests(unittest.TestCase):
         # head never leaves the print -> object zone never clears -> skip
         b = burst([(300, CENTER, True), (500, CENTER, True), (700, CENTER, True),
                    (900, CENTER, True)])
-        r = select_frame(b, W, H)
+        r = select_frame(b, W, H, EX)
         self.assertEqual(r["decision"], "skip", r)
 
     def test_prefers_sharp_park_over_blurred_more_left(self):
@@ -63,7 +69,7 @@ class SelectFrameTests(unittest.TestCase):
         # settled sharp park -> pick the sharp one, not just the leftmost.
         b = burst([(300, CENTER, True), (500, CENTER, True), (700, 3, False),
                    (900, 8, True), (1100, CENTER, True), (1300, CENTER, True)])
-        r = select_frame(b, W, H)
+        r = select_frame(b, W, H, EX)
         self.assertEqual(r["decision"], "selected", r)
         self.assertEqual(r["selected_offset_ms"], 900, r)
 
@@ -72,7 +78,7 @@ class SelectFrameTests(unittest.TestCase):
         # object must not look like "head over center" and block a valid park pick.
         b = burst([(300, CENTER, True), (500, CENTER, True), (700, 6, True),
                    (900, 6, True), (1100, CENTER, True), (1300, CENTER, True)])
-        r = select_frame(b, W, H)
+        r = select_frame(b, W, H, EX)
         self.assertEqual(r["decision"], "selected", r)
 
     def test_panned_camera_still_resolves_the_park(self):
@@ -81,7 +87,7 @@ class SelectFrameTests(unittest.TestCase):
         b = burst([(300, CENTER + 10, True), (500, CENTER + 10, True), (700, 16, True),
                    (900, 16, True), (1100, CENTER + 10, True), (1300, CENTER + 10, True)],
                   obj_x=CENTER + 10)
-        r = select_frame(b, W, H)
+        r = select_frame(b, W, H, EX)
         self.assertEqual(r["decision"], "selected", r)
         self.assertIn(r["selected_offset_ms"], (700, 900), r)
 
@@ -90,7 +96,7 @@ class SelectFrameTests(unittest.TestCase):
         # print -> must skip, not emit a head-over-print frame.
         b = burst([(900, CENTER, True), (1100, CENTER, True), (1300, CENTER, True),
                    (1500, CENTER, True)])
-        r = select_frame(b, W, H)
+        r = select_frame(b, W, H, EX)
         self.assertEqual(r["decision"], "skip", r)
 
 

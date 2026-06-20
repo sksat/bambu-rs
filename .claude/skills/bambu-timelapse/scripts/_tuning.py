@@ -22,6 +22,12 @@ KNOBS = {
     "candidate_frac": "pick the sharpest frame among those >= this * island max",
     "warmup_s": "(live) settle the background this long before emitting (s)",
     "baseline_s": "(live) rolling-baseline window for the threshold (s)",
+    "min_outlier": "(select) park left-mass outlier ratio vs the burst median",
+    "min_left_density": "(select) min mean park-zone darkness, 0-255",
+    "min_confidence": "(select) min selection confidence to keep a layer",
+    "select_candidate_frac": "(select) sharpest among burst frames >= this * burst max "
+                             "(separate from candidate_frac: select subtracts the burst median, "
+                             "mine/live use the EMA background — so they calibrate differently)",
 }
 
 

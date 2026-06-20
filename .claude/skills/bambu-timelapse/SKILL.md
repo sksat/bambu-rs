@@ -170,11 +170,15 @@ camera. The batch `mine_smooth.py` stays the choice for post-print mining of a s
 
 A camera with no `/stream` to mine can't use the miner; its per-layer `smooth` burst
 is picked by `scripts/select_smooth.py` (parked frame per layer, skips layers whose
-park fell outside the burst window). Tune `burst_offsets_ms` / `left_frac` /
-`min_left_density`. Expect to miss most layers — prefer the stream + miner where you can.
+park fell outside the burst window). It shares the same no-defaults `--config` (copy
+`tuning.example.json`); select reads only its own knobs — `left_frac`,
+`min_outlier`, `min_left_density`, `min_confidence`, and `select_candidate_frac` (kept
+separate from the miner's `candidate_frac` because select scores burst-median-subtracted
+frames, not the EMA background). Also widen/shift `burst_offsets_ms` at capture time.
+Expect to miss most layers — prefer the stream + miner where you can.
 
 ```bash
-scripts/select_smooth.py captures/<run>_smooth/ext-0 --out /tmp/sel --assemble out.mp4
+scripts/select_smooth.py captures/<run>_smooth/ext-0 --config my-setup.json --out /tmp/sel --assemble out.mp4
 ```
 
 ## VERIFIED failures — don't repeat these

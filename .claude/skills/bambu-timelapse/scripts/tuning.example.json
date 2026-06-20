@@ -1,5 +1,6 @@
 {
   "_comment": "EXAMPLE park-detection tuning for ONE specific setup: a Bambu A1 mini with a LEFT-mounted ustreamer camera, ~64x36 detection. These are NOT universal — they depend on where the camera and printer sit and how big/dark the toolhead looks. RE-CALIBRATE when the camera or printer moves (especially left_frac, abs_floor, min_left_density). Copy this file, edit for your setup, and pass it with --config. There are deliberately NO defaults in the code.",
+  "_comment_select": "The min_outlier/min_left_density/min_confidence/select_candidate_frac knobs are used ONLY by select_smooth.py (the burst fallback). select_candidate_frac is deliberately separate from candidate_frac and tuned differently (0.6 vs 0.75): select scores burst frames after subtracting the per-burst MEDIAN, while mine/live score against a causal EMA background, so the 'sharpest among the strong' cutoff differs. Each script requires only its own knobs, so a select-only or mine-only config can omit the rest.",
   "fps": 4,
   "left_frac": 0.33,
   "ema_seconds": 30.0,
@@ -10,5 +11,9 @@
   "min_sep_s": 3.0,
   "candidate_frac": 0.75,
   "warmup_s": 4.0,
-  "baseline_s": 90.0
+  "baseline_s": 90.0,
+  "min_outlier": 2.5,
+  "min_left_density": 3.0,
+  "min_confidence": 0.40,
+  "select_candidate_frac": 0.6
 }
