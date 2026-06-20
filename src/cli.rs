@@ -854,12 +854,18 @@ fn fetch_serve_status(base: &str) -> Result<PrinterStatus, CliError> {
         .get(&url)
         .call()
         .map_err(|e| {
-            CliError::new(exit::TRANSPORT, format!("couldn't reach serve at {url}: {e}"))
+            CliError::new(
+                exit::TRANSPORT,
+                format!("couldn't reach serve at {url}: {e}"),
+            )
         })?;
     // ureq is built without its `json` feature (no `into_json`), so read the body
     // and parse with serde_json directly.
     let body = resp.into_string().map_err(|e| {
-        CliError::new(exit::TRANSPORT, format!("couldn't read response from {url}: {e}"))
+        CliError::new(
+            exit::TRANSPORT,
+            format!("couldn't read response from {url}: {e}"),
+        )
     })?;
     serde_json::from_str::<PrinterStatus>(&body).map_err(|e| {
         CliError::new(
@@ -1704,7 +1710,9 @@ fn run_job_start_upload(
     if remote.to_ascii_lowercase().ends_with(".3mf") != is_3mf {
         return Err(CliError::new(
             exit::VALIDATION,
-            format!("--dest {remote:?} must keep {basename:?}'s type (both .3mf, or both raw .gcode)"),
+            format!(
+                "--dest {remote:?} must keep {basename:?}'s type (both .3mf, or both raw .gcode)"
+            ),
         ));
     }
 
@@ -1747,8 +1755,15 @@ fn run_job_start_upload(
 
     if dry_run {
         // Plan: the resolved command + what would be uploaded where (nothing is sent).
-        let mut plan = start_plan_json(&cmd, &remote, inspection.as_ref(), None, parsed_ams.as_deref());
-        plan["upload"] = serde_json::json!({ "local": local, "remote": remote, "overwrite": overwrite });
+        let mut plan = start_plan_json(
+            &cmd,
+            &remote,
+            inspection.as_ref(),
+            None,
+            parsed_ams.as_deref(),
+        );
+        plan["upload"] =
+            serde_json::json!({ "local": local, "remote": remote, "overwrite": overwrite });
         print_json(&plan);
         return Ok(());
     }
@@ -2405,7 +2420,17 @@ fn build_ffmpeg_args(
             ),
         ));
     }
-    args.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart"].map(String::from));
+    args.extend(
+        [
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+        ]
+        .map(String::from),
+    );
     args.push(out.display().to_string());
     Ok(args)
 }
@@ -2838,8 +2863,13 @@ mod tests {
     fn encode_args_for_an_mjpeg_stream() {
         use super::build_ffmpeg_args;
         use std::path::Path;
-        let args =
-            build_ffmpeg_args(Path::new("/r/plain.mjpeg"), Path::new("/r/plain.mp4"), 30, 8).unwrap();
+        let args = build_ffmpeg_args(
+            Path::new("/r/plain.mjpeg"),
+            Path::new("/r/plain.mp4"),
+            30,
+            8,
+        )
+        .unwrap();
         let joined = args.join(" ");
         assert!(joined.contains("-f mpjpeg"), "{joined}");
         assert!(joined.contains("-i /r/plain.mjpeg"));
@@ -2865,7 +2895,10 @@ mod tests {
         // frames at the original spacing).
         let fast = build_ffmpeg_args(&dir, &out, 20, 4).unwrap().join(" ");
         assert!(fast.contains("framestep=4"), "{fast}");
-        assert!(fast.contains("setpts=N/20/TB"), "stepped frames must be re-timed: {fast}");
+        assert!(
+            fast.contains("setpts=N/20/TB"),
+            "stepped frames must be re-timed: {fast}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2886,7 +2919,10 @@ mod tests {
             default_mp4_out(Path::new("/r/plain.mjpeg")),
             Path::new("/r/plain.mp4")
         );
-        assert_eq!(default_mp4_out(Path::new("/r/ext-1")), Path::new("/r/ext-1.mp4"));
+        assert_eq!(
+            default_mp4_out(Path::new("/r/ext-1")),
+            Path::new("/r/ext-1.mp4")
+        );
     }
 
     #[test]

@@ -102,12 +102,17 @@ pub fn record_loop(
         match (open)() {
             Ok(mut opened) => {
                 stats.connections += 1;
-                let (end, n) =
-                    copy_until(&mut *opened.reader, sink, cancel, max_bytes - stats.bytes, &mut buf);
+                let (end, n) = copy_until(
+                    &mut *opened.reader,
+                    sink,
+                    cancel,
+                    max_bytes - stats.bytes,
+                    &mut buf,
+                );
                 stats.bytes += n; // always count what was written, even on error
                 match end {
-                    CopyEnd::Eof => {}                         // reconnect
-                    CopyEnd::Errored => stats.failures += 1,   // count + reconnect
+                    CopyEnd::Eof => {}                       // reconnect
+                    CopyEnd::Errored => stats.failures += 1, // count + reconnect
                     CopyEnd::Cancelled | CopyEnd::CapReached => return stats,
                 }
             }
@@ -160,7 +165,10 @@ mod tests {
     impl Read for BytesThenErr {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             if self.pos >= self.data.len() {
-                return Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "drop"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "drop",
+                ));
             }
             let n = buf.len().min(self.data.len() - self.pos);
             buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
@@ -173,7 +181,10 @@ mod tests {
     fn copy_until_keeps_bytes_written_before_a_read_error() {
         // The bug the cap relies on NOT having: a mid-stream error must still report
         // the bytes already written, or a flaky stream blows past the cap.
-        let mut r = BytesThenErr { data: b"abc".to_vec(), pos: 0 };
+        let mut r = BytesThenErr {
+            data: b"abc".to_vec(),
+            pos: 0,
+        };
         let mut sink: Vec<u8> = Vec::new();
         let mut buf = [0u8; 2];
         let (end, n) = copy_until(&mut r, &mut sink, &never, 1_000, &mut buf);

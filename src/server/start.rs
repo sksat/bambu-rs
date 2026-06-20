@@ -125,7 +125,9 @@ mod tests {
             inspection: None,
         };
         match req.to_command() {
-            ProtoCommand::ProjectFile(pf) => assert!(pf.timelapse, "arms the sliced timelapse gcode"),
+            ProtoCommand::ProjectFile(pf) => {
+                assert!(pf.timelapse, "arms the sliced timelapse gcode")
+            }
             other => panic!("expected ProjectFile, got {other:?}"),
         }
     }

@@ -160,7 +160,12 @@ fn upload_rejects_expect_guards() {
     let cfg = tmp_cfg("upload-expect");
     bambu(&cfg)
         .args([
-            "job", "start", "/tmp/whatever.3mf", "--upload", "--expect-plate", "1",
+            "job",
+            "start",
+            "/tmp/whatever.3mf",
+            "--upload",
+            "--expect-plate",
+            "1",
         ])
         .assert()
         .code(3); // VALIDATION
@@ -174,8 +179,13 @@ fn upload_dest_must_keep_the_file_type() {
     let cfg = tmp_cfg("upload-dest-type");
     bambu(&cfg)
         .args([
-            "job", "start", "/tmp/model.gcode.3mf", "--upload", "--dest",
-            "/cache/model.gcode", "--confirm",
+            "job",
+            "start",
+            "/tmp/model.gcode.3mf",
+            "--upload",
+            "--dest",
+            "/cache/model.gcode",
+            "--confirm",
         ])
         .assert()
         .code(3); // VALIDATION

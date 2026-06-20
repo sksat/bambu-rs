@@ -35,7 +35,6 @@ use super::assets::static_handler;
 #[cfg(test)]
 use super::camera::NoCamera;
 use super::camera::{CameraSource, ExternalCamera, open_mjpeg_stream, url_stream_opener};
-use super::timelapse::{DEFAULT_SMOOTH_BURST_MS, FrameGrab, PlainCapture, TimelapseManager};
 #[cfg(test)]
 use super::control::FakeController;
 use super::control::{
@@ -47,6 +46,7 @@ use super::files::FileStore;
 #[cfg(test)]
 use super::start::FakeStarter;
 use super::start::{StartRequest, Starter};
+use super::timelapse::{DEFAULT_SMOOTH_BURST_MS, FrameGrab, PlainCapture, TimelapseManager};
 use crate::core::command::{AmsControl, LedNode, SpeedLevel};
 use crate::core::safety::{GcodeVerdict, TempLimits, check_extrude, check_gcode, check_jog};
 use crate::core::session::CommandOutcome;
@@ -1193,7 +1193,9 @@ async fn camera_stream(State(st): State<AppState>, Path(id): Path<String>) -> Re
     let opened = tokio::task::spawn_blocking(move || open_mjpeg_stream(&url)).await;
     let (ctype, reader) = match opened {
         Ok(Ok(s)) => (s.content_type, s.reader),
-        Ok(Err(e)) => return (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
+        Ok(Err(e)) => {
+            return (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response();
+        }
         Err(_) => return server_error("camera stream task failed".to_string()),
     };
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
@@ -1206,7 +1208,10 @@ async fn camera_stream(State(st): State<AppState>, Path(id): Path<String>) -> Re
                 Ok(n) => {
                     // blocking_send applies backpressure and fails once the client
                     // (receiver) is gone — either way we then stop reading upstream.
-                    if tx.blocking_send(Ok(Bytes::copy_from_slice(&buf[..n]))).is_err() {
+                    if tx
+                        .blocking_send(Ok(Bytes::copy_from_slice(&buf[..n])))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -1290,7 +1295,10 @@ async fn cameras_config_set(
                 .into_response();
         }
         // A stream URL, if given, is proxied too — apply the same scheme guard.
-        let stream_url = e.stream_url.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let stream_url = e
+            .stream_url
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         if let Some(s) = &stream_url
             && !is_http_url(s)
         {
@@ -1380,7 +1388,10 @@ fn timelapse_status_json(st: &AppState) -> serde_json::Value {
     let plain = st.timelapse.status_plain();
     let mut out = smooth.to_json();
     if let Some(o) = out.as_object_mut() {
-        o.insert("running".to_string(), json!(smooth.running || plain.running));
+        o.insert(
+            "running".to_string(),
+            json!(smooth.running || plain.running),
+        );
         o.insert("smooth".to_string(), smooth.to_json());
         o.insert("plain".to_string(), plain.to_json());
     }
@@ -1409,7 +1420,13 @@ fn resolve_grab(st: &AppState, camera: &str) -> Option<(String, FrameGrab)> {
 fn sanitize_hint(s: &str) -> String {
     let cleaned: String = s
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .take(40)
         .collect();
     let trimmed = cleaned.trim_matches('_');
@@ -1423,7 +1440,10 @@ fn sanitize_hint(s: &str) -> String {
 /// Start a per-layer timelapse capture from a configured camera (gated write).
 /// 409 if one is already running; 404 for an unknown/unconfigured camera. Frames
 /// land in `./captures/<epoch>_<print-hint>/`.
-async fn timelapse_start(State(st): State<AppState>, Json(b): Json<TimelapseStartBody>) -> Response {
+async fn timelapse_start(
+    State(st): State<AppState>,
+    Json(b): Json<TimelapseStartBody>,
+) -> Response {
     // Validate the mode's cadence up front (before resolving cameras), so a bad
     // `every`/`interval_ms` is a clean 400 regardless of camera config.
     let mode = b.mode.as_deref().unwrap_or("smooth");
@@ -1479,7 +1499,13 @@ async fn timelapse_start(State(st): State<AppState>, Json(b): Json<TimelapseStar
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let hint = sanitize_hint(st.source.current().subtask_name.as_deref().unwrap_or("print"));
+    let hint = sanitize_hint(
+        st.source
+            .current()
+            .subtask_name
+            .as_deref()
+            .unwrap_or("print"),
+    );
     // Per-mode dir so a concurrent smooth + plain run never mix their frames.
     let out_dir = std::path::PathBuf::from("captures").join(format!("{epoch}_{hint}_{mode}"));
     let rx = st.source.subscribe();
@@ -1491,18 +1517,22 @@ async fn timelapse_start(State(st): State<AppState>, Json(b): Json<TimelapseStar
             let caps: Vec<PlainCapture> = ids
                 .iter()
                 .zip(grabs)
-                .map(|(id, (gid, grab))| match resolve_stream_url(id, &externals) {
-                    Some(url) => PlainCapture::Stream {
-                        id: gid,
-                        open: url_stream_opener(url),
+                .map(
+                    |(id, (gid, grab))| match resolve_stream_url(id, &externals) {
+                        Some(url) => PlainCapture::Stream {
+                            id: gid,
+                            open: url_stream_opener(url),
+                        },
+                        None => PlainCapture::Sample { id: gid, grab },
                     },
-                    None => PlainCapture::Sample { id: gid, grab },
-                })
+                )
                 .collect();
             drop(externals);
             st.timelapse.start_plain(caps, interval_ms, rx, out_dir)
         }
-        _ => st.timelapse.start_smooth(grabs, b.every, burst_offsets, rx, out_dir),
+        _ => st
+            .timelapse
+            .start_smooth(grabs, b.every, burst_offsets, rx, out_dir),
     };
     match res {
         Ok(()) => Json(timelapse_status_json(&st)).into_response(),
@@ -1518,7 +1548,9 @@ async fn timelapse_stop(
     State(st): State<AppState>,
     body: Option<Json<TimelapseStopBody>>,
 ) -> Response {
-    let mode = body.and_then(|b| b.0.mode).unwrap_or_else(|| "all".to_string());
+    let mode = body
+        .and_then(|b| b.0.mode)
+        .unwrap_or_else(|| "all".to_string());
     match mode.as_str() {
         "smooth" => {
             st.timelapse.stop_smooth();
@@ -1530,7 +1562,11 @@ async fn timelapse_stop(
             st.timelapse.stop_smooth();
             st.timelapse.stop_plain();
         }
-        other => return bad_request(format!("unknown mode {other:?} (use smooth, plain, or all)")),
+        other => {
+            return bad_request(format!(
+                "unknown mode {other:?} (use smooth, plain, or all)"
+            ));
+        }
     }
     Json(timelapse_status_json(&st)).into_response()
 }
@@ -1659,7 +1695,9 @@ async fn job_upload_start(
     if !q.confirm && !q.dry_run {
         return (
             StatusCode::PRECONDITION_REQUIRED,
-            Json(json!({ "error": "confirm required: add &confirm=true (try &dry_run=true first)" })),
+            Json(
+                json!({ "error": "confirm required: add &confirm=true (try &dry_run=true first)" }),
+            ),
         )
             .into_response();
     }
@@ -1703,8 +1741,9 @@ async fn job_upload_start(
     let inspection = if is_3mf {
         match std::fs::read(tmp.path())
             .map_err(|e| e.to_string())
-            .and_then(|b| crate::core::project::inspect_plate(&b, q.plate).map_err(|e| e.to_string()))
-        {
+            .and_then(|b| {
+                crate::core::project::inspect_plate(&b, q.plate).map_err(|e| e.to_string())
+            }) {
             Ok(insp) => Some(insp),
             Err(e) => return bad_request(format!("3mf inspection: {e}")),
         }
@@ -1766,7 +1805,9 @@ async fn job_upload_start(
     drop(tmp); // remove the staged file once uploaded (or on error)
     match up {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => return (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
+        Ok(Err(e)) => {
+            return (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response();
+        }
         Err(_) => return server_error("upload task failed".to_string()),
     }
 
@@ -2317,7 +2358,7 @@ mod tests {
 
     #[test]
     fn resolve_stream_url_only_for_ext_with_a_stream() {
-        use super::{resolve_stream_url, ExternalCamera};
+        use super::{ExternalCamera, resolve_stream_url};
         let cams = vec![
             ExternalCamera::new(
                 Some("a".into()),
@@ -2385,7 +2426,9 @@ mod tests {
 
     #[tokio::test]
     async fn timelapse_status_is_open_and_initially_idle() {
-        let res = app(None, FakeController::verified()).get("/api/timelapse").await;
+        let res = app(None, FakeController::verified())
+            .get("/api/timelapse")
+            .await;
         res.assert_status_ok();
         assert_eq!(res.json::<serde_json::Value>()["running"], false);
     }

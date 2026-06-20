@@ -204,7 +204,11 @@ mod tests {
             "task_id": "B", "gcode_file": "b.3mf", "gcode_state": "PREPARE",
         }}));
         let p = rs.pointer("/print").unwrap();
-        assert_eq!(p.get("mc_percent"), Some(&json!(0)), "stale 100% must reset on a new print");
+        assert_eq!(
+            p.get("mc_percent"),
+            Some(&json!(0)),
+            "stale 100% must reset on a new print"
+        );
         assert_eq!(p.get("layer_num"), Some(&json!(0)));
     }
 
@@ -214,7 +218,11 @@ mod tests {
         rs.apply(json!({ "print": { "task_id": "A", "mc_percent": 30, "layer_num": 5 } }));
         rs.apply(json!({ "print": { "mc_percent": 31 } })); // same print, later delta
         let p = rs.pointer("/print").unwrap();
-        assert_eq!(p.get("mc_percent"), Some(&json!(31)), "same-print progress must not be zeroed");
+        assert_eq!(
+            p.get("mc_percent"),
+            Some(&json!(31)),
+            "same-print progress must not be zeroed"
+        );
         assert_eq!(p.get("layer_num"), Some(&json!(5)));
     }
 
@@ -223,7 +231,11 @@ mod tests {
         let mut rs = ReportState::new();
         rs.apply(json!({ "print": { "task_id": "A", "mc_percent": 100 } }));
         rs.apply(json!({ "print": { "task_id": "B", "mc_percent": 7 } }));
-        assert_eq!(rs.pointer("/print/mc_percent"), Some(&json!(7)), "trust a fresh percent");
+        assert_eq!(
+            rs.pointer("/print/mc_percent"),
+            Some(&json!(7)),
+            "trust a fresh percent"
+        );
     }
 
     #[test]
@@ -233,7 +245,11 @@ mod tests {
         let mut rs = ReportState::new();
         rs.apply(json!({ "print": { "task_id": "A", "mc_percent": 100, "layer_num": 60 } }));
         rs.apply(json!({ "print": { "task_id": "", "gcode_state": "FINISH" } }));
-        assert_eq!(rs.pointer("/print/mc_percent"), Some(&json!(100)), "a finished print keeps 100%");
+        assert_eq!(
+            rs.pointer("/print/mc_percent"),
+            Some(&json!(100)),
+            "a finished print keeps 100%"
+        );
     }
 
     #[test]

@@ -878,15 +878,24 @@ mod tests {
     fn device_error_attaches_a_message_only_for_device_verified_codes() {
         // Verified on the real A1 mini screen (filament/toolhead faults).
         assert_eq!(
-            DeviceError::from_code(0x1200_8015).unwrap().message.as_deref(),
+            DeviceError::from_code(0x1200_8015)
+                .unwrap()
+                .message
+                .as_deref(),
             Some("couldn't pull the filament out of the toolhead")
         );
         assert_eq!(
-            DeviceError::from_code(0x1200_8014).unwrap().message.as_deref(),
+            DeviceError::from_code(0x1200_8014)
+                .unwrap()
+                .message
+                .as_deref(),
             Some("couldn't find the filament position in the toolhead")
         );
         assert_eq!(
-            DeviceError::from_code(0x1200_8016).unwrap().message.as_deref(),
+            DeviceError::from_code(0x1200_8016)
+                .unwrap()
+                .message
+                .as_deref(),
             Some("the extruder isn't pushing filament out properly")
         );
         // An unverified code carries no fabricated message — just hex + the link.
