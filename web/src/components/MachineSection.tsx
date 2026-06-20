@@ -17,18 +17,12 @@ const MIN_EXTRUDE_TEMP = 170; // cold extrusion guard (°C)
 const STEPS = [0.1, 1, 10] as const;
 const EXTRUDE_LENS = [1, 5, 10] as const;
 
-function fmt(n: number | null): string {
-  return n != null ? Math.round(n).toString() : "—";
-}
-
 export function MachineSection({ s, control }: { s: PrinterStatus; control: Control }) {
   const b = control.busy;
   const busy = isBusy(s.gcode_state);
   const stateName = s.gcode_state ?? "unknown";
   const [step, setStep] = useState<number>(1);
   const [extLen, setExtLen] = useState<number>(5);
-  const [nozzleInput, setNozzleInput] = useState("");
-  const [bedInput, setBedInput] = useState("");
   const [cal, setCal] = useState({ bed_level: false, vibration: false, motor_noise: false });
 
   // A jog/home is unavailable if a write is in flight OR the printer is busy.
@@ -39,12 +33,6 @@ export function MachineSection({ s, control }: { s: PrinterStatus; control: Cont
 
   const jog = (axis: Axis, dir: 1 | -1) =>
     void control.jog(axis, dir * step, axis === "z" ? FEED_Z : FEED_XY);
-
-  const setTemp = (part: "nozzle" | "bed", raw: string) => {
-    const v = Number(raw);
-    if (!Number.isFinite(v)) return;
-    void control.setTemp(part, v, true);
-  };
 
   // Temp the AMS unload heats to: honour an explicit nozzle setpoint, else a
   // default that softens both PLA and PETG enough to retract cleanly.
@@ -167,73 +155,6 @@ export function MachineSection({ s, control }: { s: PrinterStatus; control: Cont
               </button>
             );
           })}
-        </div>
-      </div>
-
-      {/* ── TEMPERATURE ──────────────────────────────────────────────────── */}
-      <div className="msub">
-        <div className="lbl">temperature</div>
-        <div className="trow">
-          <span className="lbl trow__name">nozzle</span>
-          <span className="trow__read" data-testid="machine-nozzle-read">
-            {fmt(s.nozzle_temper)}° → {fmt(s.nozzle_target)}°
-          </span>
-          <input
-            className="pw trow__in"
-            inputMode="numeric"
-            placeholder="°C"
-            value={nozzleInput}
-            disabled={!!b}
-            onChange={(e) => setNozzleInput(e.target.value)}
-            data-testid="temp-nozzle-input"
-          />
-          <button
-            className="btn btn--sm"
-            disabled={!!b || !nozzleInput.trim()}
-            data-testid="temp-nozzle-set"
-            onClick={() => setTemp("nozzle", nozzleInput)}
-          >
-            set
-          </button>
-          <button
-            className="btn btn--sm"
-            disabled={!!b}
-            data-testid="temp-nozzle-cool"
-            onClick={() => void control.cooldown("nozzle")}
-          >
-            cool
-          </button>
-        </div>
-        <div className="trow">
-          <span className="lbl trow__name">bed</span>
-          <span className="trow__read" data-testid="machine-bed-read">
-            {fmt(s.bed_temper)}° → {fmt(s.bed_target)}°
-          </span>
-          <input
-            className="pw trow__in"
-            inputMode="numeric"
-            placeholder="°C"
-            value={bedInput}
-            disabled={!!b}
-            onChange={(e) => setBedInput(e.target.value)}
-            data-testid="temp-bed-input"
-          />
-          <button
-            className="btn btn--sm"
-            disabled={!!b || !bedInput.trim()}
-            data-testid="temp-bed-set"
-            onClick={() => setTemp("bed", bedInput)}
-          >
-            set
-          </button>
-          <button
-            className="btn btn--sm"
-            disabled={!!b}
-            data-testid="temp-bed-cool"
-            onClick={() => void control.cooldown("bed")}
-          >
-            cool
-          </button>
         </div>
       </div>
 

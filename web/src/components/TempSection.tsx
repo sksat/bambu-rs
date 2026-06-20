@@ -1,8 +1,28 @@
+import { useState } from "react";
 import type { TempPoint } from "../useStatus";
+import type { Control } from "../useControl";
 import type { PrinterStatus } from "../types";
 import { Sparkline, TempReadout } from "./widgets";
 
-export function TempSection({ s, history }: { s: PrinterStatus; history: TempPoint[] }) {
+export function TempSection({
+  s,
+  history,
+  control,
+}: {
+  s: PrinterStatus;
+  history: TempPoint[];
+  control: Control;
+}) {
+  const b = control.busy;
+  const [nozzleInput, setNozzleInput] = useState("");
+  const [bedInput, setBedInput] = useState("");
+
+  const setTemp = (part: "nozzle" | "bed", raw: string) => {
+    const v = Number(raw);
+    if (!Number.isFinite(v)) return;
+    void control.setTemp(part, v, true);
+  };
+
   const fans: Array<[string, number]> = (
     [
       ["part", s.cooling_fan_speed],
@@ -12,19 +32,75 @@ export function TempSection({ s, history }: { s: PrinterStatus; history: TempPoi
     ] as Array<[string, number | null | undefined]>
   ).filter((e): e is [string, number] => e[1] != null);
   const running = s.gcode_state === "RUNNING";
+
   return (
-    <section className="panel">
-      <div className="lbl">temperatures</div>
-      {/* One tier per metric: each temperature shows its value and its own graph
-          together (split by meaning, not "values" then "a graph"). */}
+    <section className="panel" data-testid="temperature">
+      <div className="lbl">temperature</div>
+      {/* One tier per metric: each temperature shows its value, its own graph, and
+          its set/cool control together (split by meaning, not "values" then "a
+          graph" then "controls" off in another panel). */}
       <div className="temps">
         <div className="temprow">
           <TempReadout label="nozzle" cur={s.nozzle_temper} target={s.nozzle_target} accent />
           <Sparkline history={history} metric="nozzle" />
+          <div className="tctl">
+            <input
+              className="pw tctl__in"
+              inputMode="numeric"
+              placeholder="°C"
+              value={nozzleInput}
+              disabled={!!b}
+              onChange={(e) => setNozzleInput(e.target.value)}
+              data-testid="temp-nozzle-input"
+            />
+            <button
+              className="btn btn--sm"
+              disabled={!!b || !nozzleInput.trim()}
+              data-testid="temp-nozzle-set"
+              onClick={() => setTemp("nozzle", nozzleInput)}
+            >
+              set
+            </button>
+            <button
+              className="btn btn--sm"
+              disabled={!!b}
+              data-testid="temp-nozzle-cool"
+              onClick={() => void control.cooldown("nozzle")}
+            >
+              cool
+            </button>
+          </div>
         </div>
         <div className="temprow">
           <TempReadout label="bed" cur={s.bed_temper} target={s.bed_target} />
           <Sparkline history={history} metric="bed" />
+          <div className="tctl">
+            <input
+              className="pw tctl__in"
+              inputMode="numeric"
+              placeholder="°C"
+              value={bedInput}
+              disabled={!!b}
+              onChange={(e) => setBedInput(e.target.value)}
+              data-testid="temp-bed-input"
+            />
+            <button
+              className="btn btn--sm"
+              disabled={!!b || !bedInput.trim()}
+              data-testid="temp-bed-set"
+              onClick={() => setTemp("bed", bedInput)}
+            >
+              set
+            </button>
+            <button
+              className="btn btn--sm"
+              disabled={!!b}
+              data-testid="temp-bed-cool"
+              onClick={() => void control.cooldown("bed")}
+            >
+              cool
+            </button>
+          </div>
         </div>
       </div>
       {fans.length > 0 && (

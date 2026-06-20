@@ -164,6 +164,18 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("toast")).toContainText("verified");
   });
 
+  test("temperature control lives inside the temperature card", async ({ page }) => {
+    const card = page.getByTestId("temperature");
+    // Card title is singular (not "temperatures").
+    await expect(card.getByText("temperature", { exact: true })).toBeVisible();
+    // The set/cool controls now sit in the temperature card, beside the readouts.
+    for (const id of ["temp-nozzle-input", "temp-nozzle-set", "temp-bed-input", "temp-bed-set"]) {
+      await expect(card.getByTestId(id)).toBeVisible();
+    }
+    // …and no longer in the machine/controls panel.
+    await expect(page.getByTestId("machine").getByTestId("temp-nozzle-input")).toHaveCount(0);
+  });
+
   test("camera tabs render and switch the active source", async ({ page }) => {
     // The E2E server is launched with two external --camera-url, so two tabs show.
     const tabs = page.locator('[data-testid^="camera-tab-"]');

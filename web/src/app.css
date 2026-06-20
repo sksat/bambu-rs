@@ -368,15 +368,18 @@ div.lbl,
   line-height: 1;
 }
 
-/* temperatures */
+/* temperature */
 .temps {
   display: flex;
   flex-direction: column;
   gap: 0.7rem;
 }
-/* one tier per metric: value on the left, its own graph filling the rest */
+/* one tier per metric: value, then its own graph filling the middle, then its
+   set/cool control. Wraps on narrow widths so the control drops to its own line
+   rather than squeezing the graph to nothing. */
 .temprow {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 0.9rem;
 }
@@ -385,10 +388,23 @@ div.lbl,
   min-width: 5.5rem;
 }
 .temprow .spark {
-  flex: 1 1 auto;
-  min-width: 0;
+  /* basis 0 so the graph fills only the leftover after the readout and control,
+     rather than claiming its content width and shoving the control to wrap. */
+  flex: 1 1 0;
+  min-width: 5rem;
   height: 40px;
   margin: 0;
+}
+/* Inline per-metric set/cool: a compact input + buttons trailing the readout. */
+.tctl {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex: 0 0 auto;
+}
+.tctl__in {
+  width: 4.2rem;
+  flex: none;
 }
 .tr {
   display: flex;
@@ -1123,28 +1139,6 @@ div.lbl,
 }
 .seg__opt {
   font-variant-numeric: tabular-nums;
-}
-
-/* Temperature rows: live readout + a small input + set/cool. */
-.trow {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.45rem;
-  margin-top: 0.5rem;
-}
-.trow__name {
-  width: 3.2rem;
-}
-.trow__read {
-  font-family: var(--mono);
-  font-variant-numeric: tabular-nums;
-  font-size: 0.86rem;
-  min-width: 6.5rem;
-}
-.trow__in {
-  width: 4.2rem;
-  flex: none;
 }
 
 /* Maintenance: calibrate checkboxes wrap then the run button trails. */

@@ -32,13 +32,14 @@ export function App() {
             <section className="dash__status">
               <JobSection s={status} control={control} />
             </section>
-            {/* Left: camera(s) with temperatures beneath. Right: one controls
-                section with the machine/motion and AMS folded in. Stacks to a
-                single column on a phone. */}
+            {/* Left: camera(s) with the temperature card (readouts + its own
+                set/cool) beneath. Right: one controls section with the
+                machine/motion and AMS folded in. Stacks to a single column on a
+                phone. */}
             <section className="dash__hero">
               <div className="dash__left">
                 <CamerasSection password={control.password || null} />
-                <TempSection s={status} history={history} />
+                <TempSection s={status} history={history} control={control} />
               </div>
               <div className="dash__control">
                 <Controls control={control} status={status}>
