@@ -21,6 +21,54 @@ use super::camera::StreamOpen;
 use super::stream_record::record_loop;
 use crate::core::status::PrinterStatus;
 use crate::core::timelapse::{ActivityAction, CaptureAction, CaptureSession, PrintActivitySession};
+use crate::park::{DECODE_H, DECODE_W, ParkCapture, run_park_camera};
+
+/// Spawns the live-park worker for ONE camera, returning its task handle. Injected so the
+/// slot lifecycle (lazy spawn on print-active, stop at finish) is unit-tested with a fake
+/// worker, while production runs the real ffmpeg supervisor ([`crate::park::run_park_camera`]).
+pub type ParkSpawn = Arc<
+    dyn Fn(ParkCapture, PathBuf, Arc<AtomicBool>, Arc<Mutex<TimelapseStatus>>) -> JoinHandle<()>
+        + Send
+        + Sync,
+>;
+
+/// The production [`ParkSpawn`]: each camera's blocking ffmpeg supervisor on the blocking
+/// pool. This is the server's thin adapter — it maps the library runner's progress
+/// callback + result onto the shared [`TimelapseStatus`] (frames/failures/last_error).
+pub fn real_park_spawn() -> ParkSpawn {
+    Arc::new(
+        |cap: ParkCapture, out_dir, cancel, status: Arc<Mutex<TimelapseStatus>>| {
+            tokio::task::spawn_blocking(move || {
+                let mut on_park = |written: bool| {
+                    let mut s = status.lock().unwrap();
+                    if written {
+                        s.frames += 1;
+                    } else {
+                        s.failures += 1;
+                        s.last_error = Some(format!("park {}: a ring JPEG never arrived", cap.id));
+                    }
+                };
+                let outcome =
+                    run_park_camera(&cap, &out_dir, DECODE_W, DECODE_H, &cancel, &mut on_park);
+                let mut s = status.lock().unwrap();
+                match outcome {
+                    Ok(stats) if stats.frames == 0 => {
+                        s.failures += 1;
+                        s.last_error = Some(format!(
+                            "park {}: read 0 frames from {}",
+                            cap.id, cap.stream_url
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        s.failures += 1;
+                        s.last_error = Some(e);
+                    }
+                }
+            })
+        },
+    )
+}
 
 /// Grab a single JPEG frame (blocking). Resolved from a camera id at start time
 /// and held for the run's duration, so later `/api/cameras/config` edits can't
@@ -113,6 +161,9 @@ struct Inner {
 pub struct TimelapseManager {
     smooth: Mutex<Inner>,
     plain: Mutex<Inner>,
+    /// Live park-preview slot: one ffmpeg supervisor per tuned stream camera, lazily
+    /// started when the print is active. Independent of smooth/plain.
+    park: Mutex<Inner>,
 }
 
 impl TimelapseManager {
@@ -176,6 +227,34 @@ impl TimelapseManager {
         )
     }
 
+    /// Start the live park-preview capture: for each tuned stream camera, lazily spawn
+    /// one ffmpeg supervisor (via `spawn_worker`) once the print is active; each emits
+    /// `latest_park.jpg` per layer under `out_dir/<camera-id>/`. `spawn_worker` is
+    /// injected so the lifecycle is testable without ffmpeg ([`real_park_spawn`] runs the
+    /// real one). Rejected if a park run is already active or `cameras` is empty.
+    pub fn start_park(
+        &self,
+        cameras: Vec<ParkCapture>,
+        rx: watch::Receiver<PrinterStatus>,
+        out_dir: PathBuf,
+        spawn_worker: ParkSpawn,
+    ) -> Result<(), String> {
+        let ids = cameras.iter().map(|c| c.id.clone()).collect();
+        start_slot(
+            &self.park,
+            cameras,
+            ids,
+            out_dir,
+            TimelapseStatus {
+                mode: "park",
+                ..Default::default()
+            },
+            move |status, caps, dir, cancel| {
+                tokio::spawn(run_park(status, rx, caps, dir, cancel, spawn_worker))
+            },
+        )
+    }
+
     /// Stop the smooth capture (idempotent). Returns whether one was running.
     pub fn stop_smooth(&self) -> bool {
         stop_slot(&self.smooth)
@@ -184,12 +263,19 @@ impl TimelapseManager {
     pub fn stop_plain(&self) -> bool {
         stop_slot(&self.plain)
     }
+    /// Stop the live park-preview capture (idempotent). Returns whether one was running.
+    pub fn stop_park(&self) -> bool {
+        stop_slot(&self.park)
+    }
 
     pub fn status_smooth(&self) -> TimelapseStatus {
         self.smooth.lock().unwrap().status.lock().unwrap().clone()
     }
     pub fn status_plain(&self) -> TimelapseStatus {
         self.plain.lock().unwrap().status.lock().unwrap().clone()
+    }
+    pub fn status_park(&self) -> TimelapseStatus {
+        self.park.lock().unwrap().status.lock().unwrap().clone()
     }
 }
 
@@ -266,11 +352,7 @@ fn burst_frame_name(frame_no: u64, layer: i64, offset_ms: u64) -> String {
 fn normalize_burst_offsets(mut offsets: Vec<u64>) -> Vec<u64> {
     offsets.sort_unstable();
     offsets.dedup();
-    if offsets.is_empty() {
-        vec![0]
-    } else {
-        offsets
-    }
+    if offsets.is_empty() { vec![0] } else { offsets }
 }
 
 /// Where a burst's grabs go: the worker channel, the cameras, the status (for
@@ -503,8 +585,10 @@ fn spawn_stream_recorders(
                 let mut s = wstatus.lock().unwrap();
                 s.failures += u64::from(stats.failures);
                 if stats.bytes == 0 {
-                    s.last_error =
-                        Some(format!("stream {id}: no data recorded ({})", target.display()));
+                    s.last_error = Some(format!(
+                        "stream {id}: no data recorded ({})",
+                        target.display()
+                    ));
                 } else if !encode_ok {
                     s.failures += 1;
                     s.last_error = Some(format!(
@@ -635,10 +719,59 @@ async fn run_plain(
     status.lock().unwrap().running = false;
 }
 
+/// The live park-preview slot's lifecycle: wait through idle (armed before the print),
+/// then on the first active status LAZILY spawn one worker per camera (via `spawn_worker`)
+/// — exactly once — and stop at FINISH/cancel, setting `cancel` so the blocking ffmpeg
+/// supervisors exit. It has no layer logic of its own: park timing comes from the camera
+/// stream (not MQTT), so this only gates start/stop on the print being active.
+async fn run_park(
+    status: Arc<Mutex<TimelapseStatus>>,
+    mut rx: watch::Receiver<PrinterStatus>,
+    captures: Vec<ParkCapture>,
+    out_dir: PathBuf,
+    cancel: Arc<AtomicBool>,
+    spawn_worker: ParkSpawn,
+) {
+    let mut activity = PrintActivitySession::new(true);
+    let mut pending = Some(captures); // spawned once, on the first active tick
+    let mut workers: Vec<JoinHandle<()>> = Vec::new();
+    loop {
+        let snap = rx.borrow_and_update().clone();
+        status.lock().unwrap().current_layer = snap.layer_num;
+        match activity.observe(&snap) {
+            ActivityAction::Capture => {
+                if let Some(caps) = pending.take() {
+                    for cap in caps {
+                        workers.push(spawn_worker(
+                            cap,
+                            out_dir.clone(),
+                            cancel.clone(),
+                            status.clone(),
+                        ));
+                    }
+                }
+            }
+            ActivityAction::Idle => {}
+            ActivityAction::Stop => break,
+        }
+        if rx.changed().await.is_err() {
+            break; // the source (and the whole server) is gone
+        }
+    }
+    // Tell the blocking ffmpeg supervisors to stop (the print ended), then let them exit.
+    cancel.store(true, Ordering::Relaxed);
+    for w in workers {
+        let _ = w.await;
+    }
+    status.lock().unwrap().running = false;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::park::ParkTuning;
     use crate::core::status::PrinterStatus;
+    use std::sync::atomic::AtomicUsize;
 
     fn st(state: &str, layer: Option<i64>) -> PrinterStatus {
         PrinterStatus {
@@ -669,17 +802,26 @@ mod tests {
         let (tx, rx) = watch::channel(st("IDLE", None));
         let grab: FrameGrab = Arc::new(|| Ok(vec![0xff, 0xd8, 0xff, 0x42]));
         let mgr = TimelapseManager::default();
-        mgr.start_smooth(one("ext-0", grab), 1, vec![0], rx, dir.clone()).unwrap();
+        mgr.start_smooth(one("ext-0", grab), 1, vec![0], rx, dir.clone())
+            .unwrap();
 
         // Drive: print starts and advances three layers, then finishes.
-        for s in [st("RUNNING", Some(1)), st("RUNNING", Some(2)), st("RUNNING", Some(3)), st("FINISH", Some(3))] {
+        for s in [
+            st("RUNNING", Some(1)),
+            st("RUNNING", Some(2)),
+            st("RUNNING", Some(3)),
+            st("FINISH", Some(3)),
+        ] {
             tx.send(s).unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         }
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
 
         let s = mgr.status_smooth();
-        assert!(!s.running, "capture should auto-stop when the print finishes");
+        assert!(
+            !s.running,
+            "capture should auto-stop when the print finishes"
+        );
         assert_eq!(s.frames, 3, "one frame per advancing layer");
         assert_eq!(s.failures, 0);
         let n = std::fs::read_dir(dir.join("ext-0")).unwrap().count();
@@ -702,7 +844,11 @@ mod tests {
             dir.clone(),
         )
         .unwrap();
-        for s in [st("RUNNING", Some(1)), st("RUNNING", Some(2)), st("FINISH", Some(2))] {
+        for s in [
+            st("RUNNING", Some(1)),
+            st("RUNNING", Some(2)),
+            st("FINISH", Some(2)),
+        ] {
             tx.send(s).unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         }
@@ -723,8 +869,18 @@ mod tests {
         let (_tx, rx) = watch::channel(st("RUNNING", Some(0)));
         let grab: FrameGrab = Arc::new(|| Ok(vec![0xff, 0xd8, 0xff]));
         let mgr = TimelapseManager::default();
-        mgr.start_smooth(one("ext-0", grab.clone()), 1, vec![0], rx.clone(), dir.clone()).unwrap();
-        assert!(mgr.start_smooth(one("ext-1", grab), 1, vec![0], rx, dir.clone()).is_err());
+        mgr.start_smooth(
+            one("ext-0", grab.clone()),
+            1,
+            vec![0],
+            rx.clone(),
+            dir.clone(),
+        )
+        .unwrap();
+        assert!(
+            mgr.start_smooth(one("ext-1", grab), 1, vec![0], rx, dir.clone())
+                .is_err()
+        );
         assert!(mgr.stop_smooth());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -734,7 +890,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bambu-tl-empty-{}", std::process::id()));
         let (_tx, rx) = watch::channel(st("RUNNING", Some(0)));
         let mgr = TimelapseManager::default();
-        assert!(mgr.start_smooth(vec![], 1, vec![0], rx, dir).is_err(), "need at least one camera");
+        assert!(
+            mgr.start_smooth(vec![], 1, vec![0], rx, dir).is_err(),
+            "need at least one camera"
+        );
     }
 
     #[tokio::test]
@@ -744,8 +903,13 @@ mod tests {
         let (tx, rx) = watch::channel(st("RUNNING", Some(0)));
         let grab: FrameGrab = Arc::new(|| Err("camera offline".to_string()));
         let mgr = TimelapseManager::default();
-        mgr.start_smooth(one("ext-0", grab), 1, vec![0], rx, dir.clone()).unwrap();
-        for s in [st("RUNNING", Some(1)), st("RUNNING", Some(2)), st("FINISH", Some(2))] {
+        mgr.start_smooth(one("ext-0", grab), 1, vec![0], rx, dir.clone())
+            .unwrap();
+        for s in [
+            st("RUNNING", Some(1)),
+            st("RUNNING", Some(2)),
+            st("FINISH", Some(2)),
+        ] {
             tx.send(s).unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         }
@@ -760,14 +924,23 @@ mod tests {
     // ── smooth park-capture burst ──
     #[test]
     fn burst_frame_name_tags_frame_layer_and_offset() {
-        assert_eq!(super::burst_frame_name(1, 5, 800), "frame_000001_layer_00005_t0800.jpg");
-        assert_eq!(super::burst_frame_name(12, 240, 0), "frame_000012_layer_00240_t0000.jpg");
+        assert_eq!(
+            super::burst_frame_name(1, 5, 800),
+            "frame_000001_layer_00005_t0800.jpg"
+        );
+        assert_eq!(
+            super::burst_frame_name(12, 240, 0),
+            "frame_000012_layer_00240_t0000.jpg"
+        );
     }
 
     #[test]
     fn normalize_burst_offsets_sorts_dedups_and_defaults_empty() {
         // Duplicates would collide on the same `_tNNNN.jpg` filename.
-        assert_eq!(super::normalize_burst_offsets(vec![800, 400, 800, 600]), vec![400, 600, 800]);
+        assert_eq!(
+            super::normalize_burst_offsets(vec![800, 400, 800, 600]),
+            vec![400, 600, 800]
+        );
         assert_eq!(super::normalize_burst_offsets(vec![500, 500]), vec![500]);
         assert_eq!(super::normalize_burst_offsets(vec![]), vec![0]);
     }
@@ -792,17 +965,28 @@ mod tests {
         super::schedule_burst(&sink, 1, 5, &[10, 30]);
         tokio::task::yield_now().await; // let the spawned tasks arm their timers at t=0
 
-        assert!(rx.try_recv().is_err(), "nothing is due before the first offset");
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing is due before the first offset"
+        );
         tokio::time::advance(Duration::from_millis(10)).await;
         tokio::task::yield_now().await;
         let (_g, p) = rx.try_recv().expect("first sample due at 10ms");
-        assert!(p.ends_with("frame_000001_layer_00005_t0010.jpg"), "{}", p.display());
+        assert!(
+            p.ends_with("frame_000001_layer_00005_t0010.jpg"),
+            "{}",
+            p.display()
+        );
         assert!(rx.try_recv().is_err(), "the 30ms sample is not due yet");
 
         tokio::time::advance(Duration::from_millis(20)).await;
         tokio::task::yield_now().await;
         let (_g, p) = rx.try_recv().expect("second sample due at 30ms");
-        assert!(p.ends_with("frame_000001_layer_00005_t0030.jpg"), "{}", p.display());
+        assert!(
+            p.ends_with("frame_000001_layer_00005_t0030.jpg"),
+            "{}",
+            p.display()
+        );
     }
 
     // A burst scheduled before the run is stopped must not grab afterwards: the
@@ -825,7 +1009,10 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_millis(20)).await;
         tokio::task::yield_now().await;
-        assert!(rx.try_recv().is_err(), "a burst that fires after stop must not grab");
+        assert!(
+            rx.try_recv().is_err(),
+            "a burst that fires after stop must not grab"
+        );
     }
 
     // ── plain (time-sampled) capture ──
@@ -836,23 +1023,34 @@ mod tests {
         let (tx, rx) = watch::channel(st("IDLE", None));
         let grab: FrameGrab = Arc::new(|| Ok(vec![0xff, 0xd8, 0xff, 0x09]));
         let mgr = TimelapseManager::default();
-        mgr.start_plain(sample("ext-0", grab), 20, rx, dir.clone()).unwrap();
+        mgr.start_plain(sample("ext-0", grab), 20, rx, dir.clone())
+            .unwrap();
 
         // Idle → nothing is sampled (it waits for the print like the smooth one).
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-        assert_eq!(mgr.status_plain().frames, 0, "no sampling before the print is active");
+        assert_eq!(
+            mgr.status_plain().frames,
+            0,
+            "no sampling before the print is active"
+        );
 
         // Printing → frames accumulate on the ~20ms clock, NOT per layer (the
         // layer never changes here, yet several frames land).
         tx.send(st("RUNNING", Some(1))).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         let mid = mgr.status_plain().frames;
-        assert!(mid >= 2, "plain samples on its own clock while printing (got {mid})");
+        assert!(
+            mid >= 2,
+            "plain samples on its own clock while printing (got {mid})"
+        );
 
         // Finishing stops it promptly (the changed-feed path, not a whole interval).
         tx.send(st("FINISH", Some(1))).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-        assert!(!mgr.status_plain().running, "plain stops when the print finishes");
+        assert!(
+            !mgr.status_plain().running,
+            "plain stops when the print finishes"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -896,7 +1094,10 @@ mod tests {
         let args = super::live_mp4_args(std::path::Path::new("/cap/ext-1/plain.mp4"));
         let joined = args.join(" ");
         assert!(joined.contains("-f mpjpeg"), "{joined}");
-        assert!(joined.contains("-i -"), "reads the stream from stdin: {joined}");
+        assert!(
+            joined.contains("-i -"),
+            "reads the stream from stdin: {joined}"
+        );
         assert!(joined.contains("libx264"));
         assert!(joined.trim_end().ends_with("/cap/ext-1/plain.mp4"));
     }
@@ -909,8 +1110,16 @@ mod tests {
         let g: FrameGrab = Arc::new(|| Ok(vec![0xff, 0xd8, 0xff, 0x01]));
         let mgr = TimelapseManager::default();
         // Different slots → neither rejects the other (unlike start-twice).
-        mgr.start_smooth(one("ext-0", g.clone()), 1, vec![0], rx.clone(), dir.join("smooth")).unwrap();
-        mgr.start_plain(sample("ext-0", g), 20, rx, dir.join("plain")).unwrap();
+        mgr.start_smooth(
+            one("ext-0", g.clone()),
+            1,
+            vec![0],
+            rx.clone(),
+            dir.join("smooth"),
+        )
+        .unwrap();
+        mgr.start_plain(sample("ext-0", g), 20, rx, dir.join("plain"))
+            .unwrap();
         assert!(mgr.status_smooth().running && mgr.status_plain().running);
 
         tx.send(st("RUNNING", Some(1))).unwrap();
@@ -923,8 +1132,100 @@ mod tests {
         // Stopping one leaves the other running.
         assert!(mgr.stop_smooth());
         assert!(!mgr.status_smooth().running);
-        assert!(mgr.status_plain().running, "plain keeps running after smooth stops");
+        assert!(
+            mgr.status_plain().running,
+            "plain keeps running after smooth stops"
+        );
         assert!(mgr.stop_plain());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── live park-preview slot (injected fake worker, no ffmpeg) ──
+    fn park_cap(id: &str) -> ParkCapture {
+        ParkCapture {
+            id: id.to_string(),
+            stream_url: "http://cam/stream".to_string(),
+            tuning: ParkTuning {
+                fps: 4.0,
+                left_frac: 0.33,
+                ema_seconds: 30.0,
+                abs_floor: 1500.0,
+                mad_k: 6.0,
+                merge_gap_s: 1.2,
+                max_island_s: 3.0,
+                min_sep_s: 3.0,
+                candidate_frac: 0.75,
+                warmup_s: 4.0,
+                baseline_s: 90.0,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn park_spawns_one_worker_per_camera_on_active_and_stops_at_finish() {
+        let dir = std::env::temp_dir().join(format!("bambu-park-slot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tx, rx) = watch::channel(st("IDLE", None));
+        let spawned = Arc::new(AtomicUsize::new(0));
+        let spawn_worker: ParkSpawn = {
+            let spawned = spawned.clone();
+            Arc::new(
+                move |_cap, _dir, cancel: Arc<AtomicBool>, status: Arc<Mutex<TimelapseStatus>>| {
+                    spawned.fetch_add(1, Ordering::SeqCst);
+                    tokio::task::spawn_blocking(move || {
+                        status.lock().unwrap().frames += 1; // a fake "park"
+                        while !cancel.load(Ordering::Relaxed) {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                    })
+                },
+            )
+        };
+        let mgr = TimelapseManager::default();
+        mgr.start_park(
+            vec![park_cap("ext-0"), park_cap("ext-1")],
+            rx,
+            dir.clone(),
+            spawn_worker,
+        )
+        .unwrap();
+
+        // Idle → nothing spawned yet (armed, waiting for the print).
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        assert_eq!(spawned.load(Ordering::SeqCst), 0, "no workers while idle");
+
+        // Active → one worker per camera, exactly once.
+        tx.send(st("RUNNING", Some(1))).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert_eq!(spawned.load(Ordering::SeqCst), 2, "one per camera");
+        tx.send(st("RUNNING", Some(2))).unwrap(); // another active tick
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        assert_eq!(
+            spawned.load(Ordering::SeqCst),
+            2,
+            "spawned once, not per tick"
+        );
+        assert_eq!(mgr.status_park().frames, 2);
+
+        // Finish → cancel → the fake workers exit → the slot stops.
+        tx.send(st("FINISH", Some(2))).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !mgr.status_park().running,
+            "park stops when the print finishes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn park_with_no_cameras_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("bambu-park-empty-{}", std::process::id()));
+        let (_tx, rx) = watch::channel(st("RUNNING", Some(0)));
+        let mgr = TimelapseManager::default();
+        let noop: ParkSpawn = Arc::new(|_, _, _, _| tokio::task::spawn_blocking(|| {}));
+        assert!(
+            mgr.start_park(vec![], rx, dir, noop).is_err(),
+            "need at least one camera"
+        );
     }
 }
