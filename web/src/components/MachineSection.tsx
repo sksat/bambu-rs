@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type KeyboardEvent } from "react";
 import type { Control, Axis } from "../useControl";
 import type { PrinterStatus } from "../types";
 import { WifiSignal } from "./widgets";
@@ -68,10 +68,26 @@ function JogDial({
   title?: string;
 }) {
   const HALF = 44; // wedge half-angle; a hair under 45° leaves a thin seam between wedges
+  // The segments are SVG, so they aren't <button>s — wire up keyboard activation
+  // (Enter/Space) and guard every action on `disabled`, so keyboard/switch users can
+  // jog and home just like the old button D-pad. tabIndex below removes them from the
+  // tab order while disabled; the click guard backstops the CSS pointer-events:none.
+  const act = (fn: () => void) => {
+    if (!disabled) fn();
+  };
+  const onKey = (e: KeyboardEvent<SVGElement>, fn: () => void) => {
+    if (disabled) return;
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      fn();
+    }
+  };
   return (
+    // viewBox padded beyond the 100-unit dial so the axis labels (r=49) sit clearly
+    // outside the outer ring instead of grazing it; the .dial CSS width compensates.
     <svg
       className={disabled ? "dial dial--off" : "dial"}
-      viewBox="0 0 100 100"
+      viewBox="-4 -4 108 108"
       role="group"
       aria-label="XY jog"
       aria-disabled={disabled}
@@ -85,9 +101,13 @@ function JogDial({
             <g key={`${d.key}-${ring.label}`} className={`dial__seg dial__seg--r${ri}`}>
               <path
                 d={ringSector(ring.r0, ring.r1, d.ang - HALF, d.ang + HALF)}
+                role="button"
+                tabIndex={disabled ? -1 : 0}
+                aria-disabled={disabled || undefined}
                 data-testid={`jog-${d.key}-${ring.label}`}
                 aria-label={`${d.label} ${ring.step} mm`}
-                onClick={() => onJog(d.axis, d.dir * ring.step)}
+                onClick={() => act(() => onJog(d.axis, d.dir * ring.step))}
+                onKeyDown={(e) => onKey(e, () => onJog(d.axis, d.dir * ring.step))}
               />
               <text className="dial__num" x={tx} y={ty}>
                 {ring.label}
@@ -97,7 +117,7 @@ function JogDial({
         }),
       )}
       {JOG_DIRS.map((d) => {
-        const [lx, ly] = polar(47, d.ang);
+        const [lx, ly] = polar(49, d.ang);
         return (
           <text key={d.key} className="dial__axis" x={lx} y={ly}>
             {d.label}
@@ -109,9 +129,13 @@ function JogDial({
         cx="50"
         cy="50"
         r="11"
+        role="button"
+        tabIndex={disabled ? -1 : 0}
+        aria-disabled={disabled || undefined}
         data-testid="home-all"
         aria-label="home all axes (G28)"
-        onClick={() => onHome()}
+        onClick={() => act(() => onHome())}
+        onKeyDown={(e) => onKey(e, () => onHome())}
       />
       <text className="dial__home-glyph" x="50" y="50">
         ⌂

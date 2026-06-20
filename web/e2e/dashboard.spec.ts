@@ -170,6 +170,10 @@ test.describe("dashboard (fake mode)", () => {
     for (const id of ["jog-yplus-1", "jog-xminus-10", "jog-xplus-.1", "home-all"]) {
       await expect(page.getByTestId(id)).toBeAttached();
     }
+    // The SVG segments/home carry button semantics so keyboard users can jog/home
+    // (they aren't real <button>s — role + key handling is wired manually).
+    await expect(page.getByTestId("jog-yplus-1")).toHaveAttribute("role", "button");
+    await expect(page.getByTestId("home-all")).toHaveAttribute("role", "button");
     // Z ladder rungs: magnitude is the position (.1/1/10 each way), no separate step picker.
     for (const id of ["jog-zplus-10", "jog-zplus-.1", "jog-zminus-1", "jog-zminus-10"]) {
       await expect(page.getByTestId(id)).toBeAttached();

@@ -1140,10 +1140,12 @@ div.lbl,
   gap: 1.1rem;
   margin-top: 0.55rem;
 }
-/* concentric XY jog dial (SVG): a wedge per direction, a ring per step */
+/* concentric XY jog dial (SVG): a wedge per direction, a ring per step. Width is
+   bumped past the visual dial so the padded viewBox (-4..104) keeps the rings the
+   same physical size while the axis labels get room outside them. */
 .dial {
   display: block;
-  width: min(17rem, 72vw);
+  width: min(18.5rem, 78vw);
   aspect-ratio: 1;
   touch-action: manipulation;
 }
@@ -1156,6 +1158,14 @@ div.lbl,
   stroke-width: 0.7;
   cursor: pointer;
   transition: fill 0.1s;
+}
+/* Keyboard focus: the segments/home are SVG, not <button>, so paint our own ring
+   (accent stroke) instead of the UA outline, which traces the wedge bbox oddly. */
+.dial__seg path:focus-visible,
+.dial__home:focus-visible {
+  outline: none;
+  stroke: var(--accent);
+  stroke-width: 1.4;
 }
 /* Resting fills: warm amber-tinted concentric bands, more saturated outward so the
    coarse 10 mm ring reads as the "big move" and the fine .1 mm as the inner trim. */
