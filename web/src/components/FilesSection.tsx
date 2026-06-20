@@ -56,8 +56,15 @@ export function FilesSection({ sdcard }: { sdcard?: boolean | null }) {
   // old dir resolved late), we drop it instead of clobbering the new listing — the
   // stale-response race that made the list lag a CWD change.
   const dirRef = useRef(dir);
+  // True while a listing fetch is outstanding. The periodic auto-refresh checks this and
+  // skips its tick rather than stacking a second slow FTP listing on one already running
+  // (overlapping connects only make the A1's slow FTP slower). User-initiated loads (a dir
+  // change, the manual refresh, post-upload) ignore the guard and always run.
+  const inFlight = useRef(false);
 
-  const refresh = useCallback(async (d: string) => {
+  const refresh = useCallback(async (d: string, opts?: { auto?: boolean }) => {
+    if (opts?.auto && inFlight.current) return;
+    inFlight.current = true;
     try {
       const r = await fetch(`/api/file?dir=${encodeURIComponent(d)}`);
       const data = (await r.json()) as { files?: FileEntry[]; error?: string };
@@ -71,6 +78,8 @@ export function FilesSection({ sdcard }: { sdcard?: boolean | null }) {
       }
     } catch {
       if (d === dirRef.current) setMsg("network error");
+    } finally {
+      inFlight.current = false;
     }
   }, []);
 
@@ -83,7 +92,7 @@ export function FilesSection({ sdcard }: { sdcard?: boolean | null }) {
     dirRef.current = dir;
     setEntries(null);
     void refresh(dir);
-    const id = setInterval(() => void refresh(dir), REFRESH_MS);
+    const id = setInterval(() => void refresh(dir, { auto: true }), REFRESH_MS);
     return () => clearInterval(id);
   }, [dir, refresh]);
 

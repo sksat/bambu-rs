@@ -155,6 +155,32 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByText("SUB_FILE.gcode.3mf")).toBeVisible();
   });
 
+  test("auto-refresh doesn't pile up a second listing while one is in flight", async ({
+    page,
+  }) => {
+    // The printer's FTP listing is slow; the 5s auto-refresh must skip a tick while a
+    // listing is still running rather than stacking another slow connect on top of it.
+    let subReqs = 0;
+    await page.route(/\/api\/file\?dir=/, async (route) => {
+      const dir = new URL(route.request().url()).searchParams.get("dir");
+      if (dir === "/") {
+        await route.fulfill({ json: { files: [{ name: "sub", is_dir: true, size: 0 }] } });
+      } else if (dir === "/sub") {
+        subReqs += 1;
+        await new Promise((r) => setTimeout(r, 7000)); // still in flight at the 5s tick
+        await route.fulfill({ json: { files: [{ name: "X.gcode.3mf", is_dir: false, size: 1 }] } });
+      } else {
+        await route.fulfill({ json: { files: [] } });
+      }
+    });
+    await page.reload();
+    await page.getByTestId("dir").filter({ hasText: "sub" }).click();
+    await expect(page.getByTestId("files-path")).toHaveText("/sub");
+    // Cross the 5s auto-refresh tick while the first /sub listing is still loading.
+    await page.waitForTimeout(6000);
+    expect(subReqs).toBe(1); // the interval skipped instead of firing an overlapping request
+  });
+
   test("changing directory drops a stale in-flight listing for the old dir", async ({ page }) => {
     // Reproduces the bug where the list lagged a CWD change: a slow listing for the dir we
     // just left lands AFTER the new one and reverts the view. Root is mocked slow on its
