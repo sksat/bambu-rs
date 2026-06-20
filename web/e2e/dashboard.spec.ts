@@ -70,9 +70,10 @@ test.describe("dashboard (fake mode)", () => {
   });
 
   test("job controls are gated by the printer state", async ({ page }) => {
-    // resume is valid only while PAUSE — the fake never pauses, so it stays
-    // disabled regardless of phase (the clearest proof state-gating is on).
-    await expect(page.getByRole("button", { name: "resume", exact: true })).toBeDisabled();
+    // pause/resume is one flip-button that only reads "resume" while PAUSE. The
+    // fake status stream only ever shows RUNNING/FINISH (never PAUSE), so the
+    // resume affordance is never offered — the button stays "pause".
+    await expect(page.getByTestId("job-resume")).toHaveCount(0);
     // The fake source cycles RUNNING → FINISH, so pause/stop availability must
     // track the *displayed* state, not a fixed assumption. Poll state + the
     // buttons together so we evaluate a single consistent frame.
