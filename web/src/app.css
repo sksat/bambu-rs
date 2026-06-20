@@ -650,6 +650,55 @@ div.lbl,
   background: var(--err);
 }
 
+/* WiFi signal meter: a row of 4 bars whose filled count + tone colour + the dBm
+   text all carry strength (CUD — not colour alone). Sits in the Overview band's
+   top-right corner; keeps its size so the filename shrinks instead. */
+.wifi {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-shrink: 0;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--dim);
+}
+.wifi__bars {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 1.5px;
+  height: 0.85rem;
+}
+/* Stepped bars (short→tall) so the shape reads as signal strength even in mono. */
+.wifi__bar {
+  width: 3px;
+  background: var(--hair);
+  border-radius: 1px;
+}
+.wifi__bar:nth-child(1) {
+  height: 30%;
+}
+.wifi__bar:nth-child(2) {
+  height: 55%;
+}
+.wifi__bar:nth-child(3) {
+  height: 78%;
+}
+.wifi__bar:nth-child(4) {
+  height: 100%;
+}
+.wifi--ok .wifi__bar.is-on {
+  background: var(--ok);
+}
+.wifi--warn .wifi__bar.is-on {
+  background: var(--warn);
+}
+.wifi--err .wifi__bar.is-on {
+  background: var(--err);
+}
+.wifi__v {
+  font-variant-numeric: tabular-nums;
+}
+
 /* health / alerts */
 .sec--health .lbl.alert {
   color: var(--err);

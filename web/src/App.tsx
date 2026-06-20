@@ -1,7 +1,7 @@
 import { useStatus } from "./useStatus";
 import { useControl } from "./useControl";
 import { Header } from "./components/Header";
-import { JobSection } from "./components/JobSection";
+import { OverviewSection } from "./components/OverviewSection";
 import { TempSection } from "./components/TempSection";
 import { AmsSection } from "./components/AmsSection";
 import { Controls, ConfirmDialog } from "./components/Controls";
@@ -30,7 +30,7 @@ export function App() {
           <main className="dash">
             {/* Big status band across the top. */}
             <section className="dash__status">
-              <JobSection s={status} control={control} />
+              <OverviewSection s={status} control={control} />
             </section>
             {/* Left: camera(s) with the temperature card (readouts + its own
                 set/cool) beneath. Right: one controls section with the

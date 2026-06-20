@@ -70,3 +70,20 @@ export function remainText(remain?: number | null): string {
   // A1 spools report 0 (no RFID weight) and -1 means unknown — neither is "0%".
   return remain != null && remain > 0 ? `${remain}%` : "—";
 }
+
+/** Wi-Fi signal strength, parsed from the wire string (`wifi_signal`, e.g.
+ *  `-62dBm`) into a display tier: a bar count (1–4), a colour tone, and a word.
+ *  The three together encode strength redundantly so it doesn't rely on colour
+ *  (CUD). Returns null when absent or unparseable, so the indicator simply
+ *  doesn't render. Bands are the usual dBm ranges; tune against the device. */
+export function wifiTier(
+  signal: string | null,
+): { dbm: number; bars: 1 | 2 | 3 | 4; tone: "ok" | "warn" | "err"; word: string } | null {
+  if (!signal) return null;
+  const dbm = parseInt(signal, 10);
+  if (!Number.isFinite(dbm)) return null;
+  if (dbm >= -55) return { dbm, bars: 4, tone: "ok", word: "strong" };
+  if (dbm >= -67) return { dbm, bars: 3, tone: "warn", word: "fair" };
+  if (dbm >= -75) return { dbm, bars: 2, tone: "warn", word: "fair" };
+  return { dbm, bars: 1, tone: "err", word: "weak" };
+}

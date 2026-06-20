@@ -2,9 +2,9 @@ import type { PrinterStatus } from "../types";
 import type { Control } from "../useControl";
 import { fmtEta, fmtFinishTime, speedName } from "../format";
 import { JobControls } from "./Controls";
-import { Bar, Field, Thumb } from "./widgets";
+import { Bar, Field, Thumb, WifiSignal } from "./widgets";
 
-export function JobSection({ s, control }: { s: PrinterStatus; control: Control }) {
+export function OverviewSection({ s, control }: { s: PrinterStatus; control: Control }) {
   const state = s.gcode_state ?? "—";
   const pct = s.mc_percent ?? 0;
   const prepPct = s.gcode_file_prepare_percent ?? 0;
@@ -33,6 +33,10 @@ export function JobSection({ s, control }: { s: PrinterStatus; control: Control 
             {preparing && <span className="chip warn">preparing</span>}
           </div>
         </div>
+        {/* Connectivity badge in the top-right corner of the band: the WiFi
+            signal you want to keep an eye on while a print runs. Renders nothing
+            when the signal is absent. */}
+        <WifiSignal signal={s.wifi_signal} />
       </div>
       <Bar pct={shown} prep={preparing} running={state === "RUNNING"} />
       <div className="readline">

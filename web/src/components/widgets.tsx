@@ -2,7 +2,7 @@ import { useState } from "react";
 import type { CSSProperties } from "react";
 import type { TempPoint } from "../useStatus";
 import type { AmsTray } from "../types";
-import { remainText, swatch, trayLabel } from "../format";
+import { remainText, swatch, trayLabel, wifiTier } from "../format";
 
 /// The plate preview embedded in a sliced .3mf; renders nothing if absent or for
 /// non-.3mf files.
@@ -70,6 +70,30 @@ export function Humidity({ level, raw }: { level: number; raw?: number | null })
         <span className="hum__dot" style={{ left: `${pct}%` }} />
       </span>
       <span className="hum__end">dry</span>
+    </span>
+  );
+}
+
+// Wi-Fi signal as a 4-bar meter: the filled bar count, the tone colour, and the
+// dBm text all carry the strength, so it reads without relying on colour (CUD,
+// same philosophy as Humidity). Renders nothing when the signal is absent or
+// unparseable (the `<redacted>` sentinel is already None on the wire).
+export function WifiSignal({ signal }: { signal: string | null }) {
+  const t = wifiTier(signal);
+  if (!t) return null;
+  return (
+    <span
+      className={`wifi wifi--${t.tone}`}
+      aria-label={`wifi ${t.dbm}dBm (${t.word})`}
+      title={`wifi ${t.dbm}dBm — ${t.word}`}
+      data-testid="wifi"
+    >
+      <span className="wifi__bars" aria-hidden="true">
+        {[1, 2, 3, 4].map((i) => (
+          <span key={i} className={`wifi__bar${i <= t.bars ? " is-on" : ""}`} />
+        ))}
+      </span>
+      <span className="wifi__v">{t.dbm}dBm</span>
     </span>
   );
 }

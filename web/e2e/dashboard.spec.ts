@@ -14,6 +14,14 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("bed-temp")).toContainText("°C");
   });
 
+  test("wifi signal shows as a tiered meter in the overview band", async ({ page }) => {
+    const wifi = page.getByTestId("wifi");
+    // The fake reports -58dBm → a "fair" tier (warn tone), dBm shown as text.
+    await expect(wifi).toBeVisible();
+    await expect(wifi).toContainText("-58dBm");
+    await expect(wifi).toHaveClass(/wifi--warn/);
+  });
+
   test("renders the AMS trays", async ({ page }) => {
     await expect(page.getByTestId("tray-0")).toBeVisible();
     await expect(page.getByTestId("tray-3")).toBeVisible();
@@ -30,6 +38,13 @@ test.describe("dashboard (fake mode)", () => {
     await expect(toggle).toHaveAttribute("aria-checked", "false");
     await toggle.click();
     await expect(page.getByTestId("toast")).toContainText("verified");
+  });
+
+  test("chamber light is not duplicated in the footer", async ({ page }) => {
+    // Its authoritative toggle lives in the controls panel; the footer status
+    // chips must not repeat the chamber light (only other lights, if any).
+    await expect(page.getByTestId("light-toggle")).toBeVisible();
+    await expect(page.getByTestId("foot")).not.toContainText("chamber");
   });
 
   test("speed shows the active tier", async ({ page }) => {
