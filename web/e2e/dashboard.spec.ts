@@ -248,6 +248,80 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("camera-view-live")).toBeEnabled();
   });
 
+  test("park player scrubs the captured filmstrip (mocked run)", async ({ page }) => {
+    // Fake mode has no real ffmpeg park run, so drive the player off mocked endpoints: a
+    // live run that owns the park cam (ext-2) with a 3-frame filmstrip. This exercises the
+    // toggle gate, the player render, live-tip follow, and frame stepping.
+    const run = (over: Record<string, unknown>) => ({
+      running: false,
+      mode: "park",
+      cameras: [] as string[],
+      camera: null,
+      every: 0,
+      interval_ms: null,
+      frames: 0,
+      failures: 0,
+      current_layer: null,
+      out_dir: null,
+      last_error: null,
+      ...over,
+    });
+    await page.route("**/api/timelapse", (r) =>
+      r.fulfill({
+        json: {
+          ...run({ running: true }),
+          smooth: run({}),
+          plain: run({}),
+          park: run({ running: true, cameras: ["ext-2"], frames: 3 }),
+        },
+      }),
+    );
+    // Deliberately SPARSE frame numbers (0, 2, 5 — a skipped/malformed line leaves a gap):
+    // the player must address frames by their real `n`, not the scrubber position.
+    await page.route("**/api/cameras/ext-2/park", (r) =>
+      r.fulfill({
+        json: {
+          running: true,
+          count: 3,
+          parks: [
+            { n: 0, t: 0.0, confidence: 0.91 },
+            { n: 2, t: 5.2, confidence: 0.88 },
+            { n: 5, t: 10.4, confidence: 0.95 },
+          ],
+        },
+      }),
+    );
+    // Any indexed frame → a stand-in JPEG (the bytes don't matter; we assert data-n).
+    await page.route("**/api/cameras/ext-2/park/*", (r) =>
+      r.fulfill({ contentType: "image/jpeg", body: "jpeg" }),
+    );
+    await page.goto("/"); // re-navigate so the routes apply from a clean load
+
+    await page.getByTestId("camera-tab-ext-2").click();
+    // A run owns ext-2, so the toggle is enabled → switch to the player.
+    await expect(page.getByTestId("camera-view-park")).toBeEnabled();
+    await page.getByTestId("camera-view-park").click();
+
+    // It opens on the live tip: last position (3/3) → real frame n=5, live badge showing.
+    await expect(page.getByTestId("park-player")).toBeVisible();
+    await expect(page.getByTestId("park-count")).toHaveText("3 / 3");
+    await expect(page.getByTestId("park-frame")).toHaveAttribute("data-n", "5");
+    await expect(page.getByTestId("park-live")).toBeVisible();
+
+    // Step back: prev → position 2/3 → real frame n=2; leaving the tip clears the badge.
+    await page.getByTestId("park-prev").click();
+    await expect(page.getByTestId("park-count")).toHaveText("2 / 3");
+    await expect(page.getByTestId("park-frame")).toHaveAttribute("data-n", "2");
+    await expect(page.getByTestId("park-live")).toHaveCount(0);
+
+    // Jump to first (n=0), then back to latest (n=5).
+    await page.getByTestId("park-first").click();
+    await expect(page.getByTestId("park-frame")).toHaveAttribute("data-n", "0");
+    await page.getByTestId("park-latest").click();
+    await expect(page.getByTestId("park-count")).toHaveText("3 / 3");
+    await expect(page.getByTestId("park-frame")).toHaveAttribute("data-n", "5");
+  });
+
   test("a dead camera reports the offline state", async ({ page }) => {
     // Both configured cameras point at dead URLs, so the snapshot 502s and the
     // active view reports offline.

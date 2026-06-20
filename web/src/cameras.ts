@@ -28,6 +28,36 @@ export interface ExternalCfg {
   park_tuning?: ParkTuning | null;
 }
 
+// One captured park frame, for the player's scrubber: its index `n`, the relative
+// capture time `t` (seconds into the run), and the detector's confidence.
+export interface ParkFrame {
+  n: number;
+  t: number | null;
+  confidence: number | null;
+}
+
+// A camera's park filmstrip (open read): whether the run is still live, the frame
+// count, and per-frame metadata. Available while a run is active AND after it stops
+// (until the next run), so the player can review the whole strip.
+export interface ParkIndex {
+  running: boolean;
+  count: number;
+  parks: ParkFrame[];
+}
+
+// Fetch a camera's park filmstrip index (`/park` — the individual frames are `/park/{n}`).
+// 404 (no run for this id) and any error read as an empty, not-running strip — the player
+// then shows the "no frames yet" state.
+export async function listParks(id: string): Promise<ParkIndex> {
+  try {
+    const r = await fetch(`/api/cameras/${encodeURIComponent(id)}/park`);
+    if (!r.ok) return { running: false, count: 0, parks: [] };
+    return (await r.json()) as ParkIndex;
+  } catch {
+    return { running: false, count: 0, parks: [] };
+  }
+}
+
 // The list of currently-available cameras (open read); tolerate failure as none.
 export async function listCameras(): Promise<Camera[]> {
   try {

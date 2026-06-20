@@ -1425,6 +1425,93 @@ div.lbl,
   opacity: 0.4;
   cursor: not-allowed;
 }
+
+/* park player: a video-player-style review of the captured per-layer park frames —
+   a framed frame, a transport row (first/prev/play/next/latest), a scrubber, and a
+   frame counter. Used live (tailing the tip) and after a run stops (review-only). */
+.pp {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.pp__frame {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: contain;
+  background: var(--hair-2);
+  border: 1px solid var(--hair);
+  border-radius: 8px;
+}
+/* empty strip: a framed box holding the centered "no frames yet" message */
+.pp--empty {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  background: var(--hair-2);
+  border: 1px solid var(--hair);
+  border-radius: 8px;
+}
+.pp__bar {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.pp__btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.7rem;
+  padding: 0.2rem 0.35rem;
+  font-size: 0.7rem;
+  color: var(--fg);
+  background: var(--hair-2);
+  border: 1px solid var(--hair);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.pp__btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.pp__btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+/* play/pause: accent-filled so it reads as the primary transport action */
+.pp__btn--play {
+  color: var(--bg);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.pp__btn--play:hover:not(:disabled) {
+  color: var(--bg);
+  filter: brightness(1.06);
+}
+.pp__scrub {
+  flex: 1;
+  min-width: 3rem;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.pp__count {
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+/* the live-tail indicator: a recording-red dot, the livestream convention */
+.pp__live {
+  font-size: 0.62rem;
+  color: var(--err);
+  white-space: nowrap;
+  letter-spacing: 0.02em;
+}
+.pp__meta {
+  font-family: var(--mono);
+  font-size: 0.64rem;
+}
+
 /* manage form: add/remove external cameras at runtime */
 .cam__row-group {
   display: flex;

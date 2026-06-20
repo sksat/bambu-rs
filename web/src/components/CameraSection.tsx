@@ -14,6 +14,7 @@ import {
   type TimelapseMode,
   type RunState,
 } from "../timelapse";
+import { ParkPlayer } from "./ParkPlayer";
 
 // Refresh cadence (the delay AFTER a frame settles before fetching the next). We
 // drive the loop off the <img>'s load/error rather than a fixed timer so a slow
@@ -28,9 +29,9 @@ const SLOW_MS = 5000;
 //   - live: the camera itself — `stream` (a long-lived <img> on the MJPEG endpoint,
 //     continuous, no re-fetch loop) or `snapshot` (poll one JPEG per cycle, driven
 //     off load/error so a slow source is never re-requested before its grab finishes).
-//   - park: the live "parked frame per layer" preview (`/park` → latest_park.jpg),
-//     polled like a snapshot; only offered for park-capable cameras and only has
-//     content while a park run is active (404 → "no park frame yet").
+//   - park: a scrubbable player over the captured per-layer park frames (the
+//     <ParkPlayer> — index at `/park`, frames at `/park/{n}`); offered for park-capable
+//     cameras and usable during a run AND after it stops (the filmstrip stays reviewable).
 // A configured-but-dead source shows an "offline" message. Re-mount it (key by id)
 // when the active tab changes to reset cleanly.
 function CameraView({
@@ -38,15 +39,15 @@ function CameraView({
   label,
   stream,
   park,
-  parkRunning,
+  parkAvailable,
 }: {
   id: string;
   label: string;
   stream?: boolean;
   park?: boolean;
-  // Whether a park run is active for THIS camera — the park view only has frames then,
-  // so the toggle is enabled only while it's true.
-  parkRunning?: boolean;
+  // Whether a park run owns THIS camera (running OR stopped) — i.e. there's a filmstrip
+  // to review, so the park toggle is enabled. Frames stay reviewable after the run stops.
+  parkAvailable?: boolean;
 }) {
   const [ts, setTs] = useState(() => Date.now());
   const [offline, setOffline] = useState(false);
@@ -55,11 +56,11 @@ function CameraView({
 
   useEffect(() => () => clearTimeout(timer.current), []);
   // Fall back to live if the park view stops being valid — capability cleared (toggle
-  // hides) OR the park run ended (its /park endpoint now 404s) — so we never sit stuck
-  // on an empty park view.
+  // hides) OR no park run owns this camera anymore (a new run elsewhere) — so we never
+  // sit stuck on an unavailable park view.
   useEffect(() => {
-    if (view === "park" && (!park || !parkRunning)) setView("live");
-  }, [park, parkRunning, view]);
+    if (view === "park" && (!park || !parkAvailable)) setView("live");
+  }, [park, parkAvailable, view]);
 
   const scheduleNext = (delay: number) => {
     clearTimeout(timer.current);
@@ -67,11 +68,9 @@ function CameraView({
   };
 
   const isPark = view === "park";
-  // Park previews poll (one JPEG per cycle); live is a continuous stream or a poll.
-  const polling = isPark || !stream;
-  const src = isPark
-    ? `/api/cameras/${id}/park?t=${ts}`
-    : `/api/cameras/${id}/${stream ? "stream" : "snapshot"}?t=${ts}`;
+  // Live is a continuous stream or a snapshot poll; the park view is the <ParkPlayer>.
+  const polling = !stream;
+  const liveSrc = `/api/cameras/${id}/${stream ? "stream" : "snapshot"}?t=${ts}`;
   const show = (v: "live" | "park") => {
     setView(v);
     setOffline(false);
@@ -92,34 +91,40 @@ function CameraView({
           <button
             className={isPark ? "cam__toggle-btn cam__toggle-btn--on" : "cam__toggle-btn"}
             data-testid="camera-view-park"
-            disabled={!parkRunning}
-            title={parkRunning ? undefined : "start a park run to see the live preview"}
+            disabled={!parkAvailable}
+            title={parkAvailable ? undefined : "start a park run to capture frames"}
             onClick={() => show("park")}
           >
             park
           </button>
         </div>
       )}
-      <img
-        className={offline ? "cam__view cam__view--off" : "cam__view"}
-        alt={label}
-        src={src}
-        data-testid="camera-view"
-        data-mode={isPark ? "park" : stream ? "stream" : "snapshot"}
-        onLoad={() => {
-          if (offline) setOffline(false);
-          // A continuous stream is never re-requested; snapshots and park polls are.
-          if (polling) scheduleNext(FAST_MS);
-        }}
-        onError={() => {
-          if (!offline) setOffline(true);
-          scheduleNext(SLOW_MS); // reconnect (stream) / retry (snapshot/park)
-        }}
-      />
-      {offline && (
-        <div className="cam__msg" data-testid="camera-offline">
-          {isPark ? "no park frame yet — start a park run" : "no frame — camera offline"}
-        </div>
+      {isPark ? (
+        <ParkPlayer id={id} />
+      ) : (
+        <>
+          <img
+            className={offline ? "cam__view cam__view--off" : "cam__view"}
+            alt={label}
+            src={liveSrc}
+            data-testid="camera-view"
+            data-mode={stream ? "stream" : "snapshot"}
+            onLoad={() => {
+              if (offline) setOffline(false);
+              // A continuous stream is never re-requested; snapshots are.
+              if (polling) scheduleNext(FAST_MS);
+            }}
+            onError={() => {
+              if (!offline) setOffline(true);
+              scheduleNext(SLOW_MS); // reconnect (stream) / retry (snapshot)
+            }}
+          />
+          {offline && (
+            <div className="cam__msg" data-testid="camera-offline">
+              no frame — camera offline
+            </div>
+          )}
+        </>
       )}
     </div>
   );
@@ -330,8 +335,8 @@ export function CamerasSection({ password }: { password: string | null }) {
   const [cameras, setCameras] = useState<Camera[]>([]);
   const [active, setActive] = useState<string>("");
   const [managing, setManaging] = useState(false);
-  // The live park run's state, so the view can offer the park toggle only while a run is
-  // actually producing frames for the active camera.
+  // The park run's state, so the view offers the park toggle whenever a run (active OR
+  // recently stopped) owns the active camera — its filmstrip is reviewable either way.
   const [parkRun, setParkRun] = useState<RunState | null>(null);
 
   const reload = async () => {
@@ -359,7 +364,9 @@ export function CamerasSection({ password }: { password: string | null }) {
   }, []);
 
   const activeCam = cameras.find((c) => c.id === active);
-  const parkRunning = !!parkRun?.running && parkRun.cameras.includes(active);
+  // A filmstrip exists for the active camera iff a park run (running or stopped) captured
+  // it — the player then works (live tail while running, review-only after stop).
+  const parkAvailable = !!parkRun && parkRun.cameras.includes(active);
 
   return (
     <>
@@ -404,7 +411,7 @@ export function CamerasSection({ password }: { password: string | null }) {
                 label={activeCam.label}
                 stream={activeCam.stream}
                 park={activeCam.park}
-                parkRunning={parkRunning}
+                parkAvailable={parkAvailable}
               />
             )}
             {activeCam && (

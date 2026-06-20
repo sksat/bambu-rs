@@ -311,7 +311,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/cameras", get(cameras_list))
         .route("/api/cameras/{id}/snapshot", get(camera_snapshot))
         .route("/api/cameras/{id}/stream", get(camera_stream))
-        .route("/api/cameras/{id}/park", get(camera_park))
+        .route("/api/cameras/{id}/park", get(park_index))
+        .route("/api/cameras/{id}/park/{n}", get(camera_park_frame))
         .route("/api/timelapse", get(timelapse_status));
     let writes = Router::new()
         .route("/api/job/pause", post(job_pause))
@@ -1243,24 +1244,76 @@ async fn camera_stream(State(st): State<AppState>, Path(id): Path<String>) -> Re
 // The MJPEG stream opener now lives in `super::camera` (open_mjpeg_stream), shared
 // with the plain-timelapse stream recorder.
 
-/// Serve the latest live-park preview JPEG for one camera (open read): the running
-/// `park` timelapse run writes `<out>/<id>/latest_park.jpg` each layer. 404 before the
-/// first park, when no park run is active, or for an id not in the run. The id is matched
-/// against the run's own camera list (not joined blindly), so a crafted id can't traverse.
-async fn camera_park(State(st): State<AppState>, Path(id): Path<String>) -> Response {
-    let park = st.timelapse.status_park();
-    // Only while a run is ACTIVE — a stopped/finished run keeps out_dir + cameras, so
-    // without this it would keep serving the last frame as if still live.
-    if !park.running {
-        return StatusCode::NOT_FOUND.into_response();
+/// Parse a park run's `parks.jsonl` (one line per write) into a per-frame index for the
+/// player: one entry per distinct frame `n` (a `replace` line re-uses an `n`, so the last
+/// one — the stronger frame — wins), sorted by n, with malformed/blank lines skipped. Each
+/// entry is `{ n, t, confidence }` — enough for a scrubber with a timestamp readout. Pure,
+/// so it's unit-tested without the filesystem.
+fn parse_parks_index(contents: &str) -> Vec<serde_json::Value> {
+    let mut by_n: std::collections::BTreeMap<u64, serde_json::Value> =
+        std::collections::BTreeMap::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(n) = v.get("n").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        by_n.insert(
+            n,
+            json!({
+                "n": n,
+                "t": v.get("t").and_then(serde_json::Value::as_f64),
+                "confidence": v.get("confidence").and_then(serde_json::Value::as_f64),
+            }),
+        );
     }
-    let Some(dir) = park.out_dir else {
+    by_n.into_values().collect()
+}
+
+/// The park index `/api/cameras/{id}/park`: a camera's captured park frames for the
+/// dashboard player (open read), `{ running, count, parks: [{n, t, confidence}, …] }` from
+/// `<out>/<id>/parks.jsonl`. The individual frames are `…/park/{n}` ([`camera_park_frame`]).
+/// Available while the run is active AND after it stops (until the next run replaces the
+/// status's out_dir), so the whole filmstrip stays reviewable. 404 when no park run owns
+/// `id`. The id is matched against the run's own camera list, never joined blindly.
+async fn park_index(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+    let park = st.timelapse.status_park();
+    let Some(dir) = park.out_dir.as_ref() else {
         return StatusCode::NOT_FOUND.into_response();
     };
     if !park.cameras.iter().any(|c| c == &id) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let path = std::path::Path::new(&dir).join(&id).join("latest_park.jpg");
+    let jsonl = std::path::Path::new(dir).join(&id).join("parks.jsonl");
+    let parks = match tokio::fs::read_to_string(&jsonl).await {
+        Ok(s) => parse_parks_index(&s),
+        Err(_) => Vec::new(), // run started, no park written yet → an empty filmstrip
+    };
+    Json(json!({ "running": park.running, "count": parks.len(), "parks": parks })).into_response()
+}
+
+/// Serve one indexed park frame `/api/cameras/{id}/park/{n}` (`park_NNNNNN.jpg`) for a
+/// camera (open read). Same gating and lifetime as the [`park_index`] it belongs to. `n`
+/// is numeric, so it can't traverse; an index with no file (out of range / pruned) 404s.
+async fn camera_park_frame(
+    State(st): State<AppState>,
+    Path((id, n)): Path<(String, u64)>,
+) -> Response {
+    let park = st.timelapse.status_park();
+    let Some(dir) = park.out_dir.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !park.cameras.iter().any(|c| c == &id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let path = std::path::Path::new(dir)
+        .join(&id)
+        .join(format!("park_{n:06}.jpg"));
     match tokio::fs::read(&path).await {
         Ok(bytes) => (
             [
@@ -1270,7 +1323,7 @@ async fn camera_park(State(st): State<AppState>, Path(id): Path<String>) -> Resp
             bytes,
         )
             .into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(), // no park captured yet
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -2522,11 +2575,156 @@ mod tests {
             .assert_status_bad_request();
     }
 
+    #[test]
+    fn parse_parks_index_dedupes_by_n_keeps_the_replace_and_sorts() {
+        // parks.jsonl has one line per WRITE: a `replace` re-uses the prior `n` with a
+        // stronger frame, so the index must keep one entry per distinct n (the last/
+        // stronger metadata wins), sorted by n, and skip malformed/blank lines.
+        let jsonl = concat!(
+            "{\"n\":1,\"idx\":20,\"t\":5.0,\"confidence\":0.70,\"replace\":false}\n",
+            "{\"n\":0,\"idx\":10,\"t\":2.5,\"confidence\":0.80,\"replace\":false}\n",
+            "{\"n\":1,\"idx\":22,\"t\":5.6,\"confidence\":0.95,\"replace\":true}\n",
+            "not json\n",
+            "\n",
+        );
+        let idx = parse_parks_index(jsonl);
+        assert_eq!(idx.len(), 2, "two distinct frames: {idx:?}");
+        assert_eq!(idx[0]["n"], 0, "sorted by n");
+        assert_eq!(idx[1]["n"], 1);
+        assert_eq!(
+            idx[1]["confidence"], 0.95,
+            "the replace's stronger metadata wins"
+        );
+        assert_eq!(idx[1]["t"], 5.6);
+    }
+
+    /// Build a test server that shares its [`TimelapseManager`] handle, so a test can
+    /// install a park run (out_dir + cameras) and seed its on-disk frames.
+    fn app_with_timelapse(
+        controller: impl Controller + 'static,
+    ) -> (TestServer, Arc<TimelapseManager>) {
+        let tl: Arc<TimelapseManager> = Default::default();
+        let state = AppState {
+            source: Arc::new(FakeSource::idle()),
+            controller: Arc::new(controller),
+            files: Arc::new(FakeFiles),
+            starter: Arc::new(FakeStarter),
+            password: None,
+            start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            external_cameras: Arc::new(RwLock::new(Vec::new())),
+            internal_camera: Arc::new(NoCamera),
+            timelapse: tl.clone(),
+        };
+        (TestServer::new(router(state)), tl)
+    }
+
+    fn test_tuning() -> ParkTuning {
+        ParkTuning {
+            fps: 4.0,
+            left_frac: 0.33,
+            ema_seconds: 6.0,
+            abs_floor: 1500.0,
+            mad_k: 6.0,
+            merge_gap_s: 1.2,
+            max_island_s: 3.0,
+            min_sep_s: 3.0,
+            candidate_frac: 0.75,
+            warmup_s: 0.5,
+            baseline_s: 20.0,
+        }
+    }
+
+    /// Install a park run for `id` writing into `out`, with a no-op worker (the test seeds
+    /// the frame files itself). Returns the status `tx` to keep the run's channel alive.
+    fn install_park_run(
+        tl: &Arc<TimelapseManager>,
+        out: &std::path::Path,
+        id: &str,
+    ) -> watch::Sender<PrinterStatus> {
+        let (tx, rx) = watch::channel(PrinterStatus::default());
+        let noop: crate::server::timelapse::ParkSpawn =
+            Arc::new(|_, _, _, _| tokio::task::spawn_blocking(|| {}));
+        tl.start_park(
+            vec![ParkCapture {
+                id: id.to_string(),
+                stream_url: "http://cam/stream".into(),
+                tuning: test_tuning(),
+            }],
+            rx,
+            out.to_path_buf(),
+            noop,
+        )
+        .unwrap();
+        tx
+    }
+
     #[tokio::test]
-    async fn camera_park_is_404_without_a_running_park() {
+    async fn parks_index_and_indexed_frames_serve_during_and_after_a_run() {
+        let dir = std::env::temp_dir().join(format!("bambu-api-parks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cam = dir.join("ext-0");
+        std::fs::create_dir_all(&cam).unwrap();
+
+        let (server, tl) = app_with_timelapse(FakeController::verified());
+        let _tx = install_park_run(&tl, &dir, "ext-0");
+
+        std::fs::write(cam.join("park_000000.jpg"), b"FRAME0").unwrap();
+        std::fs::write(cam.join("park_000001.jpg"), b"FRAME1").unwrap();
+        std::fs::write(
+            cam.join("parks.jsonl"),
+            "{\"n\":0,\"t\":1.0,\"confidence\":0.8}\n{\"n\":1,\"t\":2.0,\"confidence\":0.9}\n",
+        )
+        .unwrap();
+
+        // The index lists both frames, sorted, with a count.
+        let res = server.get("/api/cameras/ext-0/park").await;
+        res.assert_status_ok();
+        let body: serde_json::Value = res.json();
+        assert_eq!(body["count"], 2);
+        assert_eq!(body["parks"][0]["n"], 0);
+        assert_eq!(body["parks"][1]["n"], 1);
+
+        // An indexed frame serves its exact JPEG bytes.
+        let f1 = server.get("/api/cameras/ext-0/park/1").await;
+        f1.assert_status_ok();
+        assert_eq!(f1.as_bytes().as_ref(), b"FRAME1");
+
+        // Out-of-range index → 404; a camera not in the run → 404 (no traversal join).
+        server
+            .get("/api/cameras/ext-0/park/9")
+            .await
+            .assert_status_not_found();
+        server
+            .get("/api/cameras/ext-1/park")
+            .await
+            .assert_status_not_found();
+        server
+            .get("/api/cameras/ext-1/park/0")
+            .await
+            .assert_status_not_found();
+
+        // After the run STOPS, the filmstrip stays reviewable (until the next run).
+        tl.stop_park();
+        let after = server.get("/api/cameras/ext-0/park").await;
+        after.assert_status_ok();
+        assert_eq!(after.json::<serde_json::Value>()["count"], 2);
+        server
+            .get("/api/cameras/ext-0/park/0")
+            .await
+            .assert_status_ok();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn parks_index_and_frame_are_404_without_a_run() {
         let server = app(None, FakeController::verified());
         server
             .get("/api/cameras/ext-0/park")
+            .await
+            .assert_status_not_found();
+        server
+            .get("/api/cameras/ext-0/park/0")
             .await
             .assert_status_not_found();
     }
