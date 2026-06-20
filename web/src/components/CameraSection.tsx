@@ -146,6 +146,7 @@ function runLabel(run: RunState | undefined): string {
 function ModeRow({
   name,
   desc,
+  note,
   testid,
   run,
   busy,
@@ -155,6 +156,8 @@ function ModeRow({
 }: {
   name: string;
   desc: ReactNode;
+  // Optional faint sub-line below the description (e.g. a precondition reminder).
+  note?: ReactNode;
   testid: string;
   run: RunState | undefined;
   busy: boolean;
@@ -167,6 +170,7 @@ function ModeRow({
       <div className="cam__mode-info">
         <span className="cam__mode-name">{name}</span>
         <span className="cam__mode-desc dim">{desc}</span>
+        {note && <span className="cam__mode-note dim">{note}</span>}
       </div>
       {run?.running ? (
         <div className="cam__mode-act">
@@ -233,7 +237,18 @@ function TimelapseBar({
 
   const multi = cameras.length > 1;
   const targets = allCams && multi ? cameras.map((c) => c.id) : [activeCamera];
-  const activeIsPark = cameras.find((c) => c.id === activeCamera)?.park ?? false;
+  // Two purposes, each auto-picking its METHOD by the active camera's capability:
+  //  - clean timelapse → park (camera-detected) when the camera has a stream + tuning,
+  //    else smooth (printer-layer-synced snapshots).
+  //  - print video → records the real stream (stream cams) or samples snapshots (else).
+  //    `plain` auto-splits this server-side; the interval only applies to snapshot cams.
+  const active = cameras.find((c) => c.id === activeCamera);
+  const activeIsPark = active?.park ?? false;
+  const layerMode: TimelapseMode = activeIsPark ? "park" : "smooth";
+  const layerRun = activeIsPark ? tl?.park : tl?.smooth;
+  const targetCams = allCams && multi ? cameras : active ? [active] : [];
+  const anySnapshot = targetCams.some((c) => !c.stream);
+  const someStream = targetCams.some((c) => c.stream);
 
   const startMode = async (mode: TimelapseMode) => {
     setBusy(true);
@@ -256,7 +271,7 @@ function TimelapseBar({
   return (
     <div className="cam__tl" data-testid="timelapse-bar">
       <div className="cam__tl-head">
-        <span className="lbl">timelapse</span>
+        <span className="lbl">capture</span>
         {/* Target: which camera(s) a started mode captures. Only when there's a choice. */}
         {multi && (
           <div className="seg seg--target" role="radiogroup" aria-label="capture target">
@@ -285,24 +300,38 @@ function TimelapseBar({
         )}
       </div>
 
+      {/* Purpose 1 — a clean, object-only timelapse: one frame per layer with the head
+          parked. Method (park vs smooth) is auto-picked by the active camera. */}
       <ModeRow
-        name="smooth"
-        desc="one clean frame per layer — head parked out of shot (the classic timelapse)"
-        testid="smooth"
-        run={tl?.smooth}
+        name="clean timelapse"
+        desc={
+          activeIsPark
+            ? "one object-only frame per layer — the real park, detected from the camera (scrub it in the park view above)"
+            : "one object-only frame per layer — synced to the printer's layer signal"
+        }
+        note="needs the print started with timelapse armed, so the head parks each layer"
+        testid={layerMode}
+        run={layerRun}
         busy={busy}
-        onStart={() => void startMode("smooth")}
-        onStop={() => void stopMode("smooth")}
+        onStart={() => void startMode(layerMode)}
+        onStop={() => void stopMode(layerMode)}
       />
 
+      {/* Purpose 2 — a video of the print (head in shot). Stream cameras record the real
+          stream; snapshot cameras sample every N s (the interval only applies to those). */}
       <ModeRow
-        name="plain"
+        name="print video"
         desc={
-          tl?.plain.running ? (
-            <>a frame every {plainSecs}s — head in shot (a normal sped-up video)</>
+          !anySnapshot ? (
+            <>records the live camera stream — head in shot (the real video)</>
+          ) : tl?.plain.running ? (
+            <>
+              a frame every {plainSecs}s, head in shot
+              {someStream ? " (stream cams record continuously)" : ""}
+            </>
           ) : (
             <>
-              a frame every{" "}
+              {allCams && multi && someStream ? "snapshot cams: " : ""}a frame every{" "}
               <input
                 className="pw cam__tl-secs"
                 inputMode="decimal"
@@ -311,7 +340,7 @@ function TimelapseBar({
                 data-testid="timelapse-plain-secs"
                 onChange={(e) => setPlainSecs(Number(e.target.value) || 0)}
               />{" "}
-              s — head in shot (a normal sped-up video)
+              s, head in shot
             </>
           )
         }
@@ -320,21 +349,8 @@ function TimelapseBar({
         busy={busy}
         onStart={() => void startMode("plain")}
         onStop={() => void stopMode("plain")}
-        startDisabled={plainSecs < 0.1}
+        startDisabled={anySnapshot && plainSecs < 0.1}
       />
-
-      {/* park: only for park-capable cameras (a stream + a calibrated tuning). */}
-      {activeIsPark && (
-        <ModeRow
-          name="park"
-          desc="live per-layer frames detected from the camera — scrub them in the park view above"
-          testid="park"
-          run={tl?.park}
-          busy={busy}
-          onStart={() => void startMode("park")}
-          onStop={() => void stopMode("park")}
-        />
-      )}
 
       {msg && (
         <span className="cam__tl-msg dim" data-testid="timelapse-msg">
