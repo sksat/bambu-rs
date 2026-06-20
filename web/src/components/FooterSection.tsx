@@ -3,9 +3,12 @@ import type { PrinterStatus } from "../types";
 export function FooterSection({ s }: { s: PrinterStatus }) {
   const chips: Array<[string, string]> = [];
   // The band carries WiFi + the nozzle spec; the AMS header carries RFID; the
-  // Files panel header carries the SD card. The footer is just conditional
-  // notices (an active timelapse, a pending firmware update) now.
-  if (s.ipcam?.timelapse) chips.push(["timelapse", s.ipcam.timelapse]);
+  // Files panel header carries the SD card. The footer is just conditional notices
+  // (extra lights, a pending firmware update) now.
+  //
+  // We deliberately DON'T surface `ipcam.timelapse` here: it's the printer's built-in
+  // camera recording toggle (dead on this A1), and it collides with the dashboard's own
+  // "record a timelapse" feature — "timelapse: disable" reads as "your recording is off".
   // The chamber light has its own toggle in the controls panel — don't repeat it
   // here. Other light nodes (e.g. a work light) still surface as status chips.
   for (const l of s.lights ?? []) {
