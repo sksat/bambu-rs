@@ -28,7 +28,7 @@ use crate::core::safety::{self, GcodeVerdict, TempLimits};
 use crate::core::stage::Stage;
 use crate::core::start::{self, PrintStartParams};
 use crate::core::status::{GcodeState, PrinterStatus};
-use crate::core::timelapse::{CaptureAction, CaptureSession};
+use crate::core::timelapse::{ActivityAction, CaptureAction, CaptureSession, PrintActivitySession};
 use crate::core::version::Module;
 use crate::ftp::{FtpError, FtpsClient};
 use crate::park::{DECODE_H, DECODE_W, ParkCapture, ParkEvent, run_park_camera};
@@ -444,6 +444,11 @@ enum TimelapseAction {
         /// printer's connection). Without it the run ends on --max-seconds / Ctrl-C.
         #[arg(long, value_name = "SERVE_URL")]
         serve: Option<String>,
+        /// Auto-stop when the print ends by watching the printer DIRECTLY over MQTT (uses
+        /// the selected profile / BAMBU_* env). Alternative to --serve when no serve is
+        /// running — the A1 accepts a second MQTT connection, so it won't disrupt one.
+        #[arg(long, conflicts_with = "serve")]
+        watch_printer: bool,
         /// Detection decode width (tiny grayscale; rarely changed).
         #[arg(long, default_value_t = DECODE_W as u32)]
         width: u32,
@@ -2404,6 +2409,7 @@ fn run_timelapse(cli: &Cli, action: &TimelapseAction) -> Result<(), CliError> {
             assemble,
             out_fps,
             serve,
+            watch_printer,
             width,
             height,
             max_seconds,
@@ -2414,6 +2420,7 @@ fn run_timelapse(cli: &Cli, action: &TimelapseAction) -> Result<(), CliError> {
             assemble: assemble.as_deref(),
             out_fps: *out_fps,
             serve: serve.as_deref(),
+            watch_printer: *watch_printer,
             width: *width,
             height: *height,
             max_seconds: *max_seconds,
@@ -2430,6 +2437,7 @@ struct ParkArgs<'a> {
     assemble: Option<&'a std::path::Path>,
     out_fps: u32,
     serve: Option<&'a str>,
+    watch_printer: bool,
     width: u32,
     height: u32,
     max_seconds: Option<u64>,
@@ -2449,6 +2457,7 @@ fn run_timelapse_park(args: ParkArgs) -> Result<(), CliError> {
         assemble,
         out_fps,
         serve,
+        watch_printer,
         width,
         height,
         max_seconds,
@@ -2497,6 +2506,8 @@ fn run_timelapse_park(args: ParkArgs) -> Result<(), CliError> {
     }
     if let Some(base) = serve {
         spawn_serve_autostop(base, &cancel)?;
+    } else if watch_printer {
+        spawn_printer_autostop(cli, &cancel)?;
     }
 
     eprintln!("watching {stream_url} -> {}", out.display());
@@ -2506,9 +2517,16 @@ fn run_timelapse_park(args: ParkArgs) -> Result<(), CliError> {
         out.display(),
         out.display()
     );
+    let auto_stop = if serve.is_some() {
+        "print end (via serve), "
+    } else if watch_printer {
+        "print end (via printer), "
+    } else {
+        ""
+    };
     eprintln!(
         "  stops on: {}{}Ctrl-C",
-        serve.map_or(String::new(), |_| "print end (via serve), ".to_string()),
+        auto_stop,
         max_seconds.map_or(String::new(), |s| format!("{s}s, ")),
     );
 
@@ -2630,7 +2648,6 @@ fn spawn_serve_autostop(
     base: &str,
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), CliError> {
-    use crate::core::timelapse::{ActivityAction, PrintActivitySession};
     // Fail fast if serve isn't reachable, rather than silently never auto-stopping.
     fetch_serve_status(base)?;
     let base = base.to_string();
@@ -2659,6 +2676,42 @@ fn spawn_serve_autostop(
         exit::VALIDATION,
         "--serve needs the `server` feature (not compiled into this build)",
     ))
+}
+
+/// Spawn the `--watch-printer` auto-stop poller: open a DIRECT MQTT connection to the
+/// configured printer (profile / BAMBU_* env) and watch its print lifecycle through the
+/// pure [`PrintActivitySession`], flipping `cancel` once the print ends. The A1 accepts a
+/// second MQTT connection (device-verified), so this runs fine alongside a `bambu serve`.
+/// The target is resolved up front (fail-fast on a missing config); a later connection
+/// error is a non-fatal warning — the run still stops on --max-seconds / Ctrl-C.
+fn spawn_printer_autostop(
+    cli: &Cli,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), CliError> {
+    let target = resolve_target(cli)?;
+    let cancel = cancel.clone();
+    std::thread::spawn(move || {
+        let client = LanMqttClient::new(target).with_timeout(Duration::from_secs(6 * 3600));
+        let mut activity = PrintActivitySession::new(true);
+        let mut on_update = |state: &ReportState| -> WatchStep {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return WatchStep::Stop; // another stop source fired — release the connection
+            }
+            let st = PrinterStatus::from_state(state.get());
+            if activity.observe(&st) == ActivityAction::Stop {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                WatchStep::Stop
+            } else {
+                WatchStep::Continue
+            }
+        };
+        if let Err(e) = client.watch(Some(Duration::from_secs(5)), &mut on_update)
+            && !matches!(e, ClientError::Timeout(_))
+        {
+            eprintln!("warning: printer auto-stop watch ended: {e}");
+        }
+    });
+    Ok(())
 }
 
 /// Default mp4 path for an `encode` input: the input path with a `.mp4` suffix
