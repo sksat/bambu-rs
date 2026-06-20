@@ -118,6 +118,48 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("files-path")).toHaveText("/");
   });
 
+  test("changing directory drops a stale in-flight listing for the old dir", async ({ page }) => {
+    // Reproduces the bug where the list lagged a CWD change: a slow listing for the dir we
+    // just left lands AFTER the new one and reverts the view. Root is mocked slow on its
+    // SECOND fetch; the subdir is instant. We kick a (slow) root refresh, immediately enter
+    // the subdir, then ensure the late root response doesn't clobber the subdir listing.
+    let rootCalls = 0;
+    await page.route(/\/api\/file\?dir=/, async (route) => {
+      const dir = new URL(route.request().url()).searchParams.get("dir");
+      if (dir === "/") {
+        rootCalls += 1;
+        if (rootCalls >= 2) await new Promise((r) => setTimeout(r, 1500));
+        await route.fulfill({
+          json: {
+            files: [
+              { name: "sub", is_dir: true, size: 0 },
+              { name: "ROOT_ONLY.gcode.3mf", is_dir: false, size: 1 },
+            ],
+          },
+        });
+      } else if (dir === "/sub") {
+        await route.fulfill({ json: { files: [{ name: "INSIDE_SUB.gcode.3mf", is_dir: false, size: 2 }] } });
+      } else {
+        await route.fulfill({ json: { files: [] } });
+      }
+    });
+    await page.reload();
+    const sub = page.getByTestId("dir").filter({ hasText: "sub" });
+    await expect(sub).toBeVisible();
+    // Kick a slow root re-fetch (now in flight), then immediately navigate into the subdir.
+    await page.getByRole("button", { name: "refresh" }).click();
+    await sub.click();
+    await expect(page.getByTestId("files-path")).toHaveText("/sub");
+    await expect(page.getByText("INSIDE_SUB.gcode.3mf")).toBeVisible();
+    // Wait past when the late root listing lands (~1.5s) but before the 5s auto-refresh of
+    // /sub. Use one-shot count() (no auto-retry) so the auto-refresh can't heal — and mask —
+    // a momentary stale revert: the subdir listing must hold throughout.
+    await page.waitForTimeout(2200);
+    expect(await page.getByTestId("files-path").textContent()).toBe("/sub");
+    expect(await page.getByText("ROOT_ONLY.gcode.3mf").count()).toBe(0);
+    expect(await page.getByText("INSIDE_SUB.gcode.3mf").count()).toBe(1);
+  });
+
   test("shows file thumbnails (embedded plate preview)", async ({ page }) => {
     await expect(page.getByTestId("thumb").first()).toBeVisible();
   });

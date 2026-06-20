@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Thumb } from "./widgets";
 import { ModelView } from "./Viewer3D";
 import { listCameras, type Camera } from "../cameras";
@@ -51,10 +51,17 @@ export function FilesSection({ sdcard }: { sdcard?: boolean | null }) {
   const [printing, setPrinting] = useState<string | null>(null);
   const [detail, setDetail] = useState<{ path: string; entry: FileEntry } | null>(null);
 
+  // The directory currently shown. A listing fetch carries the dir it was for; if that no
+  // longer matches by the time it lands (we navigated away, or a slow auto-refresh for the
+  // old dir resolved late), we drop it instead of clobbering the new listing — the
+  // stale-response race that made the list lag a CWD change.
+  const dirRef = useRef(dir);
+
   const refresh = useCallback(async (d: string) => {
     try {
       const r = await fetch(`/api/file?dir=${encodeURIComponent(d)}`);
       const data = (await r.json()) as { files?: FileEntry[]; error?: string };
+      if (d !== dirRef.current) return; // a stale response for a directory we've left
       if (r.ok) {
         // Tolerate unexpected shapes (e.g. an older server) instead of crashing.
         setEntries((data.files ?? []).filter((e): e is FileEntry => typeof e?.name === "string"));
@@ -63,12 +70,14 @@ export function FilesSection({ sdcard }: { sdcard?: boolean | null }) {
         setMsg(data.error ?? `HTTP ${r.status}`);
       }
     } catch {
-      setMsg("network error");
+      if (d === dirRef.current) setMsg("network error");
     }
   }, []);
 
-  // (Re)load on directory change, and auto-refresh on a timer.
+  // (Re)load on directory change, and auto-refresh on a timer. Point dirRef at the current
+  // dir synchronously here so in-flight fetches for the previous dir are recognised as stale.
   useEffect(() => {
+    dirRef.current = dir;
     void refresh(dir);
     const id = setInterval(() => void refresh(dir), REFRESH_MS);
     return () => clearInterval(id);
