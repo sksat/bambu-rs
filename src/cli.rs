@@ -2696,27 +2696,43 @@ fn spawn_printer_autostop(
     let target = resolve_target(cli)?;
     let cancel = cancel.clone();
     std::thread::spawn(move || {
-        // Stall window: only fires after no report for this long. The 30s pushall below
-        // keeps reports flowing (idle or printing), so it's effectively indefinite while
-        // the printer responds.
+        use std::sync::atomic::Ordering::Relaxed;
+        // Stall window: monitor only returns after no report for this long. The 30s
+        // pushall keeps reports flowing (idle or printing), so it watches indefinitely
+        // while the printer responds, auto-reconnecting through transient drops.
         let client = LanMqttClient::new(target).with_timeout(Duration::from_secs(120));
         let mut activity = PrintActivitySession::new(true);
-        let mut on_update = |state: &ReportState| -> WatchStep {
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                return WatchStep::Stop; // another stop source fired — release the connection
+        // Retry loop: monitor returns when WE stop it (print end / cancel) or after a
+        // sustained outage (a stall returns Ok, a hard error returns Err). If we didn't
+        // stop it, auto-stop is momentarily unarmed — say so (never exit silently) and
+        // re-enter, so it RESUMES once the printer responds again. --max-seconds / Ctrl-C
+        // stay as backstops throughout.
+        while !cancel.load(Relaxed) {
+            let mut on_update = |state: &ReportState| -> WatchStep {
+                if cancel.load(Relaxed) {
+                    return WatchStep::Stop; // another stop source fired
+                }
+                let st = PrinterStatus::from_state(state.get());
+                if activity.observe(&st) == ActivityAction::Stop {
+                    cancel.store(true, Relaxed);
+                    WatchStep::Stop
+                } else {
+                    WatchStep::Continue
+                }
+            };
+            let result = client.monitor(Some(Duration::from_secs(30)), &mut on_update);
+            if cancel.load(Relaxed) {
+                break; // we (or another stop source) ended the run
             }
-            let st = PrinterStatus::from_state(state.get());
-            if activity.observe(&st) == ActivityAction::Stop {
-                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                WatchStep::Stop
-            } else {
-                WatchStep::Continue
+            match result {
+                Err(e) if !matches!(e, ClientError::Timeout(_)) => {
+                    eprintln!("warning: printer auto-stop watch error: {e}; retrying…")
+                }
+                _ => eprintln!(
+                    "warning: printer unreachable — print-end auto-stop paused, retrying…"
+                ),
             }
-        };
-        if let Err(e) = client.monitor(Some(Duration::from_secs(30)), &mut on_update)
-            && !matches!(e, ClientError::Timeout(_))
-        {
-            eprintln!("warning: printer auto-stop watch ended: {e}");
+            std::thread::sleep(Duration::from_secs(5));
         }
     });
     Ok(())
