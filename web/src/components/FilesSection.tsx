@@ -137,9 +137,15 @@ export function FilesSection({ sdcard }: { sdcard?: boolean | null }) {
       )}
       <ul className="filelist">
         {dir !== "/" && (
-          <li className="filerow filerow--dir" onClick={goUp} data-testid="updir">
-            <span className="ficon">↑</span>
-            <span className="fname">..</span>
+          <li className="filerow filerow--dir" onClick={goUp} data-testid="updir" title="up one level">
+            <span className="ficon ficon--folder">
+              <FolderIcon />
+            </span>
+            <span className="fname fname--up">..</span>
+            <span className="fsize" />
+            <span className="frow__chev" aria-hidden>
+              ‹
+            </span>
           </li>
         )}
         {sorted.map((e) =>
@@ -149,9 +155,16 @@ export function FilesSection({ sdcard }: { sdcard?: boolean | null }) {
               className="filerow filerow--dir"
               onClick={() => setDir(join(e.name))}
               data-testid="dir"
+              title={e.name}
             >
-              <span className="ficon">▸</span>
-              <span className="fname">{e.name}/</span>
+              <span className="ficon ficon--folder">
+                <FolderIcon />
+              </span>
+              <span className="fname">{e.name}</span>
+              <span className="fsize" />
+              <span className="frow__chev" aria-hidden>
+                ›
+              </span>
             </li>
           ) : (
             <li
@@ -159,14 +172,17 @@ export function FilesSection({ sdcard }: { sdcard?: boolean | null }) {
               className={`filerow${printable(e.name) ? " filerow--file" : ""}`}
               data-testid="file"
               onClick={printable(e.name) ? () => setDetail({ path: join(e.name), entry: e }) : undefined}
-              title={printable(e.name) ? "open details" : undefined}
+              title={printable(e.name) ? `${e.name} — open details` : e.name}
             >
-              <Thumb file={join(e.name)} className="thumb thumb--row" />
+              <span className="ficon ficon--file">
+                <FileIcon />
+                <Thumb file={join(e.name)} className="thumb thumb--row" />
+              </span>
               <span className="fname">{e.name}</span>
               <span className="fsize dim">{fmtSize(e.size)}</span>
-              {printable(e.name) && (
+              {printable(e.name) ? (
                 <button
-                  className="btn btn--sm"
+                  className="btn btn--sm filerow__print"
                   onClick={(ev) => {
                     ev.stopPropagation();
                     setPrinting(join(e.name));
@@ -175,11 +191,13 @@ export function FilesSection({ sdcard }: { sdcard?: boolean | null }) {
                 >
                   print
                 </button>
+              ) : (
+                <span />
               )}
             </li>
           ),
         )}
-        {sorted.length === 0 && <li className="dim">empty</li>}
+        {sorted.length === 0 && <li className="filelist__empty dim">empty</li>}
       </ul>
       {printing && <StartDialog path={printing} onClose={() => setPrinting(null)} />}
       {detail && (
@@ -526,6 +544,33 @@ function StartDialog({ path, onClose }: { path: string; onClose: () => void }) {
         </div>
       </div>
     </div>
+  );
+}
+
+// Monochrome glyphs (currentColor) for the leading icon tile, so every row has a
+// consistent, aligned leading slot — a folder for directories, a page for files (the
+// plate thumbnail, when a sliced .3mf has one, paints over this page).
+function FolderIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+      <path
+        fill="currentColor"
+        d="M3 6.6A1.6 1.6 0 0 1 4.6 5h4a1.6 1.6 0 0 1 1.13.47L11 6.7h8.4A1.6 1.6 0 0 1 21 8.3v9.1A1.6 1.6 0 0 1 19.4 19H4.6A1.6 1.6 0 0 1 3 17.4z"
+      />
+    </svg>
+  );
+}
+function FileIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+      {/* page body */}
+      <path
+        fill="currentColor"
+        d="M13 3H6.6a.6.6 0 0 0-.6.6v16.8a.6.6 0 0 0 .6.6h10.8a.6.6 0 0 0 .6-.6V8z"
+      />
+      {/* folded corner, punched out with the tile background */}
+      <path fill="var(--hair-2)" d="M13 3v4.4a.6.6 0 0 0 .6.6H18z" />
+    </svg>
   );
 }
 
