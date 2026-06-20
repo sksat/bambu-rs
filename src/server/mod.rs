@@ -13,6 +13,7 @@ pub mod camera;
 pub mod control;
 pub mod files;
 pub mod live;
+pub mod park;
 pub mod start;
 pub mod stream_record;
 pub mod timelapse;
