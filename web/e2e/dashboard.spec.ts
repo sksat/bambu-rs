@@ -399,6 +399,33 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("cameras-modal")).toHaveCount(0);
   });
 
+  test("recordings modal lists captures with an mp4 link (mocked)", async ({ page }) => {
+    await page.route("**/api/capture", (r) =>
+      r.fulfill({
+        json: {
+          captures: [
+            {
+              id: "200_cube_gcode_3mf_park",
+              started_at: 200,
+              label: "cube_gcode_3mf_park",
+              cameras: [{ id: "ext-0", kind: "park", frames: 53, has_mp4: false }],
+            },
+          ],
+        },
+      }),
+    );
+    await page.getByTestId("recordings-open").click();
+    await expect(page.getByTestId("recordings-modal")).toBeVisible();
+    const list = page.getByTestId("recordings-list");
+    await expect(list).toContainText("cube");
+    await expect(list).toContainText("53 frames");
+    // The mp4 link points at the assemble-on-demand endpoint for that run + camera.
+    await expect(list.locator("a.rec-cam__open")).toHaveAttribute(
+      "href",
+      /\/api\/capture\/200_cube_gcode_3mf_park\/ext-0\/video\.mp4/,
+    );
+  });
+
   test("camera manage modal: per-camera park tuning editor", async ({ page }) => {
     // The live-park preview is enabled by a per-camera park_tuning. Verify the manage
     // form exposes a collapsible JSON editor for it and that it's editable. Like the

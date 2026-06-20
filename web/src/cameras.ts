@@ -58,6 +58,33 @@ export async function listParks(id: string): Promise<ParkIndex> {
   }
 }
 
+// A finished/in-progress capture run on disk, for the recordings list.
+export type CaptureKind = "park" | "smooth" | "video";
+export interface CaptureCam {
+  id: string;
+  kind: CaptureKind;
+  frames: number;
+  has_mp4: boolean;
+}
+export interface CaptureRun {
+  id: string;
+  started_at: number; // unix epoch (0 if unknown)
+  label: string;
+  cameras: CaptureCam[];
+}
+
+// List recorded capture runs (open read), newest first. Tolerate failure as none. Each
+// camera's mp4 is at `/api/capture/<run>/<cam>/video.mp4` (assembled on demand).
+export async function listCaptures(): Promise<CaptureRun[]> {
+  try {
+    const r = await fetch("/api/capture");
+    if (!r.ok) return [];
+    return ((await r.json()) as { captures?: CaptureRun[] }).captures ?? [];
+  } catch {
+    return [];
+  }
+}
+
 // The list of currently-available cameras (open read); tolerate failure as none.
 export async function listCameras(): Promise<Camera[]> {
   try {

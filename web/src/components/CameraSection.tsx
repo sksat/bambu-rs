@@ -3,7 +3,9 @@ import {
   listCameras,
   getCamerasConfig,
   setCamerasConfig,
+  listCaptures,
   type Camera,
+  type CaptureRun,
   type ParkTuning,
 } from "../cameras";
 import {
@@ -412,6 +414,7 @@ export function CamerasSection({ password }: { password: string | null }) {
   const [cameras, setCameras] = useState<Camera[]>([]);
   const [active, setActive] = useState<string>("");
   const [managing, setManaging] = useState(false);
+  const [recordings, setRecordings] = useState(false);
   // The park run's state, so the view offers the park toggle whenever a run (active OR
   // recently stopped) owns the active camera — its filmstrip is reviewable either way.
   const [parkRun, setParkRun] = useState<RunState | null>(null);
@@ -450,13 +453,22 @@ export function CamerasSection({ password }: { password: string | null }) {
       <section className="panel cam" data-testid="cameras">
         <div className="cam__head">
           <span className="lbl">cameras</span>
-          <button
-            className="cam__manage"
-            data-testid="cameras-manage"
-            onClick={() => setManaging(true)}
-          >
-            manage
-          </button>
+          <div className="cam__head-actions">
+            <button
+              className="cam__manage"
+              data-testid="recordings-open"
+              onClick={() => setRecordings(true)}
+            >
+              recordings
+            </button>
+            <button
+              className="cam__manage"
+              data-testid="cameras-manage"
+              onClick={() => setManaging(true)}
+            >
+              manage
+            </button>
+          </div>
         </div>
 
         {cameras.length === 0 ? (
@@ -516,7 +528,94 @@ export function CamerasSection({ password }: { password: string | null }) {
           }}
         />
       )}
+      {recordings && <RecordingsModal onClose={() => setRecordings(false)} />}
     </>
+  );
+}
+
+// Clean a run's dir-derived label for display: drop the trailing capture-mode suffix and
+// the sanitized file extension, turn underscores into spaces ("cube-petg_gcode_3mf_park"
+// → "cube-petg"). Falls back to the raw label if cleaning empties it.
+function recLabel(label: string): string {
+  const cleaned = label
+    .replace(/_(park|smooth|plain)$/, "")
+    .replace(/_gcode_3mf/g, "")
+    .replace(/_3mf/g, "")
+    .replace(/_/g, " ")
+    .trim();
+  return cleaned || label;
+}
+
+function recWhen(epoch: number): string {
+  return epoch > 0 ? new Date(epoch * 1000).toLocaleString() : "—";
+}
+
+// A floating list of recorded capture runs (newest first). Each camera's mp4 link opens
+// `/api/capture/<run>/<cam>/video.mp4`, which the server assembles on demand — so a
+// timelapse you recorded is one click to play or save.
+function RecordingsModal({ onClose }: { onClose: () => void }) {
+  const [runs, setRuns] = useState<CaptureRun[] | null>(null);
+  useEffect(() => {
+    void listCaptures().then(setRuns);
+  }, []);
+  return (
+    <div
+      className="modal"
+      role="dialog"
+      aria-modal="true"
+      data-testid="recordings-modal"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div className="modal__box modal__box--cam">
+        <div className="cam__modal-head">
+          <span className="lbl">recordings</span>
+          <button className="cam__manage" data-testid="recordings-close" onClick={onClose}>
+            close
+          </button>
+        </div>
+        {runs === null ? (
+          <div className="cam__status">loading…</div>
+        ) : runs.length === 0 ? (
+          <p className="cam__hint cam__hint--empty" data-testid="recordings-empty">
+            No recordings yet. Start a print with “timelapse” on (or record one from the
+            camera panel) and it'll show up here.
+          </p>
+        ) : (
+          <div className="rec-list" data-testid="recordings-list">
+            {runs.map((r) => (
+              <div className="rec-run" key={r.id}>
+                <div className="rec-run__head">
+                  <span className="rec-run__label">{recLabel(r.label)}</span>
+                  <span className="dim">{recWhen(r.started_at)}</span>
+                </div>
+                {r.cameras.map((c) => (
+                  <div className="rec-cam" key={c.id}>
+                    <span className={`rec-kind rec-kind--${c.kind}`}>
+                      {c.kind === "video" ? "video" : "timelapse"}
+                    </span>
+                    <span className="dim rec-cam__meta">
+                      {c.id || "camera"}
+                      {c.kind === "video" ? "" : ` · ${c.frames} frames`}
+                    </span>
+                    <a
+                      className="cam__btn rec-cam__open"
+                      href={`/api/capture/${encodeURIComponent(r.id)}/${encodeURIComponent(c.id || "default")}/video.mp4`}
+                      target="_blank"
+                      rel="noreferrer"
+                      title="opens the mp4 (assembled on first open — may take a few seconds)"
+                    >
+                      play / save ▸
+                    </a>
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
