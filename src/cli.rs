@@ -416,10 +416,12 @@ enum TimelapseAction {
     },
     /// Live "parked frame per layer" preview from a camera's MJPEG /stream — the
     /// in-process miner, no MQTT/printer connection needed (it reads the camera, not
-    /// the printer). Updates <out>/latest_park.jpg each layer in near-real-time and
-    /// accumulates park_*.jpg + parks.jsonl for the smooth timelapse. Needs ffmpeg.
+    /// the printer). Updates <out>/latest_park.jpg each layer in near-real-time (point an
+    /// auto-reloading viewer at it, e.g. `feh --reload 1 <out>/latest_park.jpg`) and
+    /// accumulates park_*.jpg + parks.jsonl. Ctrl-C stops cleanly. Needs ffmpeg.
     ///
-    ///   bambu timelapse park http://<host>/stream --config tuning.json --out ./live
+    ///   bambu timelapse park http://<host>/stream --config tuning.json --out ./live \
+    ///     --serve http://<serve-host>:8088 --assemble timelapse.mp4
     Park {
         /// The camera's MJPEG stream URL, e.g. http://<host>/stream.
         stream_url: String,
@@ -431,13 +433,24 @@ enum TimelapseAction {
         /// Output dir for latest_park.jpg + park_*.jpg + parks.jsonl (created if missing).
         #[arg(long, default_value = "./park")]
         out: std::path::PathBuf,
+        /// On stop, assemble the accumulated park_*.jpg into this mp4 (needs ffmpeg).
+        #[arg(long)]
+        assemble: Option<std::path::PathBuf>,
+        /// Playback frame rate for --assemble.
+        #[arg(long, default_value_t = 12)]
+        out_fps: u32,
+        /// Auto-stop when the print ends: poll a running `bambu serve`'s /api/status for
+        /// the print lifecycle (no MQTT from here, so it never conflicts with serve or the
+        /// printer's connection). Without it the run ends on --max-seconds / Ctrl-C.
+        #[arg(long, value_name = "SERVE_URL")]
+        serve: Option<String>,
         /// Detection decode width (tiny grayscale; rarely changed).
         #[arg(long, default_value_t = DECODE_W as u32)]
         width: u32,
         /// Detection decode height.
         #[arg(long, default_value_t = DECODE_H as u32)]
         height: u32,
-        /// Stop cleanly after N seconds (default: run until the stream ends / Ctrl-C).
+        /// Stop cleanly after N seconds (default: run until --serve's print-end / Ctrl-C).
         #[arg(long)]
         max_seconds: Option<u64>,
     },
@@ -2388,11 +2401,39 @@ fn run_timelapse(cli: &Cli, action: &TimelapseAction) -> Result<(), CliError> {
             stream_url,
             config,
             out,
+            assemble,
+            out_fps,
+            serve,
             width,
             height,
             max_seconds,
-        } => run_timelapse_park(cli, stream_url, config, out, *width, *height, *max_seconds),
+        } => run_timelapse_park(ParkArgs {
+            stream_url,
+            config,
+            out,
+            assemble: assemble.as_deref(),
+            out_fps: *out_fps,
+            serve: serve.as_deref(),
+            width: *width,
+            height: *height,
+            max_seconds: *max_seconds,
+            cli,
+        }),
     }
+}
+
+/// Inputs for [`run_timelapse_park`] — bundled to keep the call readable as options grow.
+struct ParkArgs<'a> {
+    stream_url: &'a str,
+    config: &'a std::path::Path,
+    out: &'a std::path::Path,
+    assemble: Option<&'a std::path::Path>,
+    out_fps: u32,
+    serve: Option<&'a str>,
+    width: u32,
+    height: u32,
+    max_seconds: Option<u64>,
+    cli: &'a Cli,
 }
 
 /// `bambu timelapse park`: drive the live park miner over a camera's MJPEG stream. No
@@ -2400,15 +2441,19 @@ fn run_timelapse(cli: &Cli, action: &TimelapseAction) -> Result<(), CliError> {
 /// the stream URL + a calibrated tuning. Blocks until the stream ends, `--max-seconds`
 /// elapses, or the process is interrupted; reports each park to stderr and a final
 /// summary (JSON with `--json`).
-fn run_timelapse_park(
-    cli: &Cli,
-    stream_url: &str,
-    config: &std::path::Path,
-    out: &std::path::Path,
-    width: u32,
-    height: u32,
-    max_seconds: Option<u64>,
-) -> Result<(), CliError> {
+fn run_timelapse_park(args: ParkArgs) -> Result<(), CliError> {
+    let ParkArgs {
+        stream_url,
+        config,
+        out,
+        assemble,
+        out_fps,
+        serve,
+        width,
+        height,
+        max_seconds,
+        cli,
+    } = args;
     // No baked defaults: a missing knob is a hard error, not a silent stale value.
     let raw = std::fs::read_to_string(config).map_err(|e| {
         CliError::new(
@@ -2433,8 +2478,16 @@ fn run_timelapse_park(
         stream_url: stream_url.to_string(),
         tuning,
     };
+    // Every stop source — Ctrl-C, --max-seconds, and --serve's print-end — converges on
+    // this one flag, which run_park_camera's watchdog turns into an ffmpeg kill + clean
+    // unwind (final summary + --assemble).
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // Optional clean stop: a watchdog flips `cancel`, which kills ffmpeg and unwinds.
+    {
+        let cancel = cancel.clone();
+        // A second Ctrl-C is left to the OS default (hard kill) in case cleanup hangs.
+        let _ =
+            ctrlc::set_handler(move || cancel.store(true, std::sync::atomic::Ordering::Relaxed));
+    }
     if let Some(secs) = max_seconds {
         let cancel = cancel.clone();
         std::thread::spawn(move || {
@@ -2442,10 +2495,21 @@ fn run_timelapse_park(
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         });
     }
+    if let Some(base) = serve {
+        spawn_serve_autostop(base, &cancel)?;
+    }
+
+    eprintln!("watching {stream_url} -> {}", out.display());
     eprintln!(
-        "watching {stream_url} -> {} ({})",
+        "  live preview: open {}/latest_park.jpg in an auto-reloading viewer \
+         (e.g. feh --reload 1 {}/latest_park.jpg)",
         out.display(),
-        max_seconds.map_or("Ctrl-C to stop".to_string(), |s| format!("stops in {s}s"))
+        out.display()
+    );
+    eprintln!(
+        "  stops on: {}{}Ctrl-C",
+        serve.map_or(String::new(), |_| "print end (via serve), ".to_string()),
+        max_seconds.map_or(String::new(), |s| format!("{s}s, ")),
     );
 
     let mut parks = 0u64;
@@ -2484,6 +2548,20 @@ fn run_timelapse_park(
         stats.dropped,
         out.display()
     );
+
+    let assembled = match assemble {
+        Some(mp4) if stats.parks > 0 => {
+            assemble_park_mp4(out, mp4, out_fps)?;
+            eprintln!("assembled {}", mp4.display());
+            Some(mp4.to_string_lossy().to_string())
+        }
+        Some(_) => {
+            eprintln!("nothing to assemble (no parks captured)");
+            None
+        }
+        None => None,
+    };
+
     if want_json(cli) {
         print_json(&serde_json::json!({
             "out": out.to_string_lossy(),
@@ -2491,9 +2569,96 @@ fn run_timelapse_park(
             "parks": stats.parks,
             "replaced": stats.replaced,
             "dropped": stats.dropped,
+            "assembled": assembled,
         }));
     }
     Ok(())
+}
+
+/// Assemble the accumulated `park_%06d.jpg` sequence in `out_dir` into `mp4` at `fps`.
+fn assemble_park_mp4(
+    out_dir: &std::path::Path,
+    mp4: &std::path::Path,
+    fps: u32,
+) -> Result<(), CliError> {
+    let pattern = out_dir.join("park_%06d.jpg");
+    let args = [
+        "-y".to_string(),
+        "-framerate".to_string(),
+        fps.max(1).to_string(),
+        "-i".to_string(),
+        pattern.display().to_string(),
+        "-vf".to_string(),
+        "scale='min(1280,iw)':-2,format=yuv420p".to_string(),
+        "-c:v".to_string(),
+        "libx264".to_string(),
+        "-crf".to_string(),
+        "23".to_string(),
+        "-movflags".to_string(),
+        "+faststart".to_string(),
+        mp4.display().to_string(),
+    ];
+    let status = std::process::Command::new("ffmpeg")
+        .args(&args)
+        .status()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                CliError::new(
+                    exit::VALIDATION,
+                    "ffmpeg not found on PATH — install ffmpeg to assemble the mp4",
+                )
+            } else {
+                CliError::new(exit::GENERAL, format!("running ffmpeg: {e}"))
+            }
+        })?;
+    if !status.success() {
+        return Err(CliError::new(
+            exit::GENERAL,
+            format!("ffmpeg failed to assemble {}", mp4.display()),
+        ));
+    }
+    Ok(())
+}
+
+/// Spawn the `--serve` auto-stop poller: read a running serve's `/api/status` on an
+/// interval, feed it through the pure print-lifecycle state machine, and flip `cancel`
+/// once the print ends (after having been active). No MQTT from here — serve owns the
+/// single printer connection — so it never conflicts. Transient poll failures are skipped
+/// (the run still stops on Ctrl-C / --max-seconds).
+#[cfg(feature = "server")]
+fn spawn_serve_autostop(
+    base: &str,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), CliError> {
+    use crate::core::timelapse::{ActivityAction, PrintActivitySession};
+    // Fail fast if serve isn't reachable, rather than silently never auto-stopping.
+    fetch_serve_status(base)?;
+    let base = base.to_string();
+    let cancel = cancel.clone();
+    std::thread::spawn(move || {
+        let mut activity = PrintActivitySession::new(true);
+        while !cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Ok(status) = fetch_serve_status(&base)
+                && activity.observe(&status) == ActivityAction::Stop
+            {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    });
+    Ok(())
+}
+
+#[cfg(not(feature = "server"))]
+fn spawn_serve_autostop(
+    _base: &str,
+    _cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), CliError> {
+    Err(CliError::new(
+        exit::VALIDATION,
+        "--serve needs the `server` feature (not compiled into this build)",
+    ))
 }
 
 /// Default mp4 path for an `encode` input: the input path with a `.mp4` suffix
