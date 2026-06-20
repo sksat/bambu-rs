@@ -436,7 +436,9 @@ test.describe("dashboard (fake mode)", () => {
     );
   });
 
-  test("recordings show a thumbnail and play inline on click (mocked)", async ({ page }) => {
+  test("recordings show a thumbnail and play in an enlarged lightbox (mocked)", async ({
+    page,
+  }) => {
     await page.route("**/api/capture", (r) =>
       r.fulfill({
         json: {
@@ -473,15 +475,25 @@ test.describe("dashboard (fake mode)", () => {
       /\/api\/capture\/200_cube_gcode_3mf_park\/ext-0\/thumb\.jpg/,
     );
 
-    // Clicking the poster swaps it for an inline <video> at the assemble-on-demand mp4 —
-    // no new tab, playback happens right in the modal.
+    // Clicking the poster opens an enlarged lightbox with the <video> at the
+    // assemble-on-demand mp4 — no new tab, playback happens right in the dashboard.
     await page.getByTestId("rec-play").click();
+    const lightbox = page.getByTestId("rec-lightbox");
+    await expect(lightbox).toBeVisible();
     const video = page.getByTestId("rec-video");
     await expect(video).toBeVisible();
     await expect(video).toHaveAttribute(
       "src",
       /\/api\/capture\/200_cube_gcode_3mf_park\/ext-0\/video\.mp4/,
     );
+    // The enlarged player is wider than the recordings modal box (it's the point).
+    const lightW = (await lightbox.locator(".rec-light__box").boundingBox())?.width ?? 0;
+    const modalW = (await page.locator(".modal__box--cam").boundingBox())?.width ?? 0;
+    expect(lightW).toBeGreaterThan(modalW);
+    // Closing returns to the list without leaving the recordings modal.
+    await page.getByTestId("rec-light-close").click();
+    await expect(lightbox).toHaveCount(0);
+    await expect(page.getByTestId("recordings-modal")).toBeVisible();
   });
 
   test("the recordings modal paints above the AMS spools", async ({ page }) => {
