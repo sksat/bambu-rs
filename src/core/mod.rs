@@ -10,6 +10,7 @@ pub(crate) mod fake;
 pub mod firmware;
 pub mod hms;
 pub mod model;
+pub mod park;
 pub mod project;
 pub mod report;
 pub mod safety;
