@@ -445,8 +445,8 @@ mod tests {
         emits
     }
 
-    fn repeat(f: &Vec<u8>, n: usize) -> Vec<Vec<u8>> {
-        std::iter::repeat_n(f.clone(), n).collect()
+    fn repeat(f: &[u8], n: usize) -> Vec<Vec<u8>> {
+        std::iter::repeat_n(f.to_vec(), n).collect()
     }
 
     fn chain(parts: &[Vec<Vec<u8>>]) -> Vec<Vec<u8>> {

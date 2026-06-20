@@ -21,6 +21,7 @@ use crate::core::capability::{self, ControlAssessment, ControlRefusal};
 use crate::core::command::{
     AmsControl, AmsFilamentSetting, Command as ProtoCommand, LedNode, SpeedLevel, TimelapseControl,
 };
+use crate::core::park::ParkTuning;
 use crate::core::project::{self, PlateInspection};
 use crate::core::report::ReportState;
 use crate::core::safety::{self, GcodeVerdict, TempLimits};
@@ -30,6 +31,7 @@ use crate::core::status::{GcodeState, PrinterStatus};
 use crate::core::timelapse::{CaptureAction, CaptureSession};
 use crate::core::version::Module;
 use crate::ftp::{FtpError, FtpsClient};
+use crate::park::{DECODE_H, DECODE_W, ParkCapture, run_park_camera};
 
 /// Exit codes (a subset of the documented scheme).
 mod exit {
@@ -411,6 +413,33 @@ enum TimelapseAction {
         /// {frame}/{layer}/{outdir} tokens. Run directly, never via a shell.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1.., value_name = "CMD")]
         on_layer_cmd: Vec<String>,
+    },
+    /// Live "parked frame per layer" preview from a camera's MJPEG /stream — the
+    /// in-process miner, no MQTT/printer connection needed (it reads the camera, not
+    /// the printer). Updates <out>/latest_park.jpg each layer in near-real-time and
+    /// accumulates park_*.jpg + parks.jsonl for the smooth timelapse. Needs ffmpeg.
+    ///
+    ///   bambu timelapse park http://<host>/stream --config tuning.json --out ./live
+    Park {
+        /// The camera's MJPEG stream URL, e.g. http://<host>/stream.
+        stream_url: String,
+        /// Per-camera detection tuning JSON (copy the skill's tuning.example.json and
+        /// calibrate). There are deliberately NO defaults — a missing knob is an error,
+        /// because the right values depend on where the camera and printer sit.
+        #[arg(long)]
+        config: std::path::PathBuf,
+        /// Output dir for latest_park.jpg + park_*.jpg + parks.jsonl (created if missing).
+        #[arg(long, default_value = "./park")]
+        out: std::path::PathBuf,
+        /// Detection decode width (tiny grayscale; rarely changed).
+        #[arg(long, default_value_t = DECODE_W as u32)]
+        width: u32,
+        /// Detection decode height.
+        #[arg(long, default_value_t = DECODE_H as u32)]
+        height: u32,
+        /// Stop cleanly after N seconds (default: run until the stream ends / Ctrl-C).
+        #[arg(long)]
+        max_seconds: Option<u64>,
     },
     /// Encode a captured timelapse to mp4 with ffmpeg (must be on PATH). INPUT is
     /// either a directory of frame_*.jpg (the smooth per-layer or plain sampled
@@ -2355,7 +2384,109 @@ fn run_timelapse(cli: &Cli, action: &TimelapseAction) -> Result<(), CliError> {
             fps,
             speed,
         } => run_encode(input, out.as_deref(), *fps, *speed),
+        TimelapseAction::Park {
+            stream_url,
+            config,
+            out,
+            width,
+            height,
+            max_seconds,
+        } => run_timelapse_park(cli, stream_url, config, out, *width, *height, *max_seconds),
     }
+}
+
+/// `bambu timelapse park`: drive the live park miner over a camera's MJPEG stream. No
+/// printer/MQTT connection — the park signal comes from the camera, so this just needs
+/// the stream URL + a calibrated tuning. Blocks until the stream ends, `--max-seconds`
+/// elapses, or the process is interrupted; reports each park to stderr and a final
+/// summary (JSON with `--json`).
+fn run_timelapse_park(
+    cli: &Cli,
+    stream_url: &str,
+    config: &std::path::Path,
+    out: &std::path::Path,
+    width: u32,
+    height: u32,
+    max_seconds: Option<u64>,
+) -> Result<(), CliError> {
+    // No baked defaults: a missing knob is a hard error, not a silent stale value.
+    let raw = std::fs::read_to_string(config).map_err(|e| {
+        CliError::new(
+            exit::VALIDATION,
+            format!("reading tuning config {}: {e}", config.display()),
+        )
+    })?;
+    let tuning: ParkTuning = serde_json::from_str(&raw).map_err(|e| {
+        CliError::new(
+            exit::VALIDATION,
+            format!(
+                "invalid tuning config {} (no defaults): {e}",
+                config.display()
+            ),
+        )
+    })?;
+    std::fs::create_dir_all(out)
+        .map_err(|e| CliError::new(exit::GENERAL, format!("creating {}: {e}", out.display())))?;
+
+    let cap = ParkCapture {
+        id: "park".to_string(),
+        stream_url: stream_url.to_string(),
+        tuning,
+    };
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Optional clean stop: a watchdog flips `cancel`, which kills ffmpeg and unwinds.
+    if let Some(secs) = max_seconds {
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(secs));
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+    eprintln!(
+        "watching {stream_url} -> {} ({})",
+        out.display(),
+        max_seconds.map_or("Ctrl-C to stop".to_string(), |s| format!("stops in {s}s"))
+    );
+
+    let mut parks = 0u64;
+    let mut on_park = |written: bool| {
+        if written {
+            eprintln!("park #{parks}");
+            parks += 1;
+        }
+    };
+    let stats = run_park_camera(
+        &cap,
+        out,
+        width as usize,
+        height as usize,
+        &cancel,
+        &mut on_park,
+    )
+    .map_err(|e| CliError::new(exit::GENERAL, e))?;
+
+    if stats.frames == 0 {
+        return Err(CliError::new(
+            exit::TRANSPORT,
+            format!("read 0 frames from {stream_url} — check the URL and that ffmpeg can open it"),
+        ));
+    }
+    eprintln!(
+        "done: {} parks ({} frames, {} dropped) -> {}",
+        stats.parks,
+        stats.frames,
+        stats.dropped,
+        out.display()
+    );
+    if want_json(cli) {
+        print_json(&serde_json::json!({
+            "out": out.to_string_lossy(),
+            "frames": stats.frames,
+            "parks": stats.parks,
+            "dropped": stats.dropped,
+        }));
+    }
+    Ok(())
 }
 
 /// Default mp4 path for an `encode` input: the input path with a `.mp4` suffix

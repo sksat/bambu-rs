@@ -48,8 +48,9 @@ pub fn real_park_spawn() -> ParkSpawn {
                         s.last_error = Some(format!("park {}: a ring JPEG never arrived", cap.id));
                     }
                 };
+                let cam_dir = out_dir.join(&cap.id);
                 let outcome =
-                    run_park_camera(&cap, &out_dir, DECODE_W, DECODE_H, &cancel, &mut on_park);
+                    run_park_camera(&cap, &cam_dir, DECODE_W, DECODE_H, &cancel, &mut on_park);
                 let mut s = status.lock().unwrap();
                 match outcome {
                     Ok(stats) if stats.frames == 0 => {

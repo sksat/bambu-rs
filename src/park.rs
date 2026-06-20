@@ -254,11 +254,14 @@ pub fn prune_ring(ring_dir: &Path, keep: usize) -> usize {
 const RING_KEEP_SECONDS: f64 = 60.0;
 
 /// Run live park detection for ONE stream camera until the stream ends or `cancel` is
-/// set. Spawns one ffmpeg ([`live_park_args`]) that opens the MJPEG stream and tees a
-/// tiny gray rawvideo (read here → the detector) plus full-res JPEGs to a `.ring` dir;
-/// on each park the chosen JPEG is written to `latest_park.jpg`. An aux thread KILLS
-/// ffmpeg the instant `cancel` is set — the main read blocks until bytes arrive, so it
-/// can't observe `cancel` itself — and prunes the ring on a sliding window.
+/// set, writing its output into `cam_dir` (`latest_park.jpg` + `park_NNNNNN.jpg` +
+/// `parks.jsonl`, with a transient `.ring` subdir). The caller picks the dir — the server
+/// uses one per camera under the run dir; the CLI passes its `--out` directly. Spawns one
+/// ffmpeg ([`live_park_args`]) that opens the MJPEG stream and tees a tiny gray rawvideo
+/// (read here → the detector) plus full-res JPEGs to the ring; on each park the chosen
+/// JPEG is written to `latest_park.jpg`. An aux thread KILLS ffmpeg the instant `cancel`
+/// is set — the main read blocks until bytes arrive, so it can't observe `cancel` itself —
+/// and prunes the ring on a sliding window.
 ///
 /// Reports each park live via `on_park(written)`; returns the run's [`ParkRunStats`], or
 /// an error string if it couldn't even start (no server/CLI type leaks in, so any caller
@@ -267,14 +270,13 @@ const RING_KEEP_SECONDS: f64 = 60.0;
 /// detector, argv, writer, and prune are the unit-tested pure pieces.
 pub fn run_park_camera(
     cap: &ParkCapture,
-    out_dir: &Path,
+    cam_dir: &Path,
     w: usize,
     h: usize,
     cancel: &Arc<AtomicBool>,
     on_park: &mut dyn FnMut(bool),
 ) -> Result<ParkRunStats, String> {
-    let dir = out_dir.join(&cap.id);
-    let ring = dir.join(".ring");
+    let ring = cam_dir.join(".ring");
     std::fs::create_dir_all(&ring)
         .map_err(|e| format!("park {}: create {}: {e}", cap.id, ring.display()))?;
 
@@ -316,7 +318,7 @@ pub fn run_park_camera(
     };
 
     let mut det = LiveParkDetector::new(w, h, &cap.tuning);
-    let mut writer = ParkWriter::new(dir);
+    let mut writer = ParkWriter::new(cam_dir.to_path_buf());
     let ring_path = ring.clone();
     let read_cancel = cancel.clone();
     let wait_cancel = cancel.clone();
