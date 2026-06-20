@@ -1090,6 +1090,26 @@ div.lbl,
 .startnum {
   width: 5rem;
 }
+/* clean-timelapse capability, inspected from the file on open — a small tinted note
+   so you know before arming whether the head will actually park for this print. */
+.start__tlcap {
+  font-size: 0.7rem;
+  line-height: 1.35;
+  padding: 0.3rem 0.5rem;
+  border-radius: 6px;
+  border: 1px solid var(--hair);
+  margin-left: 1.6rem; /* align under the checkbox label, past the box */
+}
+.start__tlcap--ok {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 40%, transparent);
+  background: color-mix(in srgb, var(--ok) 9%, transparent);
+}
+.start__tlcap--warn {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 40%, transparent);
+  background: color-mix(in srgb, var(--warn) 9%, transparent);
+}
 
 /* ── gcode console ───────────────────────────────────────────────────────── */
 .gcoderow {

@@ -307,6 +307,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/files/thumbnail", get(file_thumbnail))
         .route("/api/files/raw", get(file_raw))
         .route("/api/files/gcode", get(file_gcode))
+        .route("/api/files/inspect", get(file_inspect))
         .route("/api/files/mesh", get(file_mesh))
         .route("/api/cameras", get(cameras_list))
         .route("/api/cameras/{id}/snapshot", get(camera_snapshot))
@@ -1083,6 +1084,54 @@ async fn file_gcode(State(st): State<AppState>, Query(q): Query<GcodeFileQuery>)
         Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
         Ok(Err(e)) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
         Err(_) => server_error("gcode task failed".to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct InspectQuery {
+    name: String,
+    #[serde(default = "default_plate")]
+    plate: u32,
+}
+
+/// Inspect an on-printer `.3mf` plate (open read): download + parse it, reporting whether
+/// the sliced gcode supports a clean per-layer timelapse (`has_timelapse_blocks`) plus the
+/// md5 / bed / filament metadata. Lets the start dialog show a file's timelapse capability
+/// the moment it opens — without a write-gated dry-run. Best-effort: a non-3mf or
+/// unreadable file returns `{ "inspected": false, ... }` rather than an error status, so
+/// the dialog degrades to "unknown" cleanly.
+async fn file_inspect(State(st): State<AppState>, Query(q): Query<InspectQuery>) -> Response {
+    let remote = if q.name.starts_with('/') {
+        q.name.clone()
+    } else {
+        format!("/{}", q.name)
+    };
+    if !is_safe_remote_path(&remote) || !remote.to_ascii_lowercase().ends_with(".3mf") {
+        return Json(json!({ "inspected": false, "error": "not a .3mf printer path" }))
+            .into_response();
+    }
+    if !(1..=64).contains(&q.plate) {
+        return bad_request("plate out of range (1..64)".to_string());
+    }
+    let (files, plate) = (st.files.clone(), q.plate);
+    match tokio::task::spawn_blocking(move || {
+        files
+            .fetch(&remote)
+            .and_then(|b| crate::core::project::inspect_plate(&b, plate).map_err(|e| e.to_string()))
+    })
+    .await
+    {
+        Ok(Ok(i)) => Json(json!({
+            "inspected": true,
+            "plate": i.plate,
+            "has_timelapse_blocks": i.has_timelapse_blocks,
+            "gcode_md5": i.gcode_md5,
+            "bed_type": i.bed_type,
+            "filament_colors": i.filament_colors,
+        }))
+        .into_response(),
+        Ok(Err(e)) => Json(json!({ "inspected": false, "error": e })).into_response(),
+        Err(_) => server_error("inspect task failed".to_string()),
     }
 }
 
@@ -2778,6 +2827,46 @@ mod tests {
             zip.finish().unwrap();
         }
         buf
+    }
+
+    #[tokio::test]
+    async fn file_inspect_reports_timelapse_capability_open() {
+        let state = AppState {
+            source: Arc::new(FakeSource::idle()),
+            controller: Arc::new(FakeController::verified()),
+            files: Arc::new(OneFile(three_mf_with_timelapse(3))),
+            starter: Arc::new(FakeStarter),
+            // A password is set, to prove the inspect read stays OPEN (no auth needed).
+            password: Some("secret".to_string()),
+            start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            external_cameras: Arc::new(RwLock::new(Vec::new())),
+            internal_camera: Arc::new(NoCamera),
+            timelapse: Default::default(),
+        };
+        let server = TestServer::new(router(state));
+        let res = server
+            .get("/api/files/inspect?name=/cube.gcode.3mf&plate=1")
+            .await;
+        res.assert_status_ok();
+        let body: serde_json::Value = res.json();
+        assert_eq!(body["inspected"], true);
+        assert_eq!(body["has_timelapse_blocks"], true);
+    }
+
+    #[tokio::test]
+    async fn file_inspect_degrades_to_not_inspected() {
+        // FakeFiles.fetch returns junk (not a zip) → inspected:false, never an error status.
+        let res = app(None, FakeController::verified())
+            .get("/api/files/inspect?name=/x.gcode.3mf&plate=1")
+            .await;
+        res.assert_status_ok();
+        assert_eq!(res.json::<serde_json::Value>()["inspected"], false);
+        // A non-3mf is also a clean "not inspected", not a 4xx.
+        let res2 = app(None, FakeController::verified())
+            .get("/api/files/inspect?name=/notes.txt")
+            .await;
+        res2.assert_status_ok();
+        assert_eq!(res2.json::<serde_json::Value>()["inspected"], false);
     }
 
     #[tokio::test]

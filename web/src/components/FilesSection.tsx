@@ -253,8 +253,38 @@ function StartDialog({ path, onClose }: { path: string; onClose: () => void }) {
   // Arm the printer-side timelapse: the per-layer head-park that makes a clean,
   // object-only timelapse possible. Default off — it changes print motion.
   const [timelapse, setTimelapse] = useState(false);
+  // Auto-inspected on open, so the dialog shows whether THIS file supports a clean
+  // timelapse without a Preview click: undefined = checking, null = couldn't inspect
+  // (unknown), true/false = whether the sliced gcode has the per-layer park moves.
+  const [hasBlocks, setHasBlocks] = useState<boolean | null | undefined>(undefined);
   const [result, setResult] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  // The capability inspection is an open read (no password) — run it as soon as a .3mf
+  // dialog opens (and when the plate changes), so "does this file timelapse?" is answered
+  // up front rather than only after Preview.
+  useEffect(() => {
+    if (!is3mf) return;
+    let live = true;
+    setHasBlocks(undefined);
+    void (async () => {
+      try {
+        const r = await fetch(
+          `/api/files/inspect?name=${encodeURIComponent(path)}&plate=${plate}`,
+        );
+        const d = (await r.json().catch(() => ({}))) as {
+          inspected?: boolean;
+          has_timelapse_blocks?: boolean | null;
+        };
+        if (live) setHasBlocks(d.inspected ? !!d.has_timelapse_blocks : null);
+      } catch {
+        if (live) setHasBlocks(null);
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [path, plate, is3mf]);
 
   const run = async (dryRun: boolean) => {
     setBusy(true);
@@ -368,6 +398,17 @@ function StartDialog({ path, onClose }: { path: string; onClose: () => void }) {
               />
               <span>timelapse (park the head each layer)</span>
             </label>
+            {/* The file's clean-timelapse capability, inspected on open. */}
+            {hasBlocks != null && (
+              <div
+                className={`start__tlcap start__tlcap--${hasBlocks ? "ok" : "warn"}`}
+                data-testid="start-tl-capability"
+              >
+                {hasBlocks
+                  ? "✓ this file has per-layer park moves — a clean timelapse works (arm it above)"
+                  : "⚠ this file has no per-layer park moves — the head won't park (no clean timelapse)"}
+              </div>
+            )}
           </div>
         )}
         <p className="start__help dim">

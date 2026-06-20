@@ -154,6 +154,19 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("start-result")).toContainText("busy");
   });
 
+  test("start dialog shows the file's clean-timelapse capability on open", async ({ page }) => {
+    // The open /api/files/inspect read drives an inline capability line the moment the
+    // dialog opens (fake files aren't inspectable, so mock a capable file).
+    await page.route("**/api/files/inspect**", (r) =>
+      r.fulfill({ json: { inspected: true, has_timelapse_blocks: true } }),
+    );
+    await page.getByTestId("print").first().click();
+    await expect(page.getByTestId("start-dialog")).toBeVisible();
+    const cap = page.getByTestId("start-tl-capability");
+    await expect(cap).toContainText("per-layer park moves");
+    await expect(cap).toHaveClass(/start__tlcap--ok/);
+  });
+
   test("gcode console sends a line", async ({ page }) => {
     await page.getByTestId("gcode-input").fill("G28");
     await page.getByTestId("gcode-send").click();
