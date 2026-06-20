@@ -2682,8 +2682,13 @@ fn spawn_serve_autostop(
 /// configured printer (profile / BAMBU_* env) and watch its print lifecycle through the
 /// pure [`PrintActivitySession`], flipping `cancel` once the print ends. The A1 accepts a
 /// second MQTT connection (device-verified), so this runs fine alongside a `bambu serve`.
-/// The target is resolved up front (fail-fast on a missing config); a later connection
-/// error is a non-fatal warning — the run still stops on --max-seconds / Ctrl-C.
+///
+/// Uses [`monitor`](LanMqttClient::monitor) (auto-reconnecting; the timeout is a *stall*
+/// window reset on every report) with a periodic pushall, so it watches INDEFINITELY
+/// across a long print — or while armed before it starts — and only gives up if the
+/// printer is unreachable for the whole stall window. The target is resolved up front
+/// (fail-fast on a missing config); a later disappearance is a non-fatal warning, since
+/// --max-seconds / Ctrl-C still stop the run.
 fn spawn_printer_autostop(
     cli: &Cli,
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -2691,7 +2696,10 @@ fn spawn_printer_autostop(
     let target = resolve_target(cli)?;
     let cancel = cancel.clone();
     std::thread::spawn(move || {
-        let client = LanMqttClient::new(target).with_timeout(Duration::from_secs(6 * 3600));
+        // Stall window: only fires after no report for this long. The 30s pushall below
+        // keeps reports flowing (idle or printing), so it's effectively indefinite while
+        // the printer responds.
+        let client = LanMqttClient::new(target).with_timeout(Duration::from_secs(120));
         let mut activity = PrintActivitySession::new(true);
         let mut on_update = |state: &ReportState| -> WatchStep {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2705,7 +2713,7 @@ fn spawn_printer_autostop(
                 WatchStep::Continue
             }
         };
-        if let Err(e) = client.watch(Some(Duration::from_secs(5)), &mut on_update)
+        if let Err(e) = client.monitor(Some(Duration::from_secs(30)), &mut on_update)
             && !matches!(e, ClientError::Timeout(_))
         {
             eprintln!("warning: printer auto-stop watch ended: {e}");
