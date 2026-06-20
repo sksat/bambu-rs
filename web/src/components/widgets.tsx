@@ -48,17 +48,18 @@ export function Bar({ pct, prep, running }: { pct: number; prep?: boolean; runni
 
 // The AMS reports a coarse 1–5 level on the wire field `humidity`, but a HIGHER
 // number means DRIER (verified against this device: level 5 with raw 0 = dry; the
-// upstream field name reads backwards). A bare bar didn't convey which way is good,
-// so show it on a labelled humid↔dry track: the dot sits toward "dry" when the
-// level is high. The end labels + position convey the meaning without relying on
-// colour (CUD); colour just reinforces (dry end green, humid end red).
+// upstream field name reads backwards). Render it as a 5-segment dryness meter
+// (filled from the humid end up to the level) — a discrete readout gauge, NOT a
+// track-and-thumb, which read as an operable slider. The filled count + the
+// humid/dry end labels carry level and direction without colour (CUD); colour
+// just reinforces (more filled = drier; dry end green, humid end red). The exact
+// verdict word (dry/good/fair/damp/wet) stays in the hover/aria title.
 const DRY_WORD: Record<number, string> = { 5: "dry", 4: "good", 3: "fair", 2: "damp", 1: "wet" };
 
 export function Humidity({ level, raw }: { level: number; raw?: number | null }) {
   const word = DRY_WORD[level] ?? `${level}/5`;
   const tone = level >= 4 ? "ok" : level === 3 ? "warn" : "err";
-  // Position on a humid(left)↔dry(right) track: level 1 → 0%, level 5 → 100%.
-  const pct = ((Math.min(5, Math.max(1, level)) - 1) / 4) * 100;
+  const lvl = Math.min(5, Math.max(1, level));
   return (
     <span
       className={`hum hum--${tone}`}
@@ -66,8 +67,10 @@ export function Humidity({ level, raw }: { level: number; raw?: number | null })
       title={`humidity ${level}/5 (${word})${raw != null ? ` · raw ${raw}` : ""} — higher is drier`}
     >
       <span className="hum__end">humid</span>
-      <span className="hum__track" aria-hidden="true">
-        <span className="hum__dot" style={{ left: `${pct}%` }} />
+      <span className="hum__meter" aria-hidden="true">
+        {[1, 2, 3, 4, 5].map((i) => (
+          <span key={i} className={`hum__seg${i <= lvl ? " is-on" : ""}`} />
+        ))}
       </span>
       <span className="hum__end">dry</span>
     </span>

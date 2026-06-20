@@ -639,42 +639,38 @@ div.lbl,
   font-family: var(--mono);
   font-size: 0.74rem;
 }
-/* AMS humidity on a labelled humid↔dry track: the dot's position (and colour)
-   shows where this AMS sits; the end labels carry the direction without colour. */
+/* AMS humidity as a 5-segment dryness meter (filled humid→dry up to the level):
+   a discrete readout gauge, not a track-and-thumb — the thumb read as an operable
+   slider. End labels + inline word carry direction/verdict without colour (CUD). */
 .hum {
   display: inline-flex;
   align-items: center;
-  gap: 0.55rem;
+  gap: 0.45rem;
   font-size: 0.8rem;
   color: var(--dim);
 }
 .hum__end {
   white-space: nowrap;
 }
-.hum__track {
-  position: relative;
-  width: 8rem;
-  height: 4px;
+.hum__meter {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.hum__seg {
+  width: 0.7rem;
+  height: 6px;
+  border-radius: 2px;
   background: var(--hair);
-  border-radius: 3px;
 }
-.hum__dot {
-  position: absolute;
-  top: 50%;
-  width: 13px;
-  height: 13px;
-  border-radius: 50%;
-  transform: translate(-50%, -50%);
-  background: var(--accent);
-  border: 1.5px solid var(--bg);
-}
-.hum--ok .hum__dot {
+/* Filled segments take the tone colour; more filled = drier. */
+.hum--ok .hum__seg.is-on {
   background: var(--ok);
 }
-.hum--warn .hum__dot {
+.hum--warn .hum__seg.is-on {
   background: var(--warn);
 }
-.hum--err .hum__dot {
+.hum--err .hum__seg.is-on {
   background: var(--err);
 }
 
