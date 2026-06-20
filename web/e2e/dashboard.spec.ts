@@ -33,12 +33,16 @@ test.describe("dashboard (fake mode)", () => {
     await expect(hw.getByTestId("wifi")).toBeVisible(); // beside the wifi meter
   });
 
-  test("RFID reader state shows in the AMS header", async ({ page }) => {
+  test("RFID state is derived from actual tag reads, not the A1's bogus online flag", async ({
+    page,
+  }) => {
     const r = page.getByTestId("ams-rfid");
     await expect(r).toBeVisible();
-    // The fake reports the reader present → ✓, so no warn tone (class is exactly
-    // "amslink", not "amslink amslink--warn").
-    await expect(r).toContainText("rfid");
+    // The fake mimics a real A1: online.rfid is false (a meaningless AMS-lite placeholder),
+    // yet every spool carries a real RFID read (uuid). The indicator must therefore show ✓
+    // from those reads — and with no warn tone (class is exactly "amslink"), i.e. the old
+    // permanent "offline" false alarm is gone.
+    await expect(r).toContainText("rfid ✓");
     await expect(r).toHaveClass("amslink");
   });
 

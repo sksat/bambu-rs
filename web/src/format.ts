@@ -1,5 +1,26 @@
 // Presentation helpers (pure). The wire stays raw; formatting lives here.
 
+import type { Ams } from "./bindings/Ams";
+
+// How many AMS spools have actually been RFID-identified.
+//
+// 誤報について: the dashboard used to key its RFID indicator off the report's
+// `online.rfid` flag. On the A1 mini (AMS lite) that flag — like `online.ahb` — is an
+// X1/P1-style "AMS hub / RFID bus present" bit that this hardware ALWAYS reports false
+// for, even though the reader works fine (every Bambu spool gets a tag read). The result
+// was a permanent "rfid ✕ offline" amber warning: a pure false alarm. So we derive the
+// state from real evidence instead — a spool whose RFID tag was read has a non-empty
+// `uuid`. ≥1 read ⇒ the reader provably works (✓). Zero reads is ambiguous (empty AMS,
+// all generic/non-RFID filament, or a genuine fault), so the caller shows ✕ WITHOUT a
+// warn tone rather than crying "offline" about something it can't actually distinguish.
+export function amsRfidReads(ams: Ams): number {
+  const trays = [
+    ...(ams.units ?? []).flatMap((u) => u.trays ?? []),
+    ...(ams.external ? [ams.external] : []),
+  ];
+  return trays.filter((t) => (t.uuid ?? "") !== "").length;
+}
+
 export function fmtEta(min: number): string {
   if (min <= 0) return "done";
   if (min < 60) return `${min}m`;

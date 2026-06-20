@@ -120,8 +120,12 @@ impl FakeSource {
             sdcard: Some(true),
             wifi_signal: Some("-58dBm".to_string()),
             online: Some(Online {
-                ahb: Some(true),
-                rfid: Some(true),
+                // The A1 mini (AMS lite) reports ahb/rfid false regardless of the reader
+                // actually working — these are X1/P1 "AMS hub / RFID bus" flags. The fake
+                // mirrors that so the dashboard's read-derived RFID indicator is exercised
+                // against a false online.rfid (the old false-alarm source).
+                ahb: Some(false),
+                rfid: Some(false),
                 version: Some(1),
             }),
             filament: Some(Filament {
@@ -195,6 +199,12 @@ fn fake_ams() -> Ams {
         cols: vec![color.to_string()],
         remain: Some(-1), // A1 spools don't report a usable remaining %
         state: Some(3),
+        // A genuine (Bambu) spool carries an RFID tag, so a successful read fills in a
+        // non-empty uuid + SKU id_name. The fake sets these — combined with the A1's
+        // `online.rfid: false` below — so the dashboard exercises the real scenario: the
+        // reader works (tags read) even though the online flag is a meaningless placeholder.
+        id_name: Some(format!("A01-R{id}")),
+        uuid: Some(format!("FACADE0000000000000000000000000{id}")),
         nozzle_temp_min: Some(if material == "PETG" { 230 } else { 190 }),
         nozzle_temp_max: Some(if material == "PETG" { 260 } else { 230 }),
         is_active: active,

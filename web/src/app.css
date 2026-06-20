@@ -503,17 +503,15 @@ div.lbl,
   font-size: 0.74rem;
   color: var(--warn);
 }
-/* RFID reader state, pushed to the right edge of the AMS header. ✓/✕ shape +
-   amber-on-offline (not colour alone) keeps it readable (CUD). */
+/* RFID reader state, pushed to the right edge of the AMS header. A ✓/✕ shape (not
+   colour alone) keeps it readable (CUD). Kept neutral (--dim) on purpose: ✕ is not a
+   fault — see amsRfidReads / AmsSection for why we no longer warn on it. */
 .amslink {
   margin-left: auto;
   font-family: var(--mono);
   font-size: 0.72rem;
   color: var(--dim);
   white-space: nowrap;
-}
-.amslink--warn {
-  color: var(--warn);
 }
 /* The AMS rack: a horizontal row of filament SPOOLS (colour is the hero),
    wrapping onto multiple rows on narrow/phone widths. */
