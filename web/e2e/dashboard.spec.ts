@@ -142,6 +142,13 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("start-dialog")).toBeVisible();
     await page.getByRole("button", { name: "preview" }).click();
     await expect(page.getByTestId("start-result")).toContainText("plate");
+    // Timelapse arm: off by default, so the plan's clean-timelapse clause says so;
+    // arming it updates the clause (fake files aren't inspectable, so it's the
+    // arm-state wording, not the has-blocks verdict).
+    await expect(page.getByTestId("start-result")).toContainText("timelapse off");
+    await page.getByTestId("start-timelapse").check();
+    await page.getByRole("button", { name: "preview" }).click();
+    await expect(page.getByTestId("start-result")).toContainText("timelapse armed");
     // The fake source streams RUNNING, so the idle guard refuses a new print.
     await page.getByTestId("start-confirm").click();
     await expect(page.getByTestId("start-result")).toContainText("busy");

@@ -230,12 +230,29 @@ function fileKind(name: string): string {
   return "file";
 }
 
+// The plan's clean-timelapse clause: combine whether the user armed timelapse with
+// whether the sliced file actually has the per-layer park moves (detected server-side).
+// Honest about the uncertain case (couldn't inspect → just echo the arm state).
+function timelapseNote(armed: boolean, hasBlocks: boolean | null | undefined): string {
+  if (hasBlocks == null) return armed ? "timelapse armed" : "timelapse off";
+  if (armed)
+    return hasBlocks
+      ? "timelapse armed — head parks each layer ✓"
+      : "⚠ timelapse armed but this file has no park moves — head won't park";
+  return hasBlocks
+    ? "timelapse off — this file supports a clean timelapse (arm it to use)"
+    : "timelapse off";
+}
+
 function StartDialog({ path, onClose }: { path: string; onClose: () => void }) {
   const name = path.split("/").pop() ?? path;
   const is3mf = path.toLowerCase().endsWith(".3mf");
   const [plate, setPlate] = useState(1);
   const [useAms, setUseAms] = useState(false);
   const [amsMap, setAmsMap] = useState("");
+  // Arm the printer-side timelapse: the per-layer head-park that makes a clean,
+  // object-only timelapse possible. Default off — it changes print motion.
+  const [timelapse, setTimelapse] = useState(false);
   const [result, setResult] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -257,19 +274,28 @@ function StartDialog({ path, onClose }: { path: string; onClose: () => void }) {
           plate,
           use_ams: useAms,
           ams_map,
+          timelapse,
           dry_run: dryRun,
           confirm: !dryRun,
         }),
       });
       const d = (await r.json().catch(() => ({}))) as {
         error?: string;
-        plan?: { plate: number; use_ams: boolean; ams_map: number[]; bed_type: string };
+        plan?: {
+          plate: number;
+          use_ams: boolean;
+          ams_map: number[];
+          bed_type: string;
+          // null = couldn't inspect the file (unknown); true/false = whether the sliced
+          // gcode injects the per-layer park (the precondition for a clean timelapse).
+          has_timelapse_blocks?: boolean | null;
+        };
       };
       if (dryRun && r.status === 200 && d.plan) {
         setResult(
           `will print plate ${d.plan.plate} · AMS ${
             d.plan.use_ams ? d.plan.ams_map.join(",") || "(none)" : "off"
-          } · bed ${d.plan.bed_type}`,
+          } · bed ${d.plan.bed_type} · ${timelapseNote(timelapse, d.plan.has_timelapse_blocks)}`,
         );
       } else if (r.status === 200) setResult("✓ print started");
       else if (r.status === 202) setResult("sent — not yet verified");
@@ -330,6 +356,18 @@ function StartDialog({ path, onClose }: { path: string; onClose: () => void }) {
                 />
               </label>
             )}
+            <label
+              className="startrow"
+              title="parks the head out of shot each layer — the precondition for a clean, object-only timelapse (Preview shows whether this file supports it)"
+            >
+              <input
+                type="checkbox"
+                checked={timelapse}
+                onChange={(e) => setTimelapse(e.target.checked)}
+                data-testid="start-timelapse"
+              />
+              <span>timelapse (park the head each layer)</span>
+            </label>
           </div>
         )}
         <p className="start__help dim">
