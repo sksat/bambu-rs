@@ -46,11 +46,15 @@ use super::files::FileStore;
 #[cfg(test)]
 use super::start::FakeStarter;
 use super::start::{StartRequest, Starter};
-use super::timelapse::{DEFAULT_SMOOTH_BURST_MS, FrameGrab, PlainCapture, TimelapseManager};
+use super::timelapse::{
+    DEFAULT_SMOOTH_BURST_MS, FrameGrab, PlainCapture, TimelapseManager, real_park_spawn,
+};
 use crate::core::command::{AmsControl, LedNode, SpeedLevel};
+use crate::core::park::ParkTuning;
 use crate::core::safety::{GcodeVerdict, TempLimits, check_extrude, check_gcode, check_jog};
 use crate::core::session::CommandOutcome;
 use crate::core::status::{Ams, AmsTray, AmsUnit, Filament, LightReport, Online, PrinterStatus};
+use crate::park::ParkCapture;
 
 /// Something that can provide the printer's current status and a live stream of
 /// updates. Abstracted so the server is testable without a network: tests and
@@ -307,6 +311,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/cameras", get(cameras_list))
         .route("/api/cameras/{id}/snapshot", get(camera_snapshot))
         .route("/api/cameras/{id}/stream", get(camera_stream))
+        .route("/api/cameras/{id}/park", get(camera_park))
         .route("/api/timelapse", get(timelapse_status));
     let writes = Router::new()
         .route("/api/job/pause", post(job_pause))
@@ -1115,6 +1120,9 @@ async fn cameras_list(State(st): State<AppState>) -> Json<serde_json::Value> {
             // Whether a live MJPEG stream is proxiable for this camera (so the
             // frontend uses `/stream` instead of snapshot polling).
             "stream": c.stream_url.is_some(),
+            // Whether this camera can run the live park preview: it needs both a
+            // stream and a calibrated park_tuning (the dashboard shows a tile only then).
+            "park": c.stream_url.is_some() && c.park_tuning.is_some(),
         }));
     }
     Json(json!({ "cameras": cameras }))
@@ -1235,6 +1243,32 @@ async fn camera_stream(State(st): State<AppState>, Path(id): Path<String>) -> Re
 // The MJPEG stream opener now lives in `super::camera` (open_mjpeg_stream), shared
 // with the plain-timelapse stream recorder.
 
+/// Serve the latest live-park preview JPEG for one camera (open read): the running
+/// `park` timelapse run writes `<out>/<id>/latest_park.jpg` each layer. 404 before the
+/// first park, when no park run is active, or for an id not in the run. The id is matched
+/// against the run's own camera list (not joined blindly), so a crafted id can't traverse.
+async fn camera_park(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+    let park = st.timelapse.status_park();
+    let Some(dir) = park.out_dir else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !park.cameras.iter().any(|c| c == &id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let path = std::path::Path::new(&dir).join(&id).join("latest_park.jpg");
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            [
+                (CONTENT_TYPE, "image/jpeg".to_string()),
+                (CACHE_CONTROL, "no-store".to_string()),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(), // no park captured yet
+    }
+}
+
 /// Serialise the external list (with URLs) for the gated config endpoints.
 fn external_json(st: &AppState) -> Vec<serde_json::Value> {
     st.external_cameras
@@ -1243,7 +1277,8 @@ fn external_json(st: &AppState) -> Vec<serde_json::Value> {
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            json!({ "id": format!("ext-{i}"), "label": c.label, "url": c.url, "stream_url": c.stream_url })
+            json!({ "id": format!("ext-{i}"), "label": c.label, "url": c.url,
+                    "stream_url": c.stream_url, "park_tuning": c.park_tuning })
         })
         .collect()
 }
@@ -1262,6 +1297,10 @@ struct ExternalCameraInput {
     /// Optional live MJPEG stream URL (reverse-proxied at `/stream`).
     #[serde(default)]
     stream_url: Option<String>,
+    /// Optional per-camera live-park tuning. Deserialized as [`ParkTuning`], which has NO
+    /// defaults, so a partial/garbled object is rejected (422) rather than running wrong.
+    #[serde(default)]
+    park_tuning: Option<ParkTuning>,
 }
 
 /// Both proxied URLs (snapshot + stream) must be `http://` — the proxy's `ureq`
@@ -1308,7 +1347,7 @@ async fn cameras_config_set(
             )
                 .into_response();
         }
-        next.push(ExternalCamera::new(e.label, url, stream_url, i));
+        next.push(ExternalCamera::new(e.label, url, stream_url, i).with_park_tuning(e.park_tuning));
     }
     *st.external_cameras.write().unwrap() = next;
     Json(json!({ "external": external_json(&st) })).into_response()
@@ -1386,14 +1425,16 @@ struct TimelapseStopBody {
 fn timelapse_status_json(st: &AppState) -> serde_json::Value {
     let smooth = st.timelapse.status_smooth();
     let plain = st.timelapse.status_plain();
+    let park = st.timelapse.status_park();
     let mut out = smooth.to_json();
     if let Some(o) = out.as_object_mut() {
         o.insert(
             "running".to_string(),
-            json!(smooth.running || plain.running),
+            json!(smooth.running || plain.running || park.running),
         );
         o.insert("smooth".to_string(), smooth.to_json());
         o.insert("plain".to_string(), plain.to_json());
+        o.insert("park".to_string(), park.to_json());
     }
     out
 }
@@ -1437,6 +1478,76 @@ fn sanitize_hint(s: &str) -> String {
     }
 }
 
+/// `captures/<epoch>_<print-hint>_<mode>/` — the per-run output dir (per-mode so a
+/// concurrent smooth/plain/park run never mixes frames).
+fn run_out_dir(st: &AppState, mode: &str) -> std::path::PathBuf {
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let hint = sanitize_hint(
+        st.source
+            .current()
+            .subtask_name
+            .as_deref()
+            .unwrap_or("print"),
+    );
+    std::path::PathBuf::from("captures").join(format!("{epoch}_{hint}_{mode}"))
+}
+
+/// Resolve the park-capable cameras among `ids` and start the live park slot. A camera is
+/// capable iff it's an external camera with BOTH a stream and a calibrated `park_tuning`;
+/// non-capable requested cameras are skipped (reported in `skipped`), and it's a 400 if
+/// none qualify. Each emits `<out>/<id>/latest_park.jpg` per layer, served (open) by
+/// `/api/cameras/{id}/park`.
+fn start_park_run(
+    st: &AppState,
+    ids: &[String],
+    out_dir: std::path::PathBuf,
+    rx: watch::Receiver<PrinterStatus>,
+) -> Response {
+    let externals = st.external_cameras.read().unwrap();
+    let mut caps = Vec::new();
+    let mut skipped = Vec::new();
+    for id in ids {
+        let cap = id
+            .strip_prefix("ext-")
+            .and_then(|n| n.parse::<usize>().ok())
+            .and_then(|i| externals.get(i))
+            .and_then(|c| match (&c.stream_url, &c.park_tuning) {
+                (Some(url), Some(t)) => Some(ParkCapture {
+                    id: id.clone(),
+                    stream_url: url.clone(),
+                    tuning: t.clone(),
+                }),
+                _ => None,
+            });
+        match cap {
+            Some(c) => caps.push(c),
+            None => skipped.push(id.clone()),
+        }
+    }
+    drop(externals);
+    if caps.is_empty() {
+        return bad_request(format!(
+            "no park-capable cameras among {ids:?} — each needs a stream_url and a park_tuning"
+        ));
+    }
+    match st
+        .timelapse
+        .start_park(caps, rx, out_dir, real_park_spawn())
+    {
+        Ok(()) => {
+            let mut body = timelapse_status_json(st);
+            if let Some(o) = body.as_object_mut() {
+                o.insert("skipped".to_string(), json!(skipped));
+            }
+            Json(body).into_response()
+        }
+        Err(e) => (StatusCode::CONFLICT, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
 /// Start a per-layer timelapse capture from a configured camera (gated write).
 /// 409 if one is already running; 404 for an unknown/unconfigured camera. Frames
 /// land in `./captures/<epoch>_<print-hint>/`.
@@ -1472,7 +1583,14 @@ async fn timelapse_start(
                 return bad_request("interval_ms must be >= 100".to_string());
             }
         }
-        other => return bad_request(format!("unknown mode {other:?} (use smooth or plain)")),
+        // Park has no cadence knobs; its requirement (a stream + park_tuning per camera)
+        // is enforced when the cameras resolve below.
+        "park" => {}
+        other => {
+            return bad_request(format!(
+                "unknown mode {other:?} (use smooth, plain, or park)"
+            ));
+        }
     }
     // `cameras` wins; fall back to the single `camera`. De-dupe but keep order.
     let mut ids: Vec<String> = if !b.cameras.is_empty() {
@@ -1483,6 +1601,13 @@ async fn timelapse_start(
     ids.dedup();
     if ids.is_empty() {
         return bad_request("specify a camera or cameras to capture".to_string());
+    }
+    // Park reads the camera stream (not snapshot grabs) and needs per-camera tuning, so it
+    // resolves cameras differently — branch before the grab resolution the others need.
+    if mode == "park" {
+        let out_dir = run_out_dir(&st, mode);
+        let rx = st.source.subscribe();
+        return start_park_run(&st, &ids, out_dir, rx);
     }
     let mut grabs = Vec::with_capacity(ids.len());
     for id in &ids {
@@ -1495,19 +1620,8 @@ async fn timelapse_start(
         };
         grabs.push(resolved);
     }
-    let epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let hint = sanitize_hint(
-        st.source
-            .current()
-            .subtask_name
-            .as_deref()
-            .unwrap_or("print"),
-    );
     // Per-mode dir so a concurrent smooth + plain run never mix their frames.
-    let out_dir = std::path::PathBuf::from("captures").join(format!("{epoch}_{hint}_{mode}"));
+    let out_dir = run_out_dir(&st, mode);
     let rx = st.source.subscribe();
     let res = match mode {
         "plain" => {
@@ -1540,10 +1654,10 @@ async fn timelapse_start(
     }
 }
 
-/// Stop a capture run (gated write; idempotent). `{"mode":"smooth"|"plain"}` stops
-/// just that one; no body / `"all"` stops both. An unrecognized mode is a 400
-/// rather than a silent "all" — a typo must not abort the run the caller meant
-/// to keep going (smooth and plain are independently controlled).
+/// Stop a capture run (gated write; idempotent). `{"mode":"smooth"|"plain"|"park"}`
+/// stops just that one; no body / `"all"` stops every slot. An unrecognized mode is a
+/// 400 rather than a silent "all" — a typo must not abort a run the caller meant to keep
+/// going (the slots are independently controlled).
 async fn timelapse_stop(
     State(st): State<AppState>,
     body: Option<Json<TimelapseStopBody>>,
@@ -1558,13 +1672,17 @@ async fn timelapse_stop(
         "plain" => {
             st.timelapse.stop_plain();
         }
+        "park" => {
+            st.timelapse.stop_park();
+        }
         "all" => {
             st.timelapse.stop_smooth();
             st.timelapse.stop_plain();
+            st.timelapse.stop_park();
         }
         other => {
             return bad_request(format!(
-                "unknown mode {other:?} (use smooth, plain, or all)"
+                "unknown mode {other:?} (use smooth, plain, park, or all)"
             ));
         }
     }
@@ -2330,6 +2448,82 @@ mod tests {
             .json::<serde_json::Value>();
         assert_eq!(cfg["external"][0]["stream_url"], "http://cam.local/stream");
         assert!(cfg["external"][1]["stream_url"].is_null());
+    }
+
+    #[tokio::test]
+    async fn park_tuning_round_trips_and_flags_capability() {
+        let server = app(None, FakeController::verified());
+        let tuning = json!({ "fps": 4, "left_frac": 0.33, "ema_seconds": 30, "abs_floor": 1500,
+            "mad_k": 6, "merge_gap_s": 1.2, "max_island_s": 3, "min_sep_s": 3,
+            "candidate_frac": 0.75, "warmup_s": 4, "baseline_s": 90 });
+        server
+            .post("/api/cameras/config")
+            .json(&json!({ "external": [
+                { "label": "front", "url": "http://cam.local/snap",
+                  "stream_url": "http://cam.local/stream", "park_tuning": tuning },
+                // a stream camera WITHOUT tuning — not park-capable
+                { "url": "http://cam.local/b.jpg", "stream_url": "http://cam.local/bstream" },
+            ]}))
+            .await
+            .assert_status_ok();
+        // park-capability needs BOTH a stream and a tuning.
+        let list = server.get("/api/cameras").await.json::<serde_json::Value>();
+        let cams = list["cameras"].as_array().unwrap();
+        assert_eq!(cams[0]["park"], true);
+        assert_eq!(
+            cams[1]["park"], false,
+            "stream but no tuning → not park-capable"
+        );
+        // The gated config read echoes the tuning so the manage form can prefill.
+        let cfg = server
+            .get("/api/cameras/config")
+            .await
+            .json::<serde_json::Value>();
+        assert!(cfg["external"][0]["park_tuning"].is_object());
+        assert_eq!(cfg["external"][0]["park_tuning"]["fps"], json!(4.0));
+        assert!(cfg["external"][1]["park_tuning"].is_null());
+    }
+
+    #[tokio::test]
+    async fn camera_config_rejects_a_partial_park_tuning() {
+        // No baked defaults: a park_tuning missing a knob (abs_floor) must be rejected,
+        // not run with a wrong value.
+        let server = app(None, FakeController::verified());
+        let res = server
+            .post("/api/cameras/config")
+            .json(&json!({ "external": [
+                { "url": "http://cam.local/a.jpg", "stream_url": "http://cam.local/s",
+                  "park_tuning": { "fps": 4, "left_frac": 0.33 } },
+            ]}))
+            .await;
+        assert!(
+            !res.status_code().is_success(),
+            "partial tuning must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn timelapse_start_park_rejects_without_a_capable_camera() {
+        let server = app(None, FakeController::verified());
+        server
+            .post("/api/cameras/config")
+            .json(&json!({ "external": [ { "url": "http://cam.local/a.jpg" } ] }))
+            .await
+            .assert_status_ok();
+        server
+            .post("/api/timelapse/start")
+            .json(&json!({ "mode": "park", "camera": "ext-0" }))
+            .await
+            .assert_status_bad_request();
+    }
+
+    #[tokio::test]
+    async fn camera_park_is_404_without_a_running_park() {
+        let server = app(None, FakeController::verified());
+        server
+            .get("/api/cameras/ext-0/park")
+            .await
+            .assert_status_not_found();
     }
 
     #[tokio::test]

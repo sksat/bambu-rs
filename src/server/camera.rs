@@ -67,7 +67,8 @@ impl CameraSource for NoCamera {
 /// One configured **external** IP camera: a human label plus the snapshot URL the
 /// server proxies. The URL is an internal LAN address kept server-side — it's only
 /// exposed on the gated config endpoint, never on the open camera listing.
-#[derive(Clone, Debug, PartialEq, Eq)]
+// No `Eq`: `park_tuning` carries f64 knobs (ParkTuning is `PartialEq` only).
+#[derive(Clone, Debug, PartialEq)]
 pub struct ExternalCamera {
     pub label: String,
     pub url: String,
@@ -75,12 +76,18 @@ pub struct ExternalCamera {
     /// present the server can reverse-proxy a continuous multipart stream instead
     /// of polling `url` for single JPEGs. `None` = snapshot-only.
     pub stream_url: Option<String>,
+    /// Optional per-camera live-park detection tuning. Present (with a `stream_url`)
+    /// makes the camera eligible for the `park` timelapse slot; the values are
+    /// camera-specific (framing), so there are no shared defaults. `None` = no live
+    /// park preview for this camera.
+    pub park_tuning: Option<crate::core::park::ParkTuning>,
 }
 
 impl ExternalCamera {
     /// Build from an optional label + snapshot URL + optional stream URL, filling
     /// a blank label with a stable `external N` (1-based `index`). A blank stream
-    /// URL normalises to `None`.
+    /// URL normalises to `None`. `park_tuning` starts `None`; set it with
+    /// [`with_park_tuning`](Self::with_park_tuning).
     pub fn new(
         label: Option<String>,
         url: String,
@@ -98,7 +105,14 @@ impl ExternalCamera {
             label,
             url: url.trim().to_string(),
             stream_url,
+            park_tuning: None,
         }
+    }
+
+    /// Attach (or clear) the per-camera live-park tuning. Chained after [`new`](Self::new).
+    pub fn with_park_tuning(mut self, tuning: Option<crate::core::park::ParkTuning>) -> Self {
+        self.park_tuning = tuning;
+        self
     }
 
     /// Parse a CLI/env entry: `label=url`, or a bare `url` (auto-labelled). The

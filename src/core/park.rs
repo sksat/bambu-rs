@@ -19,13 +19,13 @@
 
 use std::collections::VecDeque;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Park-detection heuristics for ONE camera/printer setup. Deserialized from a config
 /// (e.g. `scripts/tuning.example.json`); there are deliberately NO defaults, so a
 /// missing field fails to parse rather than running with a wrong baked value. Extra
 /// keys in the JSON (the batch/select knobs, `_comment`s) are ignored.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct ParkTuning {
     /// Stream sampling rate (frames/s) the detector is fed at.
     pub fps: f64,
