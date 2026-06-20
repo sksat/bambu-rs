@@ -967,6 +967,9 @@ div.lbl,
 /* ── toast ───────────────────────────────────────────────────────────────── */
 .toast {
   position: fixed;
+  /* Above .modal (z-index 50) so an action's confirmation toast stays visible even when
+     a dialog is open. */
+  z-index: 60;
   left: 50%;
   bottom: max(1rem, env(safe-area-inset-bottom));
   transform: translateX(-50%);
@@ -1009,6 +1012,12 @@ div.lbl,
 .modal {
   position: fixed;
   inset: 0;
+  /* A fixed overlay with no z-index paints in the same "stack-level 0" group as any
+     position:relative content (e.g. the AMS spool discs). Painting then follows DOM
+     tree order, so panels rendered AFTER the modal's subtree (the AMS panel) punch
+     THROUGH the scrim. A positive z-index lifts the whole overlay into its own layer
+     above all such page content. (Toast sits one above so confirmations stay visible.) */
+  z-index: 50;
   display: grid;
   place-items: center;
   background: rgba(0, 0, 0, 0.55);

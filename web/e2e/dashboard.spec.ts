@@ -432,6 +432,37 @@ test.describe("dashboard (fake mode)", () => {
     );
   });
 
+  test("the recordings modal paints above the AMS spools", async ({ page }) => {
+    // Regression: `.modal` is position:fixed with no z-index, and it lives in an EARLIER
+    // DOM subtree (the camera panel) than the AMS panel, whose spool discs are
+    // position:relative. By CSS painting order, two stack-level-0 positioned boxes paint
+    // in tree order — so without a z-index on the modal, the later-in-tree AMS spools
+    // bleed ON TOP of the modal scrim. That's the "AMS slot shows above the recording
+    // window" bug. Assert the modal wins the overlap at a spool's location.
+    await page.getByTestId("recordings-open").click();
+    await expect(page.getByTestId("recordings-modal")).toBeVisible();
+
+    const disc = page.getByTestId("tray-0").locator(".spool__disc");
+    // Scroll the spool into the viewport (the fixed modal stays put, covering it).
+    await disc.scrollIntoViewIfNeeded();
+    const box = await disc.boundingBox();
+    if (!box) throw new Error("spool disc has no bounding box");
+    const x = box.x + box.width / 2;
+    const y = box.y + box.height / 2;
+
+    // The topmost painted element at the spool's centre must belong to the modal
+    // (its scrim/box), not the AMS spool punching through.
+    const onTop = await page.evaluate(
+      ([px, py]) => {
+        const el = document.elementFromPoint(px, py);
+        return { inModal: !!el?.closest(".modal"), inSpool: !!el?.closest(".spool") };
+      },
+      [x, y],
+    );
+    expect(onTop.inSpool).toBe(false);
+    expect(onTop.inModal).toBe(true);
+  });
+
   test("camera manage modal: per-camera park tuning editor", async ({ page }) => {
     // The live-park preview is enabled by a per-camera park_tuning. Verify the manage
     // form exposes a collapsible JSON editor for it and that it's editable. Like the
