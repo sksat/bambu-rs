@@ -1703,8 +1703,40 @@ div.lbl,
 .cam__rec-every {
   font-size: 0.72rem;
 }
+/* the record button — the recording-red convention: a red dot + red outline, so it
+   reads as "record" at a glance (the design's accent is amber elsewhere). */
 .cam__rec-go {
   margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--err);
+  border-color: color-mix(in srgb, var(--err) 55%, transparent);
+  font-weight: 600;
+}
+.cam__rec-go:hover:not(:disabled) {
+  border-color: var(--err);
+  background: color-mix(in srgb, var(--err) 12%, transparent);
+}
+.cam__rec-dot {
+  width: 0.62rem;
+  height: 0.62rem;
+  border-radius: 50%;
+  background: var(--err);
+  flex-shrink: 0;
+}
+/* while that type is already recording, pulse the dot. */
+.cam__rec-go:disabled .cam__rec-dot {
+  animation: rec-pulse 1.3s ease-in-out infinite;
+}
+@keyframes rec-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.25;
+  }
 }
 .cam__rec-hint {
   font-size: 0.66rem;

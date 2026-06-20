@@ -382,12 +382,13 @@ function TimelapseBar({
           </label>
         )}
         <button
-          className="cam__btn cam__btn--save cam__rec-go"
+          className="cam__btn cam__rec-go"
           data-testid="record-start"
           disabled={busy || !!recRun?.running || (showEvery && plainSecs < 0.1)}
           title="records while the print runs and stops on its own when the print finishes"
           onClick={() => void startMode(recMode)}
         >
+          <span className="cam__rec-dot" aria-hidden="true" />
           {recRun?.running ? "recording…" : "record"}
         </button>
       </div>
