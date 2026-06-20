@@ -81,6 +81,11 @@ pub struct ExternalCamera {
     /// camera-specific (framing), so there are no shared defaults. `None` = no live
     /// park preview for this camera.
     pub park_tuning: Option<crate::core::park::ParkTuning>,
+    /// Optional per-camera burst-SELECTION tuning (the `select_smooth` knobs:
+    /// min_outlier/min_left_density/min_confidence/select_candidate_frac + left_frac). When
+    /// present, the serve assembles a smooth recording into a CLEAN one-frame-per-layer
+    /// timelapse (pick the parked frame per burst); absent → the raw all-frames assemble.
+    pub select_tuning: Option<crate::core::park::SelectTuning>,
 }
 
 impl ExternalCamera {
@@ -106,12 +111,19 @@ impl ExternalCamera {
             url: url.trim().to_string(),
             stream_url,
             park_tuning: None,
+            select_tuning: None,
         }
     }
 
     /// Attach (or clear) the per-camera live-park tuning. Chained after [`new`](Self::new).
     pub fn with_park_tuning(mut self, tuning: Option<crate::core::park::ParkTuning>) -> Self {
         self.park_tuning = tuning;
+        self
+    }
+
+    /// Attach (or clear) the per-camera smooth-selection tuning. Chained after [`new`](Self::new).
+    pub fn with_select_tuning(mut self, tuning: Option<crate::core::park::SelectTuning>) -> Self {
+        self.select_tuning = tuning;
         self
     }
 

@@ -1452,9 +1452,26 @@ fn run_serve(
     if let Some(path) = &cameras_config {
         for seed in load_seed_cameras(path)? {
             let i = external_cameras.len();
+            // Parse the one tuning object two ways: ParkTuning strictly (a partial tuning is
+            // a loud validation error, as before), SelectTuning best-effort (its select knobs
+            // may be absent in a park-only config → no clean smooth assemble for this camera).
+            let (park, select) = match &seed.park_tuning {
+                None => (None, None),
+                Some(v) => {
+                    let park: ParkTuning = serde_json::from_value(v.clone()).map_err(|e| {
+                        CliError::new(
+                            exit::VALIDATION,
+                            format!("invalid park_tuning in --cameras-config: {e}"),
+                        )
+                    })?;
+                    let select = serde_json::from_value(v.clone()).ok();
+                    (Some(park), select)
+                }
+            };
             external_cameras.push(
                 crate::server::ExternalCamera::new(seed.label, seed.url, seed.stream_url, i)
-                    .with_park_tuning(seed.park_tuning),
+                    .with_park_tuning(park)
+                    .with_select_tuning(select),
             );
         }
     }
@@ -1479,8 +1496,10 @@ struct SeedCamera {
     url: String,
     #[serde(default)]
     stream_url: Option<String>,
+    /// Raw tuning object; parsed below into ParkTuning (strict) AND SelectTuning
+    /// (best-effort — its extra select knobs may be absent in a park-only config).
     #[serde(default)]
-    park_tuning: Option<ParkTuning>,
+    park_tuning: Option<serde_json::Value>,
 }
 
 /// Read `--cameras-config`: a JSON array of [`SeedCamera`]. A read/parse failure (incl. a

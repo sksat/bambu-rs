@@ -1691,6 +1691,7 @@ fn default_fps() -> u32 {
 /// `run`/`cam` are validated as plain dir segments (no traversal); a missing `cam` subdir
 /// maps back to the run dir (old single-dir layout). 404 when there's nothing to serve.
 async fn capture_video(
+    State(st): State<AppState>,
     Path((run, cam)): Path<(String, String)>,
     Query(q): Query<CaptureVideoQuery>,
 ) -> Response {
@@ -1698,6 +1699,18 @@ async fn capture_video(
         return bad_request("invalid capture path".to_string());
     }
     let fps = q.fps.clamp(1, 60);
+    // A smooth recording is a per-layer BURST; if this camera has select tuning, assemble a
+    // CLEAN one-frame-per-layer timelapse (pick the parked frame). `ext-N` → external_cameras[N].
+    let select_tuning = cam
+        .strip_prefix("ext-")
+        .and_then(|n| n.parse::<usize>().ok())
+        .and_then(|i| {
+            st.external_cameras
+                .read()
+                .unwrap()
+                .get(i)
+                .and_then(|c| c.select_tuning)
+        });
     let run_dir = captures_root().join(&run);
     let sub = run_dir.join(&cam);
     let cam_dir = if sub.is_dir() { sub } else { run_dir };
@@ -1722,6 +1735,18 @@ async fn capture_video(
                     return Ok(mp4);
                 }
                 Err("video not available".to_string())
+            }
+            CaptureKind::Smooth => {
+                let out = cam_dir.join("timelapse.mp4");
+                // Clean per-layer selection when tuned; otherwise the raw all-frames assemble
+                // (a burst-y timelapse, but better than nothing for an untuned camera).
+                let selected = select_tuning.is_some_and(|sel| {
+                    crate::captures::assemble_smooth_selected_mp4(&cam_dir, &sel, &out, fps).is_ok()
+                });
+                if !selected {
+                    assemble_mp4(&cam_dir, CaptureKind::Smooth, &out, fps)?;
+                }
+                Ok(out)
             }
             kind => {
                 let out = cam_dir.join("timelapse.mp4");
