@@ -818,6 +818,13 @@ div.lbl,
   gap: 0.4rem;
   margin-top: 0.55rem;
 }
+/* A button row set apart on its own tier by a hairline (e.g. the heavier
+   calibrate/reboot routines below the everyday AMS/stepper actions). */
+.btns--sep {
+  margin-top: 0.6rem;
+  padding-top: 0.6rem;
+  border-top: 1px solid var(--hair);
+}
 .btn {
   font-family: var(--mono);
   font-size: 0.82rem;

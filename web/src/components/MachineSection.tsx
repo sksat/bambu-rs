@@ -300,18 +300,8 @@ export function MachineSection({ s, control }: { s: PrinterStatus; control: Cont
             <WifiSignal signal={s.wifi_signal} />
           </div>
         )}
+        {/* Everyday upkeep: AMS state + motor release. */}
         <div className="btns">
-          {/* Opening the picker is always allowed (it's just configuration); the run
-              button inside is what's gated on idle. */}
-          <button
-            className="btn btn--sm"
-            disabled={!!b}
-            title="choose calibration routines"
-            data-testid="calibrate-open"
-            onClick={() => setCalOpen(true)}
-          >
-            calibrate…
-          </button>
           <button
             className="btn btn--sm"
             disabled={!!b}
@@ -335,6 +325,19 @@ export function MachineSection({ s, control }: { s: PrinterStatus; control: Cont
             onClick={() => control.steppers()}
           >
             disable steppers
+          </button>
+        </div>
+        {/* Heavier whole-machine routines, set apart on their own tier. Opening the
+            calibration picker is always allowed (configuration); its run button gates on idle. */}
+        <div className="btns btns--sep">
+          <button
+            className="btn btn--sm"
+            disabled={!!b}
+            title="choose calibration routines"
+            data-testid="calibrate-open"
+            onClick={() => setCalOpen(true)}
+          >
+            calibrate…
           </button>
           <button
             className="btn btn--sm btn--danger"
