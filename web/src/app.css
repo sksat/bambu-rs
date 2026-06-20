@@ -1343,13 +1343,41 @@ div.lbl,
   font-variant-numeric: tabular-nums;
 }
 
-/* Maintenance: calibrate checkboxes wrap then the run button trails. */
-.calrow {
+/* Calibration picker modal: a short intro, a list of toggleable routines (each a name +
+   one-line description), then a motion warning before the run button. */
+.cal__intro {
+  font-size: 0.78rem;
+  margin: 0.2rem 0 0.7rem;
+}
+.cal__list {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.5rem 0.9rem;
-  margin-top: 0.55rem;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.cal__item {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  cursor: pointer;
+}
+.cal__item input {
+  margin-top: 0.15rem;
+}
+.cal__item-text {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+}
+.cal__item-name {
+  font-size: 0.84rem;
+}
+.cal__item-desc {
+  font-size: 0.72rem;
+}
+.cal__warn {
+  margin: 0.85rem 0 0.2rem;
+  font-size: 0.76rem;
+  color: var(--warn);
 }
 
 /* ── cameras (built-in over TCP:6000 + external server-proxied IP cam) ────── */

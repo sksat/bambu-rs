@@ -1,5 +1,5 @@
 import { useState, type KeyboardEvent } from "react";
-import type { Control, Axis } from "../useControl";
+import type { Control, Axis, CalibrateOpts } from "../useControl";
 import type { PrinterStatus } from "../types";
 import { WifiSignal } from "./widgets";
 
@@ -188,7 +188,7 @@ export function MachineSection({ s, control }: { s: PrinterStatus; control: Cont
   // Both jog controls encode magnitude in position: the dial's rings (XY) and the
   // Z ladder's rungs — so there's no separate step state to track.
   const [extLen, setExtLen] = useState<number>(5);
-  const [cal, setCal] = useState({ bed_level: false, vibration: false, motor_noise: false });
+  const [calOpen, setCalOpen] = useState(false);
 
   // A jog/home is unavailable if a write is in flight OR the printer is busy.
   const motionDisabled = !!b || busy;
@@ -204,8 +204,6 @@ export function MachineSection({ s, control }: { s: PrinterStatus; control: Cont
     : nozzleCold
       ? "nozzle must be ≥170°C"
       : undefined;
-
-  const anyCal = cal.bed_level || cal.vibration || cal.motor_noise;
 
   return (
     <div className="cfold" data-testid="machine">
@@ -302,45 +300,18 @@ export function MachineSection({ s, control }: { s: PrinterStatus; control: Cont
             <WifiSignal signal={s.wifi_signal} />
           </div>
         )}
-        <div className="calrow">
-          <label className="startrow" title="auto bed leveling">
-            <input
-              type="checkbox"
-              checked={cal.bed_level}
-              disabled={busy}
-              onChange={(e) => setCal((c) => ({ ...c, bed_level: e.target.checked }))}
-            />
-            <span className="lbl">bed level</span>
-          </label>
-          <label className="startrow" title="resonance/vibration compensation">
-            <input
-              type="checkbox"
-              checked={cal.vibration}
-              disabled={busy}
-              onChange={(e) => setCal((c) => ({ ...c, vibration: e.target.checked }))}
-            />
-            <span className="lbl">vibration</span>
-          </label>
-          <label className="startrow" title="motor noise cancellation">
-            <input
-              type="checkbox"
-              checked={cal.motor_noise}
-              disabled={busy}
-              onChange={(e) => setCal((c) => ({ ...c, motor_noise: e.target.checked }))}
-            />
-            <span className="lbl">motor noise</span>
-          </label>
+        <div className="btns">
+          {/* Opening the picker is always allowed (it's just configuration); the run
+              button inside is what's gated on idle. */}
           <button
             className="btn btn--sm"
-            disabled={!!b || busy || !anyCal}
-            title={busy ? `unavailable while ${stateName}` : anyCal ? undefined : "select a routine"}
-            data-testid="calibrate-run"
-            onClick={() => control.calibrate(cal)}
+            disabled={!!b}
+            title="choose calibration routines"
+            data-testid="calibrate-open"
+            onClick={() => setCalOpen(true)}
           >
-            calibrate
+            calibrate…
           </button>
-        </div>
-        <div className="btns">
           <button
             className="btn btn--sm"
             disabled={!!b}
@@ -372,6 +343,116 @@ export function MachineSection({ s, control }: { s: PrinterStatus; control: Cont
             onClick={() => control.reboot()}
           >
             reboot
+          </button>
+        </div>
+      </div>
+      {calOpen && (
+        <CalibrateModal
+          control={control}
+          busy={!!b || busy}
+          stateName={stateName}
+          onClose={() => setCalOpen(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+// The calibration picker: opened from "calibrate…", it lists the printer's routines so the
+// operator chooses which to run (ALL on by default — the common "full calibration" case).
+// This modal IS the confirmation gate (it warns that the printer moves), so "run" posts
+// directly. Disabled/`busy` reflects whether motion is currently allowed.
+const CAL_ROUTINES = [
+  { key: "bed_level", label: "bed level", desc: "auto bed leveling (mesh)" },
+  { key: "vibration", label: "vibration", desc: "resonance / vibration compensation" },
+  { key: "motor_noise", label: "motor noise", desc: "motor noise cancellation" },
+] as const;
+
+function CalibrateModal({
+  control,
+  busy,
+  stateName,
+  onClose,
+}: {
+  control: Control;
+  busy: boolean;
+  stateName: string;
+  onClose: () => void;
+}) {
+  const [cal, setCal] = useState<CalibrateOpts>({
+    bed_level: true,
+    vibration: true,
+    motor_noise: true,
+  });
+  const [running, setRunning] = useState(false);
+  const anyCal = cal.bed_level || cal.vibration || cal.motor_noise;
+  const run = async () => {
+    setRunning(true);
+    try {
+      await control.calibrate(cal);
+      onClose();
+    } finally {
+      setRunning(false);
+    }
+  };
+  return (
+    <div
+      className="modal"
+      role="dialog"
+      aria-modal="true"
+      data-testid="calibrate-modal"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div className="modal__box">
+        <div className="cam__modal-head">
+          <span className="lbl">calibration</span>
+          <button className="cam__manage" data-testid="calibrate-close" onClick={onClose}>
+            close
+          </button>
+        </div>
+        <p className="dim cal__intro">
+          Pick the routines to run — all are on by default; turn off any you want to skip.
+        </p>
+        <div className="cal__list">
+          {CAL_ROUTINES.map((t) => (
+            <label key={t.key} className="cal__item">
+              <input
+                type="checkbox"
+                checked={cal[t.key]}
+                disabled={running}
+                data-testid={`cal-${t.key}`}
+                onChange={(e) => setCal((c) => ({ ...c, [t.key]: e.target.checked }))}
+              />
+              <span className="cal__item-text">
+                <span className="cal__item-name">{t.label}</span>
+                <span className="dim cal__item-desc">{t.desc}</span>
+              </span>
+            </label>
+          ))}
+        </div>
+        <p className="cal__warn" data-testid="calibrate-warn">
+          ⚠ the printer will move on its own — keep the bed clear.
+        </p>
+        <div className="btns">
+          <button className="btn" onClick={onClose} disabled={running}>
+            cancel
+          </button>
+          <button
+            className="btn btn--go"
+            data-testid="calibrate-run"
+            disabled={busy || running || !anyCal}
+            title={
+              busy
+                ? `unavailable while ${stateName}`
+                : anyCal
+                  ? undefined
+                  : "select at least one routine"
+            }
+            onClick={() => void run()}
+          >
+            {running ? "calibrating…" : "run calibration"}
           </button>
         </div>
       </div>

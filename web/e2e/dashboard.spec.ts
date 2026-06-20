@@ -256,6 +256,26 @@ test.describe("dashboard (fake mode)", () => {
       .toBeTruthy();
   });
 
+  test("calibration opens a picker with all routines on by default", async ({ page }) => {
+    // The button just opens the picker (configuration is always allowed); the modal is the
+    // gate for actually running.
+    await page.getByTestId("calibrate-open").click();
+    const modal = page.getByTestId("calibrate-modal");
+    await expect(modal).toBeVisible();
+    // Default: every routine enabled (the common "full calibration").
+    await expect(page.getByTestId("cal-bed_level")).toBeChecked();
+    await expect(page.getByTestId("cal-vibration")).toBeChecked();
+    await expect(page.getByTestId("cal-motor_noise")).toBeChecked();
+    // Routines are individually toggleable.
+    await page.getByTestId("cal-vibration").uncheck();
+    await expect(page.getByTestId("cal-vibration")).not.toBeChecked();
+    // The fake streams RUNNING, so running is gated off (motion is unsafe mid-job).
+    await expect(page.getByTestId("calibrate-run")).toBeDisabled();
+    // Closing returns to the dashboard.
+    await page.getByTestId("calibrate-close").click();
+    await expect(modal).toHaveCount(0);
+  });
+
   test("setting a nozzle temperature reports verified (allowed while busy)", async ({ page }) => {
     const set = page.getByTestId("temp-nozzle-set");
     // Temperature changes are allowed even mid-job. The set button gates on a

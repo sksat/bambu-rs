@@ -123,25 +123,11 @@ export function useControl() {
       act(`${part} ${celsius}°`, "/api/temp", { part, celsius, confirm, force }),
     cooldown: (part: TempPart) =>
       act(`${part} cool`, "/api/temp", { part, celsius: 0, confirm: false, force: false }),
-    calibrate: (opts: CalibrateOpts) => {
-      const picked = (
-        [
-          ["bed level", opts.bed_level],
-          ["vibration", opts.vibration],
-          ["motor noise", opts.motor_noise],
-        ] as Array<[string, boolean]>
-      )
-        .filter(([, on]) => on)
-        .map(([n]) => n)
-        .join(", ");
-      requestConfirm(
-        `Run calibration (${picked})? The printer will move on its own.`,
-        () => {
-          void act("calibrate", "/api/calibrate", { ...opts, confirm: true });
-        },
-        "calibrate",
-      );
-    },
+    // The calibration modal is the deliberate gate (it lists the routines + warns that
+    // the printer moves), so this posts directly with confirm:true rather than stacking a
+    // second confirm dialog on top of the modal.
+    calibrate: (opts: CalibrateOpts) =>
+      act("calibrate", "/api/calibrate", { ...opts, confirm: true }),
     ams: (action: AmsAction, confirm: boolean) => {
       if (!confirm) return act(`ams ${action}`, "/api/ams", { action, confirm: false });
       requestConfirm(
