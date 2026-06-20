@@ -333,7 +333,7 @@ function TimelapseBar({
             ? "one object-only frame per layer — the real park, detected from the camera (scrub it in the park view above)"
             : "one object-only frame per layer — synced to the printer's layer signal"
         }
-        note="two-step: ① tick “timelapse” when you start the print (the start dialog) so the head parks, then ② start here to record each parked frame"
+        note="auto-starts when you tick “timelapse” at print start. Or start here to record a print that's already running (it must be timelapse-armed, so the head parks)."
         testid={layerMode}
         run={layerRun}
         busy={busy}

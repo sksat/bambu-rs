@@ -167,6 +167,42 @@ test.describe("dashboard (fake mode)", () => {
     await expect(cap).toHaveClass(/start__tlcap--ok/);
   });
 
+  test("arming timelapse at print start auto-starts the camera recording", async ({ page }) => {
+    // One action: confirming an armed print also starts the clean-timelapse capture on the
+    // best camera. Mock the start (the fake printer is busy) + a park-capable camera.
+    await page.route("**/api/job/start", async (r) => {
+      const body = JSON.parse(r.request().postData() || "{}");
+      if (body.dry_run) {
+        await r.fulfill({
+          json: { plan: { plate: 1, use_ams: false, ams_map: [], bed_type: "auto", has_timelapse_blocks: true } },
+        });
+      } else {
+        await r.fulfill({ status: 200, json: { ok: true } });
+      }
+    });
+    await page.route("**/api/cameras", (r) =>
+      r.fulfill({
+        json: { cameras: [{ id: "ext-1", kind: "external", label: "park cam", park: true, stream: true }] },
+      }),
+    );
+    await page.route("**/api/files/inspect**", (r) =>
+      r.fulfill({ json: { inspected: true, has_timelapse_blocks: true } }),
+    );
+    let startedMode: string | null = null;
+    await page.route("**/api/timelapse/start", async (r) => {
+      startedMode = JSON.parse(r.request().postData() || "{}").mode;
+      await r.fulfill({ status: 200, json: { ok: true } });
+    });
+
+    await page.getByTestId("print").first().click();
+    await expect(page.getByTestId("start-dialog")).toBeVisible();
+    await page.getByTestId("start-timelapse").check();
+    await page.getByTestId("start-confirm").click();
+    // Print started AND the capture auto-started on the park-capable camera (→ park mode).
+    await expect(page.getByTestId("start-result")).toContainText("recording a clean timelapse");
+    expect(startedMode).toBe("park");
+  });
+
   test("gcode console sends a line", async ({ page }) => {
     await page.getByTestId("gcode-input").fill("G28");
     await page.getByTestId("gcode-send").click();

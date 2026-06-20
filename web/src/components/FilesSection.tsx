@@ -1,6 +1,28 @@
 import { useCallback, useEffect, useState } from "react";
 import { Thumb } from "./widgets";
 import { ModelView } from "./Viewer3D";
+import { listCameras } from "../cameras";
+import { startTimelapse, type TimelapseMode } from "../timelapse";
+
+// When a print is started with timelapse armed, also kick off the clean-timelapse
+// capture so it's ONE action — the user shouldn't have to go to the camera panel and
+// press start separately. Picks the best camera (park-capable → park detection, else a
+// camera for printer-synced smooth) and starts that mode. Returns a short status to
+// append to the start result. (Mid-print manual start in the camera panel still works.)
+async function autoStartCleanTimelapse(pw: string | null): Promise<string> {
+  try {
+    const cams = await listCameras();
+    if (cams.length === 0) return "no camera configured — not recording";
+    const cam = cams.find((c) => c.park) ?? cams.find((c) => c.kind === "external") ?? cams[0];
+    const mode: TimelapseMode = cam.park ? "park" : "smooth";
+    const res = await startTimelapse(mode, [cam.id], { every: 1 }, pw);
+    if (res === "needPassword") return "set the control password to auto-record (Controls)";
+    if ("error" in res) return `couldn't auto-record: ${res.error}`;
+    return `recording a clean timelapse on “${cam.label}”`;
+  } catch {
+    return "couldn't start the recording";
+  }
+}
 
 interface FileEntry {
   name: string;
@@ -327,9 +349,16 @@ function StartDialog({ path, onClose }: { path: string; onClose: () => void }) {
             d.plan.use_ams ? d.plan.ams_map.join(",") || "(none)" : "off"
           } · bed ${d.plan.bed_type} · ${timelapseNote(timelapse, d.plan.has_timelapse_blocks)}`,
         );
-      } else if (r.status === 200) setResult("✓ print started");
-      else if (r.status === 202) setResult("sent — not yet verified");
-      else if (r.status === 401) setResult("needs the control password (set it in Controls)");
+      } else if (r.status === 200 || r.status === 202) {
+        const base = r.status === 200 ? "✓ print started" : "sent — not yet verified";
+        // One action: an armed print also auto-starts the clean-timelapse capture.
+        if (timelapse) {
+          setResult(`${base} · starting recording…`);
+          setResult(`${base} · ${await autoStartCleanTimelapse(pw)}`);
+        } else {
+          setResult(base);
+        }
+      } else if (r.status === 401) setResult("needs the control password (set it in Controls)");
       else setResult(d.error ?? `HTTP ${r.status}`);
     } catch {
       setResult("request failed");
@@ -388,7 +417,7 @@ function StartDialog({ path, onClose }: { path: string; onClose: () => void }) {
             )}
             <label
               className="startrow"
-              title="parks the head out of shot each layer — the precondition for a clean, object-only timelapse (Preview shows whether this file supports it)"
+              title="parks the head out of shot each layer AND auto-starts the camera recording — one action for a clean, object-only timelapse"
             >
               <input
                 type="checkbox"
@@ -396,7 +425,7 @@ function StartDialog({ path, onClose }: { path: string; onClose: () => void }) {
                 onChange={(e) => setTimelapse(e.target.checked)}
                 data-testid="start-timelapse"
               />
-              <span>timelapse (park the head each layer)</span>
+              <span>record a clean timelapse (parks the head each layer)</span>
             </label>
             {/* The file's clean-timelapse capability, inspected on open. */}
             {hasBlocks != null && (
@@ -405,16 +434,15 @@ function StartDialog({ path, onClose }: { path: string; onClose: () => void }) {
                 data-testid="start-tl-capability"
               >
                 {hasBlocks
-                  ? "✓ this file has per-layer park moves — a clean timelapse works (arm it above)"
+                  ? "✓ this file has per-layer park moves — a clean timelapse works"
                   : "⚠ this file has no per-layer park moves — the head won't park (no clean timelapse)"}
               </div>
             )}
-            {/* The other half of the feature lives in the camera panel — say so, so the
-                two “timelapse” controls read as one flow. */}
+            {/* Reassure that this is one action: the camera records automatically. */}
             {timelapse && (
               <p className="start__tlhint dim" data-testid="start-tl-hint">
-                this only parks the head. To save the frames, start the “clean timelapse”
-                capture in the camera panel once the print is running.
+                the camera starts recording automatically when the print begins — watch and
+                scrub it in the camera panel.
               </p>
             )}
           </div>
