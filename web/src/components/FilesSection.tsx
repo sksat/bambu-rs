@@ -1,21 +1,30 @@
 import { useCallback, useEffect, useState } from "react";
 import { Thumb } from "./widgets";
 import { ModelView } from "./Viewer3D";
-import { listCameras } from "../cameras";
+import { listCameras, type Camera } from "../cameras";
 import { startTimelapse, type TimelapseMode } from "../timelapse";
 
-// When a print is started with timelapse armed, also kick off the clean-timelapse
-// capture so it's ONE action — the user shouldn't have to go to the camera panel and
-// press start separately. Picks the best camera (park-capable → park detection, else a
-// camera for printer-synced smooth) and starts that mode. Returns a short status to
-// append to the start result. (Mid-print manual start in the camera panel still works.)
-async function autoStartCleanTimelapse(pw: string | null): Promise<string> {
+// The default recording camera: park-capable (park detection) preferred, else any
+// external (printer-synced smooth), else the first. The user can override this in the
+// dialog — this is just the smart default.
+function bestRecCamera(cams: Camera[]): Camera | undefined {
+  return cams.find((c) => c.park) ?? cams.find((c) => c.kind === "external") ?? cams[0];
+}
+
+// The clean-timelapse method a camera uses (park detection vs printer-synced smooth).
+function recMethod(cam: Camera): { mode: TimelapseMode; label: string } {
+  return cam.park
+    ? { mode: "park", label: "park detection" }
+    : { mode: "smooth", label: "printer-synced" };
+}
+
+// When a print is started with timelapse armed, also kick off the clean-timelapse capture
+// on the chosen camera so it's ONE action — no separate trip to the camera panel. Returns
+// a short status to append to the start result. (Manual mid-print start still works.)
+async function autoStartCleanTimelapse(pw: string | null, cam: Camera | undefined): Promise<string> {
+  if (!cam) return "no camera selected — not recording";
   try {
-    const cams = await listCameras();
-    if (cams.length === 0) return "no camera configured — not recording";
-    const cam = cams.find((c) => c.park) ?? cams.find((c) => c.kind === "external") ?? cams[0];
-    const mode: TimelapseMode = cam.park ? "park" : "smooth";
-    const res = await startTimelapse(mode, [cam.id], { every: 1 }, pw);
+    const res = await startTimelapse(recMethod(cam).mode, [cam.id], { every: 1 }, pw);
     if (res === "needPassword") return "set the control password to auto-record (Controls)";
     if ("error" in res) return `couldn't auto-record: ${res.error}`;
     return `recording a clean timelapse on “${cam.label}”`;
@@ -308,6 +317,23 @@ function StartDialog({ path, onClose }: { path: string; onClose: () => void }) {
     };
   }, [path, plate, is3mf]);
 
+  // Cameras for the recording-target picker. The smart default is the best camera; the
+  // user can override it below when "record a clean timelapse" is on.
+  const [cams, setCams] = useState<Camera[]>([]);
+  const [recCam, setRecCam] = useState<string>("");
+  useEffect(() => {
+    let live = true;
+    void (async () => {
+      const list = await listCameras();
+      if (!live) return;
+      setCams(list);
+      setRecCam((cur) => cur || bestRecCamera(list)?.id || "");
+    })();
+    return () => {
+      live = false;
+    };
+  }, []);
+
   const run = async (dryRun: boolean) => {
     setBusy(true);
     setResult(dryRun ? "resolving plan…" : "starting…");
@@ -354,7 +380,8 @@ function StartDialog({ path, onClose }: { path: string; onClose: () => void }) {
         // One action: an armed print also auto-starts the clean-timelapse capture.
         if (timelapse) {
           setResult(`${base} · starting recording…`);
-          setResult(`${base} · ${await autoStartCleanTimelapse(pw)}`);
+          const cam = cams.find((c) => c.id === recCam) ?? bestRecCamera(cams);
+          setResult(`${base} · ${await autoStartCleanTimelapse(pw, cam)}`);
         } else {
           setResult(base);
         }
@@ -438,11 +465,36 @@ function StartDialog({ path, onClose }: { path: string; onClose: () => void }) {
                   : "⚠ this file has no per-layer park moves — the head won't park (no clean timelapse)"}
               </div>
             )}
+            {/* Recording target: smart default (best camera), overridable when there's a
+                choice. The method (park detection vs printer-synced) follows the camera. */}
+            {timelapse && cams.length > 0 && (
+              <label className="startrow start__reccam">
+                <span className="lbl">record from</span>
+                {cams.length > 1 ? (
+                  <select
+                    className="pw"
+                    value={recCam}
+                    data-testid="start-rec-cam"
+                    onChange={(e) => setRecCam(e.target.value)}
+                  >
+                    {cams.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.label} · {recMethod(c).label}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <span className="dim" data-testid="start-rec-cam">
+                    {cams[0].label} · {recMethod(cams[0]).label}
+                  </span>
+                )}
+              </label>
+            )}
             {/* Reassure that this is one action: the camera records automatically. */}
             {timelapse && (
               <p className="start__tlhint dim" data-testid="start-tl-hint">
-                the camera starts recording automatically when the print begins — watch and
-                scrub it in the camera panel.
+                the chosen camera starts recording automatically when the print begins —
+                watch and scrub it in the camera panel.
               </p>
             )}
           </div>

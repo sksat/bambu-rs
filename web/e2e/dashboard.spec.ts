@@ -197,6 +197,8 @@ test.describe("dashboard (fake mode)", () => {
     await page.getByTestId("print").first().click();
     await expect(page.getByTestId("start-dialog")).toBeVisible();
     await page.getByTestId("start-timelapse").check();
+    // The recording-target picker shows the (smart-default) camera once cameras load.
+    await expect(page.getByTestId("start-rec-cam")).toContainText("park cam");
     await page.getByTestId("start-confirm").click();
     // Print started AND the capture auto-started on the park-capable camera (→ park mode).
     await expect(page.getByTestId("start-result")).toContainText("recording a clean timelapse");
