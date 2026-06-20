@@ -436,6 +436,54 @@ test.describe("dashboard (fake mode)", () => {
     );
   });
 
+  test("recordings show a thumbnail and play inline on click (mocked)", async ({ page }) => {
+    await page.route("**/api/capture", (r) =>
+      r.fulfill({
+        json: {
+          captures: [
+            {
+              id: "200_cube_gcode_3mf_park",
+              started_at: 200,
+              label: "cube_gcode_3mf_park",
+              cameras: [{ id: "ext-0", kind: "park", frames: 53, has_mp4: false }],
+            },
+          ],
+        },
+      }),
+    );
+    // Serve a real (1×1) image for the poster so it decodes — the fake serve has no
+    // captures on disk, and the component hides a thumbnail that fails to load.
+    await page.route("**/thumb.jpg", (r) =>
+      r.fulfill({
+        contentType: "image/png",
+        body: Buffer.from(
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+          "base64",
+        ),
+      }),
+    );
+    await page.getByTestId("recordings-open").click();
+    await expect(page.getByTestId("recordings-modal")).toBeVisible();
+    await expect(page.getByTestId("recordings-list")).toBeVisible();
+
+    // A poster thumbnail (the run's representative still) is shown before playback.
+    const thumb = page.getByTestId("rec-cam").locator("img.rec-cam__thumb");
+    await expect(thumb).toHaveAttribute(
+      "src",
+      /\/api\/capture\/200_cube_gcode_3mf_park\/ext-0\/thumb\.jpg/,
+    );
+
+    // Clicking the poster swaps it for an inline <video> at the assemble-on-demand mp4 —
+    // no new tab, playback happens right in the modal.
+    await page.getByTestId("rec-play").click();
+    const video = page.getByTestId("rec-video");
+    await expect(video).toBeVisible();
+    await expect(video).toHaveAttribute(
+      "src",
+      /\/api\/capture\/200_cube_gcode_3mf_park\/ext-0\/video\.mp4/,
+    );
+  });
+
   test("the recordings modal paints above the AMS spools", async ({ page }) => {
     // Regression: `.modal` is position:fixed with no z-index, and it lives in an EARLIER
     // DOM subtree (the camera panel) than the AMS panel, whose spool discs are

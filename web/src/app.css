@@ -1815,9 +1815,63 @@ div.lbl,
 }
 .rec-cam {
   display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 0.3rem 0;
+}
+/* The poster: a 16:9 thumbnail tile with a centered ▶ overlay; click to play inline. */
+.rec-cam__poster {
+  position: relative;
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  padding: 0;
+  border: 1px solid var(--hair);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--hair-2);
+  cursor: pointer;
+}
+.rec-cam__poster:hover {
+  border-color: var(--accent);
+}
+.rec-cam__thumb {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+/* The ▶ overlay: a translucent disc so it reads on any frame; brightens on hover. */
+.rec-cam__playicon {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 2.4rem;
+  height: 2.4rem;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--bg) 55%, transparent);
+  color: #fff;
+  font-size: 1rem;
+  padding-left: 0.15rem; /* optically center the triangle */
+}
+.rec-cam__poster:hover .rec-cam__playicon {
+  background: color-mix(in srgb, var(--accent) 80%, transparent);
+  color: var(--bg);
+}
+.rec-cam__video {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border: 1px solid var(--hair);
+  border-radius: 8px;
+  background: #000;
+}
+.rec-cam__info {
+  display: flex;
   align-items: center;
   gap: 0.5rem;
-  padding: 0.22rem 0;
 }
 .rec-kind {
   font-size: 0.58rem;

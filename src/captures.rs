@@ -90,6 +90,24 @@ pub fn classify(files: &[String]) -> Option<CaptureCam> {
     }
 }
 
+/// The representative still for a recording's thumbnail: the LAST frame of an image
+/// sequence. A timelapse's final frame shows the most-built-up object, which reads best as
+/// a poster. `None` for a Video (no frame file to serve — the caller extracts one with
+/// ffmpeg, see [`video_thumb_args`]). Pure. Frame indices are zero-padded, so the
+/// lexicographic max is the newest frame.
+pub fn thumb_frame(files: &[String], kind: CaptureKind) -> Option<String> {
+    let prefix = match kind {
+        CaptureKind::Park => "park_",
+        CaptureKind::Smooth => "frame_",
+        CaptureKind::Video => return None,
+    };
+    files
+        .iter()
+        .filter(|f| f.starts_with(prefix) && f.ends_with(".jpg"))
+        .max()
+        .cloned()
+}
+
 /// Split a run dir name into (epoch, label): `1781634785_cube_gcode_3mf` → (1781634785,
 /// "cube_gcode_3mf"). A non-numeric/absent prefix yields `(0, whole-name)`.
 pub fn parse_run_id(id: &str) -> (u64, String) {
@@ -227,6 +245,29 @@ pub fn transcode_mp4(input: &Path, out: &Path) -> Result<(), String> {
     run_ffmpeg(&transcode_args(input, out), out)
 }
 
+/// ffmpeg argv to grab a single downscaled still from a video `input` into `out` (a jpeg
+/// poster for a Video recording's thumbnail). Seeks ~1s in to skip a black/opening frame.
+/// Pure, so the command shape is unit-tested without ffmpeg.
+pub fn video_thumb_args(input: &Path, out: &Path) -> Vec<String> {
+    vec![
+        "-y".into(),
+        "-ss".into(),
+        "1".into(),
+        "-i".into(),
+        input.display().to_string(),
+        "-frames:v".into(),
+        "1".into(),
+        "-vf".into(),
+        "scale='min(480,iw)':-2".into(),
+        out.display().to_string(),
+    ]
+}
+
+/// Extract a poster still from a video recording (the thin ffmpeg seam for Video thumbs).
+pub fn extract_video_thumb(input: &Path, out: &Path) -> Result<(), String> {
+    run_ffmpeg(&video_thumb_args(input, out), out)
+}
+
 /// Run ffmpeg with `args` producing `out`. The thin seam shared by assemble + transcode;
 /// friendly error if ffmpeg is missing or the encode fails.
 fn run_ffmpeg(args: &[String], out: &Path) -> Result<(), String> {
@@ -293,6 +334,49 @@ mod tests {
         );
         assert_eq!(classify(&s(&["notes.txt"])), None);
         assert_eq!(classify(&s(&[])), None);
+    }
+
+    #[test]
+    fn thumb_frame_picks_the_last_frame_of_a_sequence() {
+        // Park/Smooth → the highest-numbered (most-built-up) frame; order in the listing
+        // doesn't matter since indices are zero-padded.
+        assert_eq!(
+            thumb_frame(
+                &s(&[
+                    "park_000002.jpg",
+                    "park_000000.jpg",
+                    "park_000001.jpg",
+                    "parks.jsonl"
+                ]),
+                CaptureKind::Park
+            ),
+            Some("park_000002.jpg".to_string())
+        );
+        assert_eq!(
+            thumb_frame(
+                &s(&[
+                    "frame_000001_layer_00057.jpg",
+                    "frame_000012_layer_00120.jpg"
+                ]),
+                CaptureKind::Smooth
+            ),
+            Some("frame_000012_layer_00120.jpg".to_string())
+        );
+        // A Video has no frame file to serve; the caller extracts one with ffmpeg.
+        assert_eq!(thumb_frame(&s(&["plain.mp4"]), CaptureKind::Video), None);
+        // Nothing matching → None (no crash on an empty/odd dir).
+        assert_eq!(thumb_frame(&s(&["notes.txt"]), CaptureKind::Park), None);
+    }
+
+    #[test]
+    fn video_thumb_args_grab_one_downscaled_still() {
+        let input = Path::new("/caps/run/ext-1/plain.mp4");
+        let out = Path::new("/caps/run/ext-1/thumb.jpg");
+        let a = video_thumb_args(input, out).join(" ");
+        assert!(a.contains("-i /caps/run/ext-1/plain.mp4"), "{a}");
+        assert!(a.contains("-frames:v 1"), "{a}");
+        assert!(a.contains("scale="), "{a}");
+        assert!(a.trim_end().ends_with("/caps/run/ext-1/thumb.jpg"), "{a}");
     }
 
     #[test]

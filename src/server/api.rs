@@ -326,7 +326,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/camera/{id}/park/{n}", get(camera_park_frame))
         .route("/api/timelapse", get(timelapse_status))
         .route("/api/capture", get(captures_list))
-        .route("/api/capture/{run}/{cam}/video.mp4", get(capture_video));
+        .route("/api/capture/{run}/{cam}/video.mp4", get(capture_video))
+        .route("/api/capture/{run}/{cam}/thumb.jpg", get(capture_thumb));
     let writes = Router::new()
         .route("/api/job/pause", post(job_pause))
         .route("/api/job/resume", post(job_resume))
@@ -1762,6 +1763,67 @@ async fn capture_video(
         .into_response()
 }
 
+/// One capture's thumbnail (open read): a representative still for the recordings list. A
+/// Park/Smooth serves its last frame straight off disk (no transcode); a Video extracts a
+/// poster with ffmpeg, cached as `thumb.jpg`. Path-safe like [`capture_video`]; 404 when
+/// there's nothing to show (incl. ffmpeg missing for a Video).
+async fn capture_thumb(Path((run, cam)): Path<(String, String)>) -> Response {
+    if !is_safe_segment(&run) || !is_safe_segment(&cam) {
+        return bad_request("invalid capture path".to_string());
+    }
+    let run_dir = captures_root().join(&run);
+    let sub = run_dir.join(&cam);
+    let cam_dir = if sub.is_dir() { sub } else { run_dir };
+    let path = tokio::task::spawn_blocking(move || -> Result<std::path::PathBuf, String> {
+        use crate::captures::{CaptureKind, classify, extract_video_thumb, thumb_frame};
+        let files: Vec<String> = std::fs::read_dir(&cam_dir)
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        let kind = classify(&files).ok_or("no recording")?.kind;
+        match kind {
+            CaptureKind::Video => {
+                let thumb = cam_dir.join("thumb.jpg");
+                if !thumb.is_file() {
+                    let mp4 = cam_dir.join("plain.mp4");
+                    let src = if mp4.is_file() {
+                        mp4
+                    } else {
+                        cam_dir.join("plain.mjpeg")
+                    };
+                    if !src.is_file() {
+                        return Err("no video".to_string());
+                    }
+                    extract_video_thumb(&src, &thumb)?;
+                }
+                Ok(thumb)
+            }
+            kind => Ok(cam_dir.join(thumb_frame(&files, kind).ok_or("no frame")?)),
+        }
+    })
+    .await;
+    let p = match path {
+        Ok(Ok(p)) => p,
+        Ok(Err(_)) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return server_error("thumb task failed".to_string()),
+    };
+    match tokio::fs::read(&p).await {
+        Ok(bytes) => (
+            [
+                (CONTENT_TYPE, "image/jpeg".to_string()),
+                // The /thumb.jpg URL tracks the run's *latest* frame, which moves while a run
+                // is live — don't let a stale poster stick. (Finished runs re-read a tiny jpeg.)
+                (CACHE_CONTROL, "no-store".to_string()),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// Resolve the park-capable cameras among `ids` and start the live park slot. A camera is
 /// capable iff it's an external camera with BOTH a stream and a calibrated `park_tuning`;
 /// non-capable requested cameras are skipped (reported in `skipped`), and it's a 400 if
@@ -3099,6 +3161,20 @@ mod tests {
         // A safe-but-nonexistent run → nothing to serve.
         server
             .get("/api/capture/no_such_run_zzz/cam/video.mp4")
+            .await
+            .assert_status_not_found();
+    }
+
+    #[tokio::test]
+    async fn capture_thumb_rejects_unsafe_and_unknown() {
+        let server = app(None, FakeController::verified());
+        // Same path-safety + missing-run handling as the video endpoint.
+        server
+            .get("/api/capture/.evil/cam/thumb.jpg")
+            .await
+            .assert_status_bad_request();
+        server
+            .get("/api/capture/no_such_run_zzz/cam/thumb.jpg")
             .await
             .assert_status_not_found();
     }

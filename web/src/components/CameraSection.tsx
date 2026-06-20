@@ -6,6 +6,7 @@ import {
   listCaptures,
   type Camera,
   type CaptureRun,
+  type CaptureCam,
   type ParkTuning,
 } from "../cameras";
 import {
@@ -591,29 +592,77 @@ function RecordingsModal({ onClose }: { onClose: () => void }) {
                   <span className="dim">{recWhen(r.started_at)}</span>
                 </div>
                 {r.cameras.map((c) => (
-                  <div className="rec-cam" key={c.id}>
-                    <span className={`rec-kind rec-kind--${c.kind}`}>
-                      {c.kind === "video" ? "video" : "timelapse"}
-                    </span>
-                    <span className="dim rec-cam__meta">
-                      {c.id || "camera"}
-                      {c.kind === "video" ? "" : ` · ${c.frames} frames`}
-                    </span>
-                    <a
-                      className="cam__btn rec-cam__open"
-                      href={`/api/capture/${encodeURIComponent(r.id)}/${encodeURIComponent(c.id || "default")}/video.mp4`}
-                      target="_blank"
-                      rel="noreferrer"
-                      title="opens the mp4 (assembled on first open — may take a few seconds)"
-                    >
-                      play / save ▸
-                    </a>
-                  </div>
+                  <RecCam key={c.id} runId={r.id} c={c} />
                 ))}
               </div>
             ))}
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+// One recording in the list: a clickable poster (thumbnail + ▶) that expands to inline
+// mp4 playback, plus a download link. The poster and the mp4 are produced on demand by the
+// serve from the run's frames (or a stored plain.mp4), so park/smooth/video all play here
+// without leaving the dashboard. Falls back to a plain ▶ tile if the thumbnail 404s.
+function RecCam({ runId, c }: { runId: string; c: CaptureCam }) {
+  const [playing, setPlaying] = useState(false);
+  const [noThumb, setNoThumb] = useState(false);
+  const base = `/api/capture/${encodeURIComponent(runId)}/${encodeURIComponent(c.id || "default")}`;
+  const thumbUrl = `${base}/thumb.jpg`;
+  const mp4Url = `${base}/video.mp4`;
+  return (
+    <div className="rec-cam" data-testid="rec-cam">
+      {playing ? (
+        <video
+          className="rec-cam__video"
+          data-testid="rec-video"
+          src={mp4Url}
+          poster={thumbUrl}
+          controls
+          autoPlay
+        />
+      ) : (
+        <button
+          className={`rec-cam__poster${noThumb ? " rec-cam__poster--empty" : ""}`}
+          data-testid="rec-play"
+          title="play here"
+          aria-label="play recording"
+          onClick={() => setPlaying(true)}
+        >
+          {!noThumb && (
+            <img
+              className="rec-cam__thumb"
+              src={thumbUrl}
+              alt=""
+              loading="lazy"
+              onError={() => setNoThumb(true)}
+            />
+          )}
+          <span className="rec-cam__playicon" aria-hidden>
+            ▶
+          </span>
+        </button>
+      )}
+      <div className="rec-cam__info">
+        <span className={`rec-kind rec-kind--${c.kind}`}>
+          {c.kind === "video" ? "video" : "timelapse"}
+        </span>
+        <span className="dim rec-cam__meta">
+          {c.id || "camera"}
+          {c.kind === "video" ? "" : ` · ${c.frames} frames`}
+        </span>
+        <a
+          className="cam__btn rec-cam__open"
+          href={mp4Url}
+          target="_blank"
+          rel="noreferrer"
+          title="open / save the mp4 (assembled on first open — may take a few seconds)"
+        >
+          save ▸
+        </a>
       </div>
     </div>
   );
