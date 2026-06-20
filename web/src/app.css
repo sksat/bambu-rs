@@ -1141,73 +1141,141 @@ div.lbl,
 .jog {
   display: flex;
   align-items: center;
-  gap: 0.9rem;
+  gap: 1.1rem;
   margin-top: 0.55rem;
 }
-.jog__pad {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  grid-template-rows: repeat(3, 1fr);
-  gap: 0.35rem;
-  /* The bed: a square, hairline-framed plate the buttons sit on. */
-  padding: 0.4rem;
-  border: 1px solid var(--hair);
-  border-radius: 8px;
-  background: var(--hair-2);
-  width: min(13.5rem, 60vw);
+/* concentric XY jog dial (SVG): a wedge per direction, a ring per step */
+.dial {
+  display: block;
+  width: min(17rem, 72vw);
   aspect-ratio: 1;
+  touch-action: manipulation;
 }
-.jog__corner {
-  /* empty grid cell */
+.dial--off {
+  opacity: 0.4;
+  pointer-events: none;
 }
-.jog__z {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 0.35rem;
+.dial__seg path {
+  stroke: var(--panel);
+  stroke-width: 0.7;
+  cursor: pointer;
+  transition: fill 0.1s;
 }
-.jog__zlbl {
-  line-height: 1;
+/* Resting fills: warm amber-tinted concentric bands, more saturated outward so the
+   coarse 10 mm ring reads as the "big move" and the fine .1 mm as the inner trim. */
+.dial__seg--r0 path {
+  fill: color-mix(in srgb, var(--accent) 10%, transparent);
 }
-.jog__btn {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 0.05rem;
-  padding: 0.3rem;
-  line-height: 1.05;
+.dial__seg--r1 path {
+  fill: color-mix(in srgb, var(--accent) 18%, transparent);
 }
-.jog__pad .jog__btn {
-  width: 100%;
-  height: 100%;
+.dial__seg--r2 path {
+  fill: color-mix(in srgb, var(--accent) 28%, transparent);
 }
-.jog__z .jog__btn {
-  width: 3rem;
-  height: 3rem;
+.dial__seg:hover path {
+  fill: color-mix(in srgb, var(--accent) 58%, transparent);
 }
-.jog__arrow {
-  font-size: 1rem;
+.dial__seg:active path {
+  fill: var(--accent);
 }
-.jog__ax {
-  font-size: 0.6rem;
-  color: var(--dim);
-  letter-spacing: 0.04em;
+.dial__num {
+  fill: var(--label);
+  font-size: 5px;
+  font-weight: 600;
+  text-anchor: middle;
+  dominant-baseline: central;
+  pointer-events: none;
 }
-.jog__btn:hover:not(:disabled) .jog__ax {
-  color: var(--accent);
+.dial__axis {
+  fill: var(--fg);
+  font-size: 5.4px;
+  font-weight: 700;
+  text-anchor: middle;
+  dominant-baseline: central;
+  pointer-events: none;
 }
-/* The centre home cell: the bed origin — accent-edged so it reads as the datum. */
-.jog__home {
-  font-size: 1.3rem;
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+/* Centre home: the bed origin — accent-edged + accent glyph so it reads as the datum. */
+.dial__home {
+  fill: var(--panel-2);
+  stroke: color-mix(in srgb, var(--accent) 50%, var(--hair));
+  stroke-width: 1;
+  cursor: pointer;
+  transition: fill 0.1s;
 }
-.jog__home:hover:not(:disabled) {
-  border-color: var(--accent);
+.dial__home:hover {
+  fill: color-mix(in srgb, var(--accent) 28%, var(--panel-2));
+}
+.dial__home-glyph {
+  fill: var(--accent);
+  font-size: 9px;
+  text-anchor: middle;
+  dominant-baseline: central;
+  pointer-events: none;
 }
 
-/* Segmented control: jog step / extrude length pickers. */
+/* Z jog ladder: a vertical stack echoing the dial — Z+ rungs above the centre datum,
+   Z- below, magnitude growing outward (coarse 10 mm at the ends, fine .1 mm nearest). */
+.zstack {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.22rem;
+  width: 3.4rem;
+}
+.zstack__datum {
+  text-align: center;
+  line-height: 1;
+  padding: 0.05rem 0;
+}
+.zrung {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.28rem;
+  padding: 0.34rem 0.4rem;
+  border: 1px solid var(--hair);
+  border-radius: 7px;
+  color: var(--fg);
+  cursor: pointer;
+  font-variant-numeric: tabular-nums;
+  transition:
+    background 0.1s,
+    border-color 0.1s;
+}
+/* Same amber progression as the dial rings: bigger move = more prominent rung. */
+.zrung--r0 {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.zrung--r1 {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+.zrung--r2 {
+  background: color-mix(in srgb, var(--accent) 28%, transparent);
+}
+.zrung:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 55%, transparent);
+  border-color: var(--accent);
+}
+.zrung:active:not(:disabled) {
+  background: var(--accent);
+}
+.zrung:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.zrung__dir {
+  font-size: 0.85rem;
+  color: var(--dim);
+}
+.zrung__mag {
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+.zrung:hover:not(:disabled) .zrung__dir {
+  color: var(--accent);
+}
+
+/* Segmented control: extrude length picker. */
 .seg {
   display: flex;
   flex-wrap: wrap;

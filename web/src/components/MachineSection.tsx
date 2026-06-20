@@ -15,25 +15,160 @@ const FEED_Z = 600;
 const FEED_EXTRUDE = 300;
 const MIN_EXTRUDE_TEMP = 170; // cold extrusion guard (°C)
 
-const STEPS = [0.1, 1, 10] as const;
+// Z jog rungs: magnitude grows away from the centre datum (.1 nearest, 10 at the
+// ends), mirroring the dial's rings (inner = fine, outer = coarse). Tapping a rung
+// jogs Z by that signed step — magnitude is the position, just like the dial.
+const Z_RUNGS = [
+  { step: 10, label: "10", ri: 2 },
+  { step: 1, label: "1", ri: 1 },
+  { step: 0.1, label: ".1", ri: 0 },
+] as const;
 const EXTRUDE_LENS = [1, 5, 10] as const;
+
+// ── Concentric XY jog dial ──────────────────────────────────────────────────
+// A polar control: four 90° wedges (Y+ top, X+ right, Y- bottom, X- left), each
+// split into three concentric rings = step (0.1 / 1 / 10 mm). Tapping a wedge's ring
+// jogs that axis by that step; the centre is home. Replaces the D-pad + the separate
+// step selector — direction is the wedge, magnitude is the ring.
+const JOG_RINGS = [
+  { step: 0.1, label: ".1", r0: 11.5, r1: 20 },
+  { step: 1, label: "1", r0: 20, r1: 32 },
+  { step: 10, label: "10", r0: 32, r1: 44.5 },
+] as const;
+const JOG_DIRS = [
+  { axis: "y" as Axis, dir: 1, label: "Y+", key: "yplus", ang: -90 },
+  { axis: "x" as Axis, dir: 1, label: "X+", key: "xplus", ang: 0 },
+  { axis: "y" as Axis, dir: -1, label: "Y−", key: "yminus", ang: 90 },
+  { axis: "x" as Axis, dir: -1, label: "X−", key: "xminus", ang: 180 },
+] as const;
+
+// Polar → cartesian about the (50,50) viewBox centre.
+function polar(r: number, deg: number): [number, number] {
+  const a = (deg * Math.PI) / 180;
+  return [50 + r * Math.cos(a), 50 + r * Math.sin(a)];
+}
+// SVG path for an annular sector (ring band r0..r1 between angles a0..a1, <180°).
+function ringSector(r0: number, r1: number, a0: number, a1: number): string {
+  const [x0o, y0o] = polar(r1, a0);
+  const [x1o, y1o] = polar(r1, a1);
+  const [x1i, y1i] = polar(r0, a1);
+  const [x0i, y0i] = polar(r0, a0);
+  return `M ${x0o} ${y0o} A ${r1} ${r1} 0 0 1 ${x1o} ${y1o} L ${x1i} ${y1i} A ${r0} ${r0} 0 0 0 ${x0i} ${y0i} Z`;
+}
+
+function JogDial({
+  onJog,
+  onHome,
+  disabled,
+  title,
+}: {
+  onJog: (axis: Axis, mm: number) => void;
+  onHome: () => void;
+  disabled: boolean;
+  title?: string;
+}) {
+  const HALF = 44; // wedge half-angle; a hair under 45° leaves a thin seam between wedges
+  return (
+    <svg
+      className={disabled ? "dial dial--off" : "dial"}
+      viewBox="0 0 100 100"
+      role="group"
+      aria-label="XY jog"
+      aria-disabled={disabled}
+      data-testid="jog-dial"
+    >
+      {title && <title>{title}</title>}
+      {JOG_DIRS.flatMap((d) =>
+        JOG_RINGS.map((ring, ri) => {
+          const [tx, ty] = polar((ring.r0 + ring.r1) / 2, d.ang);
+          return (
+            <g key={`${d.key}-${ring.label}`} className={`dial__seg dial__seg--r${ri}`}>
+              <path
+                d={ringSector(ring.r0, ring.r1, d.ang - HALF, d.ang + HALF)}
+                data-testid={`jog-${d.key}-${ring.label}`}
+                aria-label={`${d.label} ${ring.step} mm`}
+                onClick={() => onJog(d.axis, d.dir * ring.step)}
+              />
+              <text className="dial__num" x={tx} y={ty}>
+                {ring.label}
+              </text>
+            </g>
+          );
+        }),
+      )}
+      {JOG_DIRS.map((d) => {
+        const [lx, ly] = polar(47, d.ang);
+        return (
+          <text key={d.key} className="dial__axis" x={lx} y={ly}>
+            {d.label}
+          </text>
+        );
+      })}
+      <circle
+        className="dial__home"
+        cx="50"
+        cy="50"
+        r="11"
+        data-testid="home-all"
+        aria-label="home all axes (G28)"
+        onClick={() => onHome()}
+      />
+      <text className="dial__home-glyph" x="50" y="50">
+        ⌂
+      </text>
+    </svg>
+  );
+}
+
+// Z jog: a vertical ladder echoing the dial. Z+ rungs stack above the centre datum,
+// Z- below; magnitude grows outward (coarse 10 mm at the ends), so the same "further
+// out = bigger move" reading carries over from the XY dial — no separate step picker.
+function JogZStack({
+  onJog,
+  disabled,
+  title,
+}: {
+  onJog: (mm: number) => void;
+  disabled: boolean;
+  title?: string;
+}) {
+  const rung = (sign: 1 | -1, z: (typeof Z_RUNGS)[number]) => (
+    <button
+      key={`${sign > 0 ? "zplus" : "zminus"}-${z.label}`}
+      className={`zrung zrung--r${z.ri}`}
+      disabled={disabled}
+      title={title}
+      data-testid={`jog-${sign > 0 ? "zplus" : "zminus"}-${z.label}`}
+      aria-label={`Z${sign > 0 ? "+" : "−"} ${z.step} mm`}
+      onClick={() => onJog(sign * z.step)}
+    >
+      <span className="zrung__dir">{sign > 0 ? "↑" : "↓"}</span>
+      <span className="zrung__mag">{z.label}</span>
+    </button>
+  );
+  return (
+    <div className="zstack" role="group" aria-label="Z jog" data-testid="jog-zstack">
+      {/* Z+ : coarse (10) at the top, fine (.1) nearest the datum. */}
+      {Z_RUNGS.map((z) => rung(1, z))}
+      <span className="zstack__datum lbl">Z</span>
+      {/* Z- : fine (.1) nearest the datum, coarse (10) at the bottom (Z_RUNGS reversed). */}
+      {[...Z_RUNGS].reverse().map((z) => rung(-1, z))}
+    </div>
+  );
+}
 
 export function MachineSection({ s, control }: { s: PrinterStatus; control: Control }) {
   const b = control.busy;
   const busy = isBusy(s.gcode_state);
   const stateName = s.gcode_state ?? "unknown";
-  const [step, setStep] = useState<number>(1);
+  // Both jog controls encode magnitude in position: the dial's rings (XY) and the
+  // Z ladder's rungs — so there's no separate step state to track.
   const [extLen, setExtLen] = useState<number>(5);
   const [cal, setCal] = useState({ bed_level: false, vibration: false, motor_noise: false });
 
   // A jog/home is unavailable if a write is in flight OR the printer is busy.
   const motionDisabled = !!b || busy;
   const motionTitle = busy ? `unavailable while ${stateName}` : undefined;
-
-  const jogTitle = (extra?: string) => (busy ? `unavailable while ${stateName}` : extra);
-
-  const jog = (axis: Axis, dir: 1 | -1) =>
-    void control.jog(axis, dir * step, axis === "z" ? FEED_Z : FEED_XY);
 
   // Temp the AMS unload heats to: honour an explicit nozzle setpoint, else a
   // default that softens both PLA and PETG enough to retract cleanly.
@@ -50,112 +185,23 @@ export function MachineSection({ s, control }: { s: PrinterStatus; control: Cont
 
   return (
     <div className="cfold" data-testid="machine">
-      {/* ── MOVE: printer-shaped jog control ─────────────────────────────── */}
+      {/* ── MOVE: concentric XY jog dial + Z column ─────────────────────────── */}
       <div className="msub">
         <div className="lbl">move</div>
         <div className="jog">
-          {/* XY D-pad — a 3×3 grid laid out like the bed seen from above. */}
-          <div className="jog__pad" role="group" aria-label="XY jog">
-            <span className="jog__corner" aria-hidden />
-            <button
-              className="btn jog__btn"
-              disabled={motionDisabled}
-              title={motionTitle}
-              data-testid="jog-yplus"
-              onClick={() => jog("y", 1)}
-            >
-              <span className="jog__arrow">↑</span>
-              <span className="jog__ax">Y+</span>
-            </button>
-            <span className="jog__corner" aria-hidden />
-
-            <button
-              className="btn jog__btn"
-              disabled={motionDisabled}
-              title={motionTitle}
-              data-testid="jog-xminus"
-              onClick={() => jog("x", -1)}
-            >
-              <span className="jog__arrow">←</span>
-              <span className="jog__ax">X−</span>
-            </button>
-            <button
-              className="btn jog__btn jog__home"
-              disabled={motionDisabled}
-              title={jogTitle("home all axes (G28)")}
-              data-testid="home-all"
-              onClick={() => void control.home("all")}
-            >
-              ⌂
-            </button>
-            <button
-              className="btn jog__btn"
-              disabled={motionDisabled}
-              title={motionTitle}
-              data-testid="jog-xplus"
-              onClick={() => jog("x", 1)}
-            >
-              <span className="jog__arrow">→</span>
-              <span className="jog__ax">X+</span>
-            </button>
-
-            <span className="jog__corner" aria-hidden />
-            <button
-              className="btn jog__btn"
-              disabled={motionDisabled}
-              title={motionTitle}
-              data-testid="jog-yminus"
-              onClick={() => jog("y", -1)}
-            >
-              <span className="jog__arrow">↓</span>
-              <span className="jog__ax">Y−</span>
-            </button>
-            <span className="jog__corner" aria-hidden />
-          </div>
-
-          {/* Z column — the gantry, beside the bed. */}
-          <div className="jog__z" role="group" aria-label="Z jog">
-            <button
-              className="btn jog__btn"
-              disabled={motionDisabled}
-              title={motionTitle}
-              data-testid="jog-zplus"
-              onClick={() => jog("z", 1)}
-            >
-              <span className="jog__arrow">↑</span>
-              <span className="jog__ax">Z+</span>
-            </button>
-            <span className="jog__zlbl lbl">Z</span>
-            <button
-              className="btn jog__btn"
-              disabled={motionDisabled}
-              title={motionTitle}
-              data-testid="jog-zminus"
-              onClick={() => jog("z", -1)}
-            >
-              <span className="jog__arrow">↓</span>
-              <span className="jog__ax">Z−</span>
-            </button>
-          </div>
-        </div>
-
-        {/* Step selector: how far each jog travels. */}
-        <div className="seg" role="radiogroup" aria-label="jog step (mm)">
-          {STEPS.map((mm) => {
-            const active = mm === step;
-            return (
-              <button
-                key={mm}
-                className={`btn btn--sm seg__opt${active ? " is-active" : ""}`}
-                role="radio"
-                aria-checked={active}
-                data-testid="jog-step"
-                onClick={() => setStep(mm)}
-              >
-                {mm} mm
-              </button>
-            );
-          })}
+          {/* XY: a radial dial — direction is the wedge, step (0.1/1/10mm) is the ring. */}
+          <JogDial
+            onJog={(axis, mm) => void control.jog(axis, mm, FEED_XY)}
+            onHome={() => void control.home("all")}
+            disabled={motionDisabled}
+            title={motionTitle}
+          />
+          {/* Z ladder — the gantry, beside the bed; magnitude grows outward like the dial. */}
+          <JogZStack
+            onJog={(mm) => void control.jog("z", mm, FEED_Z)}
+            disabled={motionDisabled}
+            title={motionTitle}
+          />
         </div>
       </div>
 

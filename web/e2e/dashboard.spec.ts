@@ -162,31 +162,30 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
   });
 
-  test("machine panel renders with the jog D-pad", async ({ page }) => {
+  test("machine panel renders the concentric jog dial + Z ladder", async ({ page }) => {
     await expect(page.getByTestId("machine")).toBeVisible();
-    for (const id of [
-      "jog-yplus",
-      "jog-yminus",
-      "jog-xminus",
-      "jog-xplus",
-      "home-all",
-      "jog-zplus",
-      "jog-zminus",
-    ]) {
-      await expect(page.getByTestId(id)).toBeVisible();
+    await expect(page.getByTestId("jog-dial")).toBeVisible();
+    await expect(page.getByTestId("jog-zstack")).toBeVisible();
+    // a sample of the 12 wedge×ring segments + the centre home (all SVG)
+    for (const id of ["jog-yplus-1", "jog-xminus-10", "jog-xplus-.1", "home-all"]) {
+      await expect(page.getByTestId(id)).toBeAttached();
+    }
+    // Z ladder rungs: magnitude is the position (.1/1/10 each way), no separate step picker.
+    for (const id of ["jog-zplus-10", "jog-zplus-.1", "jog-zminus-1", "jog-zminus-10"]) {
+      await expect(page.getByTestId(id)).toBeAttached();
     }
   });
 
   test("jog/home are disabled while the printer is busy", async ({ page }) => {
-    // The fake source streams RUNNING (a busy state), so motion is gated off.
+    // The fake source streams RUNNING (a busy state), so motion is gated off: the dial
+    // goes aria-disabled (pointer-events off) and the Z ladder rungs disable.
     await expect
       .poll(async () => {
         const state = ((await page.getByTestId("state").textContent()) ?? "").toUpperCase().trim();
         if (state !== "RUNNING") return null;
-        const home = await page.getByTestId("home-all").isDisabled();
-        const xplus = await page.getByTestId("jog-xplus").isDisabled();
-        const zplus = await page.getByTestId("jog-zplus").isDisabled();
-        return home && xplus && zplus;
+        const dialOff = (await page.getByTestId("jog-dial").getAttribute("aria-disabled")) === "true";
+        const zplus = await page.getByTestId("jog-zplus-1").isDisabled();
+        return dialOff && zplus;
       })
       .toBeTruthy();
   });
