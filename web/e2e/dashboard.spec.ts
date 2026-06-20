@@ -239,6 +239,25 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("cameras-modal")).toHaveCount(0);
   });
 
+  test("camera manage modal: per-camera park tuning editor", async ({ page }) => {
+    // The live-park preview is enabled by a per-camera park_tuning. Verify the manage
+    // form exposes a collapsible JSON editor for it and that it's editable. Like the
+    // sibling manage test, this does NOT save — the shared --fake server's camera list
+    // stays untouched (the park toggle/start need a saved capable camera, which can't be
+    // configured here without racing the parallel camera tests).
+    await page.getByTestId("cameras-manage").click();
+    await expect(page.getByTestId("cameras-modal")).toBeVisible();
+    await expect(page.getByTestId("camera-url-0")).toBeVisible();
+    // expand the collapsed editor, then type some tuning JSON
+    await page.getByTestId("camera-park-toggle-0").click();
+    const editor = page.getByTestId("camera-park-0");
+    await expect(editor).toBeVisible();
+    await editor.fill('{"fps":4,"left_frac":0.33}');
+    await expect(editor).toHaveValue('{"fps":4,"left_frac":0.33}');
+    await page.getByTestId("cameras-modal").click({ position: { x: 6, y: 6 } });
+    await expect(page.getByTestId("cameras-modal")).toHaveCount(0);
+  });
+
   test("file detail and start dialog close on scrim (outside) click", async ({ page }) => {
     await page
       .getByTestId("file")

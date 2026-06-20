@@ -556,7 +556,7 @@ function CameraManageModal({
                   {/* Optional per-camera park tuning (needs a stream URL too). Edited as
                       raw JSON — paste tuning.example.json and calibrate; server validates. */}
                   <details className="cam__park" open={r.park_tuning.trim() !== ""}>
-                    <summary className="cam__park-sum">
+                    <summary className="cam__park-sum" data-testid={`camera-park-toggle-${i}`}>
                       park tuning (JSON) — enables the live park preview
                     </summary>
                     <textarea
