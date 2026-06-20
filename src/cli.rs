@@ -157,10 +157,11 @@ enum Command {
         #[command(subcommand)]
         action: AmsAction,
     },
-    /// Run printer calibration — pick what to calibrate (a subcommand).
+    /// Run printer calibration. With no routine flags it runs them ALL (the default);
+    /// pass any of --bed-level/--vibration/--motor-noise to run just those.
     Calibrate {
-        #[command(subcommand)]
-        what: CalibrateAction,
+        #[command(flatten)]
+        args: CalibrateArgs,
     },
     /// Send a raw G-code line and watch the report (control; needs --confirm).
     Gcode {
@@ -327,23 +328,19 @@ enum JobAction {
     },
 }
 
-/// Which calibration routine to run. Each is a separate subcommand so the choice
-/// is explicit (e.g. `bambu calibrate bed-level`).
-#[derive(Subcommand)]
-enum CalibrateAction {
-    /// Auto-level the heated bed.
-    BedLevel(CalibrateArgs),
-    /// Vibration / resonance compensation.
-    Vibration(CalibrateArgs),
-    /// Motor-noise (current) calibration.
-    MotorNoise(CalibrateArgs),
-    /// The usual A1 set: bed level + vibration.
-    Auto(CalibrateArgs),
-}
-
-/// Flags shared by every `calibrate` subcommand.
+/// `calibrate` flags: which routines to run, plus the shared run/verify knobs. Mirrors the
+/// dashboard's picker — selecting none runs them all (the common "full calibration").
 #[derive(clap::Args)]
 struct CalibrateArgs {
+    /// Auto-level the heated bed.
+    #[arg(long)]
+    bed_level: bool,
+    /// Vibration / resonance compensation.
+    #[arg(long)]
+    vibration: bool,
+    /// Motor-noise (current) calibration.
+    #[arg(long)]
+    motor_noise: bool,
     /// Show what would run, without sending it (safe).
     #[arg(long)]
     dry_run: bool,
@@ -696,7 +693,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             timeout,
         } => run_light(cli, state == "on", node, *timeout),
         Command::Speed { level, timeout } => run_speed(cli, level, *timeout),
-        Command::Calibrate { what } => run_calibrate(cli, what),
+        Command::Calibrate { args } => run_calibrate(cli, args),
         Command::Gcode {
             line,
             confirm,
@@ -2278,13 +2275,12 @@ fn run_ams(cli: &Cli, action: &AmsAction) -> Result<(), CliError> {
     }
 }
 
-fn run_calibrate(cli: &Cli, action: &CalibrateAction) -> Result<(), CliError> {
-    let (bed_level, vibration, motor_noise, args) = match action {
-        CalibrateAction::BedLevel(a) => (true, false, false, a),
-        CalibrateAction::Vibration(a) => (false, true, false, a),
-        CalibrateAction::MotorNoise(a) => (false, false, true, a),
-        CalibrateAction::Auto(a) => (true, true, false, a),
-    };
+fn run_calibrate(cli: &Cli, args: &CalibrateArgs) -> Result<(), CliError> {
+    // No routine flag → run them all (the default), matching the dashboard picker.
+    let none_picked = !(args.bed_level || args.vibration || args.motor_noise);
+    let bed_level = args.bed_level || none_picked;
+    let vibration = args.vibration || none_picked;
+    let motor_noise = args.motor_noise || none_picked;
     let cmd = ProtoCommand::Calibration {
         bed_level,
         vibration,
