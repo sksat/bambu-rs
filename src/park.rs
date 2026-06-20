@@ -106,10 +106,11 @@ impl ParkWriter {
     }
 
     /// Copy `ring_jpeg` to `latest_park.jpg` (atomic) and `park_NNNNNN.jpg`, and append a
-    /// line to `parks.jsonl`. Returns the index written.
-    pub fn write(&mut self, park: &Park, ring_jpeg: &Path) -> std::io::Result<u64> {
-        let replace = park.replace && self.emitted > 0;
-        let n = if replace {
+    /// line to `parks.jsonl`. Returns the index written and whether it REPLACED the
+    /// previous park (a stronger close pair, same layer — overwritten, not a new frame).
+    pub fn write(&mut self, park: &Park, ring_jpeg: &Path) -> std::io::Result<ParkWritten> {
+        let replaced = park.replace && self.emitted > 0;
+        let index = if replaced {
             self.emitted - 1
         } else {
             self.emitted
@@ -118,11 +119,11 @@ impl ParkWriter {
         let tmp = self.out_dir.join("latest_park.jpg.tmp");
         std::fs::copy(ring_jpeg, &tmp)?;
         std::fs::rename(&tmp, self.out_dir.join("latest_park.jpg"))?;
-        std::fs::copy(ring_jpeg, self.out_dir.join(format!("park_{n:06}.jpg")))?;
+        std::fs::copy(ring_jpeg, self.out_dir.join(format!("park_{index:06}.jpg")))?;
 
         let line = serde_json::json!({
-            "n": n, "idx": park.idx, "t": park.t, "left_mass": park.left_mass,
-            "sharpness": park.sharpness, "confidence": park.confidence, "replace": replace,
+            "n": index, "idx": park.idx, "t": park.t, "left_mass": park.left_mass,
+            "sharpness": park.sharpness, "confidence": park.confidence, "replace": replaced,
         });
         let mut f = std::fs::OpenOptions::new()
             .create(true)
@@ -130,11 +131,31 @@ impl ParkWriter {
             .open(self.out_dir.join("parks.jsonl"))?;
         writeln!(f, "{line}")?;
 
-        if !replace {
+        if !replaced {
             self.emitted += 1;
         }
-        Ok(n)
+        Ok(ParkWritten { index, replaced })
     }
+}
+
+/// Result of [`ParkWriter::write`]: the index of the `park_NNNNNN.jpg` written, and
+/// whether it overwrote the previous park (a same-layer supersession) vs. added a new one.
+pub struct ParkWritten {
+    pub index: u64,
+    pub replaced: bool,
+}
+
+/// What happened to one emitted park — the live progress hook's event. A `Replaced` is
+/// NOT a new layer: it overwrote the previous park with a stronger frame, so it must not
+/// be counted as an additional park.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkEvent {
+    /// A new distinct park frame was written (`park_NNNNNN.jpg` added).
+    Written,
+    /// A stronger close pair superseded the previous park (overwritten, same layer).
+    Replaced,
+    /// The park's ring JPEG never arrived / the write failed — the frame is lost.
+    Dropped,
 }
 
 /// Outcome of one detection run over a gray stream.
@@ -142,32 +163,43 @@ impl ParkWriter {
 pub struct ParkRunStats {
     /// Gray frames read from the stream.
     pub frames: u64,
-    /// Parks written (distinct frames; a `replace` overwrites rather than adds).
+    /// Distinct parks written (one `park_NNNNNN.jpg` each; a replace does NOT count here).
     pub parks: u64,
+    /// Parks superseded by a stronger close pair (overwrote an existing frame).
+    pub replaced: u64,
     /// Parks whose full-res ring JPEG never arrived / failed to write — dropped with a
     /// count rather than silently, so a missing layer is visible.
     pub dropped: u64,
 }
 
 /// Resolve one emitted park to disk: await its ring JPEG (briefly), write it, and
-/// tally/report the outcome. `on_emit(written)` fires per park (written or dropped) so
-/// the caller can update live progress without waiting for the run to end.
+/// tally/report the outcome. `on_emit` fires per park so the caller can update live
+/// progress without waiting for the run to end — distinguishing a new park from a
+/// supersession so neither over-counts.
 fn emit_park(
     park: &Park,
     ring_jpeg: &dyn Fn(u64) -> PathBuf,
     await_ring: &dyn Fn(&Path) -> bool,
     writer: &mut ParkWriter,
-    on_emit: &mut dyn FnMut(bool),
+    on_emit: &mut dyn FnMut(ParkEvent),
     stats: &mut ParkRunStats,
 ) {
     let path = ring_jpeg(park.idx);
-    let written = await_ring(&path) && writer.write(park, &path).is_ok();
-    if written {
-        stats.parks += 1;
+    let event = if await_ring(&path) {
+        match writer.write(park, &path) {
+            Ok(w) if w.replaced => ParkEvent::Replaced,
+            Ok(_) => ParkEvent::Written,
+            Err(_) => ParkEvent::Dropped,
+        }
     } else {
-        stats.dropped += 1;
+        ParkEvent::Dropped
+    };
+    match event {
+        ParkEvent::Written => stats.parks += 1,
+        ParkEvent::Replaced => stats.replaced += 1,
+        ParkEvent::Dropped => stats.dropped += 1,
     }
-    on_emit(written);
+    on_emit(event);
 }
 
 /// Drive the detector over a gray rawvideo stream, writing each emitted park. Pure of
@@ -175,7 +207,7 @@ fn emit_park(
 /// wait, `cancel`, and the `on_emit` progress hook are all injected, so this is
 /// unit-tested with an in-memory stream and pre-created fake ring files. `await_ring`
 /// lets the real worker poll briefly for the JPEG (it can lag the gray by a tick) while
-/// a test returns instantly; `on_emit(written)` fires per park for live status.
+/// a test returns instantly; `on_emit` fires a [`ParkEvent`] per park for live status.
 #[allow(clippy::too_many_arguments)]
 pub fn detect_stream(
     reader: &mut dyn Read,
@@ -185,7 +217,7 @@ pub fn detect_stream(
     ring_jpeg: &dyn Fn(u64) -> PathBuf,
     await_ring: &dyn Fn(&Path) -> bool,
     cancel: &dyn Fn() -> bool,
-    on_emit: &mut dyn FnMut(bool),
+    on_emit: &mut dyn FnMut(ParkEvent),
 ) -> ParkRunStats {
     let mut stats = ParkRunStats::default();
     let mut buf = vec![0u8; frame_size];
@@ -263,18 +295,19 @@ const RING_KEEP_SECONDS: f64 = 60.0;
 /// is set — the main read blocks until bytes arrive, so it can't observe `cancel` itself —
 /// and prunes the ring on a sliding window.
 ///
-/// Reports each park live via `on_park(written)`; returns the run's [`ParkRunStats`], or
-/// an error string if it couldn't even start (no server/CLI type leaks in, so any caller
-/// adapts it). `stats.frames == 0` on return means the stream produced nothing — the
-/// caller decides how to surface that. This is the thin, on-device-verified I/O seam; the
-/// detector, argv, writer, and prune are the unit-tested pure pieces.
+/// Reports each park live via `on_park` ([`ParkEvent`]); returns the run's
+/// [`ParkRunStats`], or an error string if it couldn't even start (no server/CLI type
+/// leaks in, so any caller adapts it). `stats.frames == 0` on return means the stream
+/// produced nothing — the caller decides how to surface that. This is the thin,
+/// on-device-verified I/O seam; the detector, argv, writer, and prune are the unit-tested
+/// pure pieces.
 pub fn run_park_camera(
     cap: &ParkCapture,
     cam_dir: &Path,
     w: usize,
     h: usize,
     cancel: &Arc<AtomicBool>,
-    on_park: &mut dyn FnMut(bool),
+    on_park: &mut dyn FnMut(ParkEvent),
 ) -> Result<ParkRunStats, String> {
     let ring = cam_dir.join(".ring");
     std::fs::create_dir_all(&ring)
@@ -412,7 +445,9 @@ mod tests {
         let ring = dir.join("full_000000003.jpg");
         std::fs::write(&ring, b"JPEGA").unwrap();
         let mut w = ParkWriter::new(dir.clone());
-        assert_eq!(w.write(&park(3, false), &ring).unwrap(), 0);
+        let wr = w.write(&park(3, false), &ring).unwrap();
+        assert_eq!(wr.index, 0);
+        assert!(!wr.replaced);
         assert_eq!(w.emitted(), 1);
         assert_eq!(
             std::fs::read(dir.join("latest_park.jpg")).unwrap(),
@@ -437,8 +472,9 @@ mod tests {
         std::fs::write(&r2, b"STRONG").unwrap();
         let mut w = ParkWriter::new(dir.clone());
         w.write(&park(3, false), &r1).unwrap(); // n=0, emitted -> 1
-        let n = w.write(&park(5, true), &r2).unwrap(); // replace: reuse n=0, emitted stays 1
-        assert_eq!(n, 0, "replace reuses the previous index");
+        let wr = w.write(&park(5, true), &r2).unwrap(); // replace: reuse n=0, emitted stays 1
+        assert_eq!(wr.index, 0, "replace reuses the previous index");
+        assert!(wr.replaced, "flagged as a replacement");
         assert_eq!(w.emitted(), 1, "replace does not add a frame");
         assert_eq!(
             std::fs::read(dir.join("park_000000.jpg")).unwrap(),
@@ -498,6 +534,30 @@ mod tests {
         img
     }
 
+    /// Like [`cframe`] but the head is drawn only on the top half of rows → a fainter
+    /// island (less left-mass), e.g. a blurred travel move that a real park supersedes.
+    fn cframe_weak(head_x: usize) -> Vec<u8> {
+        let (bg, fix, obj, head) = (200u8, 40u8, 110u8, 25u8);
+        let mut img = vec![bg; W * H];
+        for y in 0..H {
+            let row = y * W;
+            img[row] = fix;
+            img[row + 1] = fix;
+            for x in (W / 2 - 3)..(W / 2 + 3) {
+                img[row + x] = obj;
+            }
+            if y >= H / 2 {
+                continue;
+            }
+            for x in 0..W {
+                if (x as i64 - head_x as i64).unsigned_abs() <= 4 {
+                    img[row + x] = head;
+                }
+            }
+        }
+        img
+    }
+
     #[test]
     fn detect_stream_writes_one_park_and_maps_the_ring_index() {
         let dir = tmp("detect");
@@ -530,8 +590,8 @@ mod tests {
             &|idx| ring_jpeg_path(&rd, idx),
             &|p| p.exists(),
             &|| false,
-            &mut |written| {
-                if written {
+            &mut |ev| {
+                if ev == ParkEvent::Written {
                     emitted += 1;
                 }
             },
@@ -542,6 +602,62 @@ mod tests {
         assert_eq!(stats.frames, 21, "all frames read");
         assert!(dir.join("latest_park.jpg").exists());
         assert!(dir.join("park_000000.jpg").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detect_stream_counts_a_replacement_as_replaced_not_a_new_park() {
+        // a weak island then a stronger one <min_sep later (the core replace scenario):
+        // the second SUPERSEDES the first, so it must count as Replaced, not a 2nd park.
+        let dir = tmp("replace-stream");
+        let ring_dir = dir.join(".ring");
+        std::fs::create_dir_all(&ring_dir).unwrap();
+        for idx in 0..30 {
+            std::fs::write(ring_jpeg_path(&ring_dir, idx), b"R").unwrap();
+        }
+        let mut bytes = Vec::new();
+        for _ in 0..8 {
+            bytes.extend_from_slice(&cframe(W / 2));
+        }
+        for _ in 0..2 {
+            bytes.extend_from_slice(&cframe_weak(6));
+        }
+        for _ in 0..5 {
+            bytes.extend_from_slice(&cframe(W / 2));
+        }
+        for _ in 0..2 {
+            bytes.extend_from_slice(&cframe(6));
+        }
+        for _ in 0..8 {
+            bytes.extend_from_slice(&cframe(W / 2));
+        }
+
+        let mut det = LiveParkDetector::new(W, H, &cfg());
+        let mut writer = ParkWriter::new(dir.clone());
+        let rd = ring_dir.clone();
+        let (mut written, mut replaced) = (0u32, 0u32);
+        let stats = detect_stream(
+            &mut Cursor::new(bytes),
+            &mut det,
+            W * H,
+            &mut writer,
+            &|idx| ring_jpeg_path(&rd, idx),
+            &|p| p.exists(),
+            &|| false,
+            &mut |ev| match ev {
+                ParkEvent::Written => written += 1,
+                ParkEvent::Replaced => replaced += 1,
+                ParkEvent::Dropped => {}
+            },
+        );
+        assert_eq!(stats.parks, 1, "one distinct park on disk: {stats:?}");
+        assert_eq!(
+            stats.replaced, 1,
+            "the stronger pair superseded it: {stats:?}"
+        );
+        assert_eq!(written, 1, "live count: one new park, not two");
+        assert_eq!(replaced, 1);
+        assert_eq!(writer.emitted(), 1, "one park_*.jpg on disk");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

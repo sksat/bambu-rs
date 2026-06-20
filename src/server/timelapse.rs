@@ -21,7 +21,7 @@ use super::camera::StreamOpen;
 use super::stream_record::record_loop;
 use crate::core::status::PrinterStatus;
 use crate::core::timelapse::{ActivityAction, CaptureAction, CaptureSession, PrintActivitySession};
-use crate::park::{DECODE_H, DECODE_W, ParkCapture, run_park_camera};
+use crate::park::{DECODE_H, DECODE_W, ParkCapture, ParkEvent, run_park_camera};
 
 /// Spawns the live-park worker for ONE camera, returning its task handle. Injected so the
 /// slot lifecycle (lazy spawn on print-active, stop at finish) is unit-tested with a fake
@@ -39,13 +39,18 @@ pub fn real_park_spawn() -> ParkSpawn {
     Arc::new(
         |cap: ParkCapture, out_dir, cancel, status: Arc<Mutex<TimelapseStatus>>| {
             tokio::task::spawn_blocking(move || {
-                let mut on_park = |written: bool| {
+                let mut on_park = |ev: ParkEvent| {
                     let mut s = status.lock().unwrap();
-                    if written {
-                        s.frames += 1;
-                    } else {
-                        s.failures += 1;
-                        s.last_error = Some(format!("park {}: a ring JPEG never arrived", cap.id));
+                    match ev {
+                        ParkEvent::Written => s.frames += 1,
+                        // A replace refines the previous park in place — same layer, not
+                        // a new frame, so the distinct-park count stays put.
+                        ParkEvent::Replaced => {}
+                        ParkEvent::Dropped => {
+                            s.failures += 1;
+                            s.last_error =
+                                Some(format!("park {}: a ring JPEG never arrived", cap.id));
+                        }
                     }
                 };
                 let cam_dir = out_dir.join(&cap.id);

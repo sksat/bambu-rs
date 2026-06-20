@@ -31,7 +31,7 @@ use crate::core::status::{GcodeState, PrinterStatus};
 use crate::core::timelapse::{CaptureAction, CaptureSession};
 use crate::core::version::Module;
 use crate::ftp::{FtpError, FtpsClient};
-use crate::park::{DECODE_H, DECODE_W, ParkCapture, run_park_camera};
+use crate::park::{DECODE_H, DECODE_W, ParkCapture, ParkEvent, run_park_camera};
 
 /// Exit codes (a subset of the documented scheme).
 mod exit {
@@ -2449,11 +2449,16 @@ fn run_timelapse_park(
     );
 
     let mut parks = 0u64;
-    let mut on_park = |written: bool| {
-        if written {
+    let mut on_park = |ev| match ev {
+        ParkEvent::Written => {
             eprintln!("park #{parks}");
             parks += 1;
         }
+        // A replace refines the last park (stronger frame, same layer) — not a new one.
+        ParkEvent::Replaced => {
+            eprintln!("park #{} updated (stronger frame)", parks.saturating_sub(1))
+        }
+        ParkEvent::Dropped => eprintln!("warning: a park frame was dropped (ring JPEG missing)"),
     };
     let stats = run_park_camera(
         &cap,
@@ -2472,9 +2477,10 @@ fn run_timelapse_park(
         ));
     }
     eprintln!(
-        "done: {} parks ({} frames, {} dropped) -> {}",
+        "done: {} parks ({} frames, {} replaced, {} dropped) -> {}",
         stats.parks,
         stats.frames,
+        stats.replaced,
         stats.dropped,
         out.display()
     );
@@ -2483,6 +2489,7 @@ fn run_timelapse_park(
             "out": out.to_string_lossy(),
             "frames": stats.frames,
             "parks": stats.parks,
+            "replaced": stats.replaced,
             "dropped": stats.dropped,
         }));
     }
