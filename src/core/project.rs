@@ -35,6 +35,14 @@ pub struct PlateInspection {
     pub bed_type: Option<String>,
     /// `filament_colors` from `Metadata/plate_N.json` (hex `#RRGGBB`), in order.
     pub filament_colors: Vec<String>,
+    /// Whether the plate gcode INJECTS the slicer's per-layer timelapse block (the
+    /// head-park + external-shutter moves) at layer changes — the precondition for a
+    /// "clean", object-only timelapse. NOTE: even when present the block only RUNS if
+    /// timelapse is armed at print start (it's wrapped in an `M622 J1` runtime
+    /// conditional), so this is *capability*, not a guarantee the head will park. See
+    /// [`injects_timelapse_blocks`] for how it's detected (a gcode scan — the
+    /// `timelapse_type` metadata field is uniformly 0 and does NOT track this).
+    pub has_timelapse_blocks: bool,
 }
 
 /// A problem reading/parsing the `.3mf`.
@@ -118,6 +126,8 @@ pub fn inspect_plate(zip_bytes: &[u8], plate: u32) -> Result<PlateInspection, Pr
             None => (None, Vec::new()),
         };
 
+    let has_timelapse_blocks = injects_timelapse_blocks(&gcode);
+
     Ok(PlateInspection {
         plate,
         gcode_md5,
@@ -125,7 +135,28 @@ pub fn inspect_plate(zip_bytes: &[u8], plate: u32) -> Result<PlateInspection, Pr
         sidecar_matches,
         bed_type,
         filament_colors,
+        has_timelapse_blocks,
     })
+}
+
+/// Does the plate gcode INJECT the per-layer timelapse block (head-park + external
+/// shutter), vs merely list it in the settings dump or omit it entirely?
+///
+/// Detected by the slicer's `SKIPTYPE: timelapse` marker. A file that injects the block at
+/// each layer change has MANY (one per layer); a file that only echoes the `time_lapse_gcode`
+/// template in its machine-settings dump has at most ONE; an older profile without the block
+/// has NONE. So `> 1` separates "injected per layer" from "dump-only / absent" — conservative
+/// on purpose: a single (dump-only) mention reads as "no", so we never falsely promise the
+/// head will park. (`timelapse_type` in the 3mf metadata is uniformly 0 and useless here —
+/// device-verified across real slices.)
+fn injects_timelapse_blocks(gcode: &[u8]) -> bool {
+    const MARKER: &[u8] = b"SKIPTYPE: timelapse";
+    gcode
+        .windows(MARKER.len())
+        .filter(|w| *w == MARKER)
+        .take(2) // early-out: two occurrences already proves per-layer injection
+        .count()
+        > 1
 }
 
 /// Verify caller-asserted expectations against an inspected plate.
@@ -263,6 +294,27 @@ mod tests {
         assert!(got.sidecar_matches);
         assert_eq!(got.bed_type.as_deref(), Some("textured_plate"));
         assert_eq!(got.filament_colors, vec!["#F2754E", "#000000"]);
+        assert!(!got.has_timelapse_blocks); // this gcode has no timelapse markers
+    }
+
+    #[test]
+    fn detects_per_layer_timelapse_block_injection() {
+        // Injected at layer changes (the settings dump + several layers) → many markers.
+        let injected = b"; time_lapse_gcode = ;SKIPTYPE: timelapse template\n\
+                         G1 Z1\n; SKIPTYPE: timelapse\nM1004 S5 P1\n\
+                         G1 Z2\n; SKIPTYPE: timelapse\nM1004 S5 P1\n";
+        let zip = make_3mf(&[("Metadata/plate_1.gcode", injected)]);
+        assert!(inspect_plate(&zip, 1).unwrap().has_timelapse_blocks);
+
+        // Only the machine-settings dump mentions it once (not injected per layer) → no.
+        let dump_only = b"; time_lapse_gcode = ;SKIPTYPE: timelapse template\nG28\nG1 X1\n";
+        let zip = make_3mf(&[("Metadata/plate_1.gcode", dump_only)]);
+        assert!(!inspect_plate(&zip, 1).unwrap().has_timelapse_blocks);
+
+        // Older profile with no timelapse gcode at all → no.
+        let none = b"G28\nG1 X1 Y1\nG1 Z0.2\n";
+        let zip = make_3mf(&[("Metadata/plate_1.gcode", none)]);
+        assert!(!inspect_plate(&zip, 1).unwrap().has_timelapse_blocks);
     }
 
     #[test]
@@ -327,6 +379,7 @@ mod tests {
             sidecar_matches: true,
             bed_type: None,
             filament_colors: vec![],
+            has_timelapse_blocks: false,
         };
         // Uppercase + whitespace asserted value still matches.
         assert!(
@@ -367,6 +420,7 @@ mod tests {
             sidecar_matches: true,
             bed_type: None,
             filament_colors: vec![],
+            has_timelapse_blocks: false,
         };
         assert_eq!(
             verify_expectations(&inspection, 2, None, None),

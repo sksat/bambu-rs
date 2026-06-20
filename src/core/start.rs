@@ -81,6 +81,7 @@ mod tests {
             sidecar_matches: true,
             bed_type: None,
             filament_colors: vec![],
+            has_timelapse_blocks: false,
         }
     }
 

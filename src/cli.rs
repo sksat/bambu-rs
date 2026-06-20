@@ -2088,6 +2088,10 @@ fn start_plan_json(
                 "sidecar_matches": i.sidecar_matches,
                 "bed_type": i.bed_type,
                 "filament_colors": i.filament_colors,
+                // Whether the sliced gcode injects the per-layer timelapse park (the
+                // precondition for a clean/object-only timelapse — it still only runs if
+                // timelapse is armed at print start with --timelapse).
+                "has_timelapse_blocks": i.has_timelapse_blocks,
                 "ams_mapping_preview": ams_preview,
                 "source": "on-printer file (downloaded for inspection)",
                 "warnings": warnings,
