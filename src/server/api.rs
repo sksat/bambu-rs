@@ -1687,9 +1687,16 @@ async fn capture_video(
         match classify(&files).ok_or("no recording")?.kind {
             CaptureKind::Video => {
                 let mp4 = cam_dir.join("plain.mp4");
-                mp4.is_file()
-                    .then_some(mp4)
-                    .ok_or_else(|| "video not encoded".to_string())
+                if mp4.is_file() {
+                    return Ok(mp4);
+                }
+                // ffmpeg was absent at capture → only a raw plain.mjpeg. Transcode it now.
+                let mjpeg = cam_dir.join("plain.mjpeg");
+                if mjpeg.is_file() {
+                    crate::captures::transcode_mp4(&mjpeg, &mp4)?;
+                    return Ok(mp4);
+                }
+                Err("video not available".to_string())
             }
             kind => {
                 let out = cam_dir.join("timelapse.mp4");
@@ -1699,21 +1706,36 @@ async fn capture_video(
         }
     })
     .await;
-    match path {
-        Ok(Ok(p)) => match tokio::fs::read(&p).await {
-            Ok(bytes) => (
-                [
-                    (CONTENT_TYPE, "video/mp4".to_string()),
-                    (CACHE_CONTROL, "no-store".to_string()),
-                ],
-                bytes,
-            )
-                .into_response(),
-            Err(_) => StatusCode::NOT_FOUND.into_response(),
-        },
-        Ok(Err(_)) => StatusCode::NOT_FOUND.into_response(),
-        Err(_) => server_error("assemble task failed".to_string()),
-    }
+    let p = match path {
+        Ok(Ok(p)) => p,
+        Ok(Err(_)) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return server_error("assemble task failed".to_string()),
+    };
+    // Stream the file rather than buffering it — a full-print video or a long timelapse can
+    // be large, and several may download at once.
+    let Ok(file) = tokio::fs::File::open(&p).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let stream = futures_util::stream::unfold(Some(file), |st| async move {
+        let mut f = st?;
+        let mut buf = vec![0u8; 64 * 1024];
+        match tokio::io::AsyncReadExt::read(&mut f, &mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok::<Bytes, std::io::Error>(Bytes::from(buf)), Some(f)))
+            }
+            Err(e) => Some((Err(e), None)),
+        }
+    });
+    (
+        [
+            (CONTENT_TYPE, "video/mp4".to_string()),
+            (CACHE_CONTROL, "no-store".to_string()),
+        ],
+        Body::from_stream(stream),
+    )
+        .into_response()
 }
 
 /// Resolve the park-capable cameras among `ids` and start the live park slot. A camera is

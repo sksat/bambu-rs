@@ -167,6 +167,22 @@ pub fn list_captures(root: &Path) -> Vec<CaptureRun> {
     runs
 }
 
+/// The shared encode tail: downscale huge frames + yuv420p (plays everywhere), x264, and
+/// faststart so the mp4 streams. Ends with the output path.
+fn encode_tail(out: &Path) -> Vec<String> {
+    vec![
+        "-vf".into(),
+        "scale='min(1280,iw)':-2,format=yuv420p".into(),
+        "-c:v".into(),
+        "libx264".into(),
+        "-crf".into(),
+        "23".into(),
+        "-movflags".into(),
+        "+faststart".into(),
+        out.display().to_string(),
+    ]
+}
+
 /// ffmpeg argv (after the program name) to assemble a camera dir's image sequence into
 /// `out` at `fps`. `None` for a Video kind (it's already a file — nothing to assemble).
 /// Park frames are a contiguous `park_%06d.jpg`; smooth frames sort lexicographically, so
@@ -177,64 +193,66 @@ pub fn assemble_args(
     out: &Path,
     fps: u32,
 ) -> Option<Vec<String>> {
-    let fps = fps.max(1).to_string();
-    // Downscale huge frames + yuv420p so the mp4 plays everywhere.
-    let vf = "scale='min(1280,iw)':-2,format=yuv420p".to_string();
-    let mut args = vec!["-y".into(), "-framerate".into(), fps];
+    let mut args = vec!["-y".into(), "-framerate".into(), fps.max(1).to_string()];
     match kind {
-        CaptureKind::Park => {
-            args.extend([
-                "-start_number".into(),
-                "0".into(),
-                "-i".into(),
-                cam_dir.join("park_%06d.jpg").display().to_string(),
-            ]);
-        }
-        CaptureKind::Smooth => {
-            args.extend([
-                "-pattern_type".into(),
-                "glob".into(),
-                "-i".into(),
-                cam_dir.join("frame_*.jpg").display().to_string(),
-            ]);
-        }
+        CaptureKind::Park => args.extend([
+            "-start_number".into(),
+            "0".into(),
+            "-i".into(),
+            cam_dir.join("park_%06d.jpg").display().to_string(),
+        ]),
+        CaptureKind::Smooth => args.extend([
+            "-pattern_type".into(),
+            "glob".into(),
+            "-i".into(),
+            cam_dir.join("frame_*.jpg").display().to_string(),
+        ]),
         CaptureKind::Video => return None,
     }
-    args.extend([
-        "-vf".into(),
-        vf,
-        "-c:v".into(),
-        "libx264".into(),
-        "-crf".into(),
-        "23".into(),
-        "-movflags".into(),
-        "+faststart".into(),
-        out.display().to_string(),
-    ]);
+    args.extend(encode_tail(out));
     Some(args)
 }
 
-/// Assemble a camera dir's image sequence to an mp4 at `out` (overwriting). The thin ffmpeg
-/// seam shared by the CLI and the server. Returns a friendly error if ffmpeg is missing or
-/// fails, or if the kind isn't an image sequence.
-pub fn assemble_mp4(cam_dir: &Path, kind: CaptureKind, out: &Path, fps: u32) -> Result<(), String> {
-    let Some(args) = assemble_args(cam_dir, kind, out, fps) else {
-        return Err("this recording is already a video — nothing to assemble".to_string());
-    };
+/// ffmpeg argv to transcode a raw `plain.mjpeg` (the fallback recorded when ffmpeg was
+/// absent at capture time) into a playable mp4 at `out`. Pure.
+pub fn transcode_args(input: &Path, out: &Path) -> Vec<String> {
+    let mut args = vec!["-y".into(), "-i".into(), input.display().to_string()];
+    args.extend(encode_tail(out));
+    args
+}
+
+/// Transcode a raw mjpeg recording to mp4 (the thin ffmpeg seam). Same error mapping as
+/// [`assemble_mp4`].
+pub fn transcode_mp4(input: &Path, out: &Path) -> Result<(), String> {
+    run_ffmpeg(&transcode_args(input, out), out)
+}
+
+/// Run ffmpeg with `args` producing `out`. The thin seam shared by assemble + transcode;
+/// friendly error if ffmpeg is missing or the encode fails.
+fn run_ffmpeg(args: &[String], out: &Path) -> Result<(), String> {
     let status = std::process::Command::new("ffmpeg")
-        .args(&args)
+        .args(args)
         .status()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                "ffmpeg not found on PATH — install ffmpeg to assemble the mp4".to_string()
+                "ffmpeg not found on PATH — install ffmpeg to make the mp4".to_string()
             } else {
                 format!("running ffmpeg: {e}")
             }
         })?;
     if !status.success() {
-        return Err(format!("ffmpeg failed to assemble {}", out.display()));
+        return Err(format!("ffmpeg failed to make {}", out.display()));
     }
     Ok(())
+}
+
+/// Assemble a camera dir's image sequence to an mp4 at `out` (overwriting). Shared by the
+/// CLI's `--assemble` and the server. Errors if the kind isn't an image sequence.
+pub fn assemble_mp4(cam_dir: &Path, kind: CaptureKind, out: &Path, fps: u32) -> Result<(), String> {
+    let Some(args) = assemble_args(cam_dir, kind, out, fps) else {
+        return Err("this recording is already a video — nothing to assemble".to_string());
+    };
+    run_ffmpeg(&args, out)
 }
 
 #[cfg(test)]
@@ -370,5 +388,15 @@ mod tests {
 
         // A video has nothing to assemble.
         assert!(assemble_args(dir, CaptureKind::Video, out, 10).is_none());
+    }
+
+    #[test]
+    fn transcode_args_wrap_an_mjpeg_input() {
+        let input = Path::new("/caps/run/ext-1/plain.mjpeg");
+        let out = Path::new("/caps/run/ext-1/plain.mp4");
+        let a = transcode_args(input, out).join(" ");
+        assert!(a.contains("-i /caps/run/ext-1/plain.mjpeg"), "{a}");
+        assert!(a.contains("libx264"), "{a}");
+        assert!(a.trim_end().ends_with("/caps/run/ext-1/plain.mp4"), "{a}");
     }
 }
