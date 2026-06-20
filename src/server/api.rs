@@ -905,6 +905,25 @@ async fn job_start(State(st): State<AppState>, Json(b): Json<StartBody>) -> Resp
     };
 
     if b.dry_run {
+        // Best-effort: download + inspect the on-printer .3mf so the plan can say whether
+        // this plate supports a clean per-layer timelapse (the head-park blocks). Never
+        // fatal — a failed download/inspect just leaves it `null` ("unknown"), like the
+        // CLI's best-effort dry-run. Mirrors `PlateInspection::has_timelapse_blocks`.
+        let has_timelapse_blocks = if req.file.to_ascii_lowercase().ends_with(".3mf") {
+            let (files, file, plate) = (st.files.clone(), req.file.clone(), req.plate);
+            match tokio::task::spawn_blocking(move || {
+                files.fetch(&file).and_then(|bytes| {
+                    crate::core::project::inspect_plate(&bytes, plate).map_err(|e| e.to_string())
+                })
+            })
+            .await
+            {
+                Ok(Ok(insp)) => Some(insp.has_timelapse_blocks),
+                _ => None,
+            }
+        } else {
+            None
+        };
         return Json(json!({ "plan": {
             "file": req.file,
             "plate": req.plate,
@@ -912,6 +931,7 @@ async fn job_start(State(st): State<AppState>, Json(b): Json<StartBody>) -> Resp
             "ams_map": req.ams_map,
             "bed_type": req.bed_type,
             "timelapse": req.timelapse,
+            "has_timelapse_blocks": has_timelapse_blocks,
         }}))
         .into_response();
     }
@@ -1937,6 +1957,7 @@ async fn job_upload_start(
             "bed_type": bed_type,
             "timelapse": q.timelapse,
             "md5": md5,
+            "has_timelapse_blocks": inspection.as_ref().map(|i| i.has_timelapse_blocks),
             "overwrite": q.overwrite,
         }}))
         .into_response();
@@ -2714,6 +2735,89 @@ mod tests {
             .assert_status_ok();
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A files store that returns one chosen `.3mf` for `fetch()`, to drive the dry-run's
+    /// best-effort timelapse-block inspection. The other methods aren't exercised here.
+    struct OneFile(Vec<u8>);
+    impl crate::server::files::FileStore for OneFile {
+        fn list(&self, _: &str) -> Result<Vec<crate::ftp::FileEntry>, String> {
+            Ok(vec![])
+        }
+        fn upload(&self, _: &str, _: &std::path::Path) -> Result<(), String> {
+            Ok(())
+        }
+        fn thumbnail(&self, _: &str, _: u32) -> Result<Option<Vec<u8>>, String> {
+            Ok(None)
+        }
+        fn fetch(&self, _: &str) -> Result<Vec<u8>, String> {
+            Ok(self.0.clone())
+        }
+        fn gcode(&self, _: &str, _: u32) -> Result<Option<Vec<u8>>, String> {
+            Ok(None)
+        }
+        fn models(&self, _: &str) -> Result<Vec<String>, String> {
+            Ok(vec![])
+        }
+    }
+
+    /// A minimal `.3mf` whose plate gcode injects `markers` per-layer timelapse blocks.
+    fn three_mf_with_timelapse(markers: usize) -> Vec<u8> {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let mut gcode = String::from("; time_lapse_gcode = ;SKIPTYPE: timelapse template\n");
+        for i in 0..markers {
+            gcode.push_str(&format!("G1 Z{i}\n; SKIPTYPE: timelapse\nM1004 S5 P1\n"));
+        }
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.start_file("Metadata/plate_1.gcode", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(gcode.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    #[tokio::test]
+    async fn job_start_dry_run_reports_timelapse_block_capability() {
+        let state = AppState {
+            source: Arc::new(FakeSource::idle()),
+            controller: Arc::new(FakeController::verified()),
+            files: Arc::new(OneFile(three_mf_with_timelapse(3))),
+            starter: Arc::new(FakeStarter),
+            password: None,
+            start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            external_cameras: Arc::new(RwLock::new(Vec::new())),
+            internal_camera: Arc::new(NoCamera),
+            timelapse: Default::default(),
+        };
+        let server = TestServer::new(router(state));
+        let res = server
+            .post("/api/job/start")
+            .json(&json!({ "file": "/cube.gcode.3mf", "plate": 1, "dry_run": true, "timelapse": true }))
+            .await;
+        res.assert_status_ok();
+        // The on-printer file was downloaded + scanned: it has the per-layer park blocks.
+        assert_eq!(
+            res.json::<serde_json::Value>()["plan"]["has_timelapse_blocks"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn job_start_dry_run_timelapse_blocks_null_when_uninspectable() {
+        // FakeFiles.fetch returns junk (not a zip) → inspection fails → null, not an error.
+        let res = app(None, FakeController::verified())
+            .post("/api/job/start")
+            .json(&json!({ "file": "/x.gcode.3mf", "plate": 1, "dry_run": true }))
+            .await;
+        res.assert_status_ok();
+        assert!(
+            res.json::<serde_json::Value>()["plan"]["has_timelapse_blocks"].is_null(),
+            "uninspectable file → unknown (null), gracefully"
+        );
     }
 
     #[tokio::test]

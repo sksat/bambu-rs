@@ -1727,6 +1727,7 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
                     inspection.as_ref(),
                     inspect_error.as_deref(),
                     ams_mapping.as_deref(),
+                    *timelapse,
                 ));
                 return Ok(());
             }
@@ -1858,6 +1859,7 @@ fn run_job_start_upload(
             inspection.as_ref(),
             None,
             parsed_ams.as_deref(),
+            timelapse,
         );
         plan["upload"] =
             serde_json::json!({ "local": local, "remote": remote, "overwrite": overwrite });
@@ -2055,6 +2057,7 @@ fn start_plan_json(
     inspection: Option<&PlateInspection>,
     inspect_error: Option<&str>,
     ams_mapping: Option<&[i32]>,
+    timelapse_armed: bool,
 ) -> serde_json::Value {
     let inspection_json = match (inspection, inspect_error) {
         // Inspected the on-printer file successfully.
@@ -2064,6 +2067,15 @@ fn start_plan_json(
                 warnings.push(
                     "the file's own .gcode.md5 sidecar disagrees with the computed md5; \
                      using the computed value"
+                        .to_string(),
+                );
+            }
+            // Arming timelapse on a plate WITHOUT the per-layer park blocks won't park the
+            // head — no clean/object-only timelapse. Call it out before --confirm.
+            if timelapse_armed && !i.has_timelapse_blocks {
+                warnings.push(
+                    "--timelapse is set, but this plate has no per-layer park moves; \
+                     the head won't park (no clean object-only timelapse)"
                         .to_string(),
                 );
             }
