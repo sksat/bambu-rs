@@ -164,7 +164,6 @@ function captureStatus(run: RunState): { label: string; warn?: boolean; detail?:
 function ModeRow({
   name,
   desc,
-  note,
   testid,
   run,
   busy,
@@ -174,8 +173,6 @@ function ModeRow({
 }: {
   name: string;
   desc: ReactNode;
-  // Optional faint sub-line below the description (e.g. a precondition reminder).
-  note?: ReactNode;
   testid: string;
   run: RunState | undefined;
   busy: boolean;
@@ -189,7 +186,6 @@ function ModeRow({
       <div className="cam__mode-info">
         <span className="cam__mode-name">{name}</span>
         <span className="cam__mode-desc dim">{desc}</span>
-        {note && <span className="cam__mode-note dim">{note}</span>}
       </div>
       {st ? (
         <div className="cam__mode-act">
@@ -292,11 +288,15 @@ function TimelapseBar({
     setBusy(false);
   };
 
+  // Is anything recording right now? When so, this section is just a status + stop; the
+  // manual start controls are the secondary path (the print-start dialog is primary).
+  const anyRunning = !!(layerRun?.running || tl?.plain.running);
+
   return (
     <div className="cam__tl" data-testid="timelapse-bar">
       <div className="cam__tl-head">
-        <span className="lbl">capture</span>
-        {/* Target: which camera(s) a started mode captures. Only when there's a choice. */}
+        <span className="lbl">recording</span>
+        {/* Target: which camera(s) a MANUAL start captures. Only when there's a choice. */}
         {multi && (
           <div className="seg seg--target" role="radiogroup" aria-label="capture target">
             <button
@@ -323,17 +323,24 @@ function TimelapseBar({
           </div>
         )}
       </div>
+      {/* Frame the manual controls as secondary — recording is normally armed at print
+          start (one action). Only nag with this when nothing is recording yet. */}
+      {!anyRunning && (
+        <p className="cam__tl-cap dim" data-testid="capture-hint">
+          starts automatically when you begin a print with “timelapse” on — or start one
+          here to record a print that's already running.
+        </p>
+      )}
 
-      {/* Purpose 1 — a clean, object-only timelapse: one frame per layer with the head
-          parked. Method (park vs smooth) is auto-picked by the active camera. */}
+      {/* Purpose 1 — a clean, object-only timelapse: one parked frame per layer. Method
+          (park vs smooth) is auto-picked by the active camera. */}
       <ModeRow
         name="clean timelapse"
         desc={
           activeIsPark
-            ? "one object-only frame per layer — the real park, detected from the camera (scrub it in the park view above)"
-            : "one object-only frame per layer — synced to the printer's layer signal"
+            ? "one parked frame per layer — review it in the “captured” view above"
+            : "one parked frame per layer — printer-synced"
         }
-        note="auto-starts when you tick “timelapse” at print start. Or start here to record a print that's already running (it must be timelapse-armed, so the head parks)."
         testid={layerMode}
         run={layerRun}
         busy={busy}

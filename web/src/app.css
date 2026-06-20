@@ -1691,10 +1691,12 @@ div.lbl,
   font-size: 0.66rem;
   line-height: 1.3;
 }
-.cam__mode-note {
-  font-size: 0.62rem;
-  line-height: 1.25;
-  opacity: 0.85;
+/* secondary framing under the "recording" header (manual controls are not the primary
+   path — recording arms at print start). */
+.cam__tl-cap {
+  margin: 0;
+  font-size: 0.66rem;
+  line-height: 1.35;
 }
 .cam__mode-act {
   display: flex;
