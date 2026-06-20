@@ -378,6 +378,12 @@ test.describe("dashboard (fake mode)", () => {
     await page.getByTestId("park-latest").click();
     await expect(page.getByTestId("park-count")).toHaveText("3 / 3");
     await expect(page.getByTestId("park-frame")).toHaveAttribute("data-n", "5");
+    await expect(page.getByTestId("park-live")).toBeVisible();
+
+    // Pressing play while parked at the live tip replays from the start (it leaves the
+    // tip rather than sitting there) — the live badge clears as playback rewinds.
+    await page.getByTestId("park-play").click();
+    await expect(page.getByTestId("park-live")).toHaveCount(0);
   });
 
   test("a dead camera reports the offline state", async ({ page }) => {

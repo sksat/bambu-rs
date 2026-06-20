@@ -94,6 +94,19 @@ export function ParkPlayer({ id }: { id: string }) {
     setAtLive(true);
     setCur(last);
   };
+  const togglePlay = () => {
+    if (playing) {
+      setPlaying(false);
+      return;
+    }
+    // Pressing play while parked at the tip (latest) replays from the start — otherwise
+    // there'd be nothing to play. From mid-strip it just resumes from here.
+    if (cur >= last) {
+      setAtLive(false);
+      setCur(0);
+    }
+    setPlaying(true);
+  };
 
   if (count === 0) {
     return (
@@ -148,7 +161,7 @@ export function ParkPlayer({ id }: { id: string }) {
           data-testid="park-play"
           title={playing ? "pause" : "play"}
           aria-label={playing ? "pause" : "play"}
-          onClick={() => setPlaying((p) => !p)}
+          onClick={togglePlay}
         >
           {playing ? "⏸" : "▶"}
         </button>
