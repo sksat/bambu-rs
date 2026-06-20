@@ -10,9 +10,11 @@
 //! The filename → kind classification is pure (unit-tested); walking the directory is the
 //! thin I/O wrapper (tested with a temp tree).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+
+use crate::core::park::{SelectTuning, Selection, select_park_frame};
 
 /// What a camera's capture dir holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -296,6 +298,155 @@ pub fn assemble_mp4(cam_dir: &Path, kind: CaptureKind, out: &Path, fps: u32) -> 
     run_ffmpeg(&args, out)
 }
 
+/// Decode size for smooth burst selection — tiny gray, matching the live park detector and
+/// the skill's select_smooth.py (enough signal for the left-zone park, cheap to score).
+pub const SMOOTH_DECODE_W: usize = 64;
+pub const SMOOTH_DECODE_H: usize = 36;
+
+/// Parse a smooth burst frame name `frame_<n>_layer_<L>_t<offset>.jpg` → `(layer, offset_ms)`.
+/// `None` for anything that isn't a burst frame. Pure.
+pub fn parse_smooth_frame(name: &str) -> Option<(u64, u64)> {
+    let rest = name.strip_suffix(".jpg")?.strip_prefix("frame_")?;
+    let (_n, rest) = rest.split_once("_layer_")?;
+    let (layer, offset) = rest.split_once("_t")?;
+    Some((layer.parse().ok()?, offset.parse().ok()?))
+}
+
+/// ffmpeg argv to decode every `frame_*.jpg` in `cam_dir` to a `w`×`h` gray rawvideo stream
+/// on stdout (one frame after another, glob = capture order). One ffmpeg for the whole dir —
+/// no per-frame spawn. Pure (command shape unit-tested without ffmpeg).
+pub fn smooth_decode_args(cam_dir: &Path, w: usize, h: usize) -> Vec<String> {
+    vec![
+        "-v".into(),
+        "error".into(),
+        "-f".into(),
+        "image2".into(),
+        "-pattern_type".into(),
+        "glob".into(),
+        "-i".into(),
+        cam_dir.join("frame_*.jpg").display().to_string(),
+        "-vf".into(),
+        format!("scale={w}:{h},format=gray"),
+        "-f".into(),
+        "rawvideo".into(),
+        "-pix_fmt".into(),
+        "gray".into(),
+        "-".into(),
+    ]
+}
+
+/// Pick the parked frame from each layer's burst in a smooth cam dir, returning the chosen
+/// full-res JPEG paths in layer order. Decodes the whole dir to tiny gray with ONE ffmpeg,
+/// groups by layer, and runs the pure [`select_park_frame`]. Layers whose park fell outside
+/// the burst are skipped (a gap beats a head-over-print frame).
+pub fn select_smooth_frames(cam_dir: &Path, sel: &SelectTuning) -> Result<Vec<PathBuf>, String> {
+    let (w, h) = (SMOOTH_DECODE_W, SMOOTH_DECODE_H);
+    let mut files: Vec<String> = std::fs::read_dir(cam_dir)
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with("frame_") && n.ends_with(".jpg"))
+        .collect();
+    files.sort(); // lexicographic = zero-padded frame index = ffmpeg glob order
+    if files.is_empty() {
+        return Err("no smooth frames to select".to_string());
+    }
+    let out = std::process::Command::new("ffmpeg")
+        .args(smooth_decode_args(cam_dir, w, h))
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "ffmpeg not found on PATH — install ffmpeg".to_string()
+            } else {
+                format!("running ffmpeg: {e}")
+            }
+        })?;
+    if !out.status.success() {
+        return Err("ffmpeg failed to decode smooth frames".to_string());
+    }
+    let fsize = w * h;
+    if out.stdout.len() != fsize * files.len() {
+        // glob/sort drift or a decode hiccup — bail so the caller falls back to assemble-all.
+        return Err(format!(
+            "decoded {} bytes, expected {} ({} frames)",
+            out.stdout.len(),
+            fsize * files.len(),
+            files.len()
+        ));
+    }
+    // Group frames by layer (BTreeMap keeps layer order); keep each frame's offset→path.
+    use std::collections::BTreeMap;
+    let mut by_layer: BTreeMap<u64, (Vec<crate::core::park::SelectFrame>, Vec<(u64, PathBuf)>)> =
+        BTreeMap::new();
+    for (i, name) in files.iter().enumerate() {
+        let Some((layer, offset)) = parse_smooth_frame(name) else {
+            continue;
+        };
+        let gray = out.stdout[i * fsize..(i + 1) * fsize].to_vec();
+        let entry = by_layer.entry(layer).or_default();
+        entry.0.push(crate::core::park::SelectFrame {
+            offset_ms: offset,
+            gray,
+        });
+        entry.1.push((offset, cam_dir.join(name)));
+    }
+    let mut selected = Vec::new();
+    for (_layer, (frames, paths)) in by_layer {
+        if let Selection::Selected { offset_ms, .. } = select_park_frame(&frames, w, h, sel) {
+            if let Some((_, path)) = paths.into_iter().find(|(o, _)| *o == offset_ms) {
+                selected.push(path);
+            }
+        }
+    }
+    Ok(selected)
+}
+
+/// Assemble a specific, ordered list of full-res JPEGs into an mp4 (the selected parked
+/// frames). Stages them as a contiguous `sel_%06d.jpg` sequence in a temp subdir next to
+/// `out`, image2-assembles, then cleans up.
+pub fn assemble_selected_mp4(frames: &[PathBuf], out: &Path, fps: u32) -> Result<(), String> {
+    if frames.is_empty() {
+        return Err("no selected frames to assemble".to_string());
+    }
+    let stage = out
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".sel-stage");
+    let _ = std::fs::remove_dir_all(&stage);
+    std::fs::create_dir_all(&stage).map_err(|e| e.to_string())?;
+    for (i, f) in frames.iter().enumerate() {
+        std::fs::copy(f, stage.join(format!("sel_{i:06}.jpg"))).map_err(|e| e.to_string())?;
+    }
+    let mut args = vec![
+        "-y".into(),
+        "-framerate".into(),
+        fps.max(1).to_string(),
+        "-start_number".into(),
+        "0".into(),
+        "-i".into(),
+        stage.join("sel_%06d.jpg").display().to_string(),
+    ];
+    args.extend(encode_tail(out));
+    let r = run_ffmpeg(&args, out);
+    let _ = std::fs::remove_dir_all(&stage);
+    r
+}
+
+/// The clean smooth timelapse: select the parked frame per layer, then assemble just those.
+/// Errors (and the caller falls back to the raw all-frames assemble) if nothing selectable.
+pub fn assemble_smooth_selected_mp4(
+    cam_dir: &Path,
+    sel: &SelectTuning,
+    out: &Path,
+    fps: u32,
+) -> Result<(), String> {
+    let frames = select_smooth_frames(cam_dir, sel)?;
+    if frames.is_empty() {
+        return Err("no parked frames selected".to_string());
+    }
+    assemble_selected_mp4(&frames, out, fps)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,6 +623,33 @@ mod tests {
 
         // A video has nothing to assemble.
         assert!(assemble_args(dir, CaptureKind::Video, out, 10).is_none());
+    }
+
+    #[test]
+    fn parse_smooth_frame_pulls_layer_and_offset() {
+        assert_eq!(
+            parse_smooth_frame("frame_000012_layer_00007_t0900.jpg"),
+            Some((7, 900))
+        );
+        assert_eq!(
+            parse_smooth_frame("frame_000001_layer_00000_t0100.jpg"),
+            Some((0, 100))
+        );
+        // Not a burst frame.
+        assert_eq!(parse_smooth_frame("park_000003.jpg"), None);
+        assert_eq!(parse_smooth_frame("plain.mp4"), None);
+    }
+
+    #[test]
+    fn smooth_decode_args_glob_to_gray_rawvideo() {
+        let a = smooth_decode_args(Path::new("/caps/run/ext-0"), 64, 36).join(" ");
+        assert!(
+            a.contains("-pattern_type glob -i /caps/run/ext-0/frame_*.jpg"),
+            "{a}"
+        );
+        assert!(a.contains("scale=64:36,format=gray"), "{a}");
+        assert!(a.contains("-f rawvideo"), "{a}");
+        assert!(a.trim_end().ends_with(" -"), "{a}");
     }
 
     #[test]
