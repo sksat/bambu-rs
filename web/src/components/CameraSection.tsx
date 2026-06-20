@@ -92,10 +92,14 @@ function CameraView({
             className={isPark ? "cam__toggle-btn cam__toggle-btn--on" : "cam__toggle-btn"}
             data-testid="camera-view-park"
             disabled={!parkAvailable}
-            title={parkAvailable ? undefined : "start a park run to capture frames"}
+            title={
+              parkAvailable
+                ? "review the captured per-layer (parked-head) timelapse frames"
+                : "start a clean timelapse below to capture frames to review here"
+            }
             onClick={() => show("park")}
           >
-            park
+            captured
           </button>
         </div>
       )}
@@ -130,13 +134,27 @@ function CameraView({
   );
 }
 
-// One frame count, reported per-camera (each camera gets one frame per trigger)
-// so the number reads as the timelapse length, not a total to divide in your head.
-function runLabel(run: RunState | undefined): string {
-  const n = run?.cameras.length ?? 1;
-  const per = Math.floor((run?.frames ?? 0) / Math.max(n, 1));
-  const failed = run?.failures ? ` · ${run.failures} failed` : "";
-  return (n > 1 ? `${per} frames/cam · ${n} cams` : `${run?.frames ?? 0} frames`) + failed;
+// The live state of a capture run, made legible. A run ARMS on start and only begins
+// recording once the print is actually printing (lazy), so distinguish "waiting for the
+// print" from "recording" from "failing" — the last WITH a reason, since a bare
+// "0 frames · N failed" reads as broken when it's just an offline camera. Frame counts are
+// per-camera (each camera gets one frame per trigger), so the number reads as the
+// timelapse length, not a total to divide in your head.
+function captureStatus(run: RunState): { label: string; warn?: boolean; detail?: string } {
+  const n = run.cameras.length || 1;
+  const per = Math.floor(run.frames / Math.max(n, 1));
+  const frames = n > 1 ? `${per} frames/cam · ${n} cams` : `${run.frames} frames`;
+  if (run.frames === 0 && run.failures === 0) {
+    return { label: "waiting for the print…" };
+  }
+  if (run.failures > 0) {
+    return {
+      label: `rec · ${frames} · ${run.failures} failed`,
+      warn: true,
+      detail: run.last_error ?? "the camera grab is failing — is the camera online?",
+    };
+  }
+  return { label: `rec · ${frames}` };
 }
 
 // One timelapse mode as a self-describing row: its name, a VISIBLE plain-language
@@ -165,6 +183,7 @@ function ModeRow({
   onStop: () => void;
   startDisabled?: boolean;
 }) {
+  const st = run?.running ? captureStatus(run) : null;
   return (
     <div className="cam__mode" data-testid={`timelapse-${testid}`}>
       <div className="cam__mode-info">
@@ -172,10 +191,14 @@ function ModeRow({
         <span className="cam__mode-desc dim">{desc}</span>
         {note && <span className="cam__mode-note dim">{note}</span>}
       </div>
-      {run?.running ? (
+      {st ? (
         <div className="cam__mode-act">
-          <span className="cam__tl-rec" data-testid={`timelapse-${testid}-running`}>
-            ● rec · {runLabel(run)}
+          <span
+            className={`cam__tl-rec${st.warn ? " cam__tl-rec--warn" : ""}`}
+            data-testid={`timelapse-${testid}-running`}
+            title={st.detail}
+          >
+            ● {st.label}
           </span>
           <button
             className="cam__btn"
@@ -191,6 +214,7 @@ function ModeRow({
           className="cam__btn cam__btn--save cam__mode-start"
           data-testid={`timelapse-${testid}-start`}
           disabled={busy || startDisabled}
+          title="start any time — it records while the print runs and stops on its own when the print finishes"
           onClick={onStart}
         >
           start
@@ -200,12 +224,12 @@ function ModeRow({
   );
 }
 
-// Start/stop the serve-internal timelapse capture for this print. Three independent
-// modes (any can be on at once), each self-describing: "smooth" = one clean frame per
-// layer (head parked out of shot); "plain" = a frame every N seconds (head in shot, a
-// normal video); "park" = live per-layer frames detected from the camera (scrubbed in the
-// park view above). Captures the active camera, or — with the "all cams" target — every
-// configured camera at once. Polls `/api/timelapse`.
+// Start/stop the serve-internal capture for this print. Two purposes, each auto-picking
+// its method by the active camera: "clean timelapse" (one parked frame per layer — park
+// detection on a stream+tuning camera, else printer-layer-synced smooth) and "print video"
+// (the real stream, or interval snapshots). A run ARMS on start and records while the
+// print runs, stopping on its own at the end. Captures the active camera, or — with "all
+// cams" — every configured camera. Polls `/api/timelapse`.
 function TimelapseBar({
   cameras,
   activeCamera,
@@ -309,7 +333,7 @@ function TimelapseBar({
             ? "one object-only frame per layer — the real park, detected from the camera (scrub it in the park view above)"
             : "one object-only frame per layer — synced to the printer's layer signal"
         }
-        note="needs the print started with timelapse armed, so the head parks each layer"
+        note="two-step: ① tick “timelapse” when you start the print (the start dialog) so the head parks, then ② start here to record each parked frame"
         testid={layerMode}
         run={layerRun}
         busy={busy}
@@ -435,6 +459,14 @@ export function CamerasSection({ password }: { password: string | null }) {
                     {c.label}
                   </button>
                 ))}
+              </div>
+            )}
+            {/* Name the active camera's type, so the capture controls reading differently
+                per tab is understood as "different cameras", not the UI rewording itself. */}
+            {cameras.length > 1 && activeCam && (
+              <div className="cam__camtype dim" data-testid="camera-caption">
+                {activeCam.stream ? "live-stream camera" : "snapshot camera"}
+                {activeCam.park ? " · park-capable" : ""}
               </div>
             )}
             {activeCam && (

@@ -409,6 +409,14 @@ function StartDialog({ path, onClose }: { path: string; onClose: () => void }) {
                   : "⚠ this file has no per-layer park moves — the head won't park (no clean timelapse)"}
               </div>
             )}
+            {/* The other half of the feature lives in the camera panel — say so, so the
+                two “timelapse” controls read as one flow. */}
+            {timelapse && (
+              <p className="start__tlhint dim" data-testid="start-tl-hint">
+                this only parks the head. To save the frames, start the “clean timelapse”
+                capture in the camera panel once the print is running.
+              </p>
+            )}
           </div>
         )}
         <p className="start__help dim">

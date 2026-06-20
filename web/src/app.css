@@ -1022,6 +1022,10 @@ div.lbl,
   max-width: 24rem;
   width: 100%;
   box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+  /* Tall dialogs (the start dialog with the 3D viewer + form) must scroll within the
+     viewport, not push their action buttons off-screen — esp. on a phone. */
+  max-height: 90vh;
+  overflow-y: auto;
 }
 .modal__msg {
   margin: 0 0 0.4rem;
@@ -1109,6 +1113,14 @@ div.lbl,
   color: var(--warn);
   border-color: color-mix(in srgb, var(--warn) 40%, transparent);
   background: color-mix(in srgb, var(--warn) 9%, transparent);
+}
+/* points at the feature's other half (the camera-panel capture), so the two
+   "timelapse" controls read as one flow. */
+.start__tlhint {
+  margin: 0;
+  margin-left: 1.6rem;
+  font-size: 0.66rem;
+  line-height: 1.35;
 }
 
 /* ── gcode console ───────────────────────────────────────────────────────── */
@@ -1696,7 +1708,17 @@ div.lbl,
 .cam__tl-rec {
   color: var(--accent);
   font-weight: 600;
-  white-space: nowrap;
+}
+/* a failing capture (e.g. camera offline) reads red, not the calm accent, so
+   "0 frames · N failed" doesn't masquerade as healthy recording. */
+.cam__tl-rec--warn {
+  color: var(--err);
+}
+/* active-camera type caption (multi-cam), so per-tab capture wording reads as
+   "different cameras", not the UI rewording itself. */
+.cam__camtype {
+  font-size: 0.66rem;
+  margin-top: 0.4rem;
 }
 .cam__tl-secs {
   width: 2.8rem;
