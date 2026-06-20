@@ -144,8 +144,10 @@ pub fn list_captures(root: &Path) -> Vec<CaptureRun> {
                     }
                 }
             }
-            // Old layout: files directly in the run dir (id stays empty).
-            if let Some(cam) = classify(&file_names(&run_dir)) {
+            // Old layout: files directly in the run dir. Give it a non-empty id so it has
+            // a usable download URL; the endpoint maps a missing subdir back to the run dir.
+            if let Some(mut cam) = classify(&file_names(&run_dir)) {
+                cam.id = "default".to_string();
                 cameras.push(cam);
             }
             if cameras.is_empty() {
@@ -163,6 +165,76 @@ pub fn list_captures(root: &Path) -> Vec<CaptureRun> {
         .collect();
     runs.sort_by(|a, b| b.started_at.cmp(&a.started_at).then(b.id.cmp(&a.id)));
     runs
+}
+
+/// ffmpeg argv (after the program name) to assemble a camera dir's image sequence into
+/// `out` at `fps`. `None` for a Video kind (it's already a file — nothing to assemble).
+/// Park frames are a contiguous `park_%06d.jpg`; smooth frames sort lexicographically, so
+/// glob them. Pure, so the command shape is unit-tested without ffmpeg.
+pub fn assemble_args(
+    cam_dir: &Path,
+    kind: CaptureKind,
+    out: &Path,
+    fps: u32,
+) -> Option<Vec<String>> {
+    let fps = fps.max(1).to_string();
+    // Downscale huge frames + yuv420p so the mp4 plays everywhere.
+    let vf = "scale='min(1280,iw)':-2,format=yuv420p".to_string();
+    let mut args = vec!["-y".into(), "-framerate".into(), fps];
+    match kind {
+        CaptureKind::Park => {
+            args.extend([
+                "-start_number".into(),
+                "0".into(),
+                "-i".into(),
+                cam_dir.join("park_%06d.jpg").display().to_string(),
+            ]);
+        }
+        CaptureKind::Smooth => {
+            args.extend([
+                "-pattern_type".into(),
+                "glob".into(),
+                "-i".into(),
+                cam_dir.join("frame_*.jpg").display().to_string(),
+            ]);
+        }
+        CaptureKind::Video => return None,
+    }
+    args.extend([
+        "-vf".into(),
+        vf,
+        "-c:v".into(),
+        "libx264".into(),
+        "-crf".into(),
+        "23".into(),
+        "-movflags".into(),
+        "+faststart".into(),
+        out.display().to_string(),
+    ]);
+    Some(args)
+}
+
+/// Assemble a camera dir's image sequence to an mp4 at `out` (overwriting). The thin ffmpeg
+/// seam shared by the CLI and the server. Returns a friendly error if ffmpeg is missing or
+/// fails, or if the kind isn't an image sequence.
+pub fn assemble_mp4(cam_dir: &Path, kind: CaptureKind, out: &Path, fps: u32) -> Result<(), String> {
+    let Some(args) = assemble_args(cam_dir, kind, out, fps) else {
+        return Err("this recording is already a video — nothing to assemble".to_string());
+    };
+    let status = std::process::Command::new("ffmpeg")
+        .args(&args)
+        .status()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "ffmpeg not found on PATH — install ffmpeg to assemble the mp4".to_string()
+            } else {
+                format!("running ffmpeg: {e}")
+            }
+        })?;
+    if !status.success() {
+        return Err(format!("ffmpeg failed to assemble {}", out.display()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -260,7 +332,7 @@ mod tests {
         let runs = list_captures(&root);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].cameras.len(), 1);
-        assert_eq!(runs[0].cameras[0].id, ""); // files directly in the run dir
+        assert_eq!(runs[0].cameras[0].id, "default"); // files directly in the run dir
         assert_eq!(runs[0].cameras[0].kind, CaptureKind::Smooth);
         let _ = fs::remove_dir_all(&root);
     }
@@ -268,5 +340,35 @@ mod tests {
     #[test]
     fn missing_root_is_empty_not_an_error() {
         assert!(list_captures(Path::new("/no/such/captures/dir")).is_empty());
+    }
+
+    #[test]
+    fn assemble_args_match_the_kind() {
+        let dir = Path::new("/caps/run/ext-0");
+        let out = Path::new("/caps/run/ext-0/timelapse.mp4");
+        let park = assemble_args(dir, CaptureKind::Park, out, 10)
+            .unwrap()
+            .join(" ");
+        assert!(park.contains("-framerate 10"), "{park}");
+        assert!(
+            park.contains("-start_number 0 -i /caps/run/ext-0/park_%06d.jpg"),
+            "{park}"
+        );
+        assert!(park.contains("libx264"), "{park}");
+        assert!(
+            park.trim_end().ends_with("/caps/run/ext-0/timelapse.mp4"),
+            "{park}"
+        );
+
+        let smooth = assemble_args(dir, CaptureKind::Smooth, out, 12)
+            .unwrap()
+            .join(" ");
+        assert!(
+            smooth.contains("-pattern_type glob -i /caps/run/ext-0/frame_*.jpg"),
+            "{smooth}"
+        );
+
+        // A video has nothing to assemble.
+        assert!(assemble_args(dir, CaptureKind::Video, out, 10).is_none());
     }
 }

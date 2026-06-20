@@ -2665,43 +2665,17 @@ fn assemble_park_mp4(
     mp4: &std::path::Path,
     fps: u32,
 ) -> Result<(), CliError> {
-    let pattern = out_dir.join("park_%06d.jpg");
-    let args = [
-        "-y".to_string(),
-        "-framerate".to_string(),
-        fps.max(1).to_string(),
-        "-i".to_string(),
-        pattern.display().to_string(),
-        "-vf".to_string(),
-        "scale='min(1280,iw)':-2,format=yuv420p".to_string(),
-        "-c:v".to_string(),
-        "libx264".to_string(),
-        "-crf".to_string(),
-        "23".to_string(),
-        "-movflags".to_string(),
-        "+faststart".to_string(),
-        mp4.display().to_string(),
-    ];
-    let status = std::process::Command::new("ffmpeg")
-        .args(&args)
-        .status()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                CliError::new(
-                    exit::VALIDATION,
-                    "ffmpeg not found on PATH — install ffmpeg to assemble the mp4",
-                )
+    // Shared with the serve's download endpoint — one ffmpeg assembly in the library.
+    crate::captures::assemble_mp4(out_dir, crate::captures::CaptureKind::Park, mp4, fps).map_err(
+        |e| {
+            let code = if e.contains("ffmpeg not found") {
+                exit::VALIDATION
             } else {
-                CliError::new(exit::GENERAL, format!("running ffmpeg: {e}"))
-            }
-        })?;
-    if !status.success() {
-        return Err(CliError::new(
-            exit::GENERAL,
-            format!("ffmpeg failed to assemble {}", mp4.display()),
-        ));
-    }
-    Ok(())
+                exit::GENERAL
+            };
+            CliError::new(code, e)
+        },
+    )
 }
 
 /// Spawn the `--serve` auto-stop poller: read a running serve's `/api/status` on an

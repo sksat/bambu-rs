@@ -315,7 +315,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/cameras/{id}/park", get(park_index))
         .route("/api/cameras/{id}/park/{n}", get(camera_park_frame))
         .route("/api/timelapse", get(timelapse_status))
-        .route("/api/capture", get(captures_list));
+        .route("/api/capture", get(captures_list))
+        .route("/api/capture/{run}/{cam}/video.mp4", get(capture_video));
     let writes = Router::new()
         .route("/api/job/pause", post(job_pause))
         .route("/api/job/resume", post(job_resume))
@@ -1639,6 +1640,82 @@ async fn captures_list(State(_st): State<AppState>) -> Response {
     Json(json!({ "captures": runs })).into_response()
 }
 
+/// A single path segment safe to join under the captures root: no traversal, no separators,
+/// no leading dot, bounded length.
+fn is_safe_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && !s.starts_with('.')
+        && !s.contains('/')
+        && !s.contains('\\')
+        && s != ".."
+}
+
+#[derive(Deserialize)]
+struct CaptureVideoQuery {
+    /// Playback fps for an assembled image-sequence timelapse.
+    #[serde(default = "default_fps")]
+    fps: u32,
+}
+fn default_fps() -> u32 {
+    10
+}
+
+/// One capture's mp4 (open read, playable/downloadable): a Video streams its `plain.mp4`; a
+/// Park/Smooth is assembled from its frames on demand (→ `timelapse.mp4`) and streamed.
+/// `run`/`cam` are validated as plain dir segments (no traversal); a missing `cam` subdir
+/// maps back to the run dir (old single-dir layout). 404 when there's nothing to serve.
+async fn capture_video(
+    Path((run, cam)): Path<(String, String)>,
+    Query(q): Query<CaptureVideoQuery>,
+) -> Response {
+    if !is_safe_segment(&run) || !is_safe_segment(&cam) {
+        return bad_request("invalid capture path".to_string());
+    }
+    let fps = q.fps.clamp(1, 60);
+    let run_dir = captures_root().join(&run);
+    let sub = run_dir.join(&cam);
+    let cam_dir = if sub.is_dir() { sub } else { run_dir };
+    let path = tokio::task::spawn_blocking(move || -> Result<std::path::PathBuf, String> {
+        use crate::captures::{CaptureKind, assemble_mp4, classify};
+        let files: Vec<String> = std::fs::read_dir(&cam_dir)
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        match classify(&files).ok_or("no recording")?.kind {
+            CaptureKind::Video => {
+                let mp4 = cam_dir.join("plain.mp4");
+                mp4.is_file()
+                    .then_some(mp4)
+                    .ok_or_else(|| "video not encoded".to_string())
+            }
+            kind => {
+                let out = cam_dir.join("timelapse.mp4");
+                assemble_mp4(&cam_dir, kind, &out, fps)?;
+                Ok(out)
+            }
+        }
+    })
+    .await;
+    match path {
+        Ok(Ok(p)) => match tokio::fs::read(&p).await {
+            Ok(bytes) => (
+                [
+                    (CONTENT_TYPE, "video/mp4".to_string()),
+                    (CACHE_CONTROL, "no-store".to_string()),
+                ],
+                bytes,
+            )
+                .into_response(),
+            Err(_) => StatusCode::NOT_FOUND.into_response(),
+        },
+        Ok(Err(_)) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => server_error("assemble task failed".to_string()),
+    }
+}
+
 /// Resolve the park-capable cameras among `ids` and start the live park slot. A camera is
 /// capable iff it's an external camera with BOTH a stream and a calibrated `park_tuning`;
 /// non-capable requested cameras are skipped (reported in `skipped`), and it's a 400 if
@@ -2935,6 +3012,33 @@ mod tests {
             .await;
         res.assert_status_ok();
         assert!(res.json::<serde_json::Value>()["captures"].is_array());
+    }
+
+    #[test]
+    fn is_safe_segment_blocks_traversal() {
+        assert!(is_safe_segment("1781634785_cube_smooth"));
+        assert!(is_safe_segment("ext-0"));
+        assert!(is_safe_segment("default"));
+        assert!(!is_safe_segment(""));
+        assert!(!is_safe_segment(".."));
+        assert!(!is_safe_segment(".hidden"));
+        assert!(!is_safe_segment("a/b"));
+        assert!(!is_safe_segment("a\\b"));
+    }
+
+    #[tokio::test]
+    async fn capture_video_rejects_unsafe_and_unknown() {
+        let server = app(None, FakeController::verified());
+        // A leading-dot (traversal-ish) segment is refused outright.
+        server
+            .get("/api/capture/.evil/cam/video.mp4")
+            .await
+            .assert_status_bad_request();
+        // A safe-but-nonexistent run → nothing to serve.
+        server
+            .get("/api/capture/no_such_run_zzz/cam/video.mp4")
+            .await
+            .assert_status_not_found();
     }
 
     #[tokio::test]
