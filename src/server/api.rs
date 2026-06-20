@@ -258,7 +258,7 @@ pub struct AppState {
     pub start_lock: Arc<tokio::sync::Mutex<()>>,
     /// **External** IP cameras the server proxies (single-JPEG-per-GET). Held
     /// behind a lock so the dashboard can add/remove them at runtime
-    /// (`/api/cameras/config`); seeded from `--camera-url` and in-memory only.
+    /// (`/api/camera/config`); seeded from `--camera-url` and in-memory only.
     /// Proxied server-side so a browser that can't reach the LAN cam (e.g. over
     /// Tailscale) still gets a live view.
     pub external_cameras: Arc<RwLock<Vec<ExternalCamera>>>,
@@ -303,17 +303,17 @@ pub fn router(state: AppState) -> Router {
     let reads = Router::new()
         .route("/api/status", get(status))
         .route("/api/ws", get(status_ws))
-        .route("/api/files", get(list_files))
-        .route("/api/files/thumbnail", get(file_thumbnail))
-        .route("/api/files/raw", get(file_raw))
-        .route("/api/files/gcode", get(file_gcode))
-        .route("/api/files/inspect", get(file_inspect))
-        .route("/api/files/mesh", get(file_mesh))
-        .route("/api/cameras", get(cameras_list))
-        .route("/api/cameras/{id}/snapshot", get(camera_snapshot))
-        .route("/api/cameras/{id}/stream", get(camera_stream))
-        .route("/api/cameras/{id}/park", get(park_index))
-        .route("/api/cameras/{id}/park/{n}", get(camera_park_frame))
+        .route("/api/file", get(list_files))
+        .route("/api/file/thumbnail", get(file_thumbnail))
+        .route("/api/file/raw", get(file_raw))
+        .route("/api/file/gcode", get(file_gcode))
+        .route("/api/file/inspect", get(file_inspect))
+        .route("/api/file/mesh", get(file_mesh))
+        .route("/api/camera", get(cameras_list))
+        .route("/api/camera/{id}/snapshot", get(camera_snapshot))
+        .route("/api/camera/{id}/stream", get(camera_stream))
+        .route("/api/camera/{id}/park", get(park_index))
+        .route("/api/camera/{id}/park/{n}", get(camera_park_frame))
         .route("/api/timelapse", get(timelapse_status))
         .route("/api/capture", get(captures_list))
         .route("/api/capture/{run}/{cam}/video.mp4", get(capture_video));
@@ -336,14 +336,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/reboot", post(reboot))
         .route("/api/steppers", post(steppers))
         .route(
-            "/api/cameras/config",
+            "/api/camera/config",
             get(cameras_config_get).post(cameras_config_set),
         )
         .route("/api/timelapse/start", post(timelapse_start))
         .route("/api/timelapse/stop", post(timelapse_stop))
         // Uploads stream to a temp file, so the cap bounds disk, not memory.
         .route(
-            "/api/files/upload",
+            "/api/file/upload",
             post(upload_file).layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
         )
         .route(
@@ -1165,7 +1165,7 @@ async fn file_mesh(State(st): State<AppState>, Query(q): Query<MeshQuery>) -> Re
 
 // ── Cameras ──────────────────────────────────────────────────────────────────
 // The dashboard shows cameras as switchable tabs. Two kinds of source, listed
-// together by /api/cameras: the **built-in** printer chamber camera (TCP:6000,
+// together by /api/camera: the **built-in** printer chamber camera (TCP:6000,
 // often dead on the A1) and any number of **external** IP cameras the server
 // proxies (e.g. ATOM Cams over LAN). Externals can be set at launch (--camera-url,
 // repeatable) and edited at runtime via the gated config endpoint. IDs are
@@ -1346,7 +1346,7 @@ fn parse_parks_index(contents: &str) -> Vec<serde_json::Value> {
     by_n.into_values().collect()
 }
 
-/// The park index `/api/cameras/{id}/park`: a camera's captured park frames for the
+/// The park index `/api/camera/{id}/park`: a camera's captured park frames for the
 /// dashboard player (open read), `{ running, count, parks: [{n, t, confidence}, …] }` from
 /// `<out>/<id>/parks.jsonl`. The individual frames are `…/park/{n}` ([`camera_park_frame`]).
 /// Available while the run is active AND after it stops (until the next run replaces the
@@ -1368,7 +1368,7 @@ async fn park_index(State(st): State<AppState>, Path(id): Path<String>) -> Respo
     Json(json!({ "running": park.running, "count": parks.len(), "parks": parks })).into_response()
 }
 
-/// Serve one indexed park frame `/api/cameras/{id}/park/{n}` (`park_NNNNNN.jpg`) for a
+/// Serve one indexed park frame `/api/camera/{id}/park/{n}` (`park_NNNNNN.jpg`) for a
 /// camera (open read). Same gating and lifetime as the [`park_index`] it belongs to. `n`
 /// is numeric, so it can't traverse; an index with no file (out of range / pruned) 404s.
 async fn camera_park_frame(
@@ -1569,7 +1569,7 @@ fn timelapse_status_json(st: &AppState) -> serde_json::Value {
 }
 
 /// Resolve a camera id to a blocking frame-grabber + a stable label, captured at
-/// start so a later `/api/cameras/config` edit can't repoint a running capture.
+/// start so a later `/api/camera/config` edit can't repoint a running capture.
 fn resolve_grab(st: &AppState, camera: &str) -> Option<(String, FrameGrab)> {
     if camera == "internal" {
         if !st.internal_camera.configured() {
@@ -1742,7 +1742,7 @@ async fn capture_video(
 /// capable iff it's an external camera with BOTH a stream and a calibrated `park_tuning`;
 /// non-capable requested cameras are skipped (reported in `skipped`), and it's a 400 if
 /// none qualify. Each emits `<out>/<id>/latest_park.jpg` per layer, served (open) by
-/// `/api/cameras/{id}/park`.
+/// `/api/camera/{id}/park`.
 fn start_park_run(
     st: &AppState,
     ids: &[String],
@@ -2494,7 +2494,7 @@ mod tests {
     #[tokio::test]
     async fn list_files_is_open() {
         let res = app(Some("secret"), FakeController::verified())
-            .get("/api/files")
+            .get("/api/file")
             .await;
         res.assert_status_ok();
         let body: serde_json::Value = res.json();
@@ -2514,7 +2514,7 @@ mod tests {
     #[tokio::test]
     async fn thumbnail_returns_png() {
         let res = app(None, FakeController::verified())
-            .get("/api/files/thumbnail?name=coin2c.gcode.3mf")
+            .get("/api/file/thumbnail?name=coin2c.gcode.3mf")
             .await;
         res.assert_status_ok();
         assert_eq!(res.header("content-type"), "image/png");
@@ -2523,7 +2523,7 @@ mod tests {
     #[tokio::test]
     async fn raw_serves_3mf_bytes() {
         let res = app(None, FakeController::verified())
-            .get("/api/files/raw?name=/cache/coin.gcode.3mf")
+            .get("/api/file/raw?name=/cache/coin.gcode.3mf")
             .await;
         res.assert_status_ok();
         assert_eq!(res.header("content-type"), "application/octet-stream");
@@ -2532,7 +2532,7 @@ mod tests {
     #[tokio::test]
     async fn raw_rejects_other_extensions() {
         app(None, FakeController::verified())
-            .get("/api/files/raw?name=/secret.txt")
+            .get("/api/file/raw?name=/secret.txt")
             .await
             .assert_status(StatusCode::BAD_REQUEST);
     }
@@ -2540,7 +2540,7 @@ mod tests {
     #[tokio::test]
     async fn gcode_file_serves_plate_toolpath() {
         let res = app(None, FakeController::verified())
-            .get("/api/files/gcode?name=/coin2c.gcode.3mf&plate=1")
+            .get("/api/file/gcode?name=/coin2c.gcode.3mf&plate=1")
             .await;
         res.assert_status_ok();
         assert!(
@@ -2555,7 +2555,7 @@ mod tests {
     #[tokio::test]
     async fn gcode_file_rejects_non_3mf() {
         app(None, FakeController::verified())
-            .get("/api/files/gcode?name=/raw.gcode")
+            .get("/api/file/gcode?name=/raw.gcode")
             .await
             .assert_status(StatusCode::BAD_REQUEST);
     }
@@ -2563,7 +2563,7 @@ mod tests {
     #[tokio::test]
     async fn mesh_file_serves_object_models() {
         let res = app(None, FakeController::verified())
-            .get("/api/files/mesh?name=/coin2c.gcode.3mf")
+            .get("/api/file/mesh?name=/coin2c.gcode.3mf")
             .await;
         res.assert_status_ok();
         let body: serde_json::Value = res.json();
@@ -2575,7 +2575,7 @@ mod tests {
     #[tokio::test]
     async fn mesh_file_rejects_non_3mf() {
         app(None, FakeController::verified())
-            .get("/api/files/mesh?name=/raw.gcode")
+            .get("/api/file/mesh?name=/raw.gcode")
             .await
             .assert_status(StatusCode::BAD_REQUEST);
     }
@@ -2585,7 +2585,7 @@ mod tests {
     async fn cameras_list_is_empty_without_built_in_or_external() {
         // Fake/test mode has no built-in camera and no external URLs.
         let res = app(None, FakeController::verified())
-            .get("/api/cameras")
+            .get("/api/camera")
             .await;
         res.assert_status_ok();
         assert_eq!(
@@ -2602,7 +2602,7 @@ mod tests {
         let server = app(None, FakeController::verified());
         for id in ["internal", "ext-0", "bogus"] {
             server
-                .get(&format!("/api/cameras/{id}/snapshot"))
+                .get(&format!("/api/camera/{id}/snapshot"))
                 .await
                 .assert_status(StatusCode::NOT_FOUND);
         }
@@ -2613,7 +2613,7 @@ mod tests {
         let server = app(None, FakeController::verified());
         // Configure two external cameras (one labelled, one auto-labelled).
         let res = server
-            .post("/api/cameras/config")
+            .post("/api/camera/config")
             .json(&json!({
                 "external": [
                     { "label": "front", "url": "http://cam.local/a.jpg" },
@@ -2623,7 +2623,7 @@ mod tests {
             .await;
         res.assert_status_ok();
         // The open listing now shows both, with ids and labels but no URLs.
-        let list = server.get("/api/cameras").await.json::<serde_json::Value>();
+        let list = server.get("/api/camera").await.json::<serde_json::Value>();
         let cams = list["cameras"].as_array().unwrap();
         assert_eq!(cams.len(), 2);
         assert_eq!(cams[0]["id"], "ext-0");
@@ -2633,17 +2633,17 @@ mod tests {
         assert!(cams[0].get("url").is_none()); // URL never exposed on the open list
         // The gated config read echoes URLs back for the manage form.
         let cfg = server
-            .get("/api/cameras/config")
+            .get("/api/camera/config")
             .await
             .json::<serde_json::Value>();
         assert_eq!(cfg["external"][0]["url"], "http://cam.local/a.jpg");
         // Replacing with an empty list clears them.
         server
-            .post("/api/cameras/config")
+            .post("/api/camera/config")
             .json(&json!({ "external": [] }))
             .await
             .assert_status_ok();
-        let list = server.get("/api/cameras").await.json::<serde_json::Value>();
+        let list = server.get("/api/camera").await.json::<serde_json::Value>();
         assert_eq!(list["cameras"].as_array().unwrap().len(), 0);
     }
 
@@ -2651,14 +2651,14 @@ mod tests {
     async fn camera_config_rejects_non_http_url() {
         let server = app(None, FakeController::verified());
         server
-            .post("/api/cameras/config")
+            .post("/api/camera/config")
             .json(&json!({ "external": [{ "url": "file:///etc/passwd" }] }))
             .await
             .assert_status(StatusCode::BAD_REQUEST);
         // The proxy's ureq is built without TLS, so an https camera would only
         // fail later with a 502 — reject it up front rather than advertise it.
         server
-            .post("/api/cameras/config")
+            .post("/api/camera/config")
             .json(&json!({ "external": [{ "url": "https://cam.local/a.jpg" }] }))
             .await
             .assert_status(StatusCode::BAD_REQUEST);
@@ -2668,7 +2668,7 @@ mod tests {
     async fn external_camera_stream_url_round_trips_and_flags_the_list() {
         let server = app(None, FakeController::verified());
         server
-            .post("/api/cameras/config")
+            .post("/api/camera/config")
             .json(&json!({
                 "external": [
                     { "label": "front", "url": "http://cam.local/snapshot",
@@ -2680,14 +2680,14 @@ mod tests {
             .assert_status_ok();
         // The open list flags whether a live MJPEG stream is available, so the
         // frontend can pick stream vs snapshot-poll — still without leaking URLs.
-        let list = server.get("/api/cameras").await.json::<serde_json::Value>();
+        let list = server.get("/api/camera").await.json::<serde_json::Value>();
         let cams = list["cameras"].as_array().unwrap();
         assert_eq!(cams[0]["stream"], true);
         assert_eq!(cams[1]["stream"], false);
         assert!(cams[0].get("url").is_none());
         // The gated config read echoes the stream URL for the manage form.
         let cfg = server
-            .get("/api/cameras/config")
+            .get("/api/camera/config")
             .await
             .json::<serde_json::Value>();
         assert_eq!(cfg["external"][0]["stream_url"], "http://cam.local/stream");
@@ -2701,7 +2701,7 @@ mod tests {
             "mad_k": 6, "merge_gap_s": 1.2, "max_island_s": 3, "min_sep_s": 3,
             "candidate_frac": 0.75, "warmup_s": 4, "baseline_s": 90 });
         server
-            .post("/api/cameras/config")
+            .post("/api/camera/config")
             .json(&json!({ "external": [
                 { "label": "front", "url": "http://cam.local/snap",
                   "stream_url": "http://cam.local/stream", "park_tuning": tuning },
@@ -2711,7 +2711,7 @@ mod tests {
             .await
             .assert_status_ok();
         // park-capability needs BOTH a stream and a tuning.
-        let list = server.get("/api/cameras").await.json::<serde_json::Value>();
+        let list = server.get("/api/camera").await.json::<serde_json::Value>();
         let cams = list["cameras"].as_array().unwrap();
         assert_eq!(cams[0]["park"], true);
         assert_eq!(
@@ -2720,7 +2720,7 @@ mod tests {
         );
         // The gated config read echoes the tuning so the manage form can prefill.
         let cfg = server
-            .get("/api/cameras/config")
+            .get("/api/camera/config")
             .await
             .json::<serde_json::Value>();
         assert!(cfg["external"][0]["park_tuning"].is_object());
@@ -2734,7 +2734,7 @@ mod tests {
         // not run with a wrong value.
         let server = app(None, FakeController::verified());
         let res = server
-            .post("/api/cameras/config")
+            .post("/api/camera/config")
             .json(&json!({ "external": [
                 { "url": "http://cam.local/a.jpg", "stream_url": "http://cam.local/s",
                   "park_tuning": { "fps": 4, "left_frac": 0.33 } },
@@ -2750,7 +2750,7 @@ mod tests {
     async fn timelapse_start_park_rejects_without_a_capable_camera() {
         let server = app(None, FakeController::verified());
         server
-            .post("/api/cameras/config")
+            .post("/api/camera/config")
             .json(&json!({ "external": [ { "url": "http://cam.local/a.jpg" } ] }))
             .await
             .assert_status_ok();
@@ -2863,7 +2863,7 @@ mod tests {
         .unwrap();
 
         // The index lists both frames, sorted, with a count.
-        let res = server.get("/api/cameras/ext-0/park").await;
+        let res = server.get("/api/camera/ext-0/park").await;
         res.assert_status_ok();
         let body: serde_json::Value = res.json();
         assert_eq!(body["count"], 2);
@@ -2871,31 +2871,31 @@ mod tests {
         assert_eq!(body["parks"][1]["n"], 1);
 
         // An indexed frame serves its exact JPEG bytes.
-        let f1 = server.get("/api/cameras/ext-0/park/1").await;
+        let f1 = server.get("/api/camera/ext-0/park/1").await;
         f1.assert_status_ok();
         assert_eq!(f1.as_bytes().as_ref(), b"FRAME1");
 
         // Out-of-range index → 404; a camera not in the run → 404 (no traversal join).
         server
-            .get("/api/cameras/ext-0/park/9")
+            .get("/api/camera/ext-0/park/9")
             .await
             .assert_status_not_found();
         server
-            .get("/api/cameras/ext-1/park")
+            .get("/api/camera/ext-1/park")
             .await
             .assert_status_not_found();
         server
-            .get("/api/cameras/ext-1/park/0")
+            .get("/api/camera/ext-1/park/0")
             .await
             .assert_status_not_found();
 
         // After the run STOPS, the filmstrip stays reviewable (until the next run).
         tl.stop_park();
-        let after = server.get("/api/cameras/ext-0/park").await;
+        let after = server.get("/api/camera/ext-0/park").await;
         after.assert_status_ok();
         assert_eq!(after.json::<serde_json::Value>()["count"], 2);
         server
-            .get("/api/cameras/ext-0/park/0")
+            .get("/api/camera/ext-0/park/0")
             .await
             .assert_status_ok();
 
@@ -2961,7 +2961,7 @@ mod tests {
         };
         let server = TestServer::new(router(state));
         let res = server
-            .get("/api/files/inspect?name=/cube.gcode.3mf&plate=1")
+            .get("/api/file/inspect?name=/cube.gcode.3mf&plate=1")
             .await;
         res.assert_status_ok();
         let body: serde_json::Value = res.json();
@@ -2973,13 +2973,13 @@ mod tests {
     async fn file_inspect_degrades_to_not_inspected() {
         // FakeFiles.fetch returns junk (not a zip) → inspected:false, never an error status.
         let res = app(None, FakeController::verified())
-            .get("/api/files/inspect?name=/x.gcode.3mf&plate=1")
+            .get("/api/file/inspect?name=/x.gcode.3mf&plate=1")
             .await;
         res.assert_status_ok();
         assert_eq!(res.json::<serde_json::Value>()["inspected"], false);
         // A non-3mf is also a clean "not inspected", not a 4xx.
         let res2 = app(None, FakeController::verified())
-            .get("/api/files/inspect?name=/notes.txt")
+            .get("/api/file/inspect?name=/notes.txt")
             .await;
         res2.assert_status_ok();
         assert_eq!(res2.json::<serde_json::Value>()["inspected"], false);
@@ -3067,11 +3067,11 @@ mod tests {
     async fn parks_index_and_frame_are_404_without_a_run() {
         let server = app(None, FakeController::verified());
         server
-            .get("/api/cameras/ext-0/park")
+            .get("/api/camera/ext-0/park")
             .await
             .assert_status_not_found();
         server
-            .get("/api/cameras/ext-0/park/0")
+            .get("/api/camera/ext-0/park/0")
             .await
             .assert_status_not_found();
     }
@@ -3080,7 +3080,7 @@ mod tests {
     async fn camera_config_rejects_non_http_stream_url() {
         let server = app(None, FakeController::verified());
         server
-            .post("/api/cameras/config")
+            .post("/api/camera/config")
             .json(&json!({
                 "external": [
                     { "url": "http://cam.local/a.jpg", "stream_url": "file:///etc/passwd" }
@@ -3090,7 +3090,7 @@ mod tests {
             .assert_status(StatusCode::BAD_REQUEST);
         // Same TLS-less reason as the snapshot URL: no https streams.
         server
-            .post("/api/cameras/config")
+            .post("/api/camera/config")
             .json(&json!({
                 "external": [
                     { "url": "http://cam.local/a.jpg", "stream_url": "https://cam.local/stream" }
@@ -3146,14 +3146,14 @@ mod tests {
         });
         let server = app(None, FakeController::verified());
         server
-            .post("/api/cameras/config")
+            .post("/api/camera/config")
             .json(&json!({ "external": [
                 { "url": format!("http://{addr}/snap"),
                   "stream_url": format!("http://{addr}/stream") }
             ] }))
             .await
             .assert_status_ok();
-        let res = server.get("/api/cameras/ext-0/stream").await;
+        let res = server.get("/api/camera/ext-0/stream").await;
         res.assert_status_ok();
         assert!(
             res.header("content-type")
@@ -3274,7 +3274,7 @@ mod tests {
     #[tokio::test]
     async fn camera_config_is_gated_by_password() {
         app(Some("hunter2"), FakeController::verified())
-            .post("/api/cameras/config")
+            .post("/api/camera/config")
             .json(&json!({ "external": [{ "url": "http://cam.local/a.jpg" }] }))
             .await
             .assert_status(StatusCode::UNAUTHORIZED);
@@ -3283,7 +3283,7 @@ mod tests {
     #[tokio::test]
     async fn thumbnail_rejects_non_3mf() {
         app(None, FakeController::verified())
-            .get("/api/files/thumbnail?name=/timelapse/video.mp4")
+            .get("/api/file/thumbnail?name=/timelapse/video.mp4")
             .await
             .assert_status(StatusCode::BAD_REQUEST);
     }
@@ -3301,7 +3301,7 @@ mod tests {
     #[tokio::test]
     async fn upload_rejects_traversal_dir() {
         app(None, FakeController::verified())
-            .post("/api/files/upload?dir=../etc&name=a.3mf")
+            .post("/api/file/upload?dir=../etc&name=a.3mf")
             .bytes(b"data".to_vec().into())
             .await
             .assert_status(StatusCode::BAD_REQUEST);
@@ -3310,7 +3310,7 @@ mod tests {
     #[tokio::test]
     async fn upload_open_when_no_password() {
         app(None, FakeController::verified())
-            .post("/api/files/upload?name=part.gcode.3mf")
+            .post("/api/file/upload?name=part.gcode.3mf")
             .bytes(b"PK\x03\x04 fake 3mf".to_vec().into())
             .await
             .assert_status_ok();
@@ -3319,7 +3319,7 @@ mod tests {
     #[tokio::test]
     async fn upload_needs_password_when_set() {
         app(Some("secret"), FakeController::verified())
-            .post("/api/files/upload?name=part.gcode.3mf")
+            .post("/api/file/upload?name=part.gcode.3mf")
             .bytes(b"data".to_vec().into())
             .await
             .assert_status(StatusCode::UNAUTHORIZED);
@@ -3328,7 +3328,7 @@ mod tests {
     #[tokio::test]
     async fn upload_rejects_path_traversal() {
         app(None, FakeController::verified())
-            .post("/api/files/upload?name=../etc/passwd")
+            .post("/api/file/upload?name=../etc/passwd")
             .bytes(b"data".to_vec().into())
             .await
             .assert_status(StatusCode::BAD_REQUEST);

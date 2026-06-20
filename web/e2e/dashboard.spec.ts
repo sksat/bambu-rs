@@ -155,9 +155,9 @@ test.describe("dashboard (fake mode)", () => {
   });
 
   test("start dialog shows the file's clean-timelapse capability on open", async ({ page }) => {
-    // The open /api/files/inspect read drives an inline capability line the moment the
+    // The open /api/file/inspect read drives an inline capability line the moment the
     // dialog opens (fake files aren't inspectable, so mock a capable file).
-    await page.route("**/api/files/inspect**", (r) =>
+    await page.route("**/api/file/inspect**", (r) =>
       r.fulfill({ json: { inspected: true, has_timelapse_blocks: true } }),
     );
     await page.getByTestId("print").first().click();
@@ -180,12 +180,12 @@ test.describe("dashboard (fake mode)", () => {
         await r.fulfill({ status: 200, json: { ok: true } });
       }
     });
-    await page.route("**/api/cameras", (r) =>
+    await page.route("**/api/camera", (r) =>
       r.fulfill({
         json: { cameras: [{ id: "ext-1", kind: "external", label: "park cam", park: true, stream: true }] },
       }),
     );
-    await page.route("**/api/files/inspect**", (r) =>
+    await page.route("**/api/file/inspect**", (r) =>
       r.fulfill({ json: { inspected: true, has_timelapse_blocks: true } }),
     );
     let startedMode: string | null = null;
@@ -336,7 +336,7 @@ test.describe("dashboard (fake mode)", () => {
     );
     // Deliberately SPARSE frame numbers (0, 2, 5 — a skipped/malformed line leaves a gap):
     // the player must address frames by their real `n`, not the scrubber position.
-    await page.route("**/api/cameras/ext-2/park", (r) =>
+    await page.route("**/api/camera/ext-2/park", (r) =>
       r.fulfill({
         json: {
           running: true,
@@ -350,7 +350,7 @@ test.describe("dashboard (fake mode)", () => {
       }),
     );
     // Any indexed frame → a stand-in JPEG (the bytes don't matter; we assert data-n).
-    await page.route("**/api/cameras/ext-2/park/*", (r) =>
+    await page.route("**/api/camera/ext-2/park/*", (r) =>
       r.fulfill({ contentType: "image/jpeg", body: "jpeg" }),
     );
     await page.goto("/"); // re-navigate so the routes apply from a clean load

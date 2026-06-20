@@ -15,7 +15,7 @@ export function Thumb({ file, className }: { file: string; className?: string })
       className={className ?? "thumb"}
       loading="lazy"
       alt=""
-      src={`/api/files/thumbnail?name=${encodeURIComponent(name)}`}
+      src={`/api/file/thumbnail?name=${encodeURIComponent(name)}`}
       onError={() => setOk(false)}
       data-testid="thumb"
     />

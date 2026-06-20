@@ -53,7 +53,7 @@ export function FilesSection({ sdcard }: { sdcard?: boolean | null }) {
 
   const refresh = useCallback(async (d: string) => {
     try {
-      const r = await fetch(`/api/files?dir=${encodeURIComponent(d)}`);
+      const r = await fetch(`/api/file?dir=${encodeURIComponent(d)}`);
       const data = (await r.json()) as { files?: FileEntry[]; error?: string };
       if (r.ok) {
         // Tolerate unexpected shapes (e.g. an older server) instead of crashing.
@@ -88,7 +88,7 @@ export function FilesSection({ sdcard }: { sdcard?: boolean | null }) {
     if (pw) headers["Authorization"] = `Bearer ${pw}`;
     try {
       const q = `dir=${encodeURIComponent(dir)}&name=${encodeURIComponent(file.name)}`;
-      const r = await fetch(`/api/files/upload?${q}`, { method: "POST", headers, body: file });
+      const r = await fetch(`/api/file/upload?${q}`, { method: "POST", headers, body: file });
       const d = (await r.json().catch(() => ({}))) as { error?: string };
       if (r.ok) {
         setMsg(`uploaded ${file.name}`);
@@ -301,7 +301,7 @@ function StartDialog({ path, onClose }: { path: string; onClose: () => void }) {
     void (async () => {
       try {
         const r = await fetch(
-          `/api/files/inspect?name=${encodeURIComponent(path)}&plate=${plate}`,
+          `/api/file/inspect?name=${encodeURIComponent(path)}&plate=${plate}`,
         );
         const d = (await r.json().catch(() => ({}))) as {
           inspected?: boolean;

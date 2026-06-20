@@ -50,7 +50,7 @@ export interface ParkIndex {
 // then shows the "no frames yet" state.
 export async function listParks(id: string): Promise<ParkIndex> {
   try {
-    const r = await fetch(`/api/cameras/${encodeURIComponent(id)}/park`);
+    const r = await fetch(`/api/camera/${encodeURIComponent(id)}/park`);
     if (!r.ok) return { running: false, count: 0, parks: [] };
     return (await r.json()) as ParkIndex;
   } catch {
@@ -88,7 +88,7 @@ export async function listCaptures(): Promise<CaptureRun[]> {
 // The list of currently-available cameras (open read); tolerate failure as none.
 export async function listCameras(): Promise<Camera[]> {
   try {
-    const r = await fetch("/api/cameras");
+    const r = await fetch("/api/camera");
     if (!r.ok) return [];
     const d = (await r.json()) as { cameras?: Camera[] };
     return d.cameras ?? [];
@@ -104,7 +104,7 @@ export async function getCamerasConfig(
   const headers: Record<string, string> = {};
   if (password) headers["Authorization"] = `Bearer ${password}`;
   try {
-    const r = await fetch("/api/cameras/config", { headers });
+    const r = await fetch("/api/camera/config", { headers });
     if (r.status === 401) return "needPassword";
     if (!r.ok) return "error";
     const d = (await r.json()) as { external?: ExternalCfg[] };
@@ -127,7 +127,7 @@ export async function setCamerasConfig(
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (password) headers["Authorization"] = `Bearer ${password}`;
   try {
-    const r = await fetch("/api/cameras/config", {
+    const r = await fetch("/api/camera/config", {
       method: "POST",
       headers,
       body: JSON.stringify({ external }),

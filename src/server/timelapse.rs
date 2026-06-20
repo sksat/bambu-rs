@@ -77,7 +77,7 @@ pub fn real_park_spawn() -> ParkSpawn {
 }
 
 /// Grab a single JPEG frame (blocking). Resolved from a camera id at start time
-/// and held for the run's duration, so later `/api/cameras/config` edits can't
+/// and held for the run's duration, so later `/api/camera/config` edits can't
 /// repoint a running capture.
 pub type FrameGrab = Arc<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync>;
 

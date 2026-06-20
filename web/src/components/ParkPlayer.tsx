@@ -111,7 +111,7 @@ export function ParkPlayer({ id }: { id: string }) {
   // can be sparse (the index parser skips malformed lines), so don't assume n === position.
   const frameN = meta?.n ?? cur;
   // Frames are the indexed `/park/{n}` JPEGs (the index lives at `/park`).
-  const src = `/api/cameras/${id}/park/${frameN}${liveTip ? `?t=${tick}` : ""}`;
+  const src = `/api/camera/${id}/park/${frameN}${liveTip ? `?t=${tick}` : ""}`;
 
   return (
     <div className="pp" data-testid="park-player">

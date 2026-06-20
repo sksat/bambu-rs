@@ -6,7 +6,7 @@ type THREE = typeof import("three");
 // 3D viewer with two modes:
 //  • mesh     — the solid model, parsed from the .3mf's embedded object meshes
 //               (three's 3MFLoader won't follow Bambu's external-component refs,
-//               so the server hands us the mesh XML at /api/files/mesh and we
+//               so the server hands us the mesh XML at /api/file/mesh and we
 //               build the geometry ourselves).
 //  • toolpath — the sliced gcode path, with playback: a scrubber + play/pause
 //               that reveals the extrusion trail as a head marker walks the path,
@@ -56,7 +56,7 @@ export function ModelView({ path }: { path: string }) {
         let object: import("three").Object3D;
         let pb: Playback | null = null;
         if (mode === "mesh") {
-          const r = await fetch(`/api/files/mesh?name=${encodeURIComponent(path)}`);
+          const r = await fetch(`/api/file/mesh?name=${encodeURIComponent(path)}`);
           if (!r.ok) return setStatus(`couldn't load mesh (HTTP ${r.status})`);
           const models = ((await r.json()) as { models?: string[] }).models ?? [];
           if (!models.length) {
@@ -71,8 +71,8 @@ export function ModelView({ path }: { path: string }) {
           object = buildMesh(models, THREE);
         } else {
           const url = is3mf
-            ? `/api/files/gcode?name=${encodeURIComponent(path)}&plate=1`
-            : `/api/files/raw?name=${encodeURIComponent(path)}`;
+            ? `/api/file/gcode?name=${encodeURIComponent(path)}&plate=1`
+            : `/api/file/raw?name=${encodeURIComponent(path)}`;
           const r = await fetch(url);
           if (!r.ok) return setStatus(`couldn't load toolpath (HTTP ${r.status})`);
           const built = buildToolpath(await r.text(), THREE);

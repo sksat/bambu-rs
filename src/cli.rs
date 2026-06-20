@@ -214,7 +214,7 @@ enum Command {
         camera_url: Vec<String>,
         /// Seed external cameras from a JSON file — a list of
         /// `{ "label"?, "url", "stream_url"?, "park_tuning"? }`, the same shape as
-        /// `/api/cameras/config`. Unlike `--camera-url` this can carry a stream URL and
+        /// `/api/camera/config`. Unlike `--camera-url` this can carry a stream URL and
         /// per-camera park tuning (so a camera is live-park-capable from launch). Seeded
         /// after any `--camera-url`; all remain editable at runtime.
         #[arg(long, value_name = "PATH")]
@@ -1472,7 +1472,7 @@ fn run_serve(
     crate::server::serve(target, opts).map_err(|e| CliError::new(exit::GENERAL, e.to_string()))
 }
 
-/// One entry of a `--cameras-config` JSON file — the same shape as `/api/cameras/config`,
+/// One entry of a `--cameras-config` JSON file — the same shape as `/api/camera/config`,
 /// plus an optional `park_tuning` (validated by serde: no baked defaults).
 #[cfg(feature = "server")]
 #[derive(serde::Deserialize)]

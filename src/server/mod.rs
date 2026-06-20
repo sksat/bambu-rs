@@ -41,7 +41,7 @@ pub struct ServeOpts {
     pub fake: bool,
     pub interval: Option<Duration>,
     /// External IP cameras to seed at launch (each a single-JPEG-per-GET URL with
-    /// a label). The server proxies them via `/api/cameras/{id}/snapshot` so a
+    /// a label). The server proxies them via `/api/camera/{id}/snapshot` so a
     /// browser that can't reach the LAN cam (e.g. over Tailscale) still gets a live
     /// view; the dashboard can add/remove more at runtime.
     pub external_cameras: Vec<ExternalCamera>,

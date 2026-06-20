@@ -72,7 +72,7 @@ function CameraView({
   const isPark = view === "park";
   // Live is a continuous stream or a snapshot poll; the park view is the <ParkPlayer>.
   const polling = !stream;
-  const liveSrc = `/api/cameras/${id}/${stream ? "stream" : "snapshot"}?t=${ts}`;
+  const liveSrc = `/api/camera/${id}/${stream ? "stream" : "snapshot"}?t=${ts}`;
   const show = (v: "live" | "park") => {
     setView(v);
     setOffline(false);
