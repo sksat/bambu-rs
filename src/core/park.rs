@@ -116,6 +116,139 @@ fn round_to(x: f64, decimals: i32) -> f64 {
     (x * f).round() / f
 }
 
+/// One burst frame for [`select_park_frame`]: its capture offset (ms after the layer edge)
+/// and the decoded grayscale (`w*h`, row-major).
+pub struct SelectFrame {
+    pub offset_ms: u64,
+    pub gray: Vec<u8>,
+}
+
+/// Knobs for [`select_park_frame`]. Distinct from [`ParkTuning`]: selection scores against
+/// the per-burst MEDIAN (not the live EMA), so its cutoffs differ. No defaults — every knob
+/// is supplied by the caller (it depends on camera/printer placement).
+#[derive(Clone, Copy, Debug)]
+pub struct SelectTuning {
+    /// Park zone = the left this-fraction of the frame.
+    pub left_frac: f64,
+    /// The park's left-mass must exceed this × the burst-median left-mass (relative outlier).
+    pub min_outlier: f64,
+    /// …and be at least this mean darkness (0–255) over the park zone (absolute floor).
+    pub min_left_density: f64,
+    /// Among frames with left-mass ≥ this × the burst max, pick the sharpest.
+    pub select_candidate_frac: f64,
+    /// Reject the pick (skip the layer) below this confidence.
+    pub min_confidence: f64,
+}
+
+/// Why a layer's burst yielded no parked frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkipReason {
+    /// No frame showed a strong left excursion — the park fell outside the burst, or the
+    /// head stayed over the print. A gap beats emitting a head-over-print frame.
+    ParkNotCaptured,
+    /// A park was found but it wasn't confident enough.
+    LowConfidence,
+}
+
+/// The outcome of picking a layer's parked frame from its burst.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Selection {
+    Selected { offset_ms: u64, confidence: f64 },
+    Skipped { reason: SkipReason, confidence: f64 },
+}
+
+fn norm(v: f64, lo: f64, hi: f64) -> f64 {
+    if hi <= lo { 0.0 } else { (v - lo) / (hi - lo) }
+}
+
+/// Pick the parked ("head out of the way, object visible") frame from ONE layer's capture
+/// burst, or skip the layer. Pure port of the skill's `select_smooth.select_frame`.
+///
+/// Isolate the transient toolhead by subtracting the per-burst MEDIAN (static
+/// bed/object/printer/dark-fixtures cancel), then measure its dark mass in the LEFT park
+/// zone (left `left_frac` of the frame, where an X-min park maps for a left-mounted
+/// camera). The park frame's left-mass is a strong OUTLIER vs the burst median; the
+/// sharpest such frame (the settled dwell, not the motion-blurred travel) wins. A layer
+/// whose park fell outside the burst shows no outlier and is SKIPPED.
+pub fn select_park_frame(
+    frames: &[SelectFrame],
+    w: usize,
+    h: usize,
+    cfg: &SelectTuning,
+) -> Selection {
+    if frames.is_empty() {
+        return Selection::Skipped {
+            reason: SkipReason::ParkNotCaptured,
+            confidence: 0.0,
+        };
+    }
+    let n_px = w * h;
+    // Per-pixel median across the burst — the static scene (bed/object/fixtures).
+    let mut med = vec![0f64; n_px];
+    let mut col = Vec::with_capacity(frames.len());
+    for (p, m) in med.iter_mut().enumerate() {
+        col.clear();
+        col.extend(frames.iter().map(|f| f.gray[p] as f64));
+        *m = median(&col);
+    }
+    let park_hi = ((cfg.left_frac * w as f64) as usize).max(1);
+    // Dark saliency (how much darker than the median) summed over the left zone, + sharpness.
+    let mut left = Vec::with_capacity(frames.len());
+    let mut sharp = Vec::with_capacity(frames.len());
+    for f in frames {
+        let mut lm = 0.0;
+        for y in 0..h {
+            let row = y * w;
+            for x in 0..park_hi {
+                let d = med[row + x] - f.gray[row + x] as f64;
+                if d > 0.0 {
+                    lm += d;
+                }
+            }
+        }
+        left.push(lm);
+        sharp.push(sharpness(&f.gray, w, h));
+    }
+    let l_med = {
+        let m = median(&left);
+        if m == 0.0 { 1.0 } else { m }
+    };
+    let l_max = left.iter().cloned().fold(f64::MIN, f64::max);
+    let outlier = l_max / l_med; // a relative outlier…
+    let left_density = l_max / (park_hi * h) as f64; // …and absolutely dark enough
+    if outlier < cfg.min_outlier || left_density < cfg.min_left_density {
+        return Selection::Skipped {
+            reason: SkipReason::ParkNotCaptured,
+            confidence: 0.0,
+        };
+    }
+    let sh_lo = sharp.iter().cloned().fold(f64::MAX, f64::min);
+    let sh_hi = sharp.iter().cloned().fold(f64::MIN, f64::max);
+    // The park is among the strongly-left frames; pick the sharpest of them.
+    let mut best = 0usize;
+    let mut best_sharp = f64::MIN;
+    for (i, (&l, &s)) in left.iter().zip(sharp.iter()).enumerate() {
+        if l >= cfg.select_candidate_frac * l_max && s > best_sharp {
+            best_sharp = s;
+            best = i;
+        }
+    }
+    let conf = round_to(
+        ((outlier - 1.5) / 4.0).min(1.0) * 0.6 + norm(sharp[best], sh_lo, sh_hi) * 0.4,
+        3,
+    );
+    if conf < cfg.min_confidence {
+        return Selection::Skipped {
+            reason: SkipReason::LowConfidence,
+            confidence: conf,
+        };
+    }
+    Selection::Selected {
+        offset_ms: frames[best].offset_ms,
+        confidence: conf,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct IslandFrame {
     idx: u64,
@@ -567,5 +700,175 @@ mod tests {
         assert!(ema_alpha(1.0, 1.0) <= 0.999);
         assert!(ema_alpha(30.0, 4.0) > ema_alpha(6.0, 4.0));
         assert!(ema_alpha(0.0, 0.0) >= 0.0);
+    }
+}
+
+#[cfg(test)]
+mod select_tests {
+    //! Mirrors the skill's test_select_smooth.py: synthetic grayscale bursts (bright bed,
+    //! a STATIC dark object that must not be mistaken for the head, a dark moving head that
+    //! is over-print in the majority and parks far-left in a minority).
+    use super::*;
+
+    const SW: usize = 48;
+    const SH: usize = 24;
+    const BG: u8 = 200;
+    const OBJ: u8 = 110;
+    const HEAD: u8 = 25;
+    const CENTER: i64 = 24;
+
+    fn sframe(head_x: i64, sharp: bool, obj_x: i64) -> Vec<u8> {
+        let head_hw: i64 = 5;
+        let mut img = vec![BG; SW * SH];
+        for y in 0..SH {
+            let row = y * SW;
+            let lo = (obj_x - 3).max(0) as usize;
+            let hi = (obj_x + 3).min(SW as i64) as usize;
+            for px in img[row + lo..row + hi].iter_mut() {
+                *px = OBJ;
+            }
+            for x in 0..SW {
+                let d = (x as i64 - head_x).abs();
+                if d <= head_hw {
+                    img[row + x] = HEAD;
+                } else if !sharp && d <= head_hw + 3 {
+                    img[row + x] = (HEAD as f64
+                        + (d - head_hw) as f64 / 3.0 * (BG as f64 - HEAD as f64))
+                        as u8;
+                }
+            }
+        }
+        img
+    }
+
+    fn sburst(specs: &[(u64, i64, bool)], obj_x: i64) -> Vec<SelectFrame> {
+        specs
+            .iter()
+            .map(|&(o, hx, s)| SelectFrame {
+                offset_ms: o,
+                gray: sframe(hx, s, obj_x),
+            })
+            .collect()
+    }
+
+    fn ex() -> SelectTuning {
+        SelectTuning {
+            left_frac: 0.33,
+            min_outlier: 2.5,
+            min_left_density: 3.0,
+            select_candidate_frac: 0.6,
+            min_confidence: 0.40,
+        }
+    }
+
+    fn sel(b: &[SelectFrame]) -> Selection {
+        select_park_frame(b, SW, SH, &ex())
+    }
+
+    #[test]
+    fn selects_far_left_parked() {
+        let b = sburst(
+            &[
+                (300, CENTER, true),
+                (500, CENTER, true),
+                (700, 6, true),
+                (900, 6, true),
+                (1100, CENTER, true),
+                (1300, CENTER, true),
+            ],
+            CENTER,
+        );
+        match sel(&b) {
+            Selection::Selected { offset_ms, .. } => assert!(matches!(offset_ms, 700 | 900)),
+            other => panic!("expected selected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_over_print_is_skipped() {
+        let b = sburst(
+            &[
+                (300, CENTER, true),
+                (500, CENTER, true),
+                (700, CENTER, true),
+                (900, CENTER, true),
+            ],
+            CENTER,
+        );
+        assert!(matches!(sel(&b), Selection::Skipped { .. }));
+    }
+
+    #[test]
+    fn prefers_sharp_park_over_blurred_more_left() {
+        let b = sburst(
+            &[
+                (300, CENTER, true),
+                (500, CENTER, true),
+                (700, 3, false),
+                (900, 8, true),
+                (1100, CENTER, true),
+                (1300, CENTER, true),
+            ],
+            CENTER,
+        );
+        assert_eq!(
+            sel(&b),
+            Selection::Selected {
+                offset_ms: 900,
+                confidence: match sel(&b) {
+                    Selection::Selected { confidence, .. } => confidence,
+                    _ => unreachable!(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn static_dark_object_is_not_mistaken_for_head() {
+        let b = sburst(
+            &[
+                (300, CENTER, true),
+                (500, CENTER, true),
+                (700, 6, true),
+                (900, 6, true),
+                (1100, CENTER, true),
+                (1300, CENTER, true),
+            ],
+            CENTER,
+        );
+        assert!(matches!(sel(&b), Selection::Selected { .. }));
+    }
+
+    #[test]
+    fn panned_camera_still_resolves_the_park() {
+        let b = sburst(
+            &[
+                (300, CENTER + 10, true),
+                (500, CENTER + 10, true),
+                (700, 16, true),
+                (900, 16, true),
+                (1100, CENTER + 10, true),
+                (1300, CENTER + 10, true),
+            ],
+            CENTER + 10,
+        );
+        match sel(&b) {
+            Selection::Selected { offset_ms, .. } => assert!(matches!(offset_ms, 700 | 900)),
+            other => panic!("expected selected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn park_before_burst_is_skipped() {
+        let b = sburst(
+            &[
+                (900, CENTER, true),
+                (1100, CENTER, true),
+                (1300, CENTER, true),
+                (1500, CENTER, true),
+            ],
+            CENTER,
+        );
+        assert!(matches!(sel(&b), Selection::Skipped { .. }));
     }
 }
