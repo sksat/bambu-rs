@@ -1249,6 +1249,11 @@ async fn camera_stream(State(st): State<AppState>, Path(id): Path<String>) -> Re
 /// against the run's own camera list (not joined blindly), so a crafted id can't traverse.
 async fn camera_park(State(st): State<AppState>, Path(id): Path<String>) -> Response {
     let park = st.timelapse.status_park();
+    // Only while a run is ACTIVE — a stopped/finished run keeps out_dir + cameras, so
+    // without this it would keep serving the last frame as if still live.
+    if !park.running {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let Some(dir) = park.out_dir else {
         return StatusCode::NOT_FOUND.into_response();
     };
