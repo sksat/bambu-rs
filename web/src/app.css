@@ -319,6 +319,20 @@ div.lbl,
   color: var(--warn);
   border-color: color-mix(in srgb, var(--warn) 40%, transparent);
 }
+/* Hardware/connectivity cluster pinned to the band's top-right: the nozzle spec
+   sits beside the WiFi meter, both keeping their size so the filename shrinks. */
+.job__hw {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-shrink: 0;
+}
+.jobspec {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--dim);
+  white-space: nowrap;
+}
 
 /* progress bar */
 .bar {
@@ -485,6 +499,18 @@ div.lbl,
 .swap {
   font-family: var(--mono);
   font-size: 0.74rem;
+  color: var(--warn);
+}
+/* RFID reader state, pushed to the right edge of the AMS header. ✓/✕ shape +
+   amber-on-offline (not colour alone) keeps it readable (CUD). */
+.amslink {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--dim);
+  white-space: nowrap;
+}
+.amslink--warn {
   color: var(--warn);
 }
 /* The AMS rack: a horizontal row of filament SPOOLS (colour is the hero),

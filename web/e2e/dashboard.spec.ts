@@ -22,6 +22,22 @@ test.describe("dashboard (fake mode)", () => {
     await expect(wifi).toHaveClass(/wifi--warn/);
   });
 
+  test("nozzle spec shows beside the WiFi meter in the overview band", async ({ page }) => {
+    const n = page.getByTestId("nozzle-spec");
+    await expect(n).toBeVisible();
+    await expect(n).toContainText("0.4");
+    await expect(n).toContainText("stainless");
+  });
+
+  test("RFID reader state shows in the AMS header", async ({ page }) => {
+    const r = page.getByTestId("ams-rfid");
+    await expect(r).toBeVisible();
+    // The fake reports the reader present → ✓, so no warn tone (class is exactly
+    // "amslink", not "amslink amslink--warn").
+    await expect(r).toContainText("rfid");
+    await expect(r).toHaveClass("amslink");
+  });
+
   test("renders the AMS trays", async ({ page }) => {
     await expect(page.getByTestId("tray-0")).toBeVisible();
     await expect(page.getByTestId("tray-3")).toBeVisible();
@@ -40,11 +56,12 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("toast")).toContainText("verified");
   });
 
-  test("chamber light is not duplicated in the footer", async ({ page }) => {
-    // Its authoritative toggle lives in the controls panel; the footer status
-    // chips must not repeat the chamber light (only other lights, if any).
+  test("the footer no longer duplicates relocated machine status", async ({ page }) => {
+    // WiFi + nozzle moved to the overview band, RFID to the AMS header, and the
+    // chamber light keeps only its controls toggle. In fake mode that leaves the
+    // footer with no chips, so it isn't rendered at all.
     await expect(page.getByTestId("light-toggle")).toBeVisible();
-    await expect(page.getByTestId("foot")).not.toContainText("chamber");
+    await expect(page.getByTestId("foot")).toHaveCount(0);
   });
 
   test("speed shows the active tier", async ({ page }) => {

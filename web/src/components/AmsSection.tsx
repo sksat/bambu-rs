@@ -2,7 +2,7 @@ import type { Ams } from "../types";
 import { amsActivity } from "../format";
 import { Humidity, Tray } from "./widgets";
 
-export function AmsSection({ ams }: { ams: Ams }) {
+export function AmsSection({ ams, rfid }: { ams: Ams; rfid?: boolean | null }) {
   const units = ams.units ?? [];
   // Plain-words activity: "loading tray 3" / "unloading tray 3" / "tray 1 →
   // tray 3" / "tray 3 loaded" / "idle" — never a raw 254/255 sentinel.
@@ -17,6 +17,18 @@ export function AmsSection({ ams }: { ams: Ams }) {
           </span>
         ) : (
           <span className="dim">{text}</span>
+        )}
+        {/* The RFID reader (reads spool tags) belongs with the AMS — the ✓/✕
+            shape carries the state without relying on colour (CUD); offline also
+            goes amber. Hidden only when the printer doesn't report it. */}
+        {rfid != null && (
+          <span
+            className={`amslink${rfid ? "" : " amslink--warn"}`}
+            data-testid="ams-rfid"
+            title={`RFID reader ${rfid ? "online" : "offline"}`}
+          >
+            rfid {rfid ? "✓" : "✕"}
+          </span>
         )}
       </div>
       {units.map((u) => (

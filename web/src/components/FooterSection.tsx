@@ -2,14 +2,9 @@ import type { PrinterStatus } from "../types";
 
 export function FooterSection({ s }: { s: PrinterStatus }) {
   const chips: Array<[string, string]> = [];
-  // WiFi signal lives in the Overview band now; SD card in the Files panel header.
-  if (s.nozzle_diameter) {
-    chips.push([
-      "nozzle",
-      `${s.nozzle_diameter}${s.nozzle_type ? ` ${s.nozzle_type.replace(/_/g, " ")}` : ""}`,
-    ]);
-  }
-  if (s.online?.rfid != null) chips.push(["rfid", s.online.rfid ? "online" : "offline"]);
+  // The band carries WiFi + the nozzle spec; the AMS header carries RFID; the
+  // Files panel header carries the SD card. The footer is just conditional
+  // notices (an active timelapse, a pending firmware update) now.
   if (s.ipcam?.timelapse) chips.push(["timelapse", s.ipcam.timelapse]);
   // The chamber light has its own toggle in the controls panel — don't repeat it
   // here. Other light nodes (e.g. a work light) still surface as status chips.

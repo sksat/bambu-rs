@@ -44,7 +44,9 @@ export function App() {
               <div className="dash__control">
                 <Controls control={control} status={status}>
                   <MachineSection s={status} control={control} />
-                  {status.ams && <AmsSection ams={status.ams} />}
+                  {status.ams && (
+                    <AmsSection ams={status.ams} rfid={status.online?.rfid ?? null} />
+                  )}
                 </Controls>
               </div>
             </section>
