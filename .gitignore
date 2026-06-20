@@ -18,9 +18,10 @@
 # .env holds BAMBU_ACCESS_CODE and friends — never commit it
 .env
 
-# Web dashboard: build output (CI builds it; not committed) + node deps
-/web/dist/*
-!/web/dist/.gitkeep
+# Web dashboard: build output (CI builds it; not committed) + node deps.
+# build.rs create_dir_all's web/dist so the dashboard feature compiles on a
+# fresh checkout — no committed placeholder needed.
+/web/dist/
 /web/node_modules
 /web/test-results
 /web/playwright-report

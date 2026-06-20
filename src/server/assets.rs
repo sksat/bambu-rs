@@ -2,8 +2,9 @@
 //!
 //! `rust-embed` with `debug-embed` left **off**: debug builds read `web/dist/`
 //! from disk at runtime (so `pnpm dev`/rebuilds show up live), release builds
-//! embed the bytes into the binary. The folder must exist at compile time — a
-//! committed `web/dist/.gitkeep` guarantees that even before `pnpm build` runs.
+//! embed the bytes into the binary. The folder must exist at compile time;
+//! `build.rs` create_dir_all's it (under the `dashboard` feature) so a fresh
+//! checkout compiles even before `pnpm build` populates it.
 
 use axum::http::{Uri, header};
 use axum::response::{IntoResponse, Response};
