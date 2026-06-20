@@ -210,14 +210,36 @@ test.describe("dashboard (fake mode)", () => {
   });
 
   test("camera tabs render and switch the active source", async ({ page }) => {
-    // The E2E server is launched with two external --camera-url, so two tabs show.
+    // The E2E server is launched with two --camera-url + one --cameras-config (park
+    // cam), so three tabs show.
     const tabs = page.locator('[data-testid^="camera-tab-"]');
-    await expect(tabs).toHaveCount(2);
+    await expect(tabs).toHaveCount(3);
     await expect(page.getByTestId("camera-view")).toBeVisible();
     await expect(tabs.nth(0)).toHaveAttribute("aria-selected", "true");
     await tabs.nth(1).click();
     await expect(tabs.nth(1)).toHaveAttribute("aria-selected", "true");
     await expect(tabs.nth(0)).toHaveAttribute("aria-selected", "false");
+  });
+
+  test("a park-capable camera offers the live↔park toggle and start control", async ({
+    page,
+  }) => {
+    // The seeded "park cam" (a stream + a calibrated park_tuning) is park-capable, so
+    // its view gains a toggle and the timelapse bar a park start control. The other
+    // (snapshot-only) cameras do not.
+    await page.getByTestId("camera-tab-ext-0").click(); // a snapshot-only camera
+    await expect(page.getByTestId("camera-view-toggle")).toHaveCount(0);
+    await expect(page.getByTestId("timelapse-park-start")).toHaveCount(0);
+
+    await page.getByTestId("camera-tab-ext-2").click(); // the park cam
+    await expect(page.getByTestId("camera-view-toggle")).toBeVisible();
+    await expect(page.getByTestId("timelapse-park-start")).toBeVisible();
+
+    // Switching to the park view polls /api/cameras/{id}/park; with no run it 404s, so
+    // the view shows the park-specific "no frame yet" hint.
+    await page.getByTestId("camera-view-park").click();
+    await expect(page.getByTestId("camera-view")).toHaveAttribute("data-mode", "park");
+    await expect(page.getByTestId("camera-offline")).toContainText("park", { timeout: 15000 });
   });
 
   test("a dead camera reports the offline state", async ({ page }) => {
@@ -229,10 +251,10 @@ test.describe("dashboard (fake mode)", () => {
   test("camera manage modal: prefilled, adds a row, closes on scrim", async ({ page }) => {
     await page.getByTestId("cameras-manage").click();
     await expect(page.getByTestId("cameras-modal")).toBeVisible();
-    // Two configured cameras prefill two rows; wait for them before adding.
-    await expect(page.getByTestId("camera-url-1")).toBeVisible();
-    await page.getByTestId("camera-add").click();
+    // Three configured cameras prefill three rows; wait for them before adding.
     await expect(page.getByTestId("camera-url-2")).toBeVisible();
+    await page.getByTestId("camera-add").click();
+    await expect(page.getByTestId("camera-url-3")).toBeVisible();
     // Close by clicking the scrim (outside the box) — no save, so the shared
     // server's camera list is untouched.
     await page.getByTestId("cameras-modal").click({ position: { x: 6, y: 6 } });

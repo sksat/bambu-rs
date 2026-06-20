@@ -1,0 +1,20 @@
+[
+  {
+    "label": "park cam",
+    "url": "http://127.0.0.1:59997/p.jpg",
+    "stream_url": "http://127.0.0.1:59997/stream",
+    "park_tuning": {
+      "fps": 4,
+      "left_frac": 0.33,
+      "ema_seconds": 30,
+      "abs_floor": 1500,
+      "mad_k": 6,
+      "merge_gap_s": 1.2,
+      "max_island_s": 3,
+      "min_sep_s": 3,
+      "candidate_frac": 0.75,
+      "warmup_s": 4,
+      "baseline_s": 90
+    }
+  }
+]

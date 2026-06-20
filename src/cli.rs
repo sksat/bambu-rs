@@ -212,6 +212,13 @@ enum Command {
         /// be set via $BAMBU_CAMERA_URL (comma-separated).
         #[arg(long, env = "BAMBU_CAMERA_URL", value_delimiter = ',')]
         camera_url: Vec<String>,
+        /// Seed external cameras from a JSON file — a list of
+        /// `{ "label"?, "url", "stream_url"?, "park_tuning"? }`, the same shape as
+        /// `/api/cameras/config`. Unlike `--camera-url` this can carry a stream URL and
+        /// per-camera park tuning (so a camera is live-park-capable from launch). Seeded
+        /// after any `--camera-url`; all remain editable at runtime.
+        #[arg(long, value_name = "PATH")]
+        cameras_config: Option<std::path::PathBuf>,
     },
 }
 
@@ -705,6 +712,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             fake,
             interval,
             camera_url,
+            cameras_config,
         } => run_serve(
             cli,
             host,
@@ -713,6 +721,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             *fake,
             *interval,
             camera_url.clone(),
+            cameras_config.clone(),
         ),
     }
 }
@@ -1422,6 +1431,7 @@ fn run_serve(
     fake: bool,
     interval: Option<u64>,
     camera_url: Vec<String>,
+    cameras_config: Option<std::path::PathBuf>,
 ) -> Result<(), CliError> {
     // Live mode needs a connection target; fake mode doesn't touch the printer.
     let target = if fake {
@@ -1429,16 +1439,28 @@ fn run_serve(
     } else {
         Some(resolve_target(cli)?)
     };
-    // Parse each `--camera-url` entry (`label=url` or a bare `url`) into a labelled
-    // external camera, dropping blanks; the post-filter index gives stable
-    // sequential auto-labels (external 1, external 2, …).
-    let external_cameras = camera_url
+    // Parse each `--camera-url` entry (`label=url` or a bare `url`), then any from
+    // `--cameras-config` (which can also carry a stream URL + park tuning). The running
+    // index gives stable sequential auto-labels (external 1, external 2, …) across both.
+    let mut external_cameras: Vec<crate::server::ExternalCamera> = Vec::new();
+    for e in camera_url
         .iter()
         .map(|e| e.trim())
         .filter(|e| !e.is_empty())
-        .enumerate()
-        .filter_map(|(i, e)| crate::server::ExternalCamera::parse(e, i))
-        .collect();
+    {
+        if let Some(c) = crate::server::ExternalCamera::parse(e, external_cameras.len()) {
+            external_cameras.push(c);
+        }
+    }
+    if let Some(path) = &cameras_config {
+        for seed in load_seed_cameras(path)? {
+            let i = external_cameras.len();
+            external_cameras.push(
+                crate::server::ExternalCamera::new(seed.label, seed.url, seed.stream_url, i)
+                    .with_park_tuning(seed.park_tuning),
+            );
+        }
+    }
     let opts = crate::server::ServeOpts {
         host: host.to_string(),
         port,
@@ -1448,6 +1470,34 @@ fn run_serve(
         external_cameras,
     };
     crate::server::serve(target, opts).map_err(|e| CliError::new(exit::GENERAL, e.to_string()))
+}
+
+/// One entry of a `--cameras-config` JSON file — the same shape as `/api/cameras/config`,
+/// plus an optional `park_tuning` (validated by serde: no baked defaults).
+#[cfg(feature = "server")]
+#[derive(serde::Deserialize)]
+struct SeedCamera {
+    #[serde(default)]
+    label: Option<String>,
+    url: String,
+    #[serde(default)]
+    stream_url: Option<String>,
+    #[serde(default)]
+    park_tuning: Option<ParkTuning>,
+}
+
+/// Read `--cameras-config`: a JSON array of [`SeedCamera`]. A read/parse failure (incl. a
+/// partial park_tuning) is a clean validation error rather than a silent skip.
+#[cfg(feature = "server")]
+fn load_seed_cameras(path: &std::path::Path) -> Result<Vec<SeedCamera>, CliError> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| CliError::new(exit::VALIDATION, format!("reading {}: {e}", path.display())))?;
+    serde_json::from_str(&raw).map_err(|e| {
+        CliError::new(
+            exit::VALIDATION,
+            format!("invalid --cameras-config {}: {e}", path.display()),
+        )
+    })
 }
 
 fn run_gcode(
