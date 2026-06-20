@@ -4,6 +4,7 @@ import {
   getCamerasConfig,
   setCamerasConfig,
   type Camera,
+  type ParkTuning,
 } from "../cameras";
 import {
   getTimelapse,
@@ -23,18 +24,29 @@ import {
 const FAST_MS = 800;
 const SLOW_MS = 5000;
 
-// A live view of ONE camera by id. Two modes:
-//   - stream: a single long-lived <img> on the MJPEG `/stream` endpoint — the
-//     browser renders frames continuously, so there's NO re-fetch loop; on error
-//     we bump the cache-buster to reconnect after a back-off.
-//   - snapshot: poll one JPEG per cycle, driven off the <img> load/error so a
-//     slow source (e.g. the A1 built-in cam taking seconds to fail) is never
-//     re-requested before the current grab finishes.
-// A configured-but-not-streaming source shows an "offline" message. Re-mount it
-// (key by id) when the active tab changes to reset cleanly.
-function CameraView({ id, label, stream }: { id: string; label: string; stream?: boolean }) {
+// A live view of ONE camera by id. Views:
+//   - live: the camera itself — `stream` (a long-lived <img> on the MJPEG endpoint,
+//     continuous, no re-fetch loop) or `snapshot` (poll one JPEG per cycle, driven
+//     off load/error so a slow source is never re-requested before its grab finishes).
+//   - park: the live "parked frame per layer" preview (`/park` → latest_park.jpg),
+//     polled like a snapshot; only offered for park-capable cameras and only has
+//     content while a park run is active (404 → "no park frame yet").
+// A configured-but-dead source shows an "offline" message. Re-mount it (key by id)
+// when the active tab changes to reset cleanly.
+function CameraView({
+  id,
+  label,
+  stream,
+  park,
+}: {
+  id: string;
+  label: string;
+  stream?: boolean;
+  park?: boolean;
+}) {
   const [ts, setTs] = useState(() => Date.now());
   const [offline, setOffline] = useState(false);
+  const [view, setView] = useState<"live" | "park">("live");
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   useEffect(() => () => clearTimeout(timer.current), []);
@@ -44,29 +56,57 @@ function CameraView({ id, label, stream }: { id: string; label: string; stream?:
     timer.current = setTimeout(() => setTs(Date.now()), delay);
   };
 
-  const kind = stream ? "stream" : "snapshot";
+  const isPark = view === "park";
+  // Park previews poll (one JPEG per cycle); live is a continuous stream or a poll.
+  const polling = isPark || !stream;
+  const src = isPark
+    ? `/api/cameras/${id}/park?t=${ts}`
+    : `/api/cameras/${id}/${stream ? "stream" : "snapshot"}?t=${ts}`;
+  const show = (v: "live" | "park") => {
+    setView(v);
+    setOffline(false);
+    setTs(Date.now()); // force a fresh grab on switch
+  };
 
   return (
     <div className="cam__frame">
+      {park && (
+        <div className="cam__toggle" data-testid="camera-view-toggle">
+          <button
+            className={!isPark ? "cam__toggle-btn cam__toggle-btn--on" : "cam__toggle-btn"}
+            data-testid="camera-view-live"
+            onClick={() => show("live")}
+          >
+            live
+          </button>
+          <button
+            className={isPark ? "cam__toggle-btn cam__toggle-btn--on" : "cam__toggle-btn"}
+            data-testid="camera-view-park"
+            onClick={() => show("park")}
+          >
+            park
+          </button>
+        </div>
+      )}
       <img
         className={offline ? "cam__view cam__view--off" : "cam__view"}
         alt={label}
-        src={`/api/cameras/${id}/${kind}?t=${ts}`}
+        src={src}
         data-testid="camera-view"
-        data-mode={kind}
+        data-mode={isPark ? "park" : stream ? "stream" : "snapshot"}
         onLoad={() => {
           if (offline) setOffline(false);
-          // Stream is continuous — don't re-request it; only snapshots poll.
-          if (!stream) scheduleNext(FAST_MS);
+          // A continuous stream is never re-requested; snapshots and park polls are.
+          if (polling) scheduleNext(FAST_MS);
         }}
         onError={() => {
           if (!offline) setOffline(true);
-          scheduleNext(SLOW_MS); // reconnect (stream) / retry (snapshot)
+          scheduleNext(SLOW_MS); // reconnect (stream) / retry (snapshot/park)
         }}
       />
       {offline && (
         <div className="cam__msg" data-testid="camera-offline">
-          no frame — camera offline
+          {isPark ? "no park frame yet — start a park run" : "no frame — camera offline"}
         </div>
       )}
     </div>
@@ -118,6 +158,7 @@ function TimelapseBar({
 
   const multi = cameras.length > 1;
   const targets = allCams && multi ? cameras.map((c) => c.id) : [activeCamera];
+  const activeIsPark = cameras.find((c) => c.id === activeCamera)?.park ?? false;
 
   const startMode = async (mode: TimelapseMode) => {
     setBusy(true);
@@ -229,6 +270,38 @@ function TimelapseBar({
         )}
       </div>
 
+      {/* park: live "parked frame per layer" preview — only for park-capable cameras
+          (a stream + a calibrated tuning). Shows in the camera's `park` toggle view. */}
+      {activeIsPark && (
+        <div className="cam__tl-row">
+          {tl?.park.running ? (
+            <>
+              <span className="cam__tl-rec" data-testid="timelapse-park-running">
+                ● park — {runLabel(tl.park)}
+              </span>
+              <button
+                className="cam__manage"
+                data-testid="timelapse-park-stop"
+                disabled={busy}
+                onClick={() => void stopMode("park")}
+              >
+                stop
+              </button>
+            </>
+          ) : (
+            <button
+              className="cam__manage"
+              data-testid="timelapse-park-start"
+              disabled={busy}
+              title="live parked-frame preview per layer — switch the view to “park” to watch it"
+              onClick={() => void startMode("park")}
+            >
+              ● park (live preview)
+            </button>
+          )}
+        </div>
+      )}
+
       {msg && (
         <span className="cam__tl-msg dim" data-testid="timelapse-msg">
           {msg}
@@ -300,6 +373,7 @@ export function CamerasSection({ password }: { password: string | null }) {
                 id={activeCam.id}
                 label={activeCam.label}
                 stream={activeCam.stream}
+                park={activeCam.park}
               />
             )}
             {activeCam && (
@@ -327,6 +401,8 @@ interface Row {
   label: string;
   url: string;
   stream_url: string;
+  // Raw JSON for the per-camera park tuning (empty = none). Validated on save.
+  park_tuning: string;
 }
 
 // The manage dialog: a floating modal for editing the external-camera list (the
@@ -349,18 +425,44 @@ function CameraManageModal({
       const cfg = await getCamerasConfig(password);
       if (cfg === "needPassword") setStatus("needs the control password (set it in Controls)");
       else if (cfg === "error") setStatus("couldn't load camera config");
-      else setRows(cfg.map((e) => ({ label: e.label, url: e.url, stream_url: e.stream_url ?? "" })));
+      else
+        setRows(
+          cfg.map((e) => ({
+            label: e.label,
+            url: e.url,
+            stream_url: e.stream_url ?? "",
+            park_tuning: e.park_tuning ? JSON.stringify(e.park_tuning, null, 2) : "",
+          })),
+        );
     })();
   }, [password]);
 
   const save = async () => {
-    const external = rows
-      .map((r) => ({
+    const external: {
+      label?: string;
+      url: string;
+      stream_url?: string;
+      park_tuning?: ParkTuning;
+    }[] = [];
+    for (const r of rows) {
+      if (!r.url.trim()) continue;
+      let park_tuning: ParkTuning | undefined;
+      const pt = r.park_tuning.trim();
+      if (pt) {
+        try {
+          park_tuning = JSON.parse(pt) as ParkTuning;
+        } catch {
+          setStatus(`invalid park tuning JSON for “${r.label || r.url}” — must be a JSON object`);
+          return;
+        }
+      }
+      external.push({
         label: r.label.trim() || undefined,
         url: r.url.trim(),
         stream_url: r.stream_url.trim() || undefined,
-      }))
-      .filter((r) => r.url);
+        park_tuning,
+      });
+    }
     setStatus("saving…");
     const res = await setCamerasConfig(external, password);
     if (res === "needPassword") setStatus("needs the control password (set it in Controls)");
@@ -402,45 +504,69 @@ function CameraManageModal({
                 <span className="cam__col--rm" aria-hidden="true" />
               </div>
               {rows.map((r, i) => (
-                <div className="cam__row" key={i}>
-                  <input
-                    className="cam__in cam__in--label"
-                    placeholder="e.g. front"
-                    aria-label={`camera ${i + 1} name`}
-                    value={r.label}
-                    onChange={(e) =>
-                      setRows((rs) => rs.map((x, j) => (j === i ? { ...x, label: e.target.value } : x)))
-                    }
-                  />
-                  <input
-                    className="cam__in"
-                    placeholder="http://host/snapshot.jpg"
-                    aria-label={`camera ${i + 1} snapshot URL`}
-                    value={r.url}
-                    data-testid={`camera-url-${i}`}
-                    onChange={(e) =>
-                      setRows((rs) => rs.map((x, j) => (j === i ? { ...x, url: e.target.value } : x)))
-                    }
-                  />
-                  <input
-                    className="cam__in"
-                    placeholder="http://host/stream (optional)"
-                    aria-label={`camera ${i + 1} stream URL`}
-                    value={r.stream_url}
-                    data-testid={`camera-stream-${i}`}
-                    onChange={(e) =>
-                      setRows((rs) => rs.map((x, j) => (j === i ? { ...x, stream_url: e.target.value } : x)))
-                    }
-                  />
-                  <button
-                    className="cam__rm"
-                    data-testid={`camera-remove-${i}`}
-                    title="remove this camera"
-                    aria-label={`remove camera ${i + 1}`}
-                    onClick={() => setRows((rs) => rs.filter((_, j) => j !== i))}
-                  >
-                    ✕
-                  </button>
+                <div className="cam__row-group" key={i}>
+                  <div className="cam__row">
+                    <input
+                      className="cam__in cam__in--label"
+                      placeholder="e.g. front"
+                      aria-label={`camera ${i + 1} name`}
+                      value={r.label}
+                      onChange={(e) =>
+                        setRows((rs) => rs.map((x, j) => (j === i ? { ...x, label: e.target.value } : x)))
+                      }
+                    />
+                    <input
+                      className="cam__in"
+                      placeholder="http://host/snapshot.jpg"
+                      aria-label={`camera ${i + 1} snapshot URL`}
+                      value={r.url}
+                      data-testid={`camera-url-${i}`}
+                      onChange={(e) =>
+                        setRows((rs) => rs.map((x, j) => (j === i ? { ...x, url: e.target.value } : x)))
+                      }
+                    />
+                    <input
+                      className="cam__in"
+                      placeholder="http://host/stream (optional)"
+                      aria-label={`camera ${i + 1} stream URL`}
+                      value={r.stream_url}
+                      data-testid={`camera-stream-${i}`}
+                      onChange={(e) =>
+                        setRows((rs) =>
+                          rs.map((x, j) => (j === i ? { ...x, stream_url: e.target.value } : x)),
+                        )
+                      }
+                    />
+                    <button
+                      className="cam__rm"
+                      data-testid={`camera-remove-${i}`}
+                      title="remove this camera"
+                      aria-label={`remove camera ${i + 1}`}
+                      onClick={() => setRows((rs) => rs.filter((_, j) => j !== i))}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                  {/* Optional per-camera park tuning (needs a stream URL too). Edited as
+                      raw JSON — paste tuning.example.json and calibrate; server validates. */}
+                  <details className="cam__park" open={r.park_tuning.trim() !== ""}>
+                    <summary className="cam__park-sum">
+                      park tuning (JSON) — enables the live park preview
+                    </summary>
+                    <textarea
+                      className="cam__park-json"
+                      data-testid={`camera-park-${i}`}
+                      placeholder={'paste tuning.example.json and calibrate (left_frac, abs_floor, …)'}
+                      value={r.park_tuning}
+                      spellCheck={false}
+                      rows={6}
+                      onChange={(e) =>
+                        setRows((rs) =>
+                          rs.map((x, j) => (j === i ? { ...x, park_tuning: e.target.value } : x)),
+                        )
+                      }
+                    />
+                  </details>
                 </div>
               ))}
             </>
@@ -453,7 +579,9 @@ function CameraManageModal({
             <button
               className="cam__btn"
               data-testid="camera-add"
-              onClick={() => setRows((rs) => [...rs, { label: "", url: "", stream_url: "" }])}
+              onClick={() =>
+              setRows((rs) => [...rs, { label: "", url: "", stream_url: "", park_tuning: "" }])
+            }
             >
               + add camera
             </button>

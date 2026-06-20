@@ -19,13 +19,14 @@ export interface RunState {
 }
 
 /** The combined status: top-level mirrors the smooth run (back-compat) and
- *  `running` is true if either run is active; `smooth`/`plain` give each run. */
+ *  `running` is true if any run is active; `smooth`/`plain`/`park` give each run. */
 export interface TimelapseState extends RunState {
   smooth: RunState;
   plain: RunState;
+  park: RunState;
 }
 
-export type TimelapseMode = "smooth" | "plain";
+export type TimelapseMode = "smooth" | "plain" | "park";
 
 export async function getTimelapse(): Promise<TimelapseState | null> {
   try {
@@ -62,8 +63,9 @@ export function startTimelapse(
   password: string | null,
 ): Promise<Write> {
   const body: Record<string, unknown> = { mode, cameras };
+  // park has no cadence knobs (the signal is in the camera stream); smooth/plain do.
   if (mode === "plain") body.interval_ms = opts.intervalMs ?? 3000;
-  else body.every = opts.every ?? 1;
+  else if (mode === "smooth") body.every = opts.every ?? 1;
   return post("/api/timelapse/start", body, password);
 }
 

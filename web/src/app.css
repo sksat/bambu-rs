@@ -1322,7 +1322,59 @@ div.lbl,
   color: var(--dim);
   pointer-events: none;
 }
+/* live ↔ park view toggle, floated over the frame's top-right (park-capable cams) */
+.cam__toggle {
+  position: absolute;
+  top: 0.45rem;
+  right: 0.45rem;
+  z-index: 1;
+  display: flex;
+  border: 1px solid var(--hair);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.cam__toggle-btn {
+  font-size: 0.64rem;
+  padding: 0.15rem 0.5rem;
+  color: var(--dim);
+  background: color-mix(in srgb, var(--panel) 78%, transparent);
+  border: none;
+  cursor: pointer;
+}
+.cam__toggle-btn--on {
+  color: var(--bg);
+  background: var(--accent);
+}
 /* manage form: add/remove external cameras at runtime */
+.cam__row-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+/* per-camera park tuning editor (collapsible JSON) */
+.cam__park {
+  margin: 0 0 0.15rem 0.1rem;
+}
+.cam__park-sum {
+  font-size: 0.66rem;
+  color: var(--dim);
+  cursor: pointer;
+  user-select: none;
+}
+.cam__park-json {
+  width: 100%;
+  margin-top: 0.3rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.68rem;
+  line-height: 1.4;
+  color: var(--fg);
+  background: var(--hair-2);
+  border: 1px solid var(--hair);
+  border-radius: 6px;
+  padding: 0.35rem 0.45rem;
+  resize: vertical;
+  box-sizing: border-box;
+}
 .cam__form {
   margin-top: 0.55rem;
   display: flex;
