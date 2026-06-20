@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { Control, Axis } from "../useControl";
 import type { PrinterStatus } from "../types";
+import { WifiSignal } from "./widgets";
 
 // Motion is unsafe mid-job: jog/home/calibrate are gated on these phases.
 const BUSY_STATES = new Set(["RUNNING", "PAUSE", "PREPARE", "SLICING"]);
@@ -218,6 +219,19 @@ export function MachineSection({ s, control }: { s: PrinterStatus; control: Cont
       {/* ── MAINTENANCE ──────────────────────────────────────────────────── */}
       <div className="msub">
         <div className="lbl">maintenance</div>
+        {/* Hardware/connectivity status you check during upkeep: the installed nozzle
+            spec and the WiFi signal. Each renders only when its data is present. */}
+        {(s.nozzle_diameter || s.wifi_signal) && (
+          <div className="mstat" data-testid="machine-hw">
+            {s.nozzle_diameter && (
+              <span className="jobspec" data-testid="nozzle-spec" title="installed nozzle">
+                Ø{s.nozzle_diameter}
+                {s.nozzle_type ? ` ${s.nozzle_type.replace(/_/g, " ")}` : ""}
+              </span>
+            )}
+            <WifiSignal signal={s.wifi_signal} />
+          </div>
+        )}
         <div className="calrow">
           <label className="startrow" title="auto bed leveling">
             <input

@@ -38,11 +38,15 @@ function CameraView({
   label,
   stream,
   park,
+  parkRunning,
 }: {
   id: string;
   label: string;
   stream?: boolean;
   park?: boolean;
+  // Whether a park run is active for THIS camera — the park view only has frames then,
+  // so the toggle is enabled only while it's true.
+  parkRunning?: boolean;
 }) {
   const [ts, setTs] = useState(() => Date.now());
   const [offline, setOffline] = useState(false);
@@ -50,12 +54,12 @@ function CameraView({
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   useEffect(() => () => clearTimeout(timer.current), []);
-  // If this camera loses park capability while in the park view (e.g. its tuning was
-  // cleared in the manage form), fall back to live — the toggle hides, so otherwise it'd
-  // be stuck polling the now-gone /park endpoint with no way back.
+  // Fall back to live if the park view stops being valid — capability cleared (toggle
+  // hides) OR the park run ended (its /park endpoint now 404s) — so we never sit stuck
+  // on an empty park view.
   useEffect(() => {
-    if (!park) setView("live");
-  }, [park]);
+    if (view === "park" && (!park || !parkRunning)) setView("live");
+  }, [park, parkRunning, view]);
 
   const scheduleNext = (delay: number) => {
     clearTimeout(timer.current);
@@ -88,6 +92,8 @@ function CameraView({
           <button
             className={isPark ? "cam__toggle-btn cam__toggle-btn--on" : "cam__toggle-btn"}
             data-testid="camera-view-park"
+            disabled={!parkRunning}
+            title={parkRunning ? undefined : "start a park run to see the live preview"}
             onClick={() => show("park")}
           >
             park
@@ -324,6 +330,9 @@ export function CamerasSection({ password }: { password: string | null }) {
   const [cameras, setCameras] = useState<Camera[]>([]);
   const [active, setActive] = useState<string>("");
   const [managing, setManaging] = useState(false);
+  // The live park run's state, so the view can offer the park toggle only while a run is
+  // actually producing frames for the active camera.
+  const [parkRun, setParkRun] = useState<RunState | null>(null);
 
   const reload = async () => {
     const cams = await listCameras();
@@ -335,7 +344,22 @@ export function CamerasSection({ password }: { password: string | null }) {
     void reload();
   }, []);
 
+  useEffect(() => {
+    let live = true;
+    const poll = async () => {
+      const s = await getTimelapse();
+      if (live) setParkRun(s?.park ?? null);
+    };
+    void poll();
+    const id = setInterval(() => void poll(), 2000);
+    return () => {
+      live = false;
+      clearInterval(id);
+    };
+  }, []);
+
   const activeCam = cameras.find((c) => c.id === active);
+  const parkRunning = !!parkRun?.running && parkRun.cameras.includes(active);
 
   return (
     <>
@@ -380,6 +404,7 @@ export function CamerasSection({ password }: { password: string | null }) {
                 label={activeCam.label}
                 stream={activeCam.stream}
                 park={activeCam.park}
+                parkRunning={parkRunning}
               />
             )}
             {activeCam && (

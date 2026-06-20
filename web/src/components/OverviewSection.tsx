@@ -2,7 +2,7 @@ import type { PrinterStatus } from "../types";
 import type { Control } from "../useControl";
 import { fmtEta, fmtFinishTime, speedName } from "../format";
 import { JobControls } from "./Controls";
-import { Bar, Field, Thumb, WifiSignal } from "./widgets";
+import { Bar, Field, Thumb } from "./widgets";
 
 export function OverviewSection({ s, control }: { s: PrinterStatus; control: Control }) {
   const state = s.gcode_state ?? "—";
@@ -32,18 +32,6 @@ export function OverviewSection({ s, control }: { s: PrinterStatus; control: Con
             )}
             {preparing && <span className="chip warn">preparing</span>}
           </div>
-        </div>
-        {/* Hardware/connectivity cluster in the band's top-right corner: the
-            installed nozzle spec and the WiFi signal you keep an eye on while a
-            print runs. Each piece renders only when its data is present. */}
-        <div className="job__hw">
-          {s.nozzle_diameter && (
-            <span className="jobspec" data-testid="nozzle-spec" title="installed nozzle">
-              Ø{s.nozzle_diameter}
-              {s.nozzle_type ? ` ${s.nozzle_type.replace(/_/g, " ")}` : ""}
-            </span>
-          )}
-          <WifiSignal signal={s.wifi_signal} />
         </div>
       </div>
       <Bar pct={shown} prep={preparing} running={state === "RUNNING"} />

@@ -321,11 +321,13 @@ div.lbl,
 }
 /* Hardware/connectivity cluster pinned to the band's top-right: the nozzle spec
    sits beside the WiFi meter, both keeping their size so the filename shrinks. */
-.job__hw {
+/* hardware/connectivity status row inside the maintenance panel: nozzle spec + WiFi */
+.mstat {
   display: flex;
   align-items: center;
   gap: 0.6rem;
-  flex-shrink: 0;
+  flex-wrap: wrap;
+  margin-bottom: 0.45rem;
 }
 .jobspec {
   font-family: var(--mono);
@@ -1344,6 +1346,10 @@ div.lbl,
 .cam__toggle-btn--on {
   color: var(--bg);
   background: var(--accent);
+}
+.cam__toggle-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 /* manage form: add/remove external cameras at runtime */
 .cam__row-group {

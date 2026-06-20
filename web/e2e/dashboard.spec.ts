@@ -14,19 +14,23 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("bed-temp")).toContainText("°C");
   });
 
-  test("wifi signal shows as a tiered meter in the overview band", async ({ page }) => {
-    const wifi = page.getByTestId("wifi");
+  test("wifi signal shows as a tiered meter in the maintenance panel", async ({ page }) => {
+    // WiFi + nozzle spec live in the machine panel's maintenance block (status you
+    // check during upkeep), not the job overview band.
+    const wifi = page.getByTestId("machine-hw").getByTestId("wifi");
     // The fake reports -58dBm → a "fair" tier (warn tone), dBm shown as text.
     await expect(wifi).toBeVisible();
     await expect(wifi).toContainText("-58dBm");
     await expect(wifi).toHaveClass(/wifi--warn/);
   });
 
-  test("nozzle spec shows beside the WiFi meter in the overview band", async ({ page }) => {
-    const n = page.getByTestId("nozzle-spec");
+  test("nozzle spec shows beside the WiFi meter in the maintenance panel", async ({ page }) => {
+    const hw = page.getByTestId("machine-hw");
+    const n = hw.getByTestId("nozzle-spec");
     await expect(n).toBeVisible();
     await expect(n).toContainText("0.4");
     await expect(n).toContainText("stainless");
+    await expect(hw.getByTestId("wifi")).toBeVisible(); // beside the wifi meter
   });
 
   test("RFID reader state shows in the AMS header", async ({ page }) => {
@@ -57,7 +61,7 @@ test.describe("dashboard (fake mode)", () => {
   });
 
   test("the footer no longer duplicates relocated machine status", async ({ page }) => {
-    // WiFi + nozzle moved to the overview band, RFID to the AMS header, and the
+    // WiFi + nozzle moved to the maintenance panel, RFID to the AMS header, and the
     // chamber light keeps only its controls toggle. In fake mode that leaves the
     // footer with no chips, so it isn't rendered at all.
     await expect(page.getByTestId("light-toggle")).toBeVisible();
@@ -235,11 +239,10 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("camera-view-toggle")).toBeVisible();
     await expect(page.getByTestId("timelapse-park-start")).toBeVisible();
 
-    // Switching to the park view polls /api/cameras/{id}/park; with no run it 404s, so
-    // the view shows the park-specific "no frame yet" hint.
-    await page.getByTestId("camera-view-park").click();
-    await expect(page.getByTestId("camera-view")).toHaveAttribute("data-mode", "park");
-    await expect(page.getByTestId("camera-offline")).toContainText("park", { timeout: 15000 });
+    // No park run is active, so there's nothing to show in the park view — the park
+    // toggle is disabled until a run is started (you can't switch to an empty preview).
+    await expect(page.getByTestId("camera-view-park")).toBeDisabled();
+    await expect(page.getByTestId("camera-view-live")).toBeEnabled();
   });
 
   test("a dead camera reports the offline state", async ({ page }) => {
