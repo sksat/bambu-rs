@@ -198,6 +198,14 @@ function RecRow({
   );
 }
 
+// Tooltips for the clean-timelapse method override. Best-first; `segment` is the robust
+// default, `park`/`smooth` kept for comparison or as fallbacks.
+const METHOD_TITLE: Record<string, string> = {
+  segment: "dense camera stream — one clean parked frame per layer (recommended)",
+  park: "camera-detected park (legacy — misses the brief native park on some framings)",
+  smooth: "printer layer-synced snapshot burst",
+};
+
 // Start/stop the serve-internal capture for this print. Two purposes, each auto-picking
 // its method by the active camera: "clean timelapse" (one parked frame per layer — park
 // detection on a stream+tuning camera, else printer-layer-synced smooth) and "print video"
@@ -220,6 +228,9 @@ function TimelapseBar({
   const [plainSecs, setPlainSecs] = useState(3);
   // What a manual "record" captures: the object-only timelapse, or a head-in-shot video.
   const [recType, setRecType] = useState<"timelapse" | "video">("timelapse");
+  // Manual override of the clean-timelapse METHOD (segment/park/smooth). `null` = use the
+  // capability-based default (the best the active camera supports); set it to force one.
+  const [layerMethod, setLayerMethod] = useState<TimelapseMode | null>(null);
 
   useEffect(() => {
     let live = true;
@@ -245,11 +256,20 @@ function TimelapseBar({
   const active = cameras.find((c) => c.id === activeCamera);
   const activeIsSegment = active?.segment ?? false;
   const activeIsPark = active?.park ?? false;
-  // Clean timelapse method, best-first: the robust dense-stream `segment` (stream +
-  // park_tuning + select_tuning), else the old camera-detected `park`, else printer-synced
-  // `smooth`. segment ≫ park (full-layer capture vs the brief-park miner it supersedes).
-  const layerMode: TimelapseMode = activeIsSegment ? "segment" : activeIsPark ? "park" : "smooth";
-  const layerRun = activeIsSegment ? tl?.segment : activeIsPark ? tl?.park : tl?.smooth;
+  // The clean-timelapse methods this camera supports, best-first: the robust dense-stream
+  // `segment` (stream + park_tuning + select_tuning) ≫ the old camera-detected `park`
+  // (stream + park_tuning) ≫ printer-synced `smooth` (every camera). The first is the
+  // DEFAULT; the user can override to any supported one (the method selector below).
+  const layerMethods: TimelapseMode[] = activeIsSegment
+    ? ["segment", "park", "smooth"]
+    : activeIsPark
+      ? ["park", "smooth"]
+      : ["smooth"];
+  // Effective method: the user's pick when it's available for this camera, else the default.
+  const layerMode: TimelapseMode =
+    layerMethod && layerMethods.includes(layerMethod) ? layerMethod : layerMethods[0];
+  const layerRun =
+    layerMode === "segment" ? tl?.segment : layerMode === "park" ? tl?.park : tl?.smooth;
   const targetCams = allCams && multi ? cameras : active ? [active] : [];
   const anySnapshot = targetCams.some((c) => !c.stream);
   // What the selected record type maps to: clean timelapse → park (camera-detected) or
@@ -258,13 +278,15 @@ function TimelapseBar({
   const recRun = recType === "timelapse" ? layerRun : tl?.plain;
   // The interval input only matters for a sampled (snapshot-camera) video.
   const showEvery = recType === "video" && anySnapshot;
+  const layerHint =
+    layerMode === "segment"
+      ? "object only — one clean parked frame per layer, from the dense camera stream; review in the “captured” view above"
+      : layerMode === "park"
+        ? "object only — one parked frame per layer, detected from the camera; review in the “captured” view above"
+        : "object only — one parked frame per layer, printer-synced";
   const recHint =
     recType === "timelapse"
-      ? activeIsSegment
-        ? "object only — one clean parked frame per layer, from the dense camera stream; review in the “captured” view above"
-        : activeIsPark
-          ? "object only — one parked frame per layer, detected from the camera; review in the “captured” view above"
-          : "object only — one parked frame per layer, printer-synced"
+      ? layerHint
       : anySnapshot
         ? "head in shot — a sped-up video sampled from snapshots"
         : "head in shot — records the live camera stream";
@@ -376,6 +398,31 @@ function TimelapseBar({
             video
           </button>
         </div>
+        {/* Clean-timelapse METHOD: defaults to the best the camera supports; override here.
+            Only shown when there's a real choice (a segment/park-capable camera). */}
+        {recType === "timelapse" && layerMethods.length > 1 && (
+          <div
+            className="seg seg--method"
+            role="radiogroup"
+            aria-label="timelapse method"
+            data-testid="rec-method"
+          >
+            {layerMethods.map((m) => (
+              <button
+                key={m}
+                className={`btn btn--sm seg__opt${layerMode === m ? " is-active" : ""}`}
+                role="radio"
+                aria-checked={layerMode === m}
+                disabled={busy}
+                data-testid={`rec-method-${m}`}
+                title={METHOD_TITLE[m]}
+                onClick={() => setLayerMethod(m)}
+              >
+                {m}
+              </button>
+            ))}
+          </div>
+        )}
         {showEvery && (
           <label className="dim cam__rec-every">
             every{" "}

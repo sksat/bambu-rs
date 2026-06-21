@@ -1754,6 +1754,9 @@ div.lbl,
 .seg--rectype {
   margin-top: 0;
 }
+.seg--method {
+  margin-top: 0;
+}
 .cam__rec-every {
   font-size: 0.72rem;
 }

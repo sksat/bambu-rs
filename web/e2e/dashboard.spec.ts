@@ -435,6 +435,49 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("camera-view-live")).toBeEnabled();
   });
 
+  test("the clean-timelapse method can be overridden (segment default, force park)", async ({
+    page,
+  }) => {
+    // A segment-capable camera supports all three clean-timelapse methods. The selector
+    // defaults to the best (segment) but lets the user force another — the record then
+    // starts the OVERRIDDEN mode, not the default.
+    await page.route("**/api/camera", (r) =>
+      r.fulfill({
+        json: {
+          cameras: [
+            {
+              id: "ext-0",
+              kind: "external",
+              label: "seg cam",
+              stream: true,
+              park: true,
+              segment: true,
+            },
+          ],
+        },
+      }),
+    );
+    let startedMode = "";
+    await page.route("**/api/timelapse/start", async (r) => {
+      startedMode = (r.request().postDataJSON() as { mode: string }).mode;
+      await r.fulfill({ json: { segment: { running: true } } });
+    });
+    await page.reload();
+    await expect(page.getByTestId("state")).toBeVisible();
+
+    // All three methods are offered; segment is the default (active).
+    await expect(page.getByTestId("rec-method")).toBeVisible();
+    await expect(page.getByTestId("rec-method-segment")).toHaveAttribute("aria-checked", "true");
+    await expect(page.getByTestId("rec-method-park")).toBeVisible();
+    await expect(page.getByTestId("rec-method-smooth")).toBeVisible();
+
+    // Override to park, then record → the start carries park, not the segment default.
+    await page.getByTestId("rec-method-park").click();
+    await expect(page.getByTestId("rec-method-park")).toHaveAttribute("aria-checked", "true");
+    await page.getByTestId("record-start").click();
+    await expect.poll(() => startedMode).toBe("park");
+  });
+
   test("park player scrubs the captured filmstrip (mocked run)", async ({ page }) => {
     // Fake mode has no real ffmpeg park run, so drive the player off mocked endpoints: a
     // live run that owns the park cam (ext-2) with a 3-frame filmstrip. This exercises the

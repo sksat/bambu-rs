@@ -4,18 +4,24 @@ import { ModelView } from "./Viewer3D";
 import { listCameras, type Camera } from "../cameras";
 import { startTimelapse, type TimelapseMode } from "../timelapse";
 
-// The default recording camera: park-capable (park detection) preferred, else any
-// external (printer-synced smooth), else the first. The user can override this in the
-// dialog — this is just the smart default.
+// The default recording camera: segment-capable (the robust dense-stream capture) preferred,
+// then park-capable (park detection), then any external (printer-synced smooth), else the
+// first. The user can override this in the dialog — this is just the smart default.
 function bestRecCamera(cams: Camera[]): Camera | undefined {
-  return cams.find((c) => c.park) ?? cams.find((c) => c.kind === "external") ?? cams[0];
+  return (
+    cams.find((c) => c.segment) ??
+    cams.find((c) => c.park) ??
+    cams.find((c) => c.kind === "external") ??
+    cams[0]
+  );
 }
 
-// The clean-timelapse method a camera uses (park detection vs printer-synced smooth).
+// The clean-timelapse method a camera uses, best-first: dense-stream segment, else camera
+// park detection, else printer-synced smooth. Matches the camera panel's auto-pick.
 function recMethod(cam: Camera): { mode: TimelapseMode; label: string } {
-  return cam.park
-    ? { mode: "park", label: "park detection" }
-    : { mode: "smooth", label: "printer-synced" };
+  if (cam.segment) return { mode: "segment", label: "dense stream" };
+  if (cam.park) return { mode: "park", label: "park detection" };
+  return { mode: "smooth", label: "printer-synced" };
 }
 
 // When a print is started with timelapse armed, also kick off the clean-timelapse capture
