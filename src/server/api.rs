@@ -1392,15 +1392,33 @@ fn live_park_source(st: &AppState) -> Option<(String, Vec<String>, bool)> {
         st.timelapse.status_park(),
         st.timelapse.status_smooth(),
     ];
+    // Prefer a RUNNING run so the preview follows the active capture (segment → park →
+    // smooth on a tie, but they're rarely all live at once).
     if let Some(s) = sources
         .iter()
         .find(|s| s.running && s.out_dir.is_some())
     {
         return Some((s.out_dir.clone().unwrap(), s.cameras.clone(), s.running));
     }
+    // Otherwise the most RECENT completed run, not a fixed slot order — the run dir is
+    // `captures/<epoch>_<hint>_<mode>`, so its leading epoch orders them by recency with no
+    // extra bookkeeping (else a stale segment dir would shadow a newer park/smooth one).
     sources
         .into_iter()
-        .find_map(|s| s.out_dir.map(|dir| (dir, s.cameras, s.running)))
+        .filter(|s| s.out_dir.is_some())
+        .max_by_key(|s| run_dir_epoch(s.out_dir.as_deref().unwrap_or("")))
+        .map(|s| (s.out_dir.unwrap(), s.cameras, s.running))
+}
+
+/// Recency key for a run dir (`captures/<epoch>_<hint>_<mode>`): its leading epoch. An
+/// unparseable dir sorts oldest, so a real run always wins over a malformed one.
+fn run_dir_epoch(dir: &str) -> u64 {
+    std::path::Path::new(dir)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .and_then(|f| f.split('_').next())
+        .and_then(|e| e.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 async fn park_index(State(st): State<AppState>, Path(id): Path<String>) -> Response {
@@ -3014,6 +3032,22 @@ mod tests {
             .json(&json!({ "mode": "segment", "camera": "ext-0" }))
             .await
             .assert_status_bad_request();
+    }
+
+    #[test]
+    fn run_dir_epoch_orders_runs_by_recency() {
+        // The live park preview falls back to the most recent completed run; the dir's
+        // leading epoch is the recency key (mode suffix and hint underscores don't matter).
+        assert_eq!(
+            super::run_dir_epoch("captures/1718900000_benchy_segment"),
+            1718900000
+        );
+        assert!(
+            super::run_dir_epoch("captures/1718900500_x_park")
+                > super::run_dir_epoch("captures/1718900000_x_segment"),
+            "a later epoch is more recent regardless of slot"
+        );
+        assert_eq!(super::run_dir_epoch("captures/not-a-run"), 0, "unparseable sorts oldest");
     }
 
     #[tokio::test]
