@@ -367,14 +367,16 @@ fn stop_slot(inner: &Mutex<Inner>) -> bool {
 /// native `time_lapse_gcode` parks the head at the far-left X-min *after*
 /// `layer_num` increments and holds it ~300 ms, so a single grab at the edge
 /// catches the head still over the print. Device calibration found the park lands
-/// at a widely VARIABLE delay — ~300 ms to ~1700 ms, jittering layer-to-layer and
-/// drifting with print height — so the burst spans that whole range; one offset
-/// per layer lands in the park, and the per-layer selector picks it (or skips the
-/// layer). Real-hardware A/B (2026-06-21) showed parks landing past 1500 ms, so the
-/// window now reaches 1900 ms. Each frame is tagged with its offset; override via
-/// `burst_offsets_ms`.
-pub const DEFAULT_SMOOTH_BURST_MS: &[u64] =
-    &[100, 300, 500, 700, 900, 1100, 1300, 1500, 1700, 1900];
+/// at a widely VARIABLE delay, jittering layer-to-layer and DRIFTING LATER with print
+/// height — so the burst spans the range; one offset per layer lands in the park, and
+/// the per-layer selector picks it (or skips the layer). A full-benchy diagnosis
+/// (2026-06-21) found the selected parks cluster at the 1900 ms window EDGE while the
+/// skipped layers had no left excursion in 100–1900 ms at all — i.e. the park had drifted
+/// PAST the window on the taller layers. So the window now reaches 2900 ms. Each frame is
+/// tagged with its offset; override via `burst_offsets_ms`.
+pub const DEFAULT_SMOOTH_BURST_MS: &[u64] = &[
+    100, 300, 500, 700, 900, 1100, 1300, 1500, 1700, 1900, 2100, 2300, 2500, 2700, 2900,
+];
 
 /// `frame_<n>_layer_<L>_t<offset>.jpg`. The offset tag distinguishes a layer's
 /// burst samples and records which delay produced each one (for calibration).
