@@ -87,7 +87,7 @@ after the edge — default `400,600,800,1000,1200` ms — saved as
 
 ```bash
 # register the external cameras once (runtime only — never commit these URLs)
-curl -X POST "$B/api/cameras/config" -H 'content-type: application/json' \
+curl -X POST "$B/api/camera/config" -H 'content-type: application/json' \
   -d '{"external":[{"label":"atom cam","url":"http://<ATOM_IP>/cgi-bin/get_jpeg.cgi"},
                    {"label":"ustreamer","url":"http://<USTREAMER_HOST>/snapshot","stream_url":"http://<USTREAMER_HOST>/stream"}]}'
 
