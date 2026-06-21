@@ -17,11 +17,13 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::core::park::{LiveParkDetector, Park, ParkTuning};
+use crate::core::park::{
+    LiveParkDetector, Park, ParkTuning, SegmentPick, SegmentSelector, SelectTuning,
+};
 
 /// Detection decode size (tiny grayscale): enough signal for the left-zone park, cheap
 /// to score per frame. Matches the Python miner's default.
@@ -238,6 +240,72 @@ pub fn detect_stream(
     stats
 }
 
+/// Resolve one segment pick to disk: it carries no left-mass/sharpness (the median-subtract
+/// selector only yields an offset + confidence), and its `t` records the print LAYER rather
+/// than a timestamp — what a per-layer timelapse keys on. A pick is always a fresh frame
+/// (one per layer), never a same-layer supersession, so `replace` is false.
+fn emit_segment_pick(
+    pick: &SegmentPick,
+    ring_jpeg: &dyn Fn(u64) -> PathBuf,
+    await_ring: &dyn Fn(&Path) -> bool,
+    writer: &mut ParkWriter,
+    on_emit: &mut dyn FnMut(ParkEvent),
+    stats: &mut ParkRunStats,
+) {
+    let park = Park {
+        idx: pick.idx,
+        t: pick.layer as f64,
+        left_mass: 0.0,
+        sharpness: 0.0,
+        confidence: pick.confidence,
+        replace: false,
+    };
+    emit_park(&park, ring_jpeg, await_ring, writer, on_emit, stats);
+}
+
+/// Drive the dense-stream [`SegmentSelector`] over a gray rawvideo stream, writing the
+/// picked frame per print layer. The continuous stream alternative to [`detect_stream`]'s
+/// camera-only miner: instead of detecting the park by image change (which misses the
+/// brief native park), it segments the stream by LAYER (`layer_of(idx)` — the test maps
+/// idx→layer, the server reads a live atomic fed by MQTT) and median-subtract-selects the
+/// parked frame within each layer's first `window_ms`. Frame capture time is modeled from
+/// the fixed ffmpeg cadence (`idx / fps`), matching the device model. Pure of ffmpeg the
+/// same way `detect_stream` is — `reader`, `ring_jpeg`, `await_ring`, `cancel`, `on_emit`
+/// are injected, so it's unit-tested with an in-memory modeled stream and fake ring files.
+#[allow(clippy::too_many_arguments)]
+pub fn detect_stream_segmented(
+    reader: &mut dyn Read,
+    sel: &mut SegmentSelector,
+    frame_size: usize,
+    fps: f64,
+    layer_of: &dyn Fn(u64) -> i64,
+    writer: &mut ParkWriter,
+    ring_jpeg: &dyn Fn(u64) -> PathBuf,
+    await_ring: &dyn Fn(&Path) -> bool,
+    cancel: &dyn Fn() -> bool,
+    on_emit: &mut dyn FnMut(ParkEvent),
+) -> ParkRunStats {
+    let mut stats = ParkRunStats::default();
+    let mut buf = vec![0u8; frame_size];
+    let mut idx: u64 = 0;
+    loop {
+        if cancel() || !read_full(reader, &mut buf) {
+            break;
+        }
+        let layer = layer_of(idx);
+        let t_ms = (idx as f64 * 1000.0 / fps) as u64;
+        if let Some(pick) = sel.push(layer, idx, t_ms, buf.clone()) {
+            emit_segment_pick(&pick, ring_jpeg, await_ring, writer, on_emit, &mut stats);
+        }
+        idx += 1;
+        stats.frames += 1;
+    }
+    if let Some(pick) = sel.finish() {
+        emit_segment_pick(&pick, ring_jpeg, await_ring, writer, on_emit, &mut stats);
+    }
+    stats
+}
+
 /// One stream camera selected for live park detection: its id, the MJPEG stream URL
 /// ffmpeg opens, and its per-camera tuning (framing is camera-specific, so the tuning is
 /// too — there are no shared defaults).
@@ -285,6 +353,86 @@ pub fn prune_ring(ring_dir: &Path, keep: usize) -> usize {
 /// park lag, so an in-flight park's JPEG is always still present when it's written out.
 const RING_KEEP_SECONDS: f64 = 60.0;
 
+/// A spawned park-tee ffmpeg: the gray rawvideo stdout to read, plus the handles to shut it
+/// down cleanly. Shared by [`run_park_camera`] and [`run_segment_camera`] — both open the
+/// identical MJPEG tee ([`live_park_args`]) and differ only in HOW they consume the gray
+/// stream (image-change detection vs. layer segmenting).
+struct ParkFfmpeg {
+    stdout: std::process::ChildStdout,
+    child: Arc<Mutex<std::process::Child>>,
+    done: Arc<AtomicBool>,
+    aux: std::thread::JoinHandle<()>,
+}
+
+impl ParkFfmpeg {
+    /// Tell the aux thread to stop, join it, and reap ffmpeg. The caller removes the ring
+    /// dir afterward (it owns the path).
+    fn shutdown(self) {
+        self.done.store(true, Ordering::Relaxed);
+        let _ = self.aux.join();
+        let _ = self.child.lock().unwrap().wait();
+    }
+}
+
+/// Spawn the park-tee ffmpeg for one camera, teeing into `ring`, plus the aux thread that
+/// KILLS ffmpeg the instant `cancel` is set (the consuming read blocks until bytes arrive,
+/// so it can't observe `cancel` itself) and prunes the ring on a sliding window. `id` only
+/// labels the spawn error. This is the thin, on-device-verified I/O seam both runners share.
+fn spawn_park_ffmpeg(
+    id: &str,
+    stream_url: &str,
+    ring: &Path,
+    fps: f64,
+    w: usize,
+    h: usize,
+    cancel: &Arc<AtomicBool>,
+) -> Result<ParkFfmpeg, String> {
+    let mut child = std::process::Command::new("ffmpeg")
+        .args(live_park_args(stream_url, ring, fps, w, h))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("park {id}: ffmpeg spawn failed: {e}"))?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let child = Arc::new(Mutex::new(child));
+    let done = Arc::new(AtomicBool::new(false));
+
+    let aux = {
+        let (cancel, done, child, ring) = (
+            cancel.clone(),
+            done.clone(),
+            child.clone(),
+            ring.to_path_buf(),
+        );
+        let keep = (RING_KEEP_SECONDS * fps).max(40.0) as usize;
+        std::thread::spawn(move || {
+            let mut ticks = 0u32;
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = child.lock().unwrap().kill();
+                    return;
+                }
+                if done.load(Ordering::Relaxed) {
+                    return;
+                }
+                ticks += 1;
+                if ticks.is_multiple_of(4) {
+                    prune_ring(&ring, keep);
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        })
+    };
+
+    Ok(ParkFfmpeg {
+        stdout,
+        child,
+        done,
+        aux,
+    })
+}
+
 /// Run live park detection for ONE stream camera until the stream ends or `cancel` is
 /// set, writing its output into `cam_dir` (`latest_park.jpg` + `park_NNNNNN.jpg` +
 /// `parks.jsonl`, with a transient `.ring` subdir). The caller picks the dir — the server
@@ -313,42 +461,7 @@ pub fn run_park_camera(
     std::fs::create_dir_all(&ring)
         .map_err(|e| format!("park {}: create {}: {e}", cap.id, ring.display()))?;
 
-    let fps = cap.tuning.fps;
-    let mut child = std::process::Command::new("ffmpeg")
-        .args(live_park_args(&cap.stream_url, &ring, fps, w, h))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("park {}: ffmpeg spawn failed: {e}", cap.id))?;
-    let mut stdout = child.stdout.take().expect("piped stdout");
-    let child = Arc::new(Mutex::new(child));
-    let done = Arc::new(AtomicBool::new(false));
-
-    // Aux thread: kill ffmpeg the instant cancel is set (the main read blocks until bytes
-    // arrive, so it can't see cancel itself), and prune the ring on a sliding window.
-    let aux = {
-        let (cancel, done, child, ring) =
-            (cancel.clone(), done.clone(), child.clone(), ring.clone());
-        let keep = (RING_KEEP_SECONDS * fps).max(40.0) as usize;
-        std::thread::spawn(move || {
-            let mut ticks = 0u32;
-            loop {
-                if cancel.load(Ordering::Relaxed) {
-                    let _ = child.lock().unwrap().kill();
-                    return;
-                }
-                if done.load(Ordering::Relaxed) {
-                    return;
-                }
-                ticks += 1;
-                if ticks.is_multiple_of(4) {
-                    prune_ring(&ring, keep);
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-        })
-    };
+    let mut ff = spawn_park_ffmpeg(&cap.id, &cap.stream_url, &ring, cap.tuning.fps, w, h, cancel)?;
 
     let mut det = LiveParkDetector::new(w, h, &cap.tuning);
     let mut writer = ParkWriter::new(cam_dir.to_path_buf());
@@ -356,7 +469,7 @@ pub fn run_park_camera(
     let read_cancel = cancel.clone();
     let wait_cancel = cancel.clone();
     let stats = detect_stream(
-        &mut stdout,
+        &mut ff.stdout,
         &mut det,
         w * h,
         &mut writer,
@@ -366,9 +479,69 @@ pub fn run_park_camera(
         on_park,
     );
 
-    done.store(true, Ordering::Relaxed);
-    let _ = aux.join();
-    let _ = child.lock().unwrap().wait();
+    ff.shutdown();
+    let _ = std::fs::remove_dir_all(&ring);
+    Ok(stats)
+}
+
+/// One stream camera for dense-stream segmented capture: its id, the MJPEG stream URL, the
+/// capture fps (the gray cadence), the per-layer accumulation `window_ms`, and the
+/// median-subtract select knobs. Like [`ParkCapture`] these are all camera-specific
+/// (framing is) — there are no shared defaults.
+#[derive(Clone)]
+pub struct SegmentCapture {
+    pub id: String,
+    pub stream_url: String,
+    pub fps: f64,
+    pub window_ms: u64,
+    pub select_tuning: SelectTuning,
+}
+
+/// Run dense-stream segmented capture for ONE stream camera until the stream ends or
+/// `cancel` is set, writing the picked frame per print layer into `cam_dir` (the same
+/// `latest_park.jpg` + `park_NNNNNN.jpg` + `parks.jsonl` layout as [`run_park_camera`], so
+/// the dashboard reads it identically). The continuous-stream alternative to
+/// `run_park_camera`: instead of detecting the park by image change (which misses the brief
+/// native park), it segments the stream by the live print LAYER and median-subtract-selects
+/// the parked frame within each layer's window. `current_layer` is the live layer the
+/// server updates from MQTT `layer_num`; the runner just reads it per frame (a `< 0`
+/// "unknown" value still segments by whatever it reads). The ffmpeg spawn + aux are shared
+/// with `run_park_camera`; the segmenting and selection are the unit-tested pure pieces.
+pub fn run_segment_camera(
+    cap: &SegmentCapture,
+    cam_dir: &Path,
+    w: usize,
+    h: usize,
+    current_layer: &Arc<AtomicI64>,
+    cancel: &Arc<AtomicBool>,
+    on_park: &mut dyn FnMut(ParkEvent),
+) -> Result<ParkRunStats, String> {
+    let ring = cam_dir.join(".ring");
+    std::fs::create_dir_all(&ring)
+        .map_err(|e| format!("park {}: create {}: {e}", cap.id, ring.display()))?;
+
+    let mut ff = spawn_park_ffmpeg(&cap.id, &cap.stream_url, &ring, cap.fps, w, h, cancel)?;
+
+    let mut sel = SegmentSelector::new(w, h, cap.window_ms, cap.select_tuning);
+    let mut writer = ParkWriter::new(cam_dir.to_path_buf());
+    let ring_path = ring.clone();
+    let read_cancel = cancel.clone();
+    let wait_cancel = cancel.clone();
+    let layer = current_layer.clone();
+    let stats = detect_stream_segmented(
+        &mut ff.stdout,
+        &mut sel,
+        w * h,
+        cap.fps,
+        &|_idx| layer.load(Ordering::Relaxed),
+        &mut writer,
+        &|idx| ring_jpeg_path(&ring_path, idx),
+        &|p| await_ring(p, &wait_cancel),
+        &|| read_cancel.load(Ordering::Relaxed),
+        on_park,
+    );
+
+    ff.shutdown();
     let _ = std::fs::remove_dir_all(&ring);
     Ok(stats)
 }
@@ -705,6 +878,177 @@ mod tests {
             0,
             "nothing to prune when under the cap"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── dense-stream segmented capture: software device model ──
+    // Mirrors core::park's segment_tests model (bright bed + static center object + a dark
+    // head parked FAR-LEFT for a brief, per-layer-VARIABLE dwell). The I/O wiring under test
+    // here is detect_stream_segmented: it must compute each frame's time from the fps
+    // cadence, segment by the injected per-frame layer, and write the PICKED stream index's
+    // ring JPEG out — no ffmpeg, camera, or printer needed.
+    const SEG_CENTER: i64 = 24;
+
+    fn sframe(head_x: i64) -> Vec<u8> {
+        let (bg, obj, head) = (200u8, 110u8, 25u8);
+        let head_hw: i64 = 5;
+        let mut img = vec![bg; W * H];
+        for y in 0..H {
+            let row = y * W;
+            for px in img[row + (SEG_CENTER as usize - 3)..row + (SEG_CENTER as usize + 3)]
+                .iter_mut()
+            {
+                *px = obj; // static dark print object at center
+            }
+            for x in 0..W {
+                if (x as i64 - head_x).abs() <= head_hw {
+                    img[row + x] = head;
+                }
+            }
+        }
+        img
+    }
+
+    fn seg_tuning() -> SelectTuning {
+        SelectTuning {
+            left_frac: 0.33,
+            min_outlier: 2.5,
+            min_left_density: 3.0,
+            select_candidate_frac: 0.6,
+            min_confidence: 0.40,
+        }
+    }
+
+    /// Build a modeled continuous gray stream over several layers (head over-print except a
+    /// brief far-left park at a per-layer delay), returning the bytes and the per-frame layer
+    /// signal that `detect_stream_segmented`'s `layer_of` closure replays.
+    fn sim_stream(
+        layers: &[(i64, u64)], // (layer, park_at_ms); each parks 500ms over a 4000ms layer
+        fps: f64,
+    ) -> (Vec<u8>, Vec<i64>) {
+        let dt = (1000.0 / fps) as u64;
+        let mut bytes = Vec::new();
+        let mut layer_of_frame = Vec::new();
+        for &(layer, park_at) in layers {
+            let mut t = 0u64;
+            while t < 4000 {
+                let parked = t >= park_at && t < park_at + 500;
+                bytes.extend_from_slice(&sframe(if parked { 6 } else { SEG_CENTER }));
+                layer_of_frame.push(layer);
+                t += dt;
+            }
+        }
+        (bytes, layer_of_frame)
+    }
+
+    #[test]
+    fn segmented_stream_writes_one_park_per_layer_mapping_the_ring_index() {
+        let dir = tmp("segmented");
+        let ring_dir = dir.join(".ring");
+        std::fs::create_dir_all(&ring_dir).unwrap();
+
+        // 3 layers, 10 fps, parks at WILDLY varying delays (what defeats a sparse grid).
+        let fps = 10.0;
+        let (bytes, layer_of_frame) = sim_stream(&[(0, 500), (1, 2300), (2, 900)], fps);
+        for idx in 0..layer_of_frame.len() as u64 {
+            std::fs::write(ring_jpeg_path(&ring_dir, idx), format!("RING{idx}")).unwrap();
+        }
+
+        let mut sel = SegmentSelector::new(W, H, 3000, seg_tuning());
+        let mut writer = ParkWriter::new(dir.clone());
+        let rd = ring_dir.clone();
+        let lf = layer_of_frame.clone();
+        let mut written = 0u32;
+        let stats = detect_stream_segmented(
+            &mut Cursor::new(bytes),
+            &mut sel,
+            W * H,
+            fps,
+            &|idx| lf[idx as usize],
+            &mut writer,
+            &|idx| ring_jpeg_path(&rd, idx),
+            &|p| p.exists(),
+            &|| false,
+            &mut |ev| {
+                if ev == ParkEvent::Written {
+                    written += 1;
+                }
+            },
+        );
+        assert_eq!(stats.parks, 3, "one park caught per layer: {stats:?}");
+        assert_eq!(stats.dropped, 0, "{stats:?}");
+        assert_eq!(written, 3, "on_emit fired for each written park");
+        assert_eq!(writer.emitted(), 3, "three park_*.jpg on disk");
+
+        // parks.jsonl records the LAYER in `t`, in layer order, with mapped ring indices.
+        let jl = std::fs::read_to_string(dir.join("parks.jsonl")).unwrap();
+        let layers: Vec<f64> = jl
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["t"].as_f64().unwrap())
+            .collect();
+        assert_eq!(layers, vec![0.0, 1.0, 2.0], "{jl}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn segmented_stream_skips_an_over_print_only_layer() {
+        // Layer 0 never parks (head stays over-print) → no pick; layer 1 parks → one pick.
+        let dir = tmp("segmented-skip");
+        let ring_dir = dir.join(".ring");
+        std::fs::create_dir_all(&ring_dir).unwrap();
+        let fps = 10.0;
+        let (bytes, lf) = sim_stream(&[(0, 99_999), (1, 800)], fps);
+        for idx in 0..lf.len() as u64 {
+            std::fs::write(ring_jpeg_path(&ring_dir, idx), b"R").unwrap();
+        }
+        let mut sel = SegmentSelector::new(W, H, 3000, seg_tuning());
+        let mut writer = ParkWriter::new(dir.clone());
+        let rd = ring_dir.clone();
+        let lfc = lf.clone();
+        let stats = detect_stream_segmented(
+            &mut Cursor::new(bytes),
+            &mut sel,
+            W * H,
+            fps,
+            &|idx| lfc[idx as usize],
+            &mut writer,
+            &|idx| ring_jpeg_path(&rd, idx),
+            &|p| p.exists(),
+            &|| false,
+            &mut |_| {},
+        );
+        assert_eq!(stats.parks, 1, "only the parked layer yields a frame: {stats:?}");
+        assert_eq!(writer.emitted(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn segmented_stream_drops_a_pick_whose_ring_jpeg_never_arrived() {
+        // The park is selected but its full-res JPEG never landed → counted as dropped, not
+        // silently lost (a missing layer stays visible).
+        let dir = tmp("segmented-drop");
+        let ring_dir = dir.join(".ring");
+        std::fs::create_dir_all(&ring_dir).unwrap(); // empty: no ring JPEGs at all
+        let fps = 10.0;
+        let (bytes, lf) = sim_stream(&[(0, 500)], fps);
+        let mut sel = SegmentSelector::new(W, H, 3000, seg_tuning());
+        let mut writer = ParkWriter::new(dir.clone());
+        let rd = ring_dir.clone();
+        let lfc = lf.clone();
+        let stats = detect_stream_segmented(
+            &mut Cursor::new(bytes),
+            &mut sel,
+            W * H,
+            fps,
+            &|idx| lfc[idx as usize],
+            &mut writer,
+            &|idx| ring_jpeg_path(&rd, idx),
+            &|p| p.exists(),
+            &|| false,
+            &mut |_| {},
+        );
+        assert_eq!(stats.parks, 0, "{stats:?}");
+        assert_eq!(stats.dropped, 1, "the picked frame's JPEG was missing: {stats:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
