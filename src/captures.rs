@@ -312,10 +312,10 @@ pub fn parse_smooth_frame(name: &str) -> Option<(u64, u64)> {
     Some((layer.parse().ok()?, offset.parse().ok()?))
 }
 
-/// ffmpeg argv to decode every `frame_*.jpg` in `cam_dir` to a `w`×`h` gray rawvideo stream
-/// on stdout (one frame after another, glob = capture order). One ffmpeg for the whole dir —
+/// ffmpeg argv to decode every JPEG matching `glob` to a `w`×`h` gray rawvideo stream on
+/// stdout (one frame after another, glob = capture order). One ffmpeg for the whole set —
 /// no per-frame spawn. Pure (command shape unit-tested without ffmpeg).
-pub fn smooth_decode_args(cam_dir: &Path, w: usize, h: usize) -> Vec<String> {
+pub fn gray_decode_args(glob: &Path, w: usize, h: usize) -> Vec<String> {
     vec![
         "-v".into(),
         "error".into(),
@@ -324,7 +324,7 @@ pub fn smooth_decode_args(cam_dir: &Path, w: usize, h: usize) -> Vec<String> {
         "-pattern_type".into(),
         "glob".into(),
         "-i".into(),
-        cam_dir.join("frame_*.jpg").display().to_string(),
+        glob.display().to_string(),
         "-vf".into(),
         format!("scale={w}:{h},format=gray"),
         "-f".into(),
@@ -333,6 +333,76 @@ pub fn smooth_decode_args(cam_dir: &Path, w: usize, h: usize) -> Vec<String> {
         "gray".into(),
         "-".into(),
     ]
+}
+
+/// Decode args for all `frame_*.jpg` in a smooth cam dir (whole-run selection).
+pub fn smooth_decode_args(cam_dir: &Path, w: usize, h: usize) -> Vec<String> {
+    gray_decode_args(&cam_dir.join("frame_*.jpg"), w, h)
+}
+
+/// Decode + select the parked frame from ONE layer's burst — the live path used during a
+/// smooth capture (after each layer's burst settles). Decodes just that layer's
+/// `frame_*_layer_<L>_t*.jpg` with one ffmpeg and runs [`select_park_frame`]. Returns the
+/// chosen full-res JPEG path, or `None` if the layer's park wasn't captured.
+pub fn select_layer_burst(
+    cam_dir: &Path,
+    layer: i64,
+    sel: &SelectTuning,
+) -> Result<Option<PathBuf>, String> {
+    let (w, h) = (SMOOTH_DECODE_W, SMOOTH_DECODE_H);
+    let tag = format!("_layer_{layer:05}_t");
+    let mut files: Vec<String> = std::fs::read_dir(cam_dir)
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with("frame_") && n.ends_with(".jpg") && n.contains(&tag))
+        .collect();
+    files.sort();
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let glob = cam_dir.join(format!("frame_*{tag}*.jpg"));
+    let out = std::process::Command::new("ffmpeg")
+        .args(gray_decode_args(&glob, w, h))
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "ffmpeg not found on PATH — install ffmpeg".to_string()
+            } else {
+                format!("running ffmpeg: {e}")
+            }
+        })?;
+    if !out.status.success() {
+        return Err("ffmpeg failed to decode the layer burst".to_string());
+    }
+    let fsize = w * h;
+    if out.stdout.len() != fsize * files.len() {
+        return Err(format!(
+            "decoded {} bytes, expected {} ({} frames)",
+            out.stdout.len(),
+            fsize * files.len(),
+            files.len()
+        ));
+    }
+    let mut frames = Vec::with_capacity(files.len());
+    let mut paths = Vec::with_capacity(files.len());
+    for (i, name) in files.iter().enumerate() {
+        let Some((_l, offset)) = parse_smooth_frame(name) else {
+            continue;
+        };
+        frames.push(crate::core::park::SelectFrame {
+            offset_ms: offset,
+            gray: out.stdout[i * fsize..(i + 1) * fsize].to_vec(),
+        });
+        paths.push((offset, cam_dir.join(name)));
+    }
+    match select_park_frame(&frames, w, h, sel) {
+        Selection::Selected { offset_ms, .. } => Ok(paths
+            .into_iter()
+            .find(|(o, _)| *o == offset_ms)
+            .map(|(_, p)| p)),
+        Selection::Skipped { .. } => Ok(None),
+    }
 }
 
 /// Pick the parked frame from each layer's burst in a smooth cam dir, returning the chosen
