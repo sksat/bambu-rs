@@ -19,9 +19,10 @@ use tokio::task::JoinHandle;
 
 use super::camera::StreamOpen;
 use super::stream_record::record_loop;
+use crate::core::park::{Park, SelectTuning};
 use crate::core::status::PrinterStatus;
 use crate::core::timelapse::{ActivityAction, CaptureAction, CaptureSession, PrintActivitySession};
-use crate::park::{DECODE_H, DECODE_W, ParkCapture, ParkEvent, run_park_camera};
+use crate::park::{DECODE_H, DECODE_W, ParkCapture, ParkEvent, ParkWriter, run_park_camera};
 
 /// Spawns the live-park worker for ONE camera, returning its task handle. Injected so the
 /// slot lifecycle (lazy spawn on print-active, stop at finish) is unit-tested with a fake
@@ -183,6 +184,24 @@ impl TimelapseManager {
         rx: watch::Receiver<PrinterStatus>,
         out_dir: PathBuf,
     ) -> Result<(), String> {
+        self.start_smooth_with_select(cameras, every, burst_offsets, rx, out_dir, Vec::new())
+    }
+
+    /// Like [`start_smooth`](Self::start_smooth), plus per-camera burst-SELECTION tuning
+    /// (index-aligned with `cameras`; `None`/missing = no live selection). When a camera has
+    /// select tuning, after each layer's burst settles the run picks the parked frame and
+    /// publishes it as `park_*.jpg`/`parks.jsonl` in that camera's dir — so the live park
+    /// preview shows the clean timelapse DURING a smooth capture, and the finished run reads
+    /// back as a clean park recording.
+    pub fn start_smooth_with_select(
+        &self,
+        cameras: Vec<(String, FrameGrab)>,
+        every: u64,
+        burst_offsets: Vec<u64>,
+        rx: watch::Receiver<PrinterStatus>,
+        out_dir: PathBuf,
+        selects: Vec<Option<SelectTuning>>,
+    ) -> Result<(), String> {
         let every = every.max(1);
         // Sort + de-dup so duplicate offsets can't clobber each other's frame (and
         // an empty spec still grabs once at the layer edge).
@@ -201,7 +220,16 @@ impl TimelapseManager {
             // The per-layer burst spawns short-lived delayed grabs; they honor
             // `cancel` so none fire after the run is stopped.
             move |status, cams, dir, cancel| {
-                tokio::spawn(run(status, rx, cams, dir, every, burst_offsets, cancel))
+                tokio::spawn(run(
+                    status,
+                    rx,
+                    cams,
+                    dir,
+                    every,
+                    burst_offsets,
+                    selects,
+                    cancel,
+                ))
             },
         )
     }
@@ -382,6 +410,63 @@ struct BurstSink {
 /// loop never stalls (the reason for the worker indirection). A full queue drops
 /// the late sample and counts a failure, exactly like the single-grab path. The
 /// spawned tasks outlive an `abort`, so they check `cancel` to stay quiet after stop.
+/// One camera's live per-layer selection state: where its frames live, how to pick the
+/// parked one, and a serialized [`ParkWriter`] that publishes picks (`park_*.jpg` +
+/// `parks.jsonl` + `latest_park.jpg`) into the same dir.
+struct LiveSelect {
+    cam_dir: PathBuf,
+    tuning: SelectTuning,
+    writer: Arc<Mutex<ParkWriter>>,
+}
+
+/// Grace after the last burst offset before selecting — lets the worker finish writing the
+/// burst's JPEGs to disk so [`select_layer_burst`](crate::captures::select_layer_burst) sees
+/// the whole burst.
+const FINALIZE_MARGIN_MS: u64 = 800;
+
+/// After a layer's burst settles, pick the parked frame per live-select camera and publish
+/// it (so the live park preview advances during a smooth capture). Spawned, delayed, and
+/// cancel-aware like the burst grabs; the heavy decode+select runs on the blocking pool and
+/// the per-camera ParkWriter serializes the write.
+fn schedule_finalize(
+    live: &Arc<Vec<LiveSelect>>,
+    frame_no: u64,
+    layer: i64,
+    max_offset: u64,
+    cancel: &Arc<AtomicBool>,
+) {
+    let live = live.clone();
+    let cancel = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(max_offset + FINALIZE_MARGIN_MS)).await;
+        if cancel.load(Ordering::Relaxed) {
+            return; // the print stopped while this finalize was pending
+        }
+        for sel in live.iter() {
+            let cam_dir = sel.cam_dir.clone();
+            let tuning = sel.tuning;
+            let writer = sel.writer.clone();
+            // Decode + select off the async runtime; write under the per-camera lock.
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Ok(Some((path, confidence))) =
+                    crate::captures::select_layer_burst(&cam_dir, layer, &tuning)
+                {
+                    let park = Park {
+                        idx: frame_no,
+                        t: layer as f64,
+                        left_mass: 0.0,
+                        sharpness: 0.0,
+                        confidence,
+                        replace: false,
+                    };
+                    let _ = writer.lock().unwrap().write(&park, &path);
+                }
+            })
+            .await;
+        }
+    });
+}
+
 fn schedule_burst(sink: &BurstSink, frame_no: u64, layer: i64, offsets: &[u64]) {
     for &offset_ms in offsets {
         let sink = sink.clone();
@@ -419,11 +504,28 @@ async fn run(
     out_dir: PathBuf,
     every: u64,
     burst_offsets: Vec<u64>,
+    selects: Vec<Option<SelectTuning>>,
     cancel: Arc<AtomicBool>,
 ) {
     // wait=true: the capture may be started before the print is active; sit
     // through idle/finished until it runs, then stop when the print ends.
     let mut session = CaptureSession::new(every, true);
+    // Live per-layer selection publishers for cameras that have select tuning: each owns a
+    // serialized ParkWriter into out_dir/<id>/, so the live park preview shows the clean pick
+    // during the smooth capture. Empty (no tuning) → no live selection, classic smooth.
+    let live: Vec<LiveSelect> = cameras
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (id, _))| {
+            selects.get(i).copied().flatten().map(|tuning| LiveSelect {
+                cam_dir: out_dir.join(id),
+                tuning,
+                writer: Arc::new(Mutex::new(ParkWriter::new(out_dir.join(id)))),
+            })
+        })
+        .collect();
+    let live = Arc::new(live);
+    let max_offset = burst_offsets.iter().copied().max().unwrap_or(0);
     let cameras = Arc::new(cameras);
     // Each layer enqueues one job per camera per burst offset; scale the bound so
     // a layer's whole burst has headroom (samples are spread over time, but keep
@@ -469,6 +571,9 @@ async fn run(
         match session.observe(&snap) {
             CaptureAction::Capture { frame_no, layer } => {
                 schedule_burst(&sink, frame_no, layer, &burst_offsets);
+                if !live.is_empty() {
+                    schedule_finalize(&live, frame_no, layer, max_offset, &sink.cancel);
+                }
             }
             CaptureAction::Stop => break,
             CaptureAction::Continue => {}

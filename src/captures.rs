@@ -348,7 +348,7 @@ pub fn select_layer_burst(
     cam_dir: &Path,
     layer: i64,
     sel: &SelectTuning,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Option<(PathBuf, f64)>, String> {
     let (w, h) = (SMOOTH_DECODE_W, SMOOTH_DECODE_H);
     let tag = format!("_layer_{layer:05}_t");
     let mut files: Vec<String> = std::fs::read_dir(cam_dir)
@@ -397,10 +397,13 @@ pub fn select_layer_burst(
         paths.push((offset, cam_dir.join(name)));
     }
     match select_park_frame(&frames, w, h, sel) {
-        Selection::Selected { offset_ms, .. } => Ok(paths
+        Selection::Selected {
+            offset_ms,
+            confidence,
+        } => Ok(paths
             .into_iter()
             .find(|(o, _)| *o == offset_ms)
-            .map(|(_, p)| p)),
+            .map(|(_, p)| (p, confidence))),
         Selection::Skipped { .. } => Ok(None),
     }
 }

@@ -1377,20 +1377,33 @@ fn parse_parks_index(contents: &str) -> Vec<serde_json::Value> {
 /// Available while the run is active AND after it stops (until the next run replaces the
 /// status's out_dir), so the whole filmstrip stays reviewable. 404 when no park run owns
 /// `id`. The id is matched against the run's own camera list, never joined blindly.
-async fn park_index(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+/// The source dir for the live park preview: the `park` run if one owns it, else the
+/// `smooth` run (its live per-layer selection publishes the same `park_*.jpg`/`parks.jsonl`
+/// into its dir). Returns `(out_dir, cameras, running)`.
+fn live_park_source(st: &AppState) -> Option<(String, Vec<String>, bool)> {
     let park = st.timelapse.status_park();
-    let Some(dir) = park.out_dir.as_ref() else {
+    if let Some(dir) = park.out_dir {
+        return Some((dir, park.cameras, park.running));
+    }
+    let smooth = st.timelapse.status_smooth();
+    smooth
+        .out_dir
+        .map(|dir| (dir, smooth.cameras, smooth.running))
+}
+
+async fn park_index(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+    let Some((dir, cameras, running)) = live_park_source(&st) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if !park.cameras.iter().any(|c| c == &id) {
+    if !cameras.iter().any(|c| c == &id) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let jsonl = std::path::Path::new(dir).join(&id).join("parks.jsonl");
+    let jsonl = std::path::Path::new(&dir).join(&id).join("parks.jsonl");
     let parks = match tokio::fs::read_to_string(&jsonl).await {
         Ok(s) => parse_parks_index(&s),
         Err(_) => Vec::new(), // run started, no park written yet → an empty filmstrip
     };
-    Json(json!({ "running": park.running, "count": parks.len(), "parks": parks })).into_response()
+    Json(json!({ "running": running, "count": parks.len(), "parks": parks })).into_response()
 }
 
 /// Serve one indexed park frame `/api/camera/{id}/park/{n}` (`park_NNNNNN.jpg`) for a
@@ -1400,14 +1413,13 @@ async fn camera_park_frame(
     State(st): State<AppState>,
     Path((id, n)): Path<(String, u64)>,
 ) -> Response {
-    let park = st.timelapse.status_park();
-    let Some(dir) = park.out_dir.as_ref() else {
+    let Some((dir, cameras, _)) = live_park_source(&st) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if !park.cameras.iter().any(|c| c == &id) {
+    if !cameras.iter().any(|c| c == &id) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let path = std::path::Path::new(dir)
+    let path = std::path::Path::new(&dir)
         .join(&id)
         .join(format!("park_{n:06}.jpg"));
     match tokio::fs::read(&path).await {
@@ -1998,9 +2010,30 @@ async fn timelapse_start(
             drop(externals);
             st.timelapse.start_plain(caps, interval_ms, rx, out_dir)
         }
-        _ => st
-            .timelapse
-            .start_smooth(grabs, b.every, burst_offsets, rx, out_dir),
+        _ => {
+            // Per-camera select tuning (index-aligned with `grabs`/`ids`): when present, the
+            // smooth run live-selects the parked frame per layer so the dashboard's live park
+            // preview advances during the capture and the finished run reads back clean.
+            let externals = st.external_cameras.read().unwrap();
+            let selects: Vec<Option<crate::core::park::SelectTuning>> = ids
+                .iter()
+                .map(|id| {
+                    id.strip_prefix("ext-")
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .and_then(|i| externals.get(i))
+                        .and_then(|c| c.select_tuning)
+                })
+                .collect();
+            drop(externals);
+            st.timelapse.start_smooth_with_select(
+                grabs,
+                b.every,
+                burst_offsets,
+                rx,
+                out_dir,
+                selects,
+            )
+        }
     };
     match res {
         Ok(()) => Json(timelapse_status_json(&st)).into_response(),
