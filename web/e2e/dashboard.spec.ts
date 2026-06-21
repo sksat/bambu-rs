@@ -409,10 +409,27 @@ test.describe("dashboard (fake mode)", () => {
     const tabs = page.locator('[data-testid^="camera-tab-"]');
     await expect(tabs).toHaveCount(3);
     await expect(page.getByTestId("camera-view")).toBeVisible();
-    await expect(tabs.nth(0)).toHaveAttribute("aria-selected", "true");
-    await tabs.nth(1).click();
-    await expect(tabs.nth(1)).toHaveAttribute("aria-selected", "true");
+    // The most-capable camera (the park cam, ext-2: stream + park) is the default — NOT the
+    // first tab — so a dead/snapshot source the server lists first can't shadow a working
+    // stream camera.
+    await expect(tabs.nth(2)).toHaveAttribute("aria-selected", "true");
     await expect(tabs.nth(0)).toHaveAttribute("aria-selected", "false");
+    // Switching works.
+    await tabs.nth(0).click();
+    await expect(tabs.nth(0)).toHaveAttribute("aria-selected", "true");
+    await expect(tabs.nth(2)).toHaveAttribute("aria-selected", "false");
+  });
+
+  test("the chosen camera tab is remembered across a reload", async ({ page }) => {
+    const tabs = page.locator('[data-testid^="camera-tab-"]');
+    // Default is the most-capable (park cam, ext-2). Switch to ext-0 and reload.
+    await expect(tabs.nth(2)).toHaveAttribute("aria-selected", "true");
+    await page.getByTestId("camera-tab-ext-0").click();
+    await page.reload();
+    await expect(page.getByTestId("state")).toBeVisible();
+    // The remembered choice (ext-0) wins over the capability default on reload.
+    await expect(page.getByTestId("camera-tab-ext-0")).toHaveAttribute("aria-selected", "true");
+    await expect(tabs.nth(2)).toHaveAttribute("aria-selected", "false");
   });
 
   test("a park-capable camera offers the live↔captured toggle", async ({ page }) => {

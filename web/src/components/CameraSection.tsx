@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   listCameras,
   getCamerasConfig,
@@ -27,6 +27,32 @@ import { ParkPlayer } from "./ParkPlayer";
 // grabs, and never even notice it's offline.
 const FAST_MS = 800;
 const SLOW_MS = 5000;
+
+// Remember the last camera tab the user chose, so a reload returns to it.
+const ACTIVE_CAM_KEY = "bambu.activeCamera";
+
+// Decide which camera tab is active. Keep the current one if it's still present; else the
+// last one the user picked (localStorage); else the most CAPABLE — segment > park > stream >
+// first — in stable server order. This stops a dead/snapshot built-in that the server lists
+// FIRST from becoming the default over a working stream camera, without hard-coding any
+// camera as "bad" (the built-in is the right default on a printer where it actually works).
+function pickActiveCamera(cams: Camera[], current: string): string {
+  if (cams.some((c) => c.id === current)) return current;
+  let saved: string | null = null;
+  try {
+    saved = localStorage.getItem(ACTIVE_CAM_KEY);
+  } catch {
+    /* private mode / no storage — fall through to the capability default */
+  }
+  if (saved && cams.some((c) => c.id === saved)) return saved;
+  return (
+    cams.find((c) => c.segment)?.id ??
+    cams.find((c) => c.park)?.id ??
+    cams.find((c) => c.stream)?.id ??
+    cams[0]?.id ??
+    ""
+  );
+}
 
 // A live view of ONE camera by id. Views:
 //   - live: the camera itself — `stream` (a long-lived <img> on the MJPEG endpoint,
@@ -215,13 +241,18 @@ const METHOD_TITLE: Record<string, string> = {
 function TimelapseBar({
   cameras,
   activeCamera,
+  tl,
+  refreshTimelapse,
   password,
 }: {
   cameras: Camera[];
   activeCamera: string;
+  // The shared /api/timelapse state, polled once by the parent panel.
+  tl: TimelapseState | null;
+  // Re-poll it immediately (after a start/stop) for instant feedback.
+  refreshTimelapse: () => Promise<void>;
   password: string | null;
 }) {
-  const [tl, setTl] = useState<TimelapseState | null>(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const [allCams, setAllCams] = useState(false);
@@ -231,20 +262,6 @@ function TimelapseBar({
   // Manual override of the clean-timelapse METHOD (segment/park/smooth). `null` = use the
   // capability-based default (the best the active camera supports); set it to force one.
   const [layerMethod, setLayerMethod] = useState<TimelapseMode | null>(null);
-
-  useEffect(() => {
-    let live = true;
-    const poll = async () => {
-      const s = await getTimelapse();
-      if (live) setTl(s);
-    };
-    void poll();
-    const id = setInterval(() => void poll(), 2000);
-    return () => {
-      live = false;
-      clearInterval(id);
-    };
-  }, []);
 
   const multi = cameras.length > 1;
   const targets = allCams && multi ? cameras.map((c) => c.id) : [activeCamera];
@@ -294,19 +311,26 @@ function TimelapseBar({
   const startMode = async (mode: TimelapseMode) => {
     setBusy(true);
     setMsg(null);
-    const opts = mode === "plain" ? { intervalMs: Math.max(0.1, plainSecs) * 1000 } : { every: 1 };
-    const r = await startTimelapse(mode, targets, opts, password);
-    if (r === "needPassword") setMsg("needs the control password (set it in Controls)");
-    else if ("error" in r) setMsg(r.error);
-    else setTl(await getTimelapse());
-    setBusy(false);
+    try {
+      const opts =
+        mode === "plain" ? { intervalMs: Math.max(0.1, plainSecs) * 1000 } : { every: 1 };
+      const r = await startTimelapse(mode, targets, opts, password);
+      if (r === "needPassword") setMsg("needs the control password (set it in Controls)");
+      else if ("error" in r) setMsg(r.error);
+      else await refreshTimelapse();
+    } finally {
+      setBusy(false);
+    }
   };
   const stopMode = async (mode: TimelapseMode) => {
     setBusy(true);
     setMsg(null);
-    await stopTimelapse(mode, password);
-    setTl(await getTimelapse());
-    setBusy(false);
+    try {
+      await stopTimelapse(mode, password);
+      await refreshTimelapse();
+    } finally {
+      setBusy(false);
+    }
   };
 
   // Is anything recording right now? When so, this section is just a status + stop; the
@@ -469,32 +493,31 @@ export function CamerasSection({ password }: { password: string | null }) {
   const [active, setActive] = useState<string>("");
   const [managing, setManaging] = useState(false);
   const [recordings, setRecordings] = useState(false);
-  // The park + smooth run states, so the view offers the "captured" toggle whenever a run
-  // (active OR recently stopped) owns the active camera. A smooth run also publishes a
-  // per-layer park filmstrip now (live selection), so it enables the toggle too.
-  const [parkRun, setParkRun] = useState<RunState | null>(null);
-  const [smoothRun, setSmoothRun] = useState<RunState | null>(null);
-  const [segmentRun, setSegmentRun] = useState<RunState | null>(null);
+  // ONE poll of /api/timelapse for the whole panel: the live view's "captured" toggle AND
+  // the TimelapseBar both read it, so it's polled once here, not once per consumer.
+  const [tl, setTl] = useState<TimelapseState | null>(null);
 
   const reload = async () => {
     const cams = await listCameras();
     setCameras(cams);
-    setActive((a) => (cams.some((c) => c.id === a) ? a : (cams[0]?.id ?? "")));
+    setActive((a) => pickActiveCamera(cams, a));
   };
 
   useEffect(() => {
     void reload();
   }, []);
 
+  // Immediate re-poll after a mutation (start/stop) so the TimelapseBar reflects it without
+  // waiting for the 2s tick. Stable identity so it can be an effect dep without churn.
+  const refreshTimelapse = useCallback(async () => {
+    setTl(await getTimelapse());
+  }, []);
+
   useEffect(() => {
     let live = true;
     const poll = async () => {
       const s = await getTimelapse();
-      if (live) {
-        setParkRun(s?.park ?? null);
-        setSmoothRun(s?.smooth ?? null);
-        setSegmentRun(s?.segment ?? null);
-      }
+      if (live) setTl(s);
     };
     void poll();
     const id = setInterval(() => void poll(), 2000);
@@ -504,13 +527,23 @@ export function CamerasSection({ password }: { password: string | null }) {
     };
   }, []);
 
+  // Persist the chosen tab so a reload returns to it (pickActiveCamera reads it back).
+  const selectCamera = (id: string) => {
+    setActive(id);
+    try {
+      localStorage.setItem(ACTIVE_CAM_KEY, id);
+    } catch {
+      /* private mode / no storage — selection still applies for this session */
+    }
+  };
+
   const activeCam = cameras.find((c) => c.id === active);
-  // A filmstrip exists for the active camera iff a park OR smooth run (running or stopped)
-  // captured it — the player then works (live tail while running, review-only after stop).
-  // Smooth counts now: its live per-layer selection publishes the same park filmstrip.
-  const ownsActive = (r: RunState | null) => !!r && r.cameras.includes(active);
+  // A filmstrip exists for the active camera iff a park/smooth/segment run (running or
+  // stopped) captured it — the player then works (live tail while running, review-only
+  // after stop). Smooth/segment count: their live per-layer selection publishes the strip.
+  const ownsActive = (r: RunState | undefined) => !!r && r.cameras.includes(active);
   const parkAvailable =
-    ownsActive(parkRun) || ownsActive(smoothRun) || ownsActive(segmentRun);
+    ownsActive(tl?.park) || ownsActive(tl?.smooth) || ownsActive(tl?.segment);
 
   return (
     <>
@@ -550,7 +583,7 @@ export function CamerasSection({ password }: { password: string | null }) {
                     aria-selected={c.id === active}
                     className={c.id === active ? "cam__tab cam__tab--on" : "cam__tab"}
                     data-testid={`camera-tab-${c.id}`}
-                    onClick={() => setActive(c.id)}
+                    onClick={() => selectCamera(c.id)}
                   >
                     {c.label}
                   </button>
@@ -576,7 +609,13 @@ export function CamerasSection({ password }: { password: string | null }) {
               />
             )}
             {activeCam && (
-              <TimelapseBar cameras={cameras} activeCamera={activeCam.id} password={password} />
+              <TimelapseBar
+                cameras={cameras}
+                activeCamera={activeCam.id}
+                tl={tl}
+                refreshTimelapse={refreshTimelapse}
+                password={password}
+              />
             )}
           </>
         )}
