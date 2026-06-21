@@ -243,9 +243,13 @@ function TimelapseBar({
   //  - print video → records the real stream (stream cams) or samples snapshots (else).
   //    `plain` auto-splits this server-side; the interval only applies to snapshot cams.
   const active = cameras.find((c) => c.id === activeCamera);
+  const activeIsSegment = active?.segment ?? false;
   const activeIsPark = active?.park ?? false;
-  const layerMode: TimelapseMode = activeIsPark ? "park" : "smooth";
-  const layerRun = activeIsPark ? tl?.park : tl?.smooth;
+  // Clean timelapse method, best-first: the robust dense-stream `segment` (stream +
+  // park_tuning + select_tuning), else the old camera-detected `park`, else printer-synced
+  // `smooth`. segment ≫ park (full-layer capture vs the brief-park miner it supersedes).
+  const layerMode: TimelapseMode = activeIsSegment ? "segment" : activeIsPark ? "park" : "smooth";
+  const layerRun = activeIsSegment ? tl?.segment : activeIsPark ? tl?.park : tl?.smooth;
   const targetCams = allCams && multi ? cameras : active ? [active] : [];
   const anySnapshot = targetCams.some((c) => !c.stream);
   // What the selected record type maps to: clean timelapse → park (camera-detected) or
@@ -256,9 +260,11 @@ function TimelapseBar({
   const showEvery = recType === "video" && anySnapshot;
   const recHint =
     recType === "timelapse"
-      ? activeIsPark
-        ? "object only — one parked frame per layer, detected from the camera; review in the “captured” view above"
-        : "object only — one parked frame per layer, printer-synced"
+      ? activeIsSegment
+        ? "object only — one clean parked frame per layer, from the dense camera stream; review in the “captured” view above"
+        : activeIsPark
+          ? "object only — one parked frame per layer, detected from the camera; review in the “captured” view above"
+          : "object only — one parked frame per layer, printer-synced"
       : anySnapshot
         ? "head in shot — a sped-up video sampled from snapshots"
         : "head in shot — records the live camera stream";
@@ -421,6 +427,7 @@ export function CamerasSection({ password }: { password: string | null }) {
   // per-layer park filmstrip now (live selection), so it enables the toggle too.
   const [parkRun, setParkRun] = useState<RunState | null>(null);
   const [smoothRun, setSmoothRun] = useState<RunState | null>(null);
+  const [segmentRun, setSegmentRun] = useState<RunState | null>(null);
 
   const reload = async () => {
     const cams = await listCameras();
@@ -439,6 +446,7 @@ export function CamerasSection({ password }: { password: string | null }) {
       if (live) {
         setParkRun(s?.park ?? null);
         setSmoothRun(s?.smooth ?? null);
+        setSegmentRun(s?.segment ?? null);
       }
     };
     void poll();
@@ -454,7 +462,8 @@ export function CamerasSection({ password }: { password: string | null }) {
   // captured it — the player then works (live tail while running, review-only after stop).
   // Smooth counts now: its live per-layer selection publishes the same park filmstrip.
   const ownsActive = (r: RunState | null) => !!r && r.cameras.includes(active);
-  const parkAvailable = ownsActive(parkRun) || ownsActive(smoothRun);
+  const parkAvailable =
+    ownsActive(parkRun) || ownsActive(smoothRun) || ownsActive(segmentRun);
 
   return (
     <>

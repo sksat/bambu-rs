@@ -126,7 +126,7 @@ pub struct SelectFrame {
 /// Knobs for [`select_park_frame`]. Distinct from [`ParkTuning`]: selection scores against
 /// the per-burst MEDIAN (not the live EMA), so its cutoffs differ. No defaults — every knob
 /// is supplied by the caller (it depends on camera/printer placement).
-#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
 pub struct SelectTuning {
     /// Park zone = the left this-fraction of the frame.
     pub left_frac: f64,
@@ -1025,7 +1025,7 @@ mod select_tests {
                 if d <= head_hw {
                     img[row + x] = BRIGHT_HEAD;
                 } else if !sharp && d <= head_hw + 3 {
-                    let base = if (x as usize) < left_w { DARK_BACKDROP } else { BG };
+                    let base = if x < left_w { DARK_BACKDROP } else { BG };
                     img[row + x] = (BRIGHT_HEAD as f64
                         + (d - head_hw) as f64 / 3.0 * (base as f64 - BRIGHT_HEAD as f64))
                         as u8;

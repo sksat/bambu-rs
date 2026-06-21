@@ -12,6 +12,9 @@ export interface Camera {
   // True when this camera can run the live park preview: it has both a stream and
   // a calibrated park_tuning, so the view offers a park toggle.
   park?: boolean;
+  // True when it's ready for the robust dense-stream `segment` capture (stream +
+  // park_tuning + select_tuning). The clean timelapse prefers this over `park`.
+  segment?: boolean;
 }
 
 // Per-camera live-park detection tuning (the 11 knobs; no defaults). Edited as raw

@@ -1221,6 +1221,12 @@ async fn cameras_list(State(st): State<AppState>) -> Json<serde_json::Value> {
             // Whether this camera can run the live park preview: it needs both a
             // stream and a calibrated park_tuning (the dashboard shows a tile only then).
             "park": c.stream_url.is_some() && c.park_tuning.is_some(),
+            // Whether it's ready for the robust dense-stream `segment` capture: a stream,
+            // a park_tuning (for the capture fps), AND a select_tuning (the median-subtract
+            // knobs). The dashboard prefers this over `park` when present.
+            "segment": c.stream_url.is_some()
+                && c.park_tuning.is_some()
+                && c.select_tuning.is_some(),
         }));
     }
     Json(json!({ "cameras": cameras }))
@@ -1465,6 +1471,26 @@ async fn camera_park_frame(
     }
 }
 
+/// The tuning echo for the manage form: the park knobs MERGED with the select knobs into
+/// one object, mirroring the single combined object the form posts. Without the merge a
+/// re-save would drop `select_tuning` (it's stored separately but lives in the same posted
+/// object). `null` when the camera has no tuning at all.
+fn tuning_json(c: &ExternalCamera) -> serde_json::Value {
+    let Some(park) = &c.park_tuning else {
+        return serde_json::Value::Null;
+    };
+    let mut v = serde_json::to_value(park).unwrap_or_else(|_| json!({}));
+    if let (Some(obj), Some(sel)) = (v.as_object_mut(), c.select_tuning)
+        && let Ok(serde_json::Value::Object(sobj)) = serde_json::to_value(sel)
+    {
+        // Add the select-only knobs; shared keys (e.g. left_frac) keep the park value.
+        for (k, val) in sobj {
+            obj.entry(k).or_insert(val);
+        }
+    }
+    v
+}
+
 /// Serialise the external list (with URLs) for the gated config endpoints.
 fn external_json(st: &AppState) -> Vec<serde_json::Value> {
     st.external_cameras
@@ -1474,7 +1500,7 @@ fn external_json(st: &AppState) -> Vec<serde_json::Value> {
         .enumerate()
         .map(|(i, c)| {
             json!({ "id": format!("ext-{i}"), "label": c.label, "url": c.url,
-                    "stream_url": c.stream_url, "park_tuning": c.park_tuning })
+                    "stream_url": c.stream_url, "park_tuning": tuning_json(c) })
         })
         .collect()
 }
@@ -1493,10 +1519,13 @@ struct ExternalCameraInput {
     /// Optional live MJPEG stream URL (reverse-proxied at `/stream`).
     #[serde(default)]
     stream_url: Option<String>,
-    /// Optional per-camera live-park tuning. Deserialized as [`ParkTuning`], which has NO
-    /// defaults, so a partial/garbled object is rejected (422) rather than running wrong.
+    /// Optional per-camera tuning, a raw JSON object (same shape as the CLI
+    /// `--cameras-config`): parsed below into [`ParkTuning`] (STRICT — no baked defaults, a
+    /// partial object is rejected) AND `SelectTuning` (best-effort — the select knobs live
+    /// in the same object), so an HTTP-configured camera is `park`/`segment`-capable exactly
+    /// like a CLI-seeded one.
     #[serde(default)]
-    park_tuning: Option<ParkTuning>,
+    park_tuning: Option<serde_json::Value>,
 }
 
 /// Both proxied URLs (snapshot + stream) must be `http://` — the proxy's `ureq`
@@ -1543,7 +1572,24 @@ async fn cameras_config_set(
             )
                 .into_response();
         }
-        next.push(ExternalCamera::new(e.label, url, stream_url, i).with_park_tuning(e.park_tuning));
+        // One raw tuning object → ParkTuning (strict; a partial object is a 400, no baked
+        // defaults) AND SelectTuning (best-effort — the select knobs share the object), the
+        // same split the CLI `--cameras-config` does, so both paths stay consistent.
+        let (park, select) = match e.park_tuning {
+            Some(v) => {
+                let park: ParkTuning = match serde_json::from_value(v.clone()) {
+                    Ok(p) => p,
+                    Err(err) => return bad_request(format!("invalid park_tuning: {err}")),
+                };
+                (Some(park), serde_json::from_value(v).ok())
+            }
+            None => (None, None),
+        };
+        next.push(
+            ExternalCamera::new(e.label, url, stream_url, i)
+                .with_park_tuning(park)
+                .with_select_tuning(select),
+        );
     }
     *st.external_cameras.write().unwrap() = next;
     Json(json!({ "external": external_json(&st) })).into_response()
@@ -2986,6 +3032,49 @@ mod tests {
         assert!(cfg["external"][0]["park_tuning"].is_object());
         assert_eq!(cfg["external"][0]["park_tuning"]["fps"], json!(4.0));
         assert!(cfg["external"][1]["park_tuning"].is_null());
+    }
+
+    #[tokio::test]
+    async fn select_tuning_round_trips_and_flags_segment_capability() {
+        let server = app(None, FakeController::verified());
+        // ONE combined tuning object (park + select knobs), the shape the CLI seeds and the
+        // manage form posts — parsed into ParkTuning AND SelectTuning.
+        let full = json!({ "fps": 15, "left_frac": 0.33, "ema_seconds": 30, "abs_floor": 150,
+            "mad_k": 3, "merge_gap_s": 1.2, "max_island_s": 3, "min_sep_s": 3,
+            "candidate_frac": 0.75, "warmup_s": 4, "baseline_s": 90,
+            "min_outlier": 2.5, "min_left_density": 3.0, "min_confidence": 0.4,
+            "select_candidate_frac": 0.6 });
+        // park knobs only — park-capable but NOT segment-capable (no select knobs).
+        let park_only = json!({ "fps": 4, "left_frac": 0.33, "ema_seconds": 30, "abs_floor": 1500,
+            "mad_k": 6, "merge_gap_s": 1.2, "max_island_s": 3, "min_sep_s": 3,
+            "candidate_frac": 0.75, "warmup_s": 4, "baseline_s": 90 });
+        server
+            .post("/api/camera/config")
+            .json(&json!({ "external": [
+                { "url": "http://cam.local/s", "stream_url": "http://cam.local/stream", "park_tuning": full },
+                { "url": "http://cam.local/b", "stream_url": "http://cam.local/bstream", "park_tuning": park_only },
+            ]}))
+            .await
+            .assert_status_ok();
+        // segment-capability needs a stream + park_tuning + select_tuning; park needs the first two.
+        let list = server.get("/api/camera").await.json::<serde_json::Value>();
+        let cams = list["cameras"].as_array().unwrap();
+        assert_eq!(cams[0]["segment"], true, "stream + park + select → segment-capable");
+        assert_eq!(cams[0]["park"], true);
+        assert_eq!(cams[1]["segment"], false, "no select knobs → not segment-capable");
+        assert_eq!(cams[1]["park"], true, "still park-capable");
+        // The echo MERGES the select knobs back into the tuning object, so a manage-form
+        // re-save round-trips them (they'd otherwise be dropped, breaking segment).
+        let cfg = server
+            .get("/api/camera/config")
+            .await
+            .json::<serde_json::Value>();
+        assert_eq!(cfg["external"][0]["park_tuning"]["min_outlier"], json!(2.5));
+        assert_eq!(cfg["external"][0]["park_tuning"]["fps"], json!(15.0));
+        assert!(
+            cfg["external"][1]["park_tuning"].get("min_outlier").is_none(),
+            "park-only camera's echo carries no select knobs"
+        );
     }
 
     #[tokio::test]

@@ -24,9 +24,10 @@ export interface TimelapseState extends RunState {
   smooth: RunState;
   plain: RunState;
   park: RunState;
+  segment: RunState;
 }
 
-export type TimelapseMode = "smooth" | "plain" | "park";
+export type TimelapseMode = "smooth" | "plain" | "park" | "segment";
 
 export async function getTimelapse(): Promise<TimelapseState | null> {
   try {
@@ -63,7 +64,8 @@ export function startTimelapse(
   password: string | null,
 ): Promise<Write> {
   const body: Record<string, unknown> = { mode, cameras };
-  // park has no cadence knobs (the signal is in the camera stream); smooth/plain do.
+  // park/segment have no cadence knobs (the signal is in the camera stream — segment uses
+  // its full-layer window default); smooth/plain do.
   if (mode === "plain") body.interval_ms = opts.intervalMs ?? 3000;
   else if (mode === "smooth") body.every = opts.every ?? 1;
   return post("/api/timelapse/start", body, password);
