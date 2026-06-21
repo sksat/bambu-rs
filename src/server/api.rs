@@ -1603,9 +1603,10 @@ struct TimelapseStartBody {
     /// with its offset. Exposed so the offsets can be calibrated without a rebuild.
     #[serde(default)]
     burst_offsets_ms: Option<Vec<u64>>,
-    /// Segment: ms after each layer edge to keep accumulating the dense stream before
-    /// selecting the parked frame (default 3000). Bounds how long the park can lag the
-    /// layer edge; like `burst_offsets_ms` it's exposed so it can be calibrated per print.
+    /// Segment: per-layer accumulation SAFETY CAP in ms (default 120000). The native park is
+    /// a layer-change event, so the segment spans the WHOLE layer (finalized by the next
+    /// layer edge) and median-subtract selection finds the park wherever it lands; this cap
+    /// only forces a selection if `layer_num` stalls, so it sits well above any layer time.
     #[serde(default)]
     window_ms: Option<u64>,
 }
@@ -2019,7 +2020,10 @@ async fn timelapse_start(
     // `every`/`interval_ms` is a clean 400 regardless of camera config.
     let mode = b.mode.as_deref().unwrap_or("smooth");
     let interval_ms = b.interval_ms.unwrap_or(3000);
-    let window_ms = b.window_ms.unwrap_or(3000);
+    // Default: a full-layer safety cap (well above any real layer time). The native park is
+    // a layer-change event, so the segment must span the WHOLE layer to contain it — the
+    // next layer edge finalizes first; this only bites if layer_num stalls.
+    let window_ms = b.window_ms.unwrap_or(120_000);
     let burst_offsets = b
         .burst_offsets_ms
         .clone()
@@ -2048,8 +2052,10 @@ async fn timelapse_start(
         // is enforced when the cameras resolve below.
         "park" => {}
         "segment" => {
-            if !(500..=10_000).contains(&window_ms) {
-                return bad_request("window_ms must be between 500 and 10000".to_string());
+            // window_ms is the per-layer accumulation SAFETY CAP, not a gate — it must
+            // comfortably exceed a layer's print time so the next layer edge finalizes first.
+            if !(5_000..=600_000).contains(&window_ms) {
+                return bad_request("window_ms must be between 5000 and 600000".to_string());
             }
         }
         other => {

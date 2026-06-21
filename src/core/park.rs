@@ -165,11 +165,15 @@ fn norm(v: f64, lo: f64, hi: f64) -> f64 {
 /// burst, or skip the layer. Pure port of the skill's `select_smooth.select_frame`.
 ///
 /// Isolate the transient toolhead by subtracting the per-burst MEDIAN (static
-/// bed/object/printer/dark-fixtures cancel), then measure its dark mass in the LEFT park
+/// bed/object/printer/fixtures cancel), then measure how much it CHANGES the LEFT park
 /// zone (left `left_frac` of the frame, where an X-min park maps for a left-mounted
-/// camera). The park frame's left-mass is a strong OUTLIER vs the burst median; the
-/// sharpest such frame (the settled dwell, not the motion-blurred travel) wins. A layer
-/// whose park fell outside the burst shows no outlier and is SKIPPED.
+/// camera). The change is measured by ABSOLUTE deviation from the median, not just the
+/// darker direction: depending on the camera the parked head reads dark (a nozzle against a
+/// bright bed) OR bright (the white extruder body against a darker backdrop), and a
+/// dark-only measure misses the bright case entirely (it scored ~0 and skipped every layer
+/// on the front-right A1 framing). The park frame's left change is a strong OUTLIER vs the
+/// burst median; the sharpest such frame (the settled dwell, not the motion-blurred travel)
+/// wins. A layer whose park fell outside the burst shows no outlier and is SKIPPED.
 pub fn select_park_frame(
     frames: &[SelectFrame],
     w: usize,
@@ -192,7 +196,8 @@ pub fn select_park_frame(
         *m = median(&col);
     }
     let park_hi = ((cfg.left_frac * w as f64) as usize).max(1);
-    // Dark saliency (how much darker than the median) summed over the left zone, + sharpness.
+    // Change saliency (absolute deviation from the median, either polarity — the parked head
+    // may read dark or bright depending on the camera) summed over the left zone, + sharpness.
     let mut left = Vec::with_capacity(frames.len());
     let mut sharp = Vec::with_capacity(frames.len());
     for f in frames {
@@ -200,10 +205,7 @@ pub fn select_park_frame(
         for y in 0..h {
             let row = y * w;
             for x in 0..park_hi {
-                let d = med[row + x] - f.gray[row + x] as f64;
-                if d > 0.0 {
-                    lm += d;
-                }
+                lm += (med[row + x] - f.gray[row + x] as f64).abs();
             }
         }
         left.push(lm);
@@ -267,17 +269,25 @@ struct Segment {
 /// Segment the CONTINUOUS camera stream by print layer and pick the parked frame per layer
 /// with [`select_park_frame`] — the dense-stream alternative to the sparse snapshot burst.
 ///
-/// The native park is a brief (~0.5 s) far-left dwell whose delay vs the layer edge jitters
-/// wildly. A sparse grid of single grabs misses it; a continuous stream (frame-accurate
-/// timing) sampled densely over a bounded window per layer reliably contains it, and the
-/// per-burst MEDIAN subtraction then isolates the transient head. Feed gray frames as they
-/// arrive (their stream `idx`, capture time, and the current layer); each layer's first
-/// `window_ms` of frames accumulate, then the selector runs over that dense window and
-/// emits the chosen frame's index. Pure (no I/O): the caller owns ffmpeg + the ring JPEGs
-/// and copies the picked index's JPEG out.
+/// The native park runs at the LAYER CHANGE: a brief (~0.5 s) far-left dwell whose delay vs
+/// the `layer_num` edge is large and WILDLY variable (it's the layer-change gcode, so it
+/// lands near the layer's end relative to the edge, drifting with layer time). A sparse grid
+/// of single grabs misses it, and so does a short fixed window after the edge — the very
+/// failure that defeated the snapshot burst. The robust answer is to accumulate the WHOLE
+/// layer (every frame until the next layer edge) and let the MEDIAN subtraction isolate the
+/// transient far-left head against the layer's typical printing frames. So `window_ms` is a
+/// generous SAFETY CAP (max accumulation before forcing a selection, to bound memory if the
+/// A1's `layer_num` sticks), NOT a gate: in normal operation the next layer edge finalizes
+/// the segment first, well within the cap. Feed gray frames as they arrive (their stream
+/// `idx`, capture time, and the current layer); each layer's frames accumulate until the next
+/// layer (or the cap), then the selector runs over them and emits the chosen frame's index.
+/// Pure (no I/O): the caller owns ffmpeg + the ring JPEGs and copies the picked index out.
 pub struct SegmentSelector {
     w: usize,
     h: usize,
+    /// Safety cap (ms): the max a single layer's frames accumulate before a forced selection.
+    /// Normally the next layer edge finalizes the segment first; this only bites when
+    /// `layer_num` stalls, so it's set well above any real layer time.
     window_ms: u64,
     cfg: SelectTuning,
     pending: Option<Segment>,
@@ -990,6 +1000,69 @@ mod select_tests {
         );
         assert!(matches!(sel(&b), Selection::Skipped { .. }));
     }
+
+    // ── bright-head park (the real front-right A1 framing) ──
+    const DARK_BACKDROP: u8 = 80; // the purge bucket / wall filling the left of the frame
+    const BRIGHT_HEAD: u8 = 240; // the WHITE extruder body, parked far-left
+
+    /// A frame where the LEFT zone is a static DARK backdrop (bucket/wall) and the parked
+    /// head is BRIGHT — the inverse polarity of [`sframe`]. Over-print frames leave the left
+    /// zone dark; a park lands the bright head over it, so the park BRIGHTENS the left zone.
+    fn sframe_bright(head_x: i64, sharp: bool) -> Vec<u8> {
+        let head_hw: i64 = 5;
+        let left_w = (SW as f64 * 0.33) as usize;
+        let mut img = vec![BG; SW * SH];
+        for y in 0..SH {
+            let row = y * SW;
+            for px in img[row..row + left_w].iter_mut() {
+                *px = DARK_BACKDROP; // static dark left backdrop
+            }
+            for px in img[row + (CENTER as usize - 3)..row + (CENTER as usize + 3)].iter_mut() {
+                *px = OBJ; // static center print object
+            }
+            for x in 0..SW {
+                let d = (x as i64 - head_x).abs();
+                if d <= head_hw {
+                    img[row + x] = BRIGHT_HEAD;
+                } else if !sharp && d <= head_hw + 3 {
+                    let base = if (x as usize) < left_w { DARK_BACKDROP } else { BG };
+                    img[row + x] = (BRIGHT_HEAD as f64
+                        + (d - head_hw) as f64 / 3.0 * (base as f64 - BRIGHT_HEAD as f64))
+                        as u8;
+                }
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn selects_a_bright_head_park() {
+        // Real hardware: on the front-right A1 framing the parked head is the white extruder
+        // body over a darker backdrop, so it BRIGHTENS the left zone. A dark-only saliency
+        // scored ~0 here and skipped every layer; the absolute-change saliency catches it.
+        // (Validated against the live capture: dark density 2.5 → skip, abs density 9.2 → pick.)
+        let specs = [
+            (300u64, CENTER, true),
+            (500, CENTER, true),
+            (700, 6, true),
+            (900, 6, true),
+            (1100, CENTER, true),
+            (1300, CENTER, true),
+        ];
+        let b: Vec<SelectFrame> = specs
+            .iter()
+            .map(|&(o, hx, s)| SelectFrame {
+                offset_ms: o,
+                gray: sframe_bright(hx, s),
+            })
+            .collect();
+        match sel(&b) {
+            Selection::Selected { offset_ms, .. } => {
+                assert!(matches!(offset_ms, 700 | 900), "picks the bright park: {offset_ms}")
+            }
+            other => panic!("the bright-head park must be selected, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1120,6 +1193,34 @@ mod segment_tests {
         assert!(
             picks.is_empty(),
             "coarse sampling misses the brief park: {picks:?}"
+        );
+    }
+
+    #[test]
+    fn full_layer_window_catches_a_park_at_the_layer_change() {
+        // The REAL native park is the LAYER-CHANGE gcode: it fires near the END of a layer
+        // relative to the layer_num edge (here ~14s into a 16s layer), NOT in the first few
+        // seconds. This is what actually defeated the capture on hardware.
+        //
+        // Layers: two that park late + a third (never parks) to provide the closing edge.
+        let layers = [
+            (0i64, 14_000u64, 500u64, 10u64, 16_000u64),
+            (1, 14_000, 500, 10, 16_000),
+            (2, 99_999, 500, 10, 16_000),
+        ];
+        // A short window closes long before the park → catches nothing (the hardware bug).
+        let mut short = SegmentSelector::new(SW, SH, 3000, ex());
+        assert!(
+            run(&mut short, &layers).is_empty(),
+            "a 3s window closes before the layer-change park"
+        );
+        // A full-layer window finalizes on the NEXT layer edge → the park is in the segment.
+        let mut full = SegmentSelector::new(SW, SH, 120_000, ex());
+        let picks = run(&mut full, &layers);
+        assert_eq!(
+            picks.iter().map(|p| p.layer).collect::<Vec<_>>(),
+            vec![0, 1],
+            "full-layer segmenting catches the late park each parked layer: {picks:?}"
         );
     }
 }
