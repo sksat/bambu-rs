@@ -48,13 +48,14 @@ use super::start::FakeStarter;
 use super::start::{StartRequest, Starter};
 use super::timelapse::{
     DEFAULT_SMOOTH_BURST_MS, FrameGrab, PlainCapture, TimelapseManager, real_park_spawn,
+    real_segment_spawn,
 };
 use crate::core::command::{AmsControl, LedNode, SpeedLevel};
 use crate::core::park::ParkTuning;
 use crate::core::safety::{GcodeVerdict, TempLimits, check_extrude, check_gcode, check_jog};
 use crate::core::session::CommandOutcome;
 use crate::core::status::{Ams, AmsTray, AmsUnit, Filament, LightReport, Online, PrinterStatus};
-use crate::park::ParkCapture;
+use crate::park::{ParkCapture, SegmentCapture};
 
 /// Something that can provide the printer's current status and a live stream of
 /// updates. Abstracted so the server is testable without a network: tests and
@@ -1381,14 +1382,25 @@ fn parse_parks_index(contents: &str) -> Vec<serde_json::Value> {
 /// `smooth` run (its live per-layer selection publishes the same `park_*.jpg`/`parks.jsonl`
 /// into its dir). Returns `(out_dir, cameras, running)`.
 fn live_park_source(st: &AppState) -> Option<(String, Vec<String>, bool)> {
-    let park = st.timelapse.status_park();
-    if let Some(dir) = park.out_dir {
-        return Some((dir, park.cameras, park.running));
+    // The park preview reads `latest_park.jpg`/`parks.jsonl`, which three slots can produce:
+    // `segment` (the dense-stream robust path), `park` (the image-change miner), and a
+    // `smooth` run with live selection. Prefer a RUNNING one (so the preview follows the
+    // active capture when several have been started this session), else the most recent to
+    // have a dir. Within each tier order segment → park → smooth.
+    let sources = [
+        st.timelapse.status_segment(),
+        st.timelapse.status_park(),
+        st.timelapse.status_smooth(),
+    ];
+    if let Some(s) = sources
+        .iter()
+        .find(|s| s.running && s.out_dir.is_some())
+    {
+        return Some((s.out_dir.clone().unwrap(), s.cameras.clone(), s.running));
     }
-    let smooth = st.timelapse.status_smooth();
-    smooth
-        .out_dir
-        .map(|dir| (dir, smooth.cameras, smooth.running))
+    sources
+        .into_iter()
+        .find_map(|s| s.out_dir.map(|dir| (dir, s.cameras, s.running)))
 }
 
 async fn park_index(State(st): State<AppState>, Path(id): Path<String>) -> Response {
@@ -1573,6 +1585,11 @@ struct TimelapseStartBody {
     /// with its offset. Exposed so the offsets can be calibrated without a rebuild.
     #[serde(default)]
     burst_offsets_ms: Option<Vec<u64>>,
+    /// Segment: ms after each layer edge to keep accumulating the dense stream before
+    /// selecting the parked frame (default 3000). Bounds how long the park can lag the
+    /// layer edge; like `burst_offsets_ms` it's exposed so it can be calibrated per print.
+    #[serde(default)]
+    window_ms: Option<u64>,
 }
 fn default_every() -> u64 {
     1
@@ -1592,15 +1609,17 @@ fn timelapse_status_json(st: &AppState) -> serde_json::Value {
     let smooth = st.timelapse.status_smooth();
     let plain = st.timelapse.status_plain();
     let park = st.timelapse.status_park();
+    let segment = st.timelapse.status_segment();
     let mut out = smooth.to_json();
     if let Some(o) = out.as_object_mut() {
         o.insert(
             "running".to_string(),
-            json!(smooth.running || plain.running || park.running),
+            json!(smooth.running || plain.running || park.running || segment.running),
         );
         o.insert("smooth".to_string(), smooth.to_json());
         o.insert("plain".to_string(), plain.to_json());
         o.insert("park".to_string(), park.to_json());
+        o.insert("segment".to_string(), segment.to_json());
     }
     out
 }
@@ -1914,6 +1933,63 @@ fn start_park_run(
     }
 }
 
+/// Resolve the segment-capable cameras among `ids` and start the dense-stream segmented
+/// slot. A camera qualifies iff it's an external camera with a stream, a `park_tuning` (for
+/// the capture fps), AND a `select_tuning` (the median-subtract knobs) — i.e. fully
+/// calibrated for park capture. Non-capable requested cameras are skipped; it's a 400 if
+/// none qualify. Output is the same `latest_park.jpg`/`parks.jsonl` layout `park` produces,
+/// served by `/api/camera/{id}/park`.
+fn start_segment_run(
+    st: &AppState,
+    ids: &[String],
+    window_ms: u64,
+    out_dir: std::path::PathBuf,
+    rx: watch::Receiver<PrinterStatus>,
+) -> Response {
+    let externals = st.external_cameras.read().unwrap();
+    let mut caps = Vec::new();
+    let mut skipped = Vec::new();
+    for id in ids {
+        let cap = id
+            .strip_prefix("ext-")
+            .and_then(|n| n.parse::<usize>().ok())
+            .and_then(|i| externals.get(i))
+            .and_then(|c| match (&c.stream_url, &c.park_tuning, c.select_tuning) {
+                (Some(url), Some(park), Some(select)) => Some(SegmentCapture {
+                    id: id.clone(),
+                    stream_url: url.clone(),
+                    fps: park.fps,
+                    window_ms,
+                    select_tuning: select,
+                }),
+                _ => None,
+            });
+        match cap {
+            Some(c) => caps.push(c),
+            None => skipped.push(id.clone()),
+        }
+    }
+    drop(externals);
+    if caps.is_empty() {
+        return bad_request(format!(
+            "no segment-capable cameras among {ids:?} — each needs a stream_url, a park_tuning, and a select_tuning"
+        ));
+    }
+    match st
+        .timelapse
+        .start_segment(caps, rx, out_dir, real_segment_spawn())
+    {
+        Ok(()) => {
+            let mut body = timelapse_status_json(st);
+            if let Some(o) = body.as_object_mut() {
+                o.insert("skipped".to_string(), json!(skipped));
+            }
+            Json(body).into_response()
+        }
+        Err(e) => (StatusCode::CONFLICT, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
 /// Start a per-layer timelapse capture from a configured camera (gated write).
 /// 409 if one is already running; 404 for an unknown/unconfigured camera. Frames
 /// land in `./captures/<epoch>_<print-hint>/`.
@@ -1925,6 +2001,7 @@ async fn timelapse_start(
     // `every`/`interval_ms` is a clean 400 regardless of camera config.
     let mode = b.mode.as_deref().unwrap_or("smooth");
     let interval_ms = b.interval_ms.unwrap_or(3000);
+    let window_ms = b.window_ms.unwrap_or(3000);
     let burst_offsets = b
         .burst_offsets_ms
         .clone()
@@ -1952,9 +2029,14 @@ async fn timelapse_start(
         // Park has no cadence knobs; its requirement (a stream + park_tuning per camera)
         // is enforced when the cameras resolve below.
         "park" => {}
+        "segment" => {
+            if !(500..=10_000).contains(&window_ms) {
+                return bad_request("window_ms must be between 500 and 10000".to_string());
+            }
+        }
         other => {
             return bad_request(format!(
-                "unknown mode {other:?} (use smooth, plain, or park)"
+                "unknown mode {other:?} (use smooth, plain, park, or segment)"
             ));
         }
     }
@@ -1974,6 +2056,12 @@ async fn timelapse_start(
         let out_dir = run_out_dir(&st, mode);
         let rx = st.source.subscribe();
         return start_park_run(&st, &ids, out_dir, rx);
+    }
+    // Segment likewise reads the stream; it additionally needs select tuning + a window.
+    if mode == "segment" {
+        let out_dir = run_out_dir(&st, mode);
+        let rx = st.source.subscribe();
+        return start_segment_run(&st, &ids, window_ms, out_dir, rx);
     }
     let mut grabs = Vec::with_capacity(ids.len());
     for id in &ids {
@@ -2062,14 +2150,18 @@ async fn timelapse_stop(
         "park" => {
             st.timelapse.stop_park();
         }
+        "segment" => {
+            st.timelapse.stop_segment();
+        }
         "all" => {
             st.timelapse.stop_smooth();
             st.timelapse.stop_plain();
             st.timelapse.stop_park();
+            st.timelapse.stop_segment();
         }
         other => {
             return bad_request(format!(
-                "unknown mode {other:?} (use smooth, plain, park, or all)"
+                "unknown mode {other:?} (use smooth, plain, park, segment, or all)"
             ));
         }
     }
@@ -2901,6 +2993,36 @@ mod tests {
         server
             .post("/api/timelapse/start")
             .json(&json!({ "mode": "park", "camera": "ext-0" }))
+            .await
+            .assert_status_bad_request();
+    }
+
+    #[tokio::test]
+    async fn timelapse_start_segment_rejects_without_a_capable_camera() {
+        // Segment needs a stream + park_tuning + select_tuning; a stream-only camera
+        // (no tuning) isn't capable → 400, like park.
+        let server = app(None, FakeController::verified());
+        server
+            .post("/api/camera/config")
+            .json(&json!({ "external": [
+                { "url": "http://cam.local/a.jpg", "stream_url": "http://cam.local/s" },
+            ]}))
+            .await
+            .assert_status_ok();
+        server
+            .post("/api/timelapse/start")
+            .json(&json!({ "mode": "segment", "camera": "ext-0" }))
+            .await
+            .assert_status_bad_request();
+    }
+
+    #[tokio::test]
+    async fn timelapse_start_segment_rejects_a_bad_window() {
+        // window_ms is validated up front (before camera resolution), so an out-of-range
+        // value is a clean 400 regardless of camera config.
+        app(None, FakeController::verified())
+            .post("/api/timelapse/start")
+            .json(&json!({ "mode": "segment", "camera": "ext-0", "window_ms": 50 }))
             .await
             .assert_status_bad_request();
     }

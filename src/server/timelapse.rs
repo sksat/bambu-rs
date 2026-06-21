@@ -10,7 +10,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,7 +22,10 @@ use super::stream_record::record_loop;
 use crate::core::park::{Park, SelectTuning};
 use crate::core::status::PrinterStatus;
 use crate::core::timelapse::{ActivityAction, CaptureAction, CaptureSession, PrintActivitySession};
-use crate::park::{DECODE_H, DECODE_W, ParkCapture, ParkEvent, ParkWriter, run_park_camera};
+use crate::park::{
+    DECODE_H, DECODE_W, ParkCapture, ParkEvent, ParkRunStats, ParkWriter, SegmentCapture,
+    run_park_camera, run_segment_camera,
+};
 
 /// Spawns the live-park worker for ONE camera, returning its task handle. Injected so the
 /// slot lifecycle (lazy spawn on print-active, stop at finish) is unit-tested with a fake
@@ -40,41 +43,99 @@ pub fn real_park_spawn() -> ParkSpawn {
     Arc::new(
         |cap: ParkCapture, out_dir, cancel, status: Arc<Mutex<TimelapseStatus>>| {
             tokio::task::spawn_blocking(move || {
-                let mut on_park = |ev: ParkEvent| {
-                    let mut s = status.lock().unwrap();
-                    match ev {
-                        ParkEvent::Written => s.frames += 1,
-                        // A replace refines the previous park in place — same layer, not
-                        // a new frame, so the distinct-park count stays put.
-                        ParkEvent::Replaced => {}
-                        ParkEvent::Dropped => {
-                            s.failures += 1;
-                            s.last_error =
-                                Some(format!("park {}: a ring JPEG never arrived", cap.id));
-                        }
-                    }
-                };
+                let mut on_park = park_progress(cap.id.clone(), status.clone());
                 let cam_dir = out_dir.join(&cap.id);
                 let outcome =
                     run_park_camera(&cap, &cam_dir, DECODE_W, DECODE_H, &cancel, &mut on_park);
-                let mut s = status.lock().unwrap();
-                match outcome {
-                    Ok(stats) if stats.frames == 0 => {
-                        s.failures += 1;
-                        s.last_error = Some(format!(
-                            "park {}: read 0 frames from {}",
-                            cap.id, cap.stream_url
-                        ));
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        s.failures += 1;
-                        s.last_error = Some(e);
-                    }
-                }
+                report_park_run(&cap.id, &cap.stream_url, outcome, &status);
             })
         },
     )
+}
+
+/// Spawns the dense-stream segment worker for ONE camera, returning its task handle. Like
+/// [`ParkSpawn`] but the worker also reads the live print layer (the `Arc<AtomicI64>` the
+/// lifecycle loop feeds from MQTT `layer_num`), so it can segment the stream per layer.
+/// Injected so the slot lifecycle is unit-tested with a fake worker; production runs the
+/// real ffmpeg supervisor ([`crate::park::run_segment_camera`]).
+pub type SegmentSpawn = Arc<
+    dyn Fn(
+            SegmentCapture,
+            PathBuf,
+            Arc<AtomicI64>,
+            Arc<AtomicBool>,
+            Arc<Mutex<TimelapseStatus>>,
+        ) -> JoinHandle<()>
+        + Send
+        + Sync,
+>;
+
+/// The production [`SegmentSpawn`]: each camera's blocking ffmpeg supervisor for the
+/// dense-stream segmented capture, sharing the same progress→status adapter as the park
+/// slot (both write the identical `park_*.jpg` output).
+pub fn real_segment_spawn() -> SegmentSpawn {
+    Arc::new(
+        |cap: SegmentCapture,
+         out_dir,
+         current_layer: Arc<AtomicI64>,
+         cancel,
+         status: Arc<Mutex<TimelapseStatus>>| {
+            tokio::task::spawn_blocking(move || {
+                let mut on_park = park_progress(cap.id.clone(), status.clone());
+                let cam_dir = out_dir.join(&cap.id);
+                let outcome = run_segment_camera(
+                    &cap,
+                    &cam_dir,
+                    DECODE_W,
+                    DECODE_H,
+                    &current_layer,
+                    &cancel,
+                    &mut on_park,
+                );
+                report_park_run(&cap.id, &cap.stream_url, outcome, &status);
+            })
+        },
+    )
+}
+
+/// The shared progress→status adapter for both park runners: a written park bumps the
+/// frame count, a replace refines the previous park in place (same layer — not a new
+/// frame, so the count stays put), and a dropped ring JPEG is surfaced as a failure.
+fn park_progress(id: String, status: Arc<Mutex<TimelapseStatus>>) -> impl FnMut(ParkEvent) {
+    move |ev: ParkEvent| {
+        let mut s = status.lock().unwrap();
+        match ev {
+            ParkEvent::Written => s.frames += 1,
+            ParkEvent::Replaced => {}
+            ParkEvent::Dropped => {
+                s.failures += 1;
+                s.last_error = Some(format!("park {id}: a ring JPEG never arrived"));
+            }
+        }
+    }
+}
+
+/// Fold a park/segment runner's final outcome into the shared status: a clean run with zero
+/// frames (the stream produced nothing) and an outright error both count a failure with a
+/// message, so a silently-dead camera is visible.
+fn report_park_run(
+    id: &str,
+    source: &str,
+    outcome: Result<ParkRunStats, String>,
+    status: &Arc<Mutex<TimelapseStatus>>,
+) {
+    let mut s = status.lock().unwrap();
+    match outcome {
+        Ok(stats) if stats.frames == 0 => {
+            s.failures += 1;
+            s.last_error = Some(format!("park {id}: read 0 frames from {source}"));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            s.failures += 1;
+            s.last_error = Some(e);
+        }
+    }
 }
 
 /// Grab a single JPEG frame (blocking). Resolved from a camera id at start time
@@ -171,6 +232,10 @@ pub struct TimelapseManager {
     /// Live park-preview slot: one ffmpeg supervisor per tuned stream camera, lazily
     /// started when the print is active. Independent of smooth/plain.
     park: Mutex<Inner>,
+    /// Dense-stream segmented slot: like `park`, but each worker segments the continuous
+    /// stream by the live MQTT layer and median-subtract-selects the parked frame — the
+    /// robust capture for the brief native park. Independent of the others.
+    segment: Mutex<Inner>,
 }
 
 impl TimelapseManager {
@@ -289,6 +354,36 @@ impl TimelapseManager {
         )
     }
 
+    /// Start the dense-stream segmented capture: for each capable stream camera, lazily
+    /// spawn one ffmpeg supervisor (via `spawn_worker`) once the print is active. The
+    /// lifecycle maintains the live print layer (from MQTT `layer_num`) and feeds it to the
+    /// workers, which segment the stream per layer and publish the picked frame as
+    /// `latest_park.jpg`/`park_NNNNNN.jpg` (read by `/api/camera/{id}/park`, exactly like
+    /// `park`). `spawn_worker` is injected for testing; [`real_segment_spawn`] runs ffmpeg.
+    /// Rejected if a segment run is already active or `cameras` is empty.
+    pub fn start_segment(
+        &self,
+        cameras: Vec<SegmentCapture>,
+        rx: watch::Receiver<PrinterStatus>,
+        out_dir: PathBuf,
+        spawn_worker: SegmentSpawn,
+    ) -> Result<(), String> {
+        let ids = cameras.iter().map(|c| c.id.clone()).collect();
+        start_slot(
+            &self.segment,
+            cameras,
+            ids,
+            out_dir,
+            TimelapseStatus {
+                mode: "segment",
+                ..Default::default()
+            },
+            move |status, caps, dir, cancel| {
+                tokio::spawn(run_segment(status, rx, caps, dir, cancel, spawn_worker))
+            },
+        )
+    }
+
     /// Stop the smooth capture (idempotent). Returns whether one was running.
     pub fn stop_smooth(&self) -> bool {
         stop_slot(&self.smooth)
@@ -301,6 +396,10 @@ impl TimelapseManager {
     pub fn stop_park(&self) -> bool {
         stop_slot(&self.park)
     }
+    /// Stop the dense-stream segmented capture (idempotent). Returns whether one was running.
+    pub fn stop_segment(&self) -> bool {
+        stop_slot(&self.segment)
+    }
 
     pub fn status_smooth(&self) -> TimelapseStatus {
         self.smooth.lock().unwrap().status.lock().unwrap().clone()
@@ -310,6 +409,9 @@ impl TimelapseManager {
     }
     pub fn status_park(&self) -> TimelapseStatus {
         self.park.lock().unwrap().status.lock().unwrap().clone()
+    }
+    pub fn status_segment(&self) -> TimelapseStatus {
+        self.segment.lock().unwrap().status.lock().unwrap().clone()
     }
 }
 
@@ -882,6 +984,60 @@ async fn run_park(
     status.lock().unwrap().running = false;
 }
 
+/// The dense-stream segmented slot's lifecycle: like [`run_park`], but it OWNS the live
+/// print layer. Each status tick it stores `layer_num` into a shared `Arc<AtomicI64>`
+/// (`-1` until the first reported layer) that every worker reads to segment its stream —
+/// the one piece the camera stream can't supply itself. It still lazily spawns one worker
+/// per camera on the first active status and stops at FINISH/cancel.
+async fn run_segment(
+    status: Arc<Mutex<TimelapseStatus>>,
+    mut rx: watch::Receiver<PrinterStatus>,
+    captures: Vec<SegmentCapture>,
+    out_dir: PathBuf,
+    cancel: Arc<AtomicBool>,
+    spawn_worker: SegmentSpawn,
+) {
+    let current_layer = Arc::new(AtomicI64::new(-1));
+    let mut activity = PrintActivitySession::new(true);
+    let mut pending = Some(captures); // spawned once, on the first active tick
+    let mut workers: Vec<JoinHandle<()>> = Vec::new();
+    loop {
+        let snap = rx.borrow_and_update().clone();
+        // Feed the live layer BEFORE (maybe) spawning workers, so a worker never reads the
+        // initial -1 once a layer is known.
+        if let Some(l) = snap.layer_num {
+            current_layer.store(l, Ordering::Relaxed);
+        }
+        status.lock().unwrap().current_layer = snap.layer_num;
+        match activity.observe(&snap) {
+            ActivityAction::Capture => {
+                if let Some(caps) = pending.take() {
+                    for cap in caps {
+                        workers.push(spawn_worker(
+                            cap,
+                            out_dir.clone(),
+                            current_layer.clone(),
+                            cancel.clone(),
+                            status.clone(),
+                        ));
+                    }
+                }
+            }
+            ActivityAction::Idle => {}
+            ActivityAction::Stop => break,
+        }
+        if rx.changed().await.is_err() {
+            break; // the source (and the whole server) is gone
+        }
+    }
+    // Tell the blocking ffmpeg supervisors to stop (the print ended), then let them exit.
+    cancel.store(true, Ordering::Relaxed);
+    for w in workers {
+        let _ = w.await;
+    }
+    status.lock().unwrap().running = false;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1341,6 +1497,102 @@ mod tests {
         let noop: ParkSpawn = Arc::new(|_, _, _, _| tokio::task::spawn_blocking(|| {}));
         assert!(
             mgr.start_park(vec![], rx, dir, noop).is_err(),
+            "need at least one camera"
+        );
+    }
+
+    // ── dense-stream segmented slot (injected fake worker, no ffmpeg) ──
+    fn segment_cap(id: &str) -> SegmentCapture {
+        SegmentCapture {
+            id: id.to_string(),
+            stream_url: "http://cam/stream".to_string(),
+            fps: 10.0,
+            window_ms: 3000,
+            select_tuning: SelectTuning {
+                left_frac: 0.33,
+                min_outlier: 2.5,
+                min_left_density: 3.0,
+                select_candidate_frac: 0.6,
+                min_confidence: 0.40,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn segment_spawns_per_camera_and_feeds_the_live_layer() {
+        let dir = std::env::temp_dir().join(format!("bambu-seg-slot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tx, rx) = watch::channel(st("IDLE", None));
+        let spawned = Arc::new(AtomicUsize::new(0));
+        // Each fake worker captures the SHARED layer atomic; the test reads it back to prove
+        // the lifecycle feeds MQTT layer_num through to the worker.
+        let seen_layer = Arc::new(AtomicI64::new(i64::MIN));
+        let spawn_worker: SegmentSpawn = {
+            let (spawned, seen_layer) = (spawned.clone(), seen_layer.clone());
+            Arc::new(
+                move |_cap,
+                      _dir,
+                      current_layer: Arc<AtomicI64>,
+                      cancel: Arc<AtomicBool>,
+                      status: Arc<Mutex<TimelapseStatus>>| {
+                    spawned.fetch_add(1, Ordering::SeqCst);
+                    status.lock().unwrap().frames += 1; // a fake "park"
+                    let seen_layer = seen_layer.clone();
+                    tokio::task::spawn_blocking(move || {
+                        while !cancel.load(Ordering::Relaxed) {
+                            // Mirror what run_segment_camera does: read the live layer.
+                            seen_layer.store(current_layer.load(Ordering::Relaxed), Ordering::SeqCst);
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                    })
+                },
+            )
+        };
+        let mgr = TimelapseManager::default();
+        mgr.start_segment(
+            vec![segment_cap("ext-0"), segment_cap("ext-1")],
+            rx,
+            dir.clone(),
+            spawn_worker,
+        )
+        .unwrap();
+
+        // Idle → nothing spawned yet (armed, waiting for the print).
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        assert_eq!(spawned.load(Ordering::SeqCst), 0, "no workers while idle");
+
+        // Active + advancing layers → one worker per camera (once), and the live layer
+        // propagates to the workers.
+        tx.send(st("RUNNING", Some(7))).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        tx.send(st("RUNNING", Some(8))).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        assert_eq!(spawned.load(Ordering::SeqCst), 2, "one per camera, spawned once");
+        assert_eq!(mgr.status_segment().frames, 2);
+        assert_eq!(
+            seen_layer.load(Ordering::SeqCst),
+            8,
+            "the worker reads the latest MQTT layer through the shared atomic"
+        );
+
+        // Finish → cancel → the fake workers exit → the slot stops.
+        tx.send(st("FINISH", Some(8))).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        assert!(
+            !mgr.status_segment().running,
+            "segment stops when the print finishes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn segment_with_no_cameras_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("bambu-seg-empty-{}", std::process::id()));
+        let (_tx, rx) = watch::channel(st("RUNNING", Some(0)));
+        let mgr = TimelapseManager::default();
+        let noop: SegmentSpawn = Arc::new(|_, _, _, _, _| tokio::task::spawn_blocking(|| {}));
+        assert!(
+            mgr.start_segment(vec![], rx, dir, noop).is_err(),
             "need at least one camera"
         );
     }
