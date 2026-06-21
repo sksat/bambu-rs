@@ -416,9 +416,11 @@ export function CamerasSection({ password }: { password: string | null }) {
   const [active, setActive] = useState<string>("");
   const [managing, setManaging] = useState(false);
   const [recordings, setRecordings] = useState(false);
-  // The park run's state, so the view offers the park toggle whenever a run (active OR
-  // recently stopped) owns the active camera — its filmstrip is reviewable either way.
+  // The park + smooth run states, so the view offers the "captured" toggle whenever a run
+  // (active OR recently stopped) owns the active camera. A smooth run also publishes a
+  // per-layer park filmstrip now (live selection), so it enables the toggle too.
   const [parkRun, setParkRun] = useState<RunState | null>(null);
+  const [smoothRun, setSmoothRun] = useState<RunState | null>(null);
 
   const reload = async () => {
     const cams = await listCameras();
@@ -434,7 +436,10 @@ export function CamerasSection({ password }: { password: string | null }) {
     let live = true;
     const poll = async () => {
       const s = await getTimelapse();
-      if (live) setParkRun(s?.park ?? null);
+      if (live) {
+        setParkRun(s?.park ?? null);
+        setSmoothRun(s?.smooth ?? null);
+      }
     };
     void poll();
     const id = setInterval(() => void poll(), 2000);
@@ -445,9 +450,11 @@ export function CamerasSection({ password }: { password: string | null }) {
   }, []);
 
   const activeCam = cameras.find((c) => c.id === active);
-  // A filmstrip exists for the active camera iff a park run (running or stopped) captured
-  // it — the player then works (live tail while running, review-only after stop).
-  const parkAvailable = !!parkRun && parkRun.cameras.includes(active);
+  // A filmstrip exists for the active camera iff a park OR smooth run (running or stopped)
+  // captured it — the player then works (live tail while running, review-only after stop).
+  // Smooth counts now: its live per-layer selection publishes the same park filmstrip.
+  const ownsActive = (r: RunState | null) => !!r && r.cameras.includes(active);
+  const parkAvailable = ownsActive(parkRun) || ownsActive(smoothRun);
 
   return (
     <>
