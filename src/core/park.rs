@@ -126,7 +126,7 @@ pub struct SelectFrame {
 /// Knobs for [`select_park_frame`]. Distinct from [`ParkTuning`]: selection scores against
 /// the per-burst MEDIAN (not the live EMA), so its cutoffs differ. No defaults — every knob
 /// is supplied by the caller (it depends on camera/printer placement).
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
 pub struct SelectTuning {
     /// Park zone = the left this-fraction of the frame.
     pub left_frac: f64,
@@ -246,6 +246,125 @@ pub fn select_park_frame(
     Selection::Selected {
         offset_ms: frames[best].offset_ms,
         confidence: conf,
+    }
+}
+
+/// A picked frame for one layer's segment: which stream frame index to keep (→ its ring
+/// JPEG) and the selection confidence.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SegmentPick {
+    pub layer: i64,
+    pub idx: u64,
+    pub confidence: f64,
+}
+
+struct Segment {
+    layer: i64,
+    start_ms: u64,
+    frames: Vec<(u64, u64, Vec<u8>)>, // (offset_ms, stream idx, gray)
+}
+
+/// Segment the CONTINUOUS camera stream by print layer and pick the parked frame per layer
+/// with [`select_park_frame`] — the dense-stream alternative to the sparse snapshot burst.
+///
+/// The native park is a brief (~0.5 s) far-left dwell whose delay vs the layer edge jitters
+/// wildly. A sparse grid of single grabs misses it; a continuous stream (frame-accurate
+/// timing) sampled densely over a bounded window per layer reliably contains it, and the
+/// per-burst MEDIAN subtraction then isolates the transient head. Feed gray frames as they
+/// arrive (their stream `idx`, capture time, and the current layer); each layer's first
+/// `window_ms` of frames accumulate, then the selector runs over that dense window and
+/// emits the chosen frame's index. Pure (no I/O): the caller owns ffmpeg + the ring JPEGs
+/// and copies the picked index's JPEG out.
+pub struct SegmentSelector {
+    w: usize,
+    h: usize,
+    window_ms: u64,
+    cfg: SelectTuning,
+    pending: Option<Segment>,
+    done_layer: Option<i64>,
+}
+
+impl SegmentSelector {
+    pub fn new(w: usize, h: usize, window_ms: u64, cfg: SelectTuning) -> Self {
+        Self {
+            w,
+            h,
+            window_ms,
+            cfg,
+            pending: None,
+            done_layer: None,
+        }
+    }
+
+    /// Feed one stream frame. Returns a [`SegmentPick`] when a layer's window CLOSES with a
+    /// selected park — finalized either when the NEXT layer starts or `window_ms` elapses.
+    /// Frames after a layer's window (until the next layer) are ignored. `None` otherwise.
+    pub fn push(&mut self, layer: i64, idx: u64, t_ms: u64, gray: Vec<u8>) -> Option<SegmentPick> {
+        if let Some(seg) = &mut self.pending {
+            if seg.layer == layer {
+                let off = t_ms.saturating_sub(seg.start_ms);
+                if off <= self.window_ms {
+                    seg.frames.push((off, idx, gray));
+                    return None;
+                }
+                // Window elapsed → finalize; ignore later same-layer frames until next layer.
+                let pick = self.finalize();
+                self.done_layer = Some(layer);
+                return pick;
+            }
+            // A new layer arrived → finalize the old segment, open a fresh one.
+            let pick = self.finalize();
+            self.open(layer, idx, t_ms, gray);
+            return pick;
+        }
+        if self.done_layer == Some(layer) {
+            return None; // this layer's window already closed
+        }
+        self.open(layer, idx, t_ms, gray);
+        None
+    }
+
+    /// Finalize the last open segment at stream end.
+    pub fn finish(&mut self) -> Option<SegmentPick> {
+        self.finalize()
+    }
+
+    fn open(&mut self, layer: i64, idx: u64, t_ms: u64, gray: Vec<u8>) {
+        self.pending = Some(Segment {
+            layer,
+            start_ms: t_ms,
+            frames: vec![(0, idx, gray)],
+        });
+    }
+
+    fn finalize(&mut self) -> Option<SegmentPick> {
+        let seg = self.pending.take()?;
+        let frames: Vec<SelectFrame> = seg
+            .frames
+            .iter()
+            .map(|(off, _idx, g)| SelectFrame {
+                offset_ms: *off,
+                gray: g.clone(),
+            })
+            .collect();
+        match select_park_frame(&frames, self.w, self.h, &self.cfg) {
+            Selection::Selected {
+                offset_ms,
+                confidence,
+            } => {
+                let idx = seg
+                    .frames
+                    .iter()
+                    .find(|(off, _, _)| *off == offset_ms)
+                    .map(|(_, i, _)| *i)?;
+                Some(SegmentPick {
+                    layer: seg.layer,
+                    idx,
+                    confidence,
+                })
+            }
+            Selection::Skipped { .. } => None,
+        }
     }
 }
 
@@ -870,5 +989,137 @@ mod select_tests {
             CENTER,
         );
         assert!(matches!(sel(&b), Selection::Skipped { .. }));
+    }
+}
+
+#[cfg(test)]
+mod segment_tests {
+    //! Software-only DEVICE MODEL of the native park: the head is over the print (center)
+    //! most of the time and parks FAR-LEFT for a brief dwell at a per-layer-VARIABLE delay
+    //! (the real device's jitter). Feeding the modeled continuous stream through
+    //! SegmentSelector reproduces in software both the win (a frame-accurate dense stream
+    //! catches the jittery park every layer) and the failure (too-coarse sampling misses
+    //! the brief dwell) — no ffmpeg, camera, or printer needed.
+    use super::*;
+
+    const SW: usize = 48;
+    const SH: usize = 24;
+    const BG: u8 = 200;
+    const OBJ: u8 = 110;
+    const HEAD: u8 = 25;
+    const CENTER: i64 = 24;
+
+    fn sframe(head_x: i64) -> Vec<u8> {
+        let head_hw: i64 = 5;
+        let mut img = vec![BG; SW * SH];
+        for y in 0..SH {
+            let row = y * SW;
+            for px in img[row + (CENTER as usize - 3)..row + (CENTER as usize + 3)].iter_mut() {
+                *px = OBJ; // a static dark print object at center
+            }
+            for x in 0..SW {
+                if (x as i64 - head_x).abs() <= head_hw {
+                    img[row + x] = HEAD;
+                }
+            }
+        }
+        img
+    }
+
+    fn ex() -> SelectTuning {
+        SelectTuning {
+            left_frac: 0.33,
+            min_outlier: 2.5,
+            min_left_density: 3.0,
+            select_candidate_frac: 0.6,
+            min_confidence: 0.40,
+        }
+    }
+
+    /// Model one layer's camera frames at `fps` over `layer_ms`: head over-print (center)
+    /// except parked FAR-LEFT during `[park_at_ms, park_at_ms+park_dur_ms)`.
+    fn sim_layer(
+        park_at_ms: u64,
+        park_dur_ms: u64,
+        fps: u64,
+        layer_ms: u64,
+    ) -> Vec<(u64, Vec<u8>)> {
+        let dt = (1000 / fps).max(1);
+        let mut out = Vec::new();
+        let mut t = 0u64;
+        while t < layer_ms {
+            let parked = t >= park_at_ms && t < park_at_ms + park_dur_ms;
+            out.push((t, sframe(if parked { 6 } else { CENTER })));
+            t += dt;
+        }
+        out
+    }
+
+    fn run(
+        sel: &mut SegmentSelector,
+        layers: &[(i64, u64, u64, u64, u64)], // (layer, park_at, park_dur, fps, layer_ms)
+    ) -> Vec<SegmentPick> {
+        let mut idx = 0u64;
+        let mut base = 0u64;
+        let mut picks = Vec::new();
+        for &(layer, pa, pd, fps, lms) in layers {
+            for (t, gray) in sim_layer(pa, pd, fps, lms) {
+                if let Some(p) = sel.push(layer, idx, base + t, gray) {
+                    picks.push(p);
+                }
+                idx += 1;
+            }
+            base += lms;
+        }
+        if let Some(p) = sel.finish() {
+            picks.push(p);
+        }
+        picks
+    }
+
+    #[test]
+    fn dense_stream_catches_the_jittery_park_each_layer() {
+        // 10 fps, parks at WILDLY varying delays (what defeats a sparse fixed grid).
+        let mut sel = SegmentSelector::new(SW, SH, 3000, ex());
+        let layers: Vec<_> = [500u64, 2300, 900, 2400, 1500]
+            .iter()
+            .enumerate()
+            .map(|(l, &pa)| (l as i64, pa, 500u64, 10u64, 4000u64))
+            .collect();
+        let picks = run(&mut sel, &layers);
+        assert_eq!(picks.len(), 5, "one park caught per layer: {picks:?}");
+        assert!(picks.iter().all(|p| p.confidence > 0.0), "{picks:?}");
+        // picks are emitted in layer order
+        assert_eq!(
+            picks.iter().map(|p| p.layer).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn an_over_print_only_layer_is_skipped() {
+        // Layer 0 never parks → no pick (a gap beats a head-over-print frame); layer 1 does.
+        let mut sel = SegmentSelector::new(SW, SH, 3000, ex());
+        let picks = run(
+            &mut sel,
+            &[(0, 99_999, 500, 10, 4000), (1, 800, 500, 10, 4000)],
+        );
+        assert_eq!(picks.len(), 1, "{picks:?}");
+        assert_eq!(picks[0].layer, 1);
+    }
+
+    #[test]
+    fn too_coarse_sampling_misses_the_brief_park() {
+        // 1 fps (1000ms spacing) over a 300ms dwell tucked between samples → no frame lands
+        // in the park → skipped. This is the real failure mode; the fix is dense sampling.
+        let mut sel = SegmentSelector::new(SW, SH, 3000, ex());
+        let picks = run(
+            &mut sel,
+            &[(0, 1300, 300, 1, 4000), (1, 1300, 300, 1, 4000)],
+        );
+        assert!(
+            picks.is_empty(),
+            "coarse sampling misses the brief park: {picks:?}"
+        );
     }
 }
