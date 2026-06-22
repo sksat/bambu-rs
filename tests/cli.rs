@@ -1,6 +1,10 @@
 //! Black-box CLI tests (device-independent parts): help, config management,
 //! and exit codes. The `status` command needs a real printer and is covered by
 //! the manual e2e flow, not here.
+//!
+//! Gated on the `cli` feature: these drive the `bambu` binary, which isn't built
+//! without `cli`, so a lib-only build must not try to run them.
+#![cfg(feature = "cli")]
 
 use assert_cmd::Command;
 use predicates::prelude::*;
