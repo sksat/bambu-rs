@@ -461,7 +461,15 @@ pub fn run_park_camera(
     std::fs::create_dir_all(&ring)
         .map_err(|e| format!("park {}: create {}: {e}", cap.id, ring.display()))?;
 
-    let mut ff = spawn_park_ffmpeg(&cap.id, &cap.stream_url, &ring, cap.tuning.fps, w, h, cancel)?;
+    let mut ff = spawn_park_ffmpeg(
+        &cap.id,
+        &cap.stream_url,
+        &ring,
+        cap.tuning.fps,
+        w,
+        h,
+        cancel,
+    )?;
 
     let mut det = LiveParkDetector::new(w, h, &cap.tuning);
     let mut writer = ParkWriter::new(cam_dir.to_path_buf());
@@ -895,8 +903,8 @@ mod tests {
         let mut img = vec![bg; W * H];
         for y in 0..H {
             let row = y * W;
-            for px in img[row + (SEG_CENTER as usize - 3)..row + (SEG_CENTER as usize + 3)]
-                .iter_mut()
+            for px in
+                img[row + (SEG_CENTER as usize - 3)..row + (SEG_CENTER as usize + 3)].iter_mut()
             {
                 *px = obj; // static dark print object at center
             }
@@ -984,7 +992,11 @@ mod tests {
         let jl = std::fs::read_to_string(dir.join("parks.jsonl")).unwrap();
         let layers: Vec<f64> = jl
             .lines()
-            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["t"].as_f64().unwrap())
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["t"]
+                    .as_f64()
+                    .unwrap()
+            })
             .collect();
         assert_eq!(layers, vec![0.0, 1.0, 2.0], "{jl}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1017,7 +1029,10 @@ mod tests {
             &|| false,
             &mut |_| {},
         );
-        assert_eq!(stats.parks, 1, "only the parked layer yields a frame: {stats:?}");
+        assert_eq!(
+            stats.parks, 1,
+            "only the parked layer yields a frame: {stats:?}"
+        );
         assert_eq!(writer.emitted(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1048,7 +1063,10 @@ mod tests {
             &mut |_| {},
         );
         assert_eq!(stats.parks, 0, "{stats:?}");
-        assert_eq!(stats.dropped, 1, "the picked frame's JPEG was missing: {stats:?}");
+        assert_eq!(
+            stats.dropped, 1,
+            "the picked frame's JPEG was missing: {stats:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

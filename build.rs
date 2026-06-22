@@ -94,8 +94,11 @@ mod dashboard {
         }
 
         // 2. Best-effort build.
-        let built = run("pnpm", &["-C", "web", "install", "--frozen-lockfile"], &manifest)
-            && run("pnpm", &["-C", "web", "build"], &manifest)
+        let built = run(
+            "pnpm",
+            &["-C", "web", "install", "--frozen-lockfile"],
+            &manifest,
+        ) && run("pnpm", &["-C", "web", "build"], &manifest)
             && dist.join("index.html").exists();
         if !built {
             give_up(strict, "SPA build failed");

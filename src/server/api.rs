@@ -1400,10 +1400,7 @@ fn live_park_source(st: &AppState) -> Option<(String, Vec<String>, bool)> {
     ];
     // Prefer a RUNNING run so the preview follows the active capture (segment → park →
     // smooth on a tie, but they're rarely all live at once).
-    if let Some(s) = sources
-        .iter()
-        .find(|s| s.running && s.out_dir.is_some())
-    {
+    if let Some(s) = sources.iter().find(|s| s.running && s.out_dir.is_some()) {
         return Some((s.out_dir.clone().unwrap(), s.cameras.clone(), s.running));
     }
     // Otherwise the most RECENT completed run, not a fixed slot order — the run dir is
@@ -3059,9 +3056,15 @@ mod tests {
         // segment-capability needs a stream + park_tuning + select_tuning; park needs the first two.
         let list = server.get("/api/camera").await.json::<serde_json::Value>();
         let cams = list["cameras"].as_array().unwrap();
-        assert_eq!(cams[0]["segment"], true, "stream + park + select → segment-capable");
+        assert_eq!(
+            cams[0]["segment"], true,
+            "stream + park + select → segment-capable"
+        );
         assert_eq!(cams[0]["park"], true);
-        assert_eq!(cams[1]["segment"], false, "no select knobs → not segment-capable");
+        assert_eq!(
+            cams[1]["segment"], false,
+            "no select knobs → not segment-capable"
+        );
         assert_eq!(cams[1]["park"], true, "still park-capable");
         // The echo MERGES the select knobs back into the tuning object, so a manage-form
         // re-save round-trips them (they'd otherwise be dropped, breaking segment).
@@ -3072,7 +3075,9 @@ mod tests {
         assert_eq!(cfg["external"][0]["park_tuning"]["min_outlier"], json!(2.5));
         assert_eq!(cfg["external"][0]["park_tuning"]["fps"], json!(15.0));
         assert!(
-            cfg["external"][1]["park_tuning"].get("min_outlier").is_none(),
+            cfg["external"][1]["park_tuning"]
+                .get("min_outlier")
+                .is_none(),
             "park-only camera's echo carries no select knobs"
         );
     }
@@ -3142,7 +3147,11 @@ mod tests {
                 > super::run_dir_epoch("captures/1718900000_x_segment"),
             "a later epoch is more recent regardless of slot"
         );
-        assert_eq!(super::run_dir_epoch("captures/not-a-run"), 0, "unparseable sorts oldest");
+        assert_eq!(
+            super::run_dir_epoch("captures/not-a-run"),
+            0,
+            "unparseable sorts oldest"
+        );
     }
 
     #[tokio::test]

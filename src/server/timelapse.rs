@@ -1541,7 +1541,8 @@ mod tests {
                     tokio::task::spawn_blocking(move || {
                         while !cancel.load(Ordering::Relaxed) {
                             // Mirror what run_segment_camera does: read the live layer.
-                            seen_layer.store(current_layer.load(Ordering::Relaxed), Ordering::SeqCst);
+                            seen_layer
+                                .store(current_layer.load(Ordering::Relaxed), Ordering::SeqCst);
                             std::thread::sleep(std::time::Duration::from_millis(5));
                         }
                     })
@@ -1567,7 +1568,11 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         tx.send(st("RUNNING", Some(8))).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-        assert_eq!(spawned.load(Ordering::SeqCst), 2, "one per camera, spawned once");
+        assert_eq!(
+            spawned.load(Ordering::SeqCst),
+            2,
+            "one per camera, spawned once"
+        );
         assert_eq!(mgr.status_segment().frames, 2);
         assert_eq!(
             seen_layer.load(Ordering::SeqCst),

@@ -1058,7 +1058,10 @@ mod select_tests {
             .collect();
         match sel(&b) {
             Selection::Selected { offset_ms, .. } => {
-                assert!(matches!(offset_ms, 700 | 900), "picks the bright park: {offset_ms}")
+                assert!(
+                    matches!(offset_ms, 700 | 900),
+                    "picks the bright park: {offset_ms}"
+                )
             }
             other => panic!("the bright-head park must be selected, got {other:?}"),
         }
