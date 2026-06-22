@@ -1,4 +1,4 @@
-//! `bambu-rs` — a clean-room library and CLI for monitoring and driving
+//! `bambu-rs` — a clean-room library and CLI for monitoring and controlling
 //! [Bambu Lab](https://bambulab.com/) 3D printers over the LAN.
 //!
 //! This crate is built **clean-room** from the protocol documentation

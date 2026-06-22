@@ -7,7 +7,7 @@
 
 **English** · [日本語](README.ja.md)
 
-A command-line tool and library for monitoring and driving [Bambu Lab](https://bambulab.com/)
+A command-line tool and library for monitoring and controlling [Bambu Lab](https://bambulab.com/)
 3D printers over the LAN — for a person at the terminal or an AI agent.
 
 It's a **clean-room** implementation: built from the protocol documentation
