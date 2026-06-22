@@ -601,6 +601,7 @@ fn schedule_burst(sink: &BurstSink, frame_no: u64, layer: i64, offsets: &[u64]) 
 /// the print or growing without bound); a worker grabs + writes off that path.
 /// Each layer fires a short [burst](schedule_burst) of grabs (one per offset)
 /// instead of a single one, to land a frame in the native park window.
+#[allow(clippy::too_many_arguments)]
 async fn run(
     status: Arc<Mutex<TimelapseStatus>>,
     mut rx: watch::Receiver<PrinterStatus>,

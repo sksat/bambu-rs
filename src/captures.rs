@@ -449,8 +449,8 @@ pub fn select_smooth_frames(cam_dir: &Path, sel: &SelectTuning) -> Result<Vec<Pa
     }
     // Group frames by layer (BTreeMap keeps layer order); keep each frame's offset→path.
     use std::collections::BTreeMap;
-    let mut by_layer: BTreeMap<u64, (Vec<crate::core::park::SelectFrame>, Vec<(u64, PathBuf)>)> =
-        BTreeMap::new();
+    type LayerGroup = (Vec<crate::core::park::SelectFrame>, Vec<(u64, PathBuf)>);
+    let mut by_layer: BTreeMap<u64, LayerGroup> = BTreeMap::new();
     for (i, name) in files.iter().enumerate() {
         let Some((layer, offset)) = parse_smooth_frame(name) else {
             continue;
@@ -465,10 +465,10 @@ pub fn select_smooth_frames(cam_dir: &Path, sel: &SelectTuning) -> Result<Vec<Pa
     }
     let mut selected = Vec::new();
     for (_layer, (frames, paths)) in by_layer {
-        if let Selection::Selected { offset_ms, .. } = select_park_frame(&frames, w, h, sel) {
-            if let Some((_, path)) = paths.into_iter().find(|(o, _)| *o == offset_ms) {
-                selected.push(path);
-            }
+        if let Selection::Selected { offset_ms, .. } = select_park_frame(&frames, w, h, sel)
+            && let Some((_, path)) = paths.into_iter().find(|(o, _)| *o == offset_ms)
+        {
+            selected.push(path);
         }
     }
     Ok(selected)
