@@ -80,14 +80,8 @@ jobs:
         with:
           tool: cross@0.2.5
 
-      # Native targets need cargo-about on the host for the license notice; cross
-      # targets get it inside the container (Cross.toml pre-build). Keep the
-      # version in sync with Cross.toml.
-      - name: Install cargo-about
-        if: ${{ !matrix.cross }}
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-about@0.9.0
+      # No cargo-about install: since notalawyer 0.3 the license notice is gathered
+      # in-process via the cargo-about LIBRARY, so there's no binary to install.
 
       - name: Download SPA
         uses: actions/download-artifact@v4

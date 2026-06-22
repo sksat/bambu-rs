@@ -31,11 +31,10 @@
   The Linux glibc floor is pinned via `Cross.toml` (images `:0.2.5`) so the
   binaries run on old systems.
 - **license notices** (`license-notice` feature): `build.rs` runs
-  [`arkedge/notalawyer`](https://github.com/arkedge/notalawyer) → `cargo-about`
-  (per `about.toml`) and embeds the third-party notice, exposed by `bambu
-  --license-notice`. The feature is **off by default**, so normal builds and
-  `cargo install` never need `cargo-about`. `cargo-about` is installed on native
-  runners and inside the `cross` containers (`Cross.toml` `pre-build`).
+  [`arkedge/notalawyer`](https://github.com/arkedge/notalawyer), which gathers the
+  third-party notice (per `about.toml`) and embeds it, exposed by `bambu --license-notice`.
+  The feature is **off by default**, so normal builds and `cargo install` skip the
+  build-time license gathering.
 - **assets** per target: `bambu-rs-<target>-v<version>.tar.gz` (`.zip` on
   Windows) containing `bambu`(`.exe`) + README + LICENSE, plus a standalone
   `bambu-<target>` binary, each with a `.sha256` sidecar. The Unix tarballs are
@@ -56,11 +55,10 @@ the Linux **cross** link step needs Docker and hasn't been run.
   vendored OpenSSL or a rustls FTPS backend. **Needs Docker** — exercise it from
   the Actions tab via `workflow_dispatch` (runs the whole matrix, no tag), and
   test the musl targets first.
-- ✅ **`about.toml` accept-list** — verified: `cargo install --locked --features
-  cli cargo-about@0.9.0` then `cargo build --release --no-default-features
-  --features dashboard,license-notice --bin bambu` builds clean (every dependency
-  license is accepted; no panic). Re-run after a dependency bump and add any
-  reported licenses.
+- ✅ **`about.toml` accept-list** — verified (no cargo-about install needed):
+  `cargo build --no-default-features --features license-notice --bin bambu` builds clean —
+  every dependency license is accepted; no error. Re-run after a dependency bump and add any
+  reported licenses (`BAMBU_WEB_BUILD_STRICT` is unrelated; a missing license errors on its own).
 - ✅ **license notice** — verified: `bambu --license-notice` prints the embedded
   notice (~7.6k lines, all deps).
 - ✅ **self-contained SPA** — verified: a release `--features dashboard` binary

@@ -27,9 +27,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
       - name: Format
         run: cargo fmt --all -- --check
-      # `dashboard,ts-rs` is every feature EXCEPT `license-notice` (which is a
-      # release-only feature whose build.rs needs cargo-about — see Cargo.toml).
-      # Avoid `--all-features` so CI never drags in that toolchain requirement.
+      # `dashboard,ts-rs` is every feature EXCEPT `license-notice` (release-only: its
+      # build.rs gathers every dependency's license at build time — see Cargo.toml).
+      # Avoid `--all-features` so CI skips that build-time cost.
       - name: Clippy
         run: cargo clippy --all-targets --features dashboard,ts-rs -- -D warnings
 
@@ -51,8 +51,8 @@ jobs:
             features: ""
           - name: dashboard
             features: "--no-default-features --features dashboard"
-          # Every feature except the release-only `license-notice` (its build.rs
-          # needs cargo-about, so it's not exercised in CI — see Cargo.toml).
+          # Every feature except the release-only `license-notice` (its build.rs gathers
+          # all dependency licenses at build time, so it's not exercised in CI — see Cargo.toml).
           - name: full
             features: "--features dashboard,ts-rs"
     name: test (${{ matrix.name }})
@@ -144,5 +144,5 @@ jobs:
       - name: Build + test on MSRV
         env:
           RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
-        # Not --all-features: license-notice is release-only (needs cargo-about).
+        # Not --all-features: license-notice is release-only (build-time license gathering).
         run: cargo test --features dashboard,ts-rs

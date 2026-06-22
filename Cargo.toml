@@ -84,10 +84,10 @@ server = [
 # the API server and embeds `web/dist/` via rust-embed.
 dashboard = ["server", "dep:rust-embed"]
 ts-rs = ["dep:ts-rs"]
-# Embed OSS license notices (via arkedge/notalawyer + cargo-about) into the
-# binary, exposing a `--license-notice` flag. Off by default and used only for
-# release builds: enabling it makes build.rs require `cargo-about` on the build
-# host, so normal dev/CI builds and `cargo install` never need it.
+# Embed OSS license notices (via arkedge/notalawyer) into the binary, exposing a
+# `--license-notice` flag. Off by default and used only for release builds: enabling it
+# gathers every dependency's license at build time (reads about.toml, may hit the network),
+# so normal dev/CI builds and `cargo install` skip that cost.
 license-notice = ["cli", "dep:notalawyer", "dep:notalawyer-clap", "dep:notalawyer-build"]
 
 [dependencies]
@@ -102,8 +102,8 @@ futures-util = { version = "0.3.31", default-features = false, optional = true }
 md-5 = "0.11.0"
 native-tls = "0.2.18"
 # License-notice embedding (release only, behind the `license-notice` feature).
-notalawyer = { version = "0.2.0", optional = true }
-notalawyer-clap = { version = "0.2.0", optional = true }
+notalawyer = { version = "0.3", optional = true }
+notalawyer-clap = { version = "0.3", optional = true }
 rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls"] }
 rust-embed = { version = "8.11.0", optional = true }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "logging", "tls12"] }
@@ -131,9 +131,9 @@ zip = { version = "7.2.0", default-features = false, features = ["deflate"] }
 strip = true
 
 [build-dependencies]
-# Generates the embedded license notice (shells out to cargo-about). Optional —
+# Generates the embedded license notice (in-process via the cargo-about library). Optional —
 # only pulled in (and only invoked by build.rs) under the `license-notice` feature.
-notalawyer-build = { version = "0.2.0", optional = true }
+notalawyer-build = { version = "0.3", optional = true }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
