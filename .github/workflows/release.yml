@@ -1,11 +1,13 @@
 name: Release
 
-# Tag-triggered. Push a tag `vX.Y.Z` (matching Cargo.toml `version`) to build the
-# dashboard-enabled `bambu` binary for every target and draft a GitHub Release
-# with cargo-binstall-compatible assets. The release is created as a DRAFT —
-# review it, then publish manually.
+# Builds the dashboard-enabled `bambu` binary for every target. A push to `main` runs
+# the build matrix only (catches release-specific breakage — e.g. a cross link failure —
+# before tagging); a tag `vX.Y.Z` (matching Cargo.toml `version`) additionally drafts a
+# GitHub Release with cargo-binstall-compatible assets, created as a DRAFT — review it,
+# then publish manually.
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   # Lets you exercise the build matrix (no release) from the Actions tab.
   workflow_dispatch:

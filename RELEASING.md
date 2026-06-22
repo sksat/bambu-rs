@@ -50,8 +50,8 @@ The host-side of the pipeline is verified locally (x86_64-linux, 2026-06-15);
 the Linux **cross** link step needs Docker and hasn't been run.
 
 - ⚠️ **cross builds** — the gnu/musl Linux targets cross-compile in pinned `cross`
-  images (`Cross.toml`) and aren't yet confirmed end-to-end. Run the matrix via
-  `workflow_dispatch` (no tag) before relying on a release.
+  images (`Cross.toml`) and aren't yet confirmed end-to-end. The release build runs on
+  every push to `main`, so the next push exercises them (no tag needed).
 - ✅ **`about.toml` accept-list** — verified (no cargo-about install needed):
   `cargo build --no-default-features --features license-notice --bin bambu` builds clean —
   every dependency license is accepted; no error. Re-run after a dependency bump and add any
