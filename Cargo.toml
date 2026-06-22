@@ -1,6 +1,6 @@
 [package]
 name = "bambu-rs"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 # MSRV: 1.88.0 — the code uses `let` chains (`if let … && let …`), stabilised in
 # 1.88. Enforced by the `msrv` CI job. (Bumping this may free newer deps, e.g.
@@ -12,6 +12,29 @@ repository = "https://github.com/sksat/bambu-rs"
 readme = "README.md"
 keywords = ["bambulab", "3d-printing", "mqtt", "cli", "printer"]
 categories = ["command-line-utilities", "api-bindings"]
+# Explicit allow-list (overrides .gitignore): ships the frontend SOURCE so a
+# `--features dashboard` build produces the SPA via build.rs (`pnpm install && pnpm build`)
+# on crates.io or from git. web/dist itself is NOT shipped — build.rs builds it (or reuses a
+# pre-built one from the release matrix / a local `pnpm build`). The demo GIF, node_modules,
+# e2e/Playwright, and dev tests are left out to keep the crate lean.
+# Patterns are gitignore-style — a LEADING SLASH anchors to the package root, so `/src`
+# doesn't also match the thousands of `src`/`README.md`/`LICENSE` files inside web/node_modules.
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/build.rs",
+    "/README.md",
+    "/LICENSE",
+    "/about.toml",
+    "/src",
+    "/web/src",
+    "/web/index.html",
+    "/web/package.json",
+    "/web/pnpm-lock.yaml",
+    "/web/pnpm-workspace.yaml",
+    "/web/tsconfig.json",
+    "/web/vite.config.ts",
+]
 
 # Reusable library is the first-class artifact; the `bambu` CLI is its first consumer.
 [lib]
