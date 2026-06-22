@@ -79,8 +79,8 @@ bambu job start ./model.gcode.3mf --upload --plate 1 --confirm --watch
 一方、物理動作（`job start/pause/resume/stop`、`temp`、`light`、`gcode`、`ams`、`calibrate`）には
 `--confirm` が必須で、まずプリンター自身の状態
 （idle か、エラーがないか、期待したファイルとプレートか）を確認します。
-`--json` を付けると出力は機械可読になり、終了コードが「成功 / 未確認 / 拒否 / busy」を
-区別するので、スクリプトやエージェントが分岐できます。
+終了コードが「成功 / 未確認 / 拒否 / busy」を区別するので、スクリプトやエージェントが
+分岐できます。`--json` を付けると出力が機械可読になります。
 
 ## スライス
 

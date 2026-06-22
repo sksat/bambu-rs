@@ -76,9 +76,8 @@ bambu job start ./model.gcode.3mf --upload --plate 1 --confirm --watch
 Reading state takes no flags and no checks — just a connect and a snapshot. Physical actions
 (`job start/pause/resume/stop`, `temp`, `light`, `gcode`, `ams`, `calibrate`), by contrast,
 require `--confirm` and check the printer's own state first (idle, no errors, the expected
-file/plate). Under `--json` the output is machine-readable, and the exit code
-distinguishes success / unverified / rejected / busy so scripts and agents can branch
-on it.
+file/plate). The exit code distinguishes success / unverified / rejected / busy so scripts and agents
+can branch on it, and `--json` makes the output machine-readable.
 
 ## Slicing
 
