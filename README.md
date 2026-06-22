@@ -111,7 +111,7 @@ clean-timelapse capture, and the usual controls — all over the same single LAN
 (reads are open; control is gated behind an optional password).
 
 <p align="center">
-  <img src="assets/dashboard-demo.gif" alt="bambu serve web dashboard" width="600">
+  <img src="https://raw.githubusercontent.com/sksat/bambu-rs/main/assets/dashboard-demo.gif" alt="bambu serve web dashboard" width="600">
 </p>
 
 ## Timelapse
@@ -123,7 +123,7 @@ from an **external** camera, driven by the print's own layer events — one fram
 also covers printers whose built-in camera is missing or broken.
 
 <p align="center">
-  <img src="assets/timelapse-demo.gif" alt="external-camera timelapse, one parked frame per layer" width="480">
+  <img src="https://raw.githubusercontent.com/sksat/bambu-rs/main/assets/timelapse-demo.gif" alt="external-camera timelapse, one parked frame per layer" width="480">
 </p>
 
 There are two ways to feed it. Point `bambu timelapse capture` at any tool to grab a frame
