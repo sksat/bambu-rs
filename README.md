@@ -61,10 +61,16 @@ bambu hms                           # decode any health/maintenance (HMS) alerts
 bambu file ls
 bambu file upload model.gcode.3mf --dest /cache
 
+# calibrate — with no routine flag it runs them all (bed level, vibration, motor noise)
+bambu calibrate --confirm --watch
+
 # start a print: preview the resolved plan, then run it with guards and watch it
 bambu job start /cache/model.gcode.3mf --plate 1 --dry-run        # → md5 / plate / AMS map
 bambu job start /cache/model.gcode.3mf --plate 1 --ams-map 0 \
   --expect-md5 <md5> --expect-plate 1 --confirm --watch
+
+# or upload a local file and start it in one step
+bambu job start ./model.gcode.3mf --upload --plate 1 --confirm --watch
 ```
 
 Reading state takes no flags and no checks — just a connect and a snapshot. Physical actions

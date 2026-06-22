@@ -63,10 +63,16 @@ bambu hms                           # HMS（健全性・保守）アラートを
 bambu file ls
 bambu file upload model.gcode.3mf --dest /cache
 
+# キャリブレーション。ルーチン未指定なら全部（bed level, vibration, motor noise）
+bambu calibrate --confirm --watch
+
 # 印刷開始。解決後のプランをプレビューし、ガード付きで実行して監視する
 bambu job start /cache/model.gcode.3mf --plate 1 --dry-run        # → md5 / plate / AMS マップ
 bambu job start /cache/model.gcode.3mf --plate 1 --ams-map 0 \
   --expect-md5 <md5> --expect-plate 1 --confirm --watch
+
+# ローカルファイルをアップロードしてそのまま印刷
+bambu job start ./model.gcode.3mf --upload --plate 1 --confirm --watch
 ```
 
 状態の読み取りは、接続して snapshot を取るだけで、フラグも事前確認も要りません。
