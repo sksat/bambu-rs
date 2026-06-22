@@ -23,7 +23,7 @@ color: string | null,
 /**
  * All colour segments (`cols`); single-colour spools mirror `color`.
  */
-cols: Array<string>, 
+cols?: Array<string>, 
 /**
  * Remaining filament percent (`remain`); `0`/`-1` mean unknown on the A1.
  */

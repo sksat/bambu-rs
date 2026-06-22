@@ -28,4 +28,4 @@ dry_time: number | null,
 /**
  * The unit's trays/slots (`tray[]`).
  */
-trays: Array<AmsTray>, };
+trays?: Array<AmsTray>, };

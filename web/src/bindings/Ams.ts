@@ -11,7 +11,7 @@ export type Ams = {
 /**
  * Attached AMS units (`ams.ams[]`).
  */
-units: Array<AmsUnit>, 
+units?: Array<AmsUnit>, 
 /**
  * The external/virtual spool (`vt_tray`), surfaced even when not loaded.
  */

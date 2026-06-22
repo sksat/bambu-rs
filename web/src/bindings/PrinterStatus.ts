@@ -146,7 +146,7 @@ print_type: string | null,
 /**
  * Queue of upcoming stage ids (`stg`); `stg_cur` is the current one.
  */
-stg: Array<number>, 
+stg?: Array<number>, 
 /**
  * Installed nozzle diameter in mm (`nozzle_diameter`, e.g. `0.4`).
  */
@@ -222,4 +222,4 @@ upload: Upload | null,
  * Decoded HMS alerts (the device's primary fault/warning channel). Empty
  * when healthy; separate from `error`/`print_error`. See [`crate::core::hms`].
  */
-hms: Array<HmsAlert>, };
+hms?: Array<HmsAlert>, };
