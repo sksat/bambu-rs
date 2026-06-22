@@ -100,7 +100,6 @@ clap = { version = "4.6.1", features = ["derive", "env"], optional = true }
 ctrlc = { version = "3.5.0", optional = true }
 futures-util = { version = "0.3.31", default-features = false, optional = true }
 md-5 = "0.11.0"
-native-tls = "0.2.18"
 # License-notice embedding (release only, behind the `license-notice` feature).
 notalawyer = { version = "0.3", optional = true }
 notalawyer-clap = { version = "0.3", optional = true }
@@ -110,9 +109,10 @@ rustls = { version = "0.23.40", default-features = false, features = ["ring", "l
 rustls-pki-types = "1.14.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-# `deprecated` is needed for connect_secure_implicit — Bambu's FTPS is *implicit*
-# on port 990 (TLS from the start), not explicit AUTH-TLS.
-suppaftp = { version = "8.0.4", features = ["native-tls", "deprecated"] }
+# `deprecated` is needed for connect_secure_implicit — Bambu's FTPS is *implicit* on
+# port 990 (TLS from the start), not explicit AUTH-TLS. rustls-ring (not native-tls) so the
+# whole crate shares one TLS stack (see src/tls.rs) and needs no system/vendored OpenSSL.
+suppaftp = { version = "8.0.4", features = ["rustls-ring", "deprecated"] }
 tempfile = "3.27.0"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", default-features = false, features = ["rt", "time", "macros"] }

@@ -2,8 +2,8 @@
 //!
 //! Proprietary JPEG stream over **TLS on TCP 6000** (see `docs/protocol.md`):
 //! send an 80-byte auth packet (`bblp` + access code), then read framed JPEGs
-//! (16-byte header whose first u32 is the JPEG length). Self-signed v1 cert, so
-//! native-tls with accept-invalid-certs (same as FTPS).
+//! (16-byte header whose first u32 is the JPEG length). Self-signed v1 cert, so it
+//! shares the LAN rustls config ([`crate::tls`]) that accepts any certificate.
 //!
 //! Note: the A1 camera is intermittently unavailable (a firmware quirk); when it
 //! isn't streaming, the connection is accepted but no frame arrives, surfaced
@@ -13,7 +13,8 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use native_tls::TlsConnector;
+use rustls::pki_types::ServerName;
+use rustls::{ClientConnection, StreamOwned};
 
 use crate::config::ResolvedTarget;
 
@@ -73,17 +74,16 @@ impl CameraClient {
 
     /// Grab a single JPEG frame from the chamber camera.
     pub fn snapshot(&self) -> Result<Vec<u8>, CameraError> {
-        let connector = TlsConnector::builder()
-            .danger_accept_invalid_certs(true)
-            .danger_accept_invalid_hostnames(true)
-            .build()
-            .map_err(|e| CameraError::Tls(e.to_string()))?;
+        let config =
+            crate::tls::lan_client_config().map_err(|e| CameraError::Tls(e.to_string()))?;
         let tcp = TcpStream::connect((self.target.ip.as_str(), CAMERA_PORT))?;
         tcp.set_read_timeout(Some(self.timeout))?;
         tcp.set_write_timeout(Some(self.timeout))?;
-        let mut tls = connector
-            .connect(&self.target.ip, tcp)
-            .map_err(|e| CameraError::Connect(e.to_string()))?;
+        let server_name = ServerName::try_from(self.target.ip.clone())
+            .map_err(|e| CameraError::Tls(e.to_string()))?;
+        let conn = ClientConnection::new(config, server_name)
+            .map_err(|e| CameraError::Tls(e.to_string()))?;
+        let mut tls = StreamOwned::new(conn, tcp);
 
         tls.write_all(&auth_packet(&self.target.access_code))?;
 

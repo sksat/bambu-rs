@@ -9,7 +9,6 @@
 //! [`StatusSource`] abstracts snapshot fetching so consumers (and tests) don't
 //! depend on the concrete MQTT client.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use rumqttc::{
@@ -492,66 +491,8 @@ async fn poll(eventloop: &mut EventLoop) -> Result<Event, ClientError> {
 
 /// Build a rustls config that accepts the printer's self-signed certificate.
 fn tls_config() -> Result<TlsConfiguration, ClientError> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .map_err(|e| ClientError::Tls(e.to_string()))?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptSelfSigned(provider)))
-        .with_no_client_auth();
-    Ok(TlsConfiguration::Rustls(Arc::new(config)))
-}
-
-/// A deliberately-insecure verifier for the printer's LAN TLS — the rustls
-/// equivalent of OpenSSL's `CERT_NONE`.
-///
-/// Why: Bambu printers present a **self-signed X.509 *version 1*** certificate
-/// (CN = the serial, issuer "BBL CA"). rustls/webpki reject v1 certificates with
-/// `UnsupportedCertVersion`, and they have no CA chain anyway. Since the printer
-/// is reached by IP on the LAN with an out-of-band access code, we accept any
-/// certificate and skip handshake-signature validation (the encrypted channel
-/// still comes from the ephemeral key exchange). `supported_verify_schemes` is
-/// kept honest so the server picks a scheme we can negotiate.
-///
-/// This trades server authentication for connectivity; it is acceptable only for
-/// the LAN-direct, self-signed printer case.
-#[derive(Debug)]
-struct AcceptSelfSigned(Arc<rustls::crypto::CryptoProvider>);
-
-impl rustls::client::danger::ServerCertVerifier for AcceptSelfSigned {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls_pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
-        _server_name: &rustls_pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls_pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls_pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        // Skipped on purpose: webpki cannot parse the v1 cert to extract the key.
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls_pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
+    let config = crate::tls::lan_client_config().map_err(|e| ClientError::Tls(e.to_string()))?;
+    Ok(TlsConfiguration::Rustls(config))
 }
 
 #[cfg(test)]

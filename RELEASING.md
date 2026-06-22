@@ -49,12 +49,9 @@
 The host-side of the pipeline is verified locally (x86_64-linux, 2026-06-15);
 the Linux **cross** link step needs Docker and hasn't been run.
 
-- ⚠️ **native-tls / OpenSSL under `cross`** — the one unverified step (highest
-  risk). The crate uses `suppaftp` with `native-tls` (OpenSSL) for FTPS; linking
-  OpenSSL inside the old gnu/musl `cross` images can fail. If it does, the fix is
-  vendored OpenSSL or a rustls FTPS backend. **Needs Docker** — exercise it from
-  the Actions tab via `workflow_dispatch` (runs the whole matrix, no tag), and
-  test the musl targets first.
+- ⚠️ **cross builds** — the gnu/musl Linux targets cross-compile in pinned `cross`
+  images (`Cross.toml`) and aren't yet confirmed end-to-end. Run the matrix via
+  `workflow_dispatch` (no tag) before relying on a release.
 - ✅ **`about.toml` accept-list** — verified (no cargo-about install needed):
   `cargo build --no-default-features --features license-notice --bin bambu` builds clean —
   every dependency license is accepted; no error. Re-run after a dependency bump and add any

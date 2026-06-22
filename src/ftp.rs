@@ -1,16 +1,14 @@
 //! FTPS file transfer — the printer's LAN file store.
 //!
-//! **Implicit** FTPS on port 990, same `bblp` + access-code auth as MQTT, and
-//! the same self-signed X.509 **v1** certificate. So this uses native-tls
-//! (OpenSSL) with accept-invalid-certs — the rustls path rejects v1 certs (see
-//! `client.rs` for the same issue) — the equivalent of OpenSSL `CERT_NONE`,
-//! acceptable only for this LAN-direct self-signed case.
+//! **Implicit** FTPS on port 990, same `bblp` + access-code auth as MQTT, and the
+//! same self-signed X.509 **v1** certificate — so it shares the LAN rustls config
+//! ([`crate::tls`]), which accepts any certificate (the rustls equivalent of OpenSSL
+//! `CERT_NONE`), acceptable only for this LAN-direct self-signed case.
 
 use std::path::Path;
 
-use native_tls::TlsConnector;
 use serde::Serialize;
-use suppaftp::{NativeTlsConnector, NativeTlsFtpStream};
+use suppaftp::{RustlsConnector, RustlsFtpStream};
 
 use crate::config::ResolvedTarget;
 
@@ -75,15 +73,11 @@ impl FtpsClient {
         Self { target }
     }
 
-    fn connect(&self) -> Result<NativeTlsFtpStream, FtpError> {
-        let connector = TlsConnector::builder()
-            .danger_accept_invalid_certs(true)
-            .danger_accept_invalid_hostnames(true)
-            .build()
-            .map_err(|e| FtpError::Tls(e.to_string()))?;
-        let mut ftp = NativeTlsFtpStream::connect_secure_implicit(
+    fn connect(&self) -> Result<RustlsFtpStream, FtpError> {
+        let config = crate::tls::lan_client_config().map_err(|e| FtpError::Tls(e.to_string()))?;
+        let mut ftp = RustlsFtpStream::connect_secure_implicit(
             (self.target.ip.as_str(), FTPS_PORT),
-            NativeTlsConnector::from(connector),
+            RustlsConnector::from(config),
             &self.target.ip,
         )
         .map_err(|e| FtpError::Ftp(e.to_string()))?;
