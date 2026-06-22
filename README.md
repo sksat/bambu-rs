@@ -27,6 +27,23 @@ can run prints safely.
 - **Firmware-aware.** A capability/quirk registry keyed on `(model, firmware)`
   absorbs per-firmware API differences in one place.
 
+## Dashboard
+
+`bambu serve` runs a small local server with an embedded web dashboard for live
+monitoring from a phone or browser — printer status, temperatures, AMS, the live
+camera, one-click clean-timelapse capture, and the usual controls — all over the
+same single LAN connection (reads are open; control is gated behind an optional
+password). No cloud, no second app.
+
+<p align="center">
+  <img src="assets/dashboard-demo.gif" alt="bambu serve web dashboard" width="600">
+</p>
+
+```bash
+# built with --features dashboard; serves the web UI on the LAN and prints its URL
+bambu serve
+```
+
 ## Slice → print
 
 `bambu-rs` doesn't slice — it **delegates to Bambu Studio / OrcaSlicer's CLI**
