@@ -1,28 +1,66 @@
 #!/usr/bin/env python3
 """Slice an STL/3MF for the Bambu A1 mini, reliably.
 
-OrcaSlicer's CLI does NOT resolve a profile's `inherits` chain: Bambu's system
-profiles are *diffs*, so loading a leaf (e.g. "0.12mm Fine @BBL A1M") drops every
-setting that lives in a parent — layer_height, speeds, temps — and they silently
-fall back to Orca's built-in defaults (layer_height -> 0.2mm). That makes a naive
-`--load-settings <leaf>.json` quietly wrong for any non-default setting.
+The slicer CLI (OrcaSlicer or Bambu Studio) does NOT resolve a profile's `inherits`
+chain: Bambu's system profiles are *diffs*, so loading a leaf (e.g. "0.12mm Fine
+@BBL A1M") drops every setting that lives in a parent — layer_height, speeds, temps
+— and they silently fall back to built-in defaults (layer_height -> 0.2mm). A naive
+`--load-settings <leaf>.json` is quietly wrong for any non-default setting.
 
-This flattens the machine/process/filament chains (root->leaf merge) so the FULL
-profile is applied, slices, and VERIFIES the produced layer height matches the
-request (never trust the profile name).
+Two flavours of the same trap, both handled here:
+  1. process/filament: flatten the inherits chain (root->leaf merge) so the FULL
+     profile is applied. Verified against the produced layer height.
+  2. machine start/end/layer gcode: on Bambu Studio these long, machine-specific
+     blocks do NOT live on the inherits chain at all — only a *generic* fallback
+     does (its prime line `G1 ... Y200 ... E ;Draw the first line` drives off the
+     A1 mini's 180mm bed and never primes). The real blocks live in sibling
+     "<machine> template <key>.json" files, merged here explicitly. If they're
+     missed, the start-gcode check below fails loudly.
 
 Usage:
   scripts/slice.py model.stl out.gcode.3mf [--layer 0.20] [--filament "Bambu PLA Basic @BBL A1M"]
   scripts/slice.py model.stl out.gcode.3mf --process "0.20mm Strength @BBL A1M"
 """
-import argparse, json, os, re, subprocess, sys, tempfile
+import argparse, json, os, re, shutil, subprocess, sys, tempfile
 
-PROFILES = "/opt/orca-slicer/resources/profiles/BBL"
 LAYER_PROCESS = {  # A1 mini, 0.4 nozzle
     "0.08": "0.08mm Extra Fine @BBL A1M", "0.12": "0.12mm Fine @BBL A1M",
     "0.16": "0.16mm Optimal @BBL A1M", "0.20": "0.20mm Standard @BBL A1M",
     "0.24": "0.24mm Draft @BBL A1M", "0.28": "0.28mm Extra Draft @BBL A1M",
 }
+# Long machine gcode blocks that Bambu Studio keeps in sibling "template" files,
+# off the inherits chain (see module docstring). Merged into the machine profile.
+TEMPLATE_GCODES = ["machine_start_gcode", "machine_end_gcode", "layer_change_gcode",
+                   "change_filament_gcode", "time_lapse_gcode"]
+
+# Set by detect_slicer() in main(): (argv-prefix, BBL-profiles-dir, subprocess-env).
+BIN, PROFILES, ENV = None, None, None
+
+def detect_slicer():
+    """Prefer OrcaSlicer (the originally-verified path); fall back to Bambu Studio
+    (`/opt/bambustudio-bin`), which ships the same BBL profiles + CLI flags but
+    needs its bundled libs on LD_LIBRARY_PATH and LC_ALL=C (segfault workaround)."""
+    orca = shutil.which("orca-slicer")
+    orca_prof = "/opt/orca-slicer/resources/profiles/BBL"
+    if orca and os.path.isdir(orca_prof):
+        return [orca], orca_prof, dict(os.environ)
+    bs = "/opt/bambustudio-bin"
+    bs_bin = os.path.join(bs, "bin", "bambu-studio")
+    bs_prof = os.path.join(bs, "resources", "profiles", "BBL")
+    if os.path.exists(bs_bin) and os.path.isdir(bs_prof):
+        env = dict(os.environ)
+        env["LD_LIBRARY_PATH"] = os.path.join(bs, "bin")
+        env["LC_ALL"] = "C"
+        return [bs_bin], bs_prof, env
+    sys.exit("no slicer found: need `orca-slicer` (+ /opt/orca-slicer profiles) or /opt/bambustudio-bin")
+
+def merge_machine_templates(merged, machine_name):
+    for key in TEMPLATE_GCODES:
+        path = os.path.join(PROFILES, "machine", f"{machine_name} template {key}.json")
+        if os.path.exists(path):
+            d = json.load(open(path))
+            if key in d:
+                merged[key] = d[key]
 
 def flatten(subdir, leaf, overrides=None):
     chain, name, seen = [], leaf, set()
@@ -35,27 +73,71 @@ def flatten(subdir, leaf, overrides=None):
     merged = {}
     for d in reversed(chain):           # root first; child overrides parent
         merged.update(d)
-    merged["inherits"] = ""             # resolved already — don't let Orca re-chase
+    merged["inherits"] = ""             # resolved already — don't let the slicer re-chase
     merged.pop("instantiation", None)
+    if subdir == "machine":             # pull in the real start/end/layer gcode
+        merge_machine_templates(merged, leaf)
     if overrides:
         merged.update(overrides)
     return merged
+
+def bed_bounds(mach_prof):
+    xs, ys = [], []
+    for p in mach_prof.get("printable_area") or []:
+        try:
+            x, y = p.split("x"); xs.append(float(x)); ys.append(float(y))
+        except ValueError:
+            pass
+    return (max(xs) if xs else 0.0), (max(ys) if ys else 0.0)
+
+def start_gcode_fault(g, max_x, max_y):
+    """Detect the missing-template trap in the output: a generic fallback start
+    gcode extrudes off the bed (its `;Draw the first line` prime hits Y200 on a
+    180mm A1 mini). The real start's out-of-bed wipe moves (Y185) carry NO
+    extrusion, so 'extruding move past the printable area' is a clean signal."""
+    start = g.split("; CHANGE_LAYER", 1)[0]        # everything before the first layer
+    if "Draw the first line" in start:
+        return "generic fallback start gcode ('Draw the first line') — machine_start_gcode not merged"
+    if max_x and max_y:
+        for ln in start.splitlines():
+            s = ln.strip()
+            if not s.startswith(("G0 ", "G1 ")):
+                continue
+            e = re.search(r"\bE(-?[0-9.]+)", s)
+            if not e or float(e.group(1)) <= 0:    # only extruding moves matter
+                continue
+            xm = re.search(r"\bX(-?[0-9.]+)", s); ym = re.search(r"\bY(-?[0-9.]+)", s)
+            if (xm and float(xm.group(1)) > max_x + 1) or (ym and float(ym.group(1)) > max_y + 1):
+                return f"start gcode extrudes off the bed: {s[:60]!r} — real machine_start_gcode missing"
+    return None
 
 def tmp(d):
     f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
     json.dump(d, f); f.close(); return f.name
 
 def main():
+    global BIN, PROFILES, ENV
     ap = argparse.ArgumentParser()
     ap.add_argument("stl"); ap.add_argument("out")
     ap.add_argument("--layer", default="0.20", help="layer height mm (0.08/0.12/0.16/0.20/0.24/0.28 or any value)")
     ap.add_argument("--process", help="explicit process profile name (overrides --layer)")
     ap.add_argument("--filament", default="Bambu PLA Basic @BBL A1M")
     ap.add_argument("--machine", default="Bambu Lab A1 mini 0.4 nozzle")
+    # A1 mini ships a Textured PEI plate (PLA->65C, PETG->hotter). Without this the
+    # merge defaults to "Cool Plate" (35C) -> poor adhesion / warping.
+    ap.add_argument("--bed-type", default="Textured PEI Plate")
+    ap.add_argument("--brim", help="force an outer brim of this width in mm (e.g. 5)")
     a = ap.parse_args()
 
+    BIN, PROFILES, ENV = detect_slicer()
+
+    # Slicer config values are strings — a bare JSON number is dropped to default.
+    bed_ov = {"curr_bed_type": a.bed_type}
+    if a.brim is not None:
+        bed_ov.update({"brim_type": "outer_only", "brim_width": str(a.brim)})
+
     if a.process:
-        proc = flatten("process", a.process)
+        proc = flatten("process", a.process, bed_ov)
         want = str(float(proc.get("layer_height", "0.2")))
     else:
         key = f"{float(a.layer):.2f}"
@@ -63,16 +145,18 @@ def main():
         if not name:                    # non-standard height: nearest profile + force the height
             nearest = min(LAYER_PROCESS, key=lambda k: abs(float(k) - float(a.layer)))
             name = LAYER_PROCESS[nearest]
-        proc = flatten("process", name, {"layer_height": a.layer})
+        proc = flatten("process", name, {"layer_height": a.layer, **bed_ov})
         want = str(float(a.layer))
 
-    mach, pf, fil = tmp(flatten("machine", a.machine)), tmp(proc), tmp(flatten("filament", a.filament))
+    mach_prof = flatten("machine", a.machine)
+    max_x, max_y = bed_bounds(mach_prof)
+    mach, pf, fil = tmp(mach_prof), tmp(proc), tmp(flatten("filament", a.filament))
     outdir = os.path.dirname(os.path.abspath(a.out)) or "."
     os.makedirs(outdir, exist_ok=True)
-    cmd = ["orca-slicer", "--load-settings", f"{mach};{pf}", "--load-filaments", fil,
-           "--arrange", "1", "--orient", "1", "--slice", "0",
-           "--outputdir", outdir, "--export-3mf", os.path.basename(a.out), a.stl]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    cmd = BIN + ["--load-settings", f"{mach};{pf}", "--load-filaments", fil,
+                 "--arrange", "1", "--orient", "1", "--slice", "0",
+                 "--outputdir", outdir, "--export-3mf", os.path.basename(a.out), a.stl]
+    r = subprocess.run(cmd, capture_output=True, text=True, env=ENV)
     for t in (mach, pf, fil):
         os.unlink(t)
     out = os.path.join(outdir, os.path.basename(a.out))
@@ -84,8 +168,13 @@ def main():
     got = m.group(1) if m else "?"
     if got == "?" or abs(float(got) - float(want)) > 1e-6:
         sys.exit(f"VERIFY FAILED: requested {want}mm but the sliced gcode is {got}mm")
+    fault = start_gcode_fault(g, max_x, max_y)
+    if fault:
+        sys.exit(f"VERIFY FAILED (start gcode): {fault}")
     layers = re.search(r"total layer number: (\d+)", g)
-    print(f"OK {out}  layer_height={got}mm  layers={layers.group(1) if layers else '?'}  filament='{a.filament}'")
+    bed = re.search(r"^M190 S([0-9]+)", g, re.M)
+    print(f"OK {out}  layer_height={got}mm  layers={layers.group(1) if layers else '?'}  "
+          f"filament='{a.filament}'  bed={bed.group(1) if bed else '?'}C  slicer={os.path.basename(BIN[0])}")
 
 if __name__ == "__main__":
     main()
