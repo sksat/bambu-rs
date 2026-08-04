@@ -31,6 +31,40 @@ impl PrintStartParams {
     }
 }
 
+/// Expand a per-USED-filament AMS map into the positional array the printer
+/// actually consumes.
+///
+/// The wire `ams_mapping` is keyed by a filament's **position in the PROJECT's
+/// filament list**, not by the order this plate happens to use them.
+/// `Metadata/plate_N.json`'s `filament_ids` gives that position for each entry of
+/// `filament_colors`, so a plate using only the project's 2nd filament needs its
+/// tray at index 1.
+///
+/// **Device-verified failure this prevents:** passing a bare `[2]` for such a
+/// plate mapped the *first* filament instead, leaving the used one to fall back
+/// to the gcode's baked-in `M620 S<n>A` — the print silently ran from tray 1
+/// (PLA) instead of the requested tray 2 (PETG), with `print_error` staying 0.
+///
+/// Gaps (project filaments this plate never uses) are filled with the first
+/// mapped tray rather than `-1`: they should never be consulted, but if they are,
+/// landing on a loaded tray beats pulling from the external spool — which is how
+/// the wrong-material print happened in the first place.
+///
+/// Returns `used` unchanged when `filament_ids` is unusable (absent in older
+/// 3mfs, or mismatched length) — the caller validates lengths and this stays a
+/// no-op rather than inventing a mapping.
+pub fn expand_ams_map(used: &[i32], filament_ids: &[usize]) -> Vec<i32> {
+    if used.is_empty() || filament_ids.len() != used.len() {
+        return used.to_vec();
+    }
+    let len = filament_ids.iter().copied().max().unwrap_or(0) + 1;
+    let mut out = vec![used[0]; len];
+    for (slot, &idx) in filament_ids.iter().enumerate() {
+        out[idx] = used[slot];
+    }
+    out
+}
+
 /// Render the print-start command: `project_file` for a `.3mf`, `gcode_file` for
 /// raw `.gcode`. When `inspection` is present (for a `.3mf`), its plate-gcode md5
 /// is stamped into the `project_file` so the printer checks the file matches its
@@ -62,6 +96,35 @@ pub fn build_command(params: &PrintStartParams, inspection: Option<&PlateInspect
 mod tests {
     use super::*;
 
+    #[test]
+    fn ams_map_lands_on_the_projects_filament_index_not_the_used_order() {
+        // Plate 1 uses the project's FIRST filament: identity, and the historic
+        // single-entry form keeps working.
+        assert_eq!(expand_ams_map(&[0], &[0]), vec![0]);
+        // Plate 5 uses the project's SECOND filament (PETG). A bare [2] used to
+        // go out as-is and map filament 1 — the printer then fell back to the
+        // gcode's `M620 S1A` and printed PLA from tray 1. The tray must sit at
+        // index 1; index 0 is a gap, filled with a loaded tray (never -1).
+        assert_eq!(expand_ams_map(&[2], &[1]), vec![2, 2]);
+    }
+
+    #[test]
+    fn ams_map_places_each_filament_and_fills_gaps() {
+        // Uses project filaments 0 and 2 -> index 1 is a gap.
+        assert_eq!(expand_ams_map(&[3, 1], &[0, 2]), vec![3, 3, 1]);
+        // Order follows filament_ids, not the argument order.
+        assert_eq!(expand_ams_map(&[1, 3], &[2, 0]), vec![3, 1, 1]);
+    }
+
+    #[test]
+    fn ams_map_is_left_alone_when_filament_ids_are_unusable() {
+        // Older 3mf with no `filament_ids`, or a length mismatch: don't invent
+        // a mapping — hand back exactly what the caller asked for.
+        assert_eq!(expand_ams_map(&[2], &[]), vec![2]);
+        assert_eq!(expand_ams_map(&[2], &[0, 1]), vec![2]);
+        assert_eq!(expand_ams_map(&[], &[0]), Vec::<i32>::new());
+    }
+
     fn params(file: &str) -> PrintStartParams {
         PrintStartParams {
             file: file.to_string(),
@@ -81,6 +144,7 @@ mod tests {
             sidecar_matches: true,
             bed_type: None,
             filament_colors: vec![],
+            filament_ids: vec![],
             has_timelapse_blocks: false,
         }
     }

@@ -1668,7 +1668,8 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
                     "--expect-md5 / --expect-plate only apply to .3mf files",
                 ));
             }
-            let cmd = build_start_command(file, *plate, ams_map.as_deref(), bed_type, *timelapse)?;
+            let mut cmd =
+                build_start_command(file, *plate, ams_map.as_deref(), bed_type, *timelapse)?;
 
             // The AMS mapping (if any), for validation + dry-run preview.
             let ams_mapping: Option<Vec<i32>> = match &cmd {
@@ -1717,6 +1718,14 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
                                 Err(e) if *dry_run => eprintln!("warning: {}", e.message),
                                 Err(e) => return Err(e),
                             }
+                        }
+                        // The wire mapping is keyed by each filament's index in
+                        // the PROJECT, not by the order this plate uses them —
+                        // expand now that inspection knows both. Without this a
+                        // plate whose filament isn't the project's first one
+                        // silently prints from the gcode's default tray.
+                        if let (Some(m), ProtoCommand::ProjectFile(pf)) = (&ams_mapping, &mut cmd) {
+                            pf.ams_mapping = start::expand_ams_map(m, &insp.filament_ids);
                         }
                         inspection = Some(insp);
                     }
@@ -1857,11 +1866,20 @@ fn run_job_start_upload(
     };
 
     // Build the wire command for the REMOTE path, stamping in the local md5.
+    // The map goes out keyed by each filament's index in the PROJECT (see
+    // `start::expand_ams_map`) — what the caller passes is per USED filament.
+    let filament_ids = inspection
+        .as_ref()
+        .map(|i| i.filament_ids.as_slice())
+        .unwrap_or(&[]);
     let params = PrintStartParams {
         file: remote.clone(),
         plate,
         use_ams: parsed_ams.is_some(),
-        ams_map: parsed_ams.clone().unwrap_or_default(),
+        ams_map: parsed_ams
+            .as_deref()
+            .map(|m| start::expand_ams_map(m, filament_ids))
+            .unwrap_or_default(),
         bed_type: bed_type.to_string(),
         timelapse,
     };
