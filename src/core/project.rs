@@ -307,7 +307,8 @@ mod tests {
             ("Metadata/plate_1.gcode.md5", md5.to_uppercase().as_bytes()),
             (
                 "Metadata/plate_1.json",
-                br##"{"bed_type":"textured_plate","filament_colors":["#F2754E","#000000"]}"##,
+                br##"{"bed_type":"textured_plate","filament_colors":["#F2754E","#000000"],
+                      "filament_ids":[1,3]}"##,
             ),
         ]);
         let got = inspect_plate(&zip, 1).unwrap();
@@ -316,6 +317,10 @@ mod tests {
         assert!(got.sidecar_matches);
         assert_eq!(got.bed_type.as_deref(), Some("textured_plate"));
         assert_eq!(got.filament_colors, vec!["#F2754E", "#000000"]);
+        // Parsed from the same sidecar as the colours. Asserted here (not just
+        // fed to the start tests by hand) so a field-name, JSON-type, or
+        // indexing regression can't silently disable the AMS-mapping fix.
+        assert_eq!(got.filament_ids, vec![1, 3]);
         assert!(!got.has_timelapse_blocks); // this gcode has no timelapse markers
     }
 

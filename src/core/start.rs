@@ -53,6 +53,8 @@ impl PrintStartParams {
 /// Returns `used` unchanged when `filament_ids` is unusable (absent in older
 /// 3mfs, or mismatched length) — the caller validates lengths and this stays a
 /// no-op rather than inventing a mapping.
+///
+/// Called from [`build_command`], so every frontend gets the corrected array.
 pub fn expand_ams_map(used: &[i32], filament_ids: &[usize]) -> Vec<i32> {
     if used.is_empty() || filament_ids.len() != used.len() {
         return used.to_vec();
@@ -84,7 +86,14 @@ pub fn build_command(params: &PrintStartParams, inspection: Option<&PlateInspect
     pf.timelapse = params.timelapse;
     if params.use_ams {
         pf.use_ams = true;
-        pf.ams_mapping = params.ams_map.clone();
+        // Expand HERE, not in each frontend: the CLI and the dashboard both
+        // reach the wire through this builder, and a mapping that is only
+        // corrected on one of them is a wrong-material print waiting to happen
+        // on the other.
+        pf.ams_mapping = match inspection {
+            Some(insp) => expand_ams_map(&params.ams_map, &insp.filament_ids),
+            None => params.ams_map.clone(),
+        };
     }
     if let Some(insp) = inspection {
         pf.md5 = insp.gcode_md5.clone();
@@ -166,6 +175,34 @@ mod tests {
                 assert!(pf.timelapse);
                 assert!(pf.md5.is_empty(), "no inspection ⇒ no md5 check");
             }
+            other => panic!("expected ProjectFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_builder_expands_the_map_so_every_frontend_sends_the_same_wire_array() {
+        // The regression that motivated this: a plate using the project's SECOND
+        // filament. Expansion used to live in the CLI, so the dashboard still
+        // emitted the un-expanded array and printed the wrong material.
+        let mut p = params("/x.gcode.3mf");
+        p.use_ams = true;
+        p.ams_map = vec![2];
+        let mut insp = inspection("abc");
+        insp.filament_ids = vec![1];
+        match build_command(&p, Some(&insp)) {
+            Command::ProjectFile(pf) => assert_eq!(pf.ams_mapping, vec![2, 2]),
+            other => panic!("expected ProjectFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn without_an_inspection_the_map_goes_out_as_given() {
+        // Nothing to expand against — don't invent a mapping.
+        let mut p = params("/x.gcode.3mf");
+        p.use_ams = true;
+        p.ams_map = vec![2];
+        match build_command(&p, None) {
+            Command::ProjectFile(pf) => assert_eq!(pf.ams_mapping, vec![2]),
             other => panic!("expected ProjectFile, got {other:?}"),
         }
     }
