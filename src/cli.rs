@@ -151,8 +151,9 @@ enum Command {
         #[arg(long, default_value_t = 8)]
         timeout: u64,
     },
-    /// AMS operations (control, filament change, tray settings). [spec] —
-    /// derived from OpenBambuAPI, not yet confirmed on this unit's AMS Lite.
+    /// AMS operations (control, filament change, tray settings). Mostly [spec]
+    /// — derived from OpenBambuAPI — except `set-filament`, which is confirmed
+    /// on a real A1 mini AMS Lite (see its help).
     Ams {
         #[command(subcommand)]
         action: AmsAction,
@@ -516,6 +517,17 @@ enum AmsAction {
         confirm: bool,
     },
     /// Set a tray's filament profile (material/colour/temps).
+    ///
+    /// **Device-verified** on an A1 mini AMS Lite: all five fields read back
+    /// exactly as written, and the tray's bit in `tray_is_bbl_bits` flips on.
+    /// This is how a spool with no RFID — any third-party filament — gets
+    /// identified; without it the slot stays material-unknown and filament
+    /// checks have nothing to match against.
+    ///
+    /// The tray reports **every field as null for a few seconds afterwards**.
+    /// Reading back too soon shows an apparently empty slot; it repopulates on
+    /// its own (null at 3s, correct at 15s in testing). Don't read that gap as
+    /// "the write failed" or "the slot is empty".
     SetFilament {
         #[arg(long, default_value_t = 0)]
         ams: u32,
@@ -2165,7 +2177,13 @@ fn run_ams(cli: &Cli, action: &AmsAction) -> Result<(), CliError> {
                 ));
             }
             let client = connect_client(cli, 15)?;
-            eprintln!("{what} … (AMS commands are [spec]; the ACK confirms acceptance)");
+            // `set-filament` is device-verified (its effect is readable back);
+            // the rest are still spec-derived, so keep warning about those.
+            if !matches!(cmd, ProtoCommand::AmsFilamentSetting(_)) {
+                eprintln!("{what} … (this AMS command is [spec]; the ACK confirms acceptance)");
+            } else {
+                eprintln!("{what} …");
+            }
             report_command_outcome(cli, client.send_and_verify(&cmd)?)
         };
     match action {
