@@ -162,6 +162,14 @@ def main():
                  "--arrange", "1", "--orient", "1", "--slice", "0",
                  "--outputdir", outdir, "--export-3mf", os.path.basename(a.out), a.stl]
     out = os.path.join(outdir, os.path.basename(a.out))
+    # Refuse to write over the input. Slicing a .3mf in place is an easy typo,
+    # and the cleanup below would delete the source before the slicer ever
+    # opened it. samefile() catches hard links and symlinks too; it needs both
+    # to exist, so fall back to comparing resolved paths.
+    if os.path.exists(a.stl) and os.path.exists(out) and os.path.samefile(a.stl, out):
+        sys.exit(f"refusing to overwrite the input: {a.stl} and {out} are the same file")
+    if os.path.realpath(a.stl) == os.path.realpath(out):
+        sys.exit(f"refusing to overwrite the input: {a.stl} and {out} resolve to the same path")
     # Clear any earlier archive FIRST. The checks below all read `out`, so a
     # stale file from a previous run would let a failed slice verify green and
     # ship settings that have nothing to do with this invocation.
