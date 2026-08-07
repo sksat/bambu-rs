@@ -13,7 +13,7 @@ profiles under `/opt/orca-slicer/resources/profiles/BBL/{machine,process,filamen
 **Slicer auto-detect:** the helper prefers OrcaSlicer, and falls back to **Bambu
 Studio** (`/opt/bambustudio-bin`) when OrcaSlicer isn't installed — same BBL
 profiles + CLI flags, but it needs its bundled libs on `LD_LIBRARY_PATH` and
-`LC_ALL=C` (the helper sets both). This machine currently has only Bambu Studio.
+`LC_ALL=C` (the helper sets both).
 
 ## The one trap you must know
 
