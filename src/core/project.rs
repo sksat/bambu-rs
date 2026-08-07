@@ -251,17 +251,23 @@ fn parse_plate_json(raw: &[u8]) -> (Option<String>, Vec<String>, Vec<usize>) {
         })
         .unwrap_or_default();
     // Parallel to `colors`: each used filament's 0-based index in the project's
-    // filament list. Same defensive bounds.
+    // filament list.
+    //
+    // ALL-OR-NOTHING on purpose. Skipping a malformed entry would compact the
+    // array and shift every later index left — `[null, 1]` would become `[1]`,
+    // silently re-pointing the second filament's tray at the first. These
+    // indices choose which material feeds, so a plausible-but-shifted array is
+    // worse than none: an empty vec makes `expand_ams_map` a no-op and the
+    // caller's map goes out as written, which is the pre-existing behaviour for
+    // 3mfs that lack the field entirely.
     let ids = v
         .get("filament_ids")
         .and_then(|c| c.as_array())
-        .map(|arr| {
+        .filter(|arr| arr.len() <= 64)
+        .and_then(|arr| {
             arr.iter()
-                .filter_map(|c| c.as_u64())
-                .filter(|n| *n < 64)
-                .take(64)
-                .map(|n| n as usize)
-                .collect()
+                .map(|c| c.as_u64().filter(|n| *n < 64).map(|n| n as usize))
+                .collect::<Option<Vec<_>>>()
         })
         .unwrap_or_default();
     (bed_type, colors, ids)
@@ -322,6 +328,30 @@ mod tests {
         // indexing regression can't silently disable the AMS-mapping fix.
         assert_eq!(got.filament_ids, vec![1, 3]);
         assert!(!got.has_timelapse_blocks); // this gcode has no timelapse markers
+    }
+
+    #[test]
+    fn a_malformed_filament_id_discards_the_whole_array() {
+        // Compacting would turn [null, 1] into [1] and point the SECOND
+        // filament's tray at the FIRST — a wrong-material print that looks
+        // well-formed. Better to have no indices and leave the caller's map
+        // as written.
+        for bad in [
+            br##"{"filament_ids":[null,1]}"##.as_slice(),
+            br##"{"filament_ids":[0,-1]}"##.as_slice(),
+            br##"{"filament_ids":[0,"1"]}"##.as_slice(),
+            br##"{"filament_ids":[0,64]}"##.as_slice(),
+        ] {
+            let zip = make_3mf(&[
+                ("Metadata/plate_1.gcode", b"G28\n"),
+                ("Metadata/plate_1.json", bad),
+            ]);
+            assert!(
+                inspect_plate(&zip, 1).unwrap().filament_ids.is_empty(),
+                "malformed entry must void the array, not shift it: {}",
+                String::from_utf8_lossy(bad)
+            );
+        }
     }
 
     #[test]
