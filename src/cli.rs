@@ -1668,7 +1668,8 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
                     "--expect-md5 / --expect-plate only apply to .3mf files",
                 ));
             }
-            let cmd = build_start_command(file, *plate, ams_map.as_deref(), bed_type, *timelapse)?;
+            let mut cmd =
+                build_start_command(file, *plate, ams_map.as_deref(), bed_type, *timelapse)?;
 
             // The AMS mapping (if any), for validation + dry-run preview.
             let ams_mapping: Option<Vec<i32>> = match &cmd {
@@ -1718,6 +1719,17 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
                                 Err(e) => return Err(e),
                             }
                         }
+                        // The wire mapping is expanded by `core::start::build_command`
+                        // (shared with the server), so rebuild now that we have the
+                        // inspection it needs.
+                        cmd = build_start_command_with(
+                            file,
+                            *plate,
+                            ams_map.as_deref(),
+                            bed_type,
+                            *timelapse,
+                            Some(&insp),
+                        )?;
                         inspection = Some(insp);
                     }
                     // Inspection is mandatory when an expect-guard or an AMS
@@ -1857,6 +1869,9 @@ fn run_job_start_upload(
     };
 
     // Build the wire command for the REMOTE path, stamping in the local md5.
+    // The builder expands the AMS map onto the project's filament indices using
+    // the inspection (see `start::expand_ams_map`) — what the caller passes is
+    // per USED filament.
     let params = PrintStartParams {
         file: remote.clone(),
         plate,
@@ -1944,9 +1959,22 @@ fn build_start_command(
     bed_type: &str,
     timelapse: bool,
 ) -> Result<ProtoCommand, CliError> {
+    build_start_command_with(file, plate, ams_map, bed_type, timelapse, None)
+}
+
+/// As [`build_start_command`], with an inspection when we have one. The shared
+/// core builder needs it to expand the AMS map onto the project's filament
+/// indices, so a plate whose filament isn't the project's first one maps right.
+fn build_start_command_with(
+    file: &str,
+    plate: u32,
+    ams_map: Option<&str>,
+    bed_type: &str,
+    timelapse: bool,
+    inspection: Option<&PlateInspection>,
+) -> Result<ProtoCommand, CliError> {
     // AMS mapping only applies to a .3mf; parse it (the one CLI-fallible bit) and
-    // hand the resolved params to the shared core builder. md5 is left unset here
-    // (we have no inspection at this point — `job start --upload` supplies one).
+    // hand the resolved params to the shared core builder.
     let is_3mf = file.to_ascii_lowercase().ends_with(".3mf");
     let (use_ams, parsed_map) = match (is_3mf, ams_map) {
         (true, Some(map)) => (true, parse_ams_map(map)?),
@@ -1960,7 +1988,7 @@ fn build_start_command(
         bed_type: bed_type.to_string(),
         timelapse,
     };
-    Ok(start::build_command(&params, None))
+    Ok(start::build_command(&params, inspection))
 }
 
 fn parse_ams_map(map: &str) -> Result<Vec<i32>, CliError> {

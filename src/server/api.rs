@@ -921,6 +921,35 @@ async fn job_start(State(st): State<AppState>, Json(b): Json<StartBody>) -> Resp
             }
         }
     }
+    // With an AMS mapping, inspecting is MANDATORY, not a nicety: the wire array
+    // is keyed by each filament's index in the project, and only the plate's
+    // `filament_ids` says which those are. Starting without it sends the map
+    // un-expanded, which on a plate that doesn't use the project's first
+    // filament silently prints the wrong material (device-verified). Without a
+    // mapping this stays `None` — no AMS, nothing to get wrong.
+    let inspection = if b.use_ams && lower.ends_with(".3mf") {
+        let (files, file, plate) = (st.files.clone(), b.file.clone(), b.plate);
+        match tokio::task::spawn_blocking(move || {
+            files.fetch(&file).and_then(|bytes| {
+                crate::core::project::inspect_plate(&bytes, plate).map_err(|e| e.to_string())
+            })
+        })
+        .await
+        {
+            Ok(Ok(insp)) => Some(insp),
+            Ok(Err(e)) => {
+                return bad_request(format!(
+                    "cannot inspect {} to resolve the AMS mapping: {e}",
+                    b.file
+                ));
+            }
+            Err(e) => {
+                return bad_request(format!("inspection task failed: {e}"));
+            }
+        }
+    } else {
+        None
+    };
     let req = StartRequest {
         file: b.file.clone(),
         plate: b.plate,
@@ -928,9 +957,7 @@ async fn job_start(State(st): State<AppState>, Json(b): Json<StartBody>) -> Resp
         ams_map: b.ams_map.clone(),
         bed_type: b.bed_type.clone().unwrap_or_else(|| "auto".to_string()),
         timelapse: b.timelapse,
-        // The file is already on the printer here; we don't have its bytes to
-        // inspect, so no md5 check (the upload-start path supplies one).
-        inspection: None,
+        inspection,
     };
 
     if b.dry_run {

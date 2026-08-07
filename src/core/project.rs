@@ -35,6 +35,12 @@ pub struct PlateInspection {
     pub bed_type: Option<String>,
     /// `filament_colors` from `Metadata/plate_N.json` (hex `#RRGGBB`), in order.
     pub filament_colors: Vec<String>,
+    /// `filament_ids` from `Metadata/plate_N.json`: for each entry of
+    /// [`Self::filament_colors`], that filament's **0-based position in the
+    /// PROJECT's filament list** — which is the index the wire `ams_mapping` is
+    /// keyed by. A plate using only the project's 2nd filament has `[1]`, not
+    /// `[0]`. Empty when the sidecar JSON is missing or predates the field.
+    pub filament_ids: Vec<usize>,
     /// Whether the plate gcode INJECTS the slicer's per-layer timelapse block (the
     /// head-park + external-shutter moves) at layer changes — the precondition for a
     /// "clean", object-only timelapse. NOTE: even when present the block only RUNS if
@@ -120,10 +126,10 @@ pub fn inspect_plate(zip_bytes: &[u8], plate: u32) -> Result<PlateInspection, Pr
     let sidecar_matches = sidecar_md5.as_deref().is_none_or(|s| s == gcode_md5);
 
     // Best-effort plate metadata (never fatal).
-    let (bed_type, filament_colors) =
+    let (bed_type, filament_colors, filament_ids) =
         match read_entry(&mut archive, &format!("Metadata/plate_{plate}.json"))? {
             Some(raw) => parse_plate_json(&raw),
-            None => (None, Vec::new()),
+            None => (None, Vec::new(), Vec::new()),
         };
 
     let has_timelapse_blocks = injects_timelapse_blocks(&gcode);
@@ -135,6 +141,7 @@ pub fn inspect_plate(zip_bytes: &[u8], plate: u32) -> Result<PlateInspection, Pr
         sidecar_matches,
         bed_type,
         filament_colors,
+        filament_ids,
         has_timelapse_blocks,
     })
 }
@@ -219,10 +226,11 @@ fn read_entry(
     Ok(Some(buf))
 }
 
-/// Extract `bed_type` + `filament_colors` from a `plate_N.json` (best-effort).
-fn parse_plate_json(raw: &[u8]) -> (Option<String>, Vec<String>) {
+/// Extract `bed_type` + `filament_colors` + `filament_ids` from a `plate_N.json`
+/// (best-effort).
+fn parse_plate_json(raw: &[u8]) -> (Option<String>, Vec<String>, Vec<usize>) {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(raw) else {
-        return (None, Vec::new());
+        return (None, Vec::new(), Vec::new());
     };
     let bed_type = v
         .get("bed_type")
@@ -242,7 +250,27 @@ fn parse_plate_json(raw: &[u8]) -> (Option<String>, Vec<String>) {
                 .collect()
         })
         .unwrap_or_default();
-    (bed_type, colors)
+    // Parallel to `colors`: each used filament's 0-based index in the project's
+    // filament list.
+    //
+    // ALL-OR-NOTHING on purpose. Skipping a malformed entry would compact the
+    // array and shift every later index left — `[null, 1]` would become `[1]`,
+    // silently re-pointing the second filament's tray at the first. These
+    // indices choose which material feeds, so a plausible-but-shifted array is
+    // worse than none: an empty vec makes `expand_ams_map` a no-op and the
+    // caller's map goes out as written, which is the pre-existing behaviour for
+    // 3mfs that lack the field entirely.
+    let ids = v
+        .get("filament_ids")
+        .and_then(|c| c.as_array())
+        .filter(|arr| arr.len() <= 64)
+        .and_then(|arr| {
+            arr.iter()
+                .map(|c| c.as_u64().filter(|n| *n < 64).map(|n| n as usize))
+                .collect::<Option<Vec<_>>>()
+        })
+        .unwrap_or_default();
+    (bed_type, colors, ids)
 }
 
 #[cfg(test)]
@@ -285,7 +313,8 @@ mod tests {
             ("Metadata/plate_1.gcode.md5", md5.to_uppercase().as_bytes()),
             (
                 "Metadata/plate_1.json",
-                br##"{"bed_type":"textured_plate","filament_colors":["#F2754E","#000000"]}"##,
+                br##"{"bed_type":"textured_plate","filament_colors":["#F2754E","#000000"],
+                      "filament_ids":[1,3]}"##,
             ),
         ]);
         let got = inspect_plate(&zip, 1).unwrap();
@@ -294,7 +323,35 @@ mod tests {
         assert!(got.sidecar_matches);
         assert_eq!(got.bed_type.as_deref(), Some("textured_plate"));
         assert_eq!(got.filament_colors, vec!["#F2754E", "#000000"]);
+        // Parsed from the same sidecar as the colours. Asserted here (not just
+        // fed to the start tests by hand) so a field-name, JSON-type, or
+        // indexing regression can't silently disable the AMS-mapping fix.
+        assert_eq!(got.filament_ids, vec![1, 3]);
         assert!(!got.has_timelapse_blocks); // this gcode has no timelapse markers
+    }
+
+    #[test]
+    fn a_malformed_filament_id_discards_the_whole_array() {
+        // Compacting would turn [null, 1] into [1] and point the SECOND
+        // filament's tray at the FIRST — a wrong-material print that looks
+        // well-formed. Better to have no indices and leave the caller's map
+        // as written.
+        for bad in [
+            br##"{"filament_ids":[null,1]}"##.as_slice(),
+            br##"{"filament_ids":[0,-1]}"##.as_slice(),
+            br##"{"filament_ids":[0,"1"]}"##.as_slice(),
+            br##"{"filament_ids":[0,64]}"##.as_slice(),
+        ] {
+            let zip = make_3mf(&[
+                ("Metadata/plate_1.gcode", b"G28\n"),
+                ("Metadata/plate_1.json", bad),
+            ]);
+            assert!(
+                inspect_plate(&zip, 1).unwrap().filament_ids.is_empty(),
+                "malformed entry must void the array, not shift it: {}",
+                String::from_utf8_lossy(bad)
+            );
+        }
     }
 
     #[test]
@@ -379,6 +436,7 @@ mod tests {
             sidecar_matches: true,
             bed_type: None,
             filament_colors: vec![],
+            filament_ids: vec![],
             has_timelapse_blocks: false,
         };
         // Uppercase + whitespace asserted value still matches.
@@ -420,6 +478,7 @@ mod tests {
             sidecar_matches: true,
             bed_type: None,
             filament_colors: vec![],
+            filament_ids: vec![],
             has_timelapse_blocks: false,
         };
         assert_eq!(

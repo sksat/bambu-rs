@@ -31,6 +31,42 @@ impl PrintStartParams {
     }
 }
 
+/// Expand a per-USED-filament AMS map into the positional array the printer
+/// actually consumes.
+///
+/// The wire `ams_mapping` is keyed by a filament's **position in the PROJECT's
+/// filament list**, not by the order this plate happens to use them.
+/// `Metadata/plate_N.json`'s `filament_ids` gives that position for each entry of
+/// `filament_colors`, so a plate using only the project's 2nd filament needs its
+/// tray at index 1.
+///
+/// **Device-verified failure this prevents:** passing a bare `[2]` for such a
+/// plate mapped the *first* filament instead, leaving the used one to fall back
+/// to the gcode's baked-in `M620 S<n>A` — the print silently ran from tray 1
+/// (PLA) instead of the requested tray 2 (PETG), with `print_error` staying 0.
+///
+/// Gaps (project filaments this plate never uses) are filled with the first
+/// mapped tray rather than `-1`: they should never be consulted, but if they are,
+/// landing on a loaded tray beats pulling from the external spool — which is how
+/// the wrong-material print happened in the first place.
+///
+/// Returns `used` unchanged when `filament_ids` is unusable (absent in older
+/// 3mfs, or mismatched length) — the caller validates lengths and this stays a
+/// no-op rather than inventing a mapping.
+///
+/// Called from [`build_command`], so every frontend gets the corrected array.
+pub fn expand_ams_map(used: &[i32], filament_ids: &[usize]) -> Vec<i32> {
+    if used.is_empty() || filament_ids.len() != used.len() {
+        return used.to_vec();
+    }
+    let len = filament_ids.iter().copied().max().unwrap_or(0) + 1;
+    let mut out = vec![used[0]; len];
+    for (slot, &idx) in filament_ids.iter().enumerate() {
+        out[idx] = used[slot];
+    }
+    out
+}
+
 /// Render the print-start command: `project_file` for a `.3mf`, `gcode_file` for
 /// raw `.gcode`. When `inspection` is present (for a `.3mf`), its plate-gcode md5
 /// is stamped into the `project_file` so the printer checks the file matches its
@@ -50,7 +86,14 @@ pub fn build_command(params: &PrintStartParams, inspection: Option<&PlateInspect
     pf.timelapse = params.timelapse;
     if params.use_ams {
         pf.use_ams = true;
-        pf.ams_mapping = params.ams_map.clone();
+        // Expand HERE, not in each frontend: the CLI and the dashboard both
+        // reach the wire through this builder, and a mapping that is only
+        // corrected on one of them is a wrong-material print waiting to happen
+        // on the other.
+        pf.ams_mapping = match inspection {
+            Some(insp) => expand_ams_map(&params.ams_map, &insp.filament_ids),
+            None => params.ams_map.clone(),
+        };
     }
     if let Some(insp) = inspection {
         pf.md5 = insp.gcode_md5.clone();
@@ -61,6 +104,35 @@ pub fn build_command(params: &PrintStartParams, inspection: Option<&PlateInspect
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ams_map_lands_on_the_projects_filament_index_not_the_used_order() {
+        // Plate 1 uses the project's FIRST filament: identity, and the historic
+        // single-entry form keeps working.
+        assert_eq!(expand_ams_map(&[0], &[0]), vec![0]);
+        // Plate 5 uses the project's SECOND filament (PETG). A bare [2] used to
+        // go out as-is and map filament 1 — the printer then fell back to the
+        // gcode's `M620 S1A` and printed PLA from tray 1. The tray must sit at
+        // index 1; index 0 is a gap, filled with a loaded tray (never -1).
+        assert_eq!(expand_ams_map(&[2], &[1]), vec![2, 2]);
+    }
+
+    #[test]
+    fn ams_map_places_each_filament_and_fills_gaps() {
+        // Uses project filaments 0 and 2 -> index 1 is a gap.
+        assert_eq!(expand_ams_map(&[3, 1], &[0, 2]), vec![3, 3, 1]);
+        // Order follows filament_ids, not the argument order.
+        assert_eq!(expand_ams_map(&[1, 3], &[2, 0]), vec![3, 1, 1]);
+    }
+
+    #[test]
+    fn ams_map_is_left_alone_when_filament_ids_are_unusable() {
+        // Older 3mf with no `filament_ids`, or a length mismatch: don't invent
+        // a mapping — hand back exactly what the caller asked for.
+        assert_eq!(expand_ams_map(&[2], &[]), vec![2]);
+        assert_eq!(expand_ams_map(&[2], &[0, 1]), vec![2]);
+        assert_eq!(expand_ams_map(&[], &[0]), Vec::<i32>::new());
+    }
 
     fn params(file: &str) -> PrintStartParams {
         PrintStartParams {
@@ -81,6 +153,7 @@ mod tests {
             sidecar_matches: true,
             bed_type: None,
             filament_colors: vec![],
+            filament_ids: vec![],
             has_timelapse_blocks: false,
         }
     }
@@ -102,6 +175,34 @@ mod tests {
                 assert!(pf.timelapse);
                 assert!(pf.md5.is_empty(), "no inspection ⇒ no md5 check");
             }
+            other => panic!("expected ProjectFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_builder_expands_the_map_so_every_frontend_sends_the_same_wire_array() {
+        // The regression that motivated this: a plate using the project's SECOND
+        // filament. Expansion used to live in the CLI, so the dashboard still
+        // emitted the un-expanded array and printed the wrong material.
+        let mut p = params("/x.gcode.3mf");
+        p.use_ams = true;
+        p.ams_map = vec![2];
+        let mut insp = inspection("abc");
+        insp.filament_ids = vec![1];
+        match build_command(&p, Some(&insp)) {
+            Command::ProjectFile(pf) => assert_eq!(pf.ams_mapping, vec![2, 2]),
+            other => panic!("expected ProjectFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn without_an_inspection_the_map_goes_out_as_given() {
+        // Nothing to expand against — don't invent a mapping.
+        let mut p = params("/x.gcode.3mf");
+        p.use_ams = true;
+        p.ams_map = vec![2];
+        match build_command(&p, None) {
+            Command::ProjectFile(pf) => assert_eq!(pf.ams_mapping, vec![2]),
             other => panic!("expected ProjectFile, got {other:?}"),
         }
     }
