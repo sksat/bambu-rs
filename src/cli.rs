@@ -3303,7 +3303,9 @@ fn fmt_eta(min: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ams_mapping_preview, fmt_eta, spec_caveat, subst_capture_tokens, validate_ams_map};
+    use super::{
+        ams_mapping_preview, fmt_eta, spec_caveat, subst_capture_tokens, validate_ams_map,
+    };
 
     #[test]
     fn only_the_device_verified_ams_command_drops_the_spec_caveat() {
