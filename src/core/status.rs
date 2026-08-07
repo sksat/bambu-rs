@@ -296,7 +296,12 @@ pub struct Ams {
     /// Hex bitfield of occupied slots (`ams.tray_exist_bits`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tray_exist_bits: Option<String>,
-    /// Hex bitfield of genuine-Bambu (RFID) trays (`ams.tray_is_bbl_bits`).
+    /// Hex bitfield of trays with a KNOWN filament profile (`ams.tray_is_bbl_bits`).
+    ///
+    /// Despite the name this is **not** proof of genuine Bambu filament or of an
+    /// RFID read: device-verified that writing a third-party profile with
+    /// `ams_filament_setting` turns the bit on for that tray. Read it as "this
+    /// slot's material is known", not "this spool is Bambu".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tray_is_bbl_bits: Option<String>,
 }

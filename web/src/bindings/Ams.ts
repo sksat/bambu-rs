@@ -37,6 +37,11 @@ ams_exist_bits: string | null,
  */
 tray_exist_bits: string | null, 
 /**
- * Hex bitfield of genuine-Bambu (RFID) trays (`ams.tray_is_bbl_bits`).
+ * Hex bitfield of trays with a KNOWN filament profile (`ams.tray_is_bbl_bits`).
+ *
+ * Despite the name this is **not** proof of genuine Bambu filament or of an
+ * RFID read: device-verified that writing a third-party profile with
+ * `ams_filament_setting` turns the bit on for that tray. Read it as "this
+ * slot's material is known", not "this spool is Bambu".
  */
 tray_is_bbl_bits: string | null, };

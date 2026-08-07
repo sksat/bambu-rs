@@ -151,8 +151,9 @@ enum Command {
         #[arg(long, default_value_t = 8)]
         timeout: u64,
     },
-    /// AMS operations (control, filament change, tray settings). [spec] —
-    /// derived from OpenBambuAPI, not yet confirmed on this unit's AMS Lite.
+    /// AMS operations (control, filament change, tray settings). Mostly [spec]
+    /// — derived from OpenBambuAPI — except `set-filament`, which is confirmed
+    /// on a real A1 mini AMS Lite (see its help).
     Ams {
         #[command(subcommand)]
         action: AmsAction,
@@ -516,6 +517,17 @@ enum AmsAction {
         confirm: bool,
     },
     /// Set a tray's filament profile (material/colour/temps).
+    ///
+    /// **Device-verified** on an A1 mini AMS Lite: all five fields read back
+    /// exactly as written, and the tray's bit in `tray_is_bbl_bits` flips on.
+    /// This is how a spool with no RFID — any third-party filament — gets
+    /// identified; without it the slot stays material-unknown and filament
+    /// checks have nothing to match against.
+    ///
+    /// The tray reports **every field as null for a few seconds afterwards**.
+    /// Reading back too soon shows an apparently empty slot; it repopulates on
+    /// its own (null at 3s, correct at 15s in testing). Don't read that gap as
+    /// "the write failed" or "the slot is empty".
     SetFilament {
         #[arg(long, default_value_t = 0)]
         ams: u32,
@@ -2182,6 +2194,20 @@ fn ensure_idle(cli: &Cli) -> Result<(), CliError> {
     }
 }
 
+/// The trailing caveat for an AMS command's "sending …" line: empty when the
+/// command is device-verified, otherwise the spec-derived warning.
+///
+/// Split out so the classification is testable without a printer — it is the
+/// claim this distinction rests on, and a new AMS variant silently inheriting
+/// the wrong side of it would mislead in exactly the direction that matters.
+fn spec_caveat(cmd: &ProtoCommand) -> &'static str {
+    match cmd {
+        // Verified on a real A1 mini AMS Lite: every field reads back as written.
+        ProtoCommand::AmsFilamentSetting(_) => "",
+        _ => " (this AMS command is [spec]; the ACK confirms acceptance)",
+    }
+}
+
 fn run_ams(cli: &Cli, action: &AmsAction) -> Result<(), CliError> {
     // Helper: a plain control command gated on --confirm (ACK-verified).
     let control =
@@ -2193,7 +2219,7 @@ fn run_ams(cli: &Cli, action: &AmsAction) -> Result<(), CliError> {
                 ));
             }
             let client = connect_client(cli, 15)?;
-            eprintln!("{what} … (AMS commands are [spec]; the ACK confirms acceptance)");
+            eprintln!("{what} …{}", spec_caveat(&cmd));
             report_command_outcome(cli, client.send_and_verify(&cmd)?)
         };
     match action {
@@ -3305,7 +3331,38 @@ fn fmt_eta(min: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ams_mapping_preview, fmt_eta, subst_capture_tokens, validate_ams_map};
+    use super::{
+        ams_mapping_preview, fmt_eta, spec_caveat, subst_capture_tokens, validate_ams_map,
+    };
+
+    #[test]
+    fn only_the_device_verified_ams_command_drops_the_spec_caveat() {
+        use crate::core::command::{AmsControl, AmsFilamentSetting, Command};
+        assert_eq!(
+            spec_caveat(&Command::AmsFilamentSetting(Box::new(AmsFilamentSetting {
+                ams_id: 0,
+                tray_id: 0,
+                tray_color: "000000FF".into(),
+                tray_type: "PLA".into(),
+                tray_info_idx: String::new(),
+                nozzle_temp_min: 190,
+                nozzle_temp_max: 230,
+            }))),
+            "",
+            "set-filament is device-verified — claiming otherwise makes callers \
+             distrust the one AMS command that identifies third-party filament"
+        );
+        for still_spec in [
+            Command::AmsControl(AmsControl::Resume),
+            Command::AmsControl(AmsControl::Reset),
+            Command::AmsControl(AmsControl::Pause),
+        ] {
+            assert!(
+                spec_caveat(&still_spec).contains("[spec]"),
+                "{still_spec:?} is not verified here and must keep saying so"
+            );
+        }
+    }
 
     #[cfg(feature = "server")]
     #[test]
