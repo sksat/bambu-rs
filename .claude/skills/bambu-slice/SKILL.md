@@ -86,15 +86,25 @@ scripts/slice.py /tmp/cube.stl /tmp/cube.gcode.3mf            # 0.20mm PLA defau
 For a headless thumbnail run the helper under `xvfb-run -a …` (see the caveat below;
 on some boxes GL still fails and the 3mf ships without a preview — the gcode is fine).
 
-## Manual command (fallback — same trap applies)
+## Manual command (fallback — BOTH traps apply)
 
-If you slice by hand, you MUST resolve inheritance (the helper does this) and then
-verify. The lazy `--load-settings "<leaf>.json"` form is only safe for the 0.2mm
-default. Always confirm the real result:
+**Use the helper.** Slicing by hand means reproducing both traps yourself: flatten
+the `inherits` chain *and* merge the `<machine> template <key>.json` gcodes. Neither
+is optional, and neither depends on the layer height.
+
+An earlier version of this section said `--load-settings "<leaf>.json"` was "safe for
+the 0.2mm default". **That is wrong** — it only ever addressed the first trap. The
+leaf also lacks the machine gcode templates, so on Bambu Studio that shortcut still
+emits the generic start whose prime line drives 20mm off the bed. A 0.2mm slice made
+that way looks correct in every check below and still crashes the head.
+
+If you slice by hand anyway, verify the real result — including the start gcode:
 
 ```bash
 unzip -p out.gcode.3mf Metadata/plate_1.gcode | grep -m1 '; layer_height'
 unzip -l out.gcode.3mf | grep Metadata/plate_1.gcode   # proves it's sliced, not just a project 3mf
+# the second trap: a generic start gcode gives itself away here
+unzip -p out.gcode.3mf Metadata/plate_1.gcode | grep -c 'Draw the first line'   # must be 0
 ```
 
 ### Headless caveat (thumbnails)

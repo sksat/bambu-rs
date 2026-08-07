@@ -106,8 +106,13 @@ def start_gcode_fault(g, max_x, max_y):
             e = re.search(r"\bE(-?[0-9.]+)", s)
             if not e or float(e.group(1)) <= 0:    # only extruding moves matter
                 continue
+            # Both bounds, not just the maximum: off the bed is off the bed, and
+            # a negative prime (G1 X-5 E1) is as much a crash as one past Y200.
+            # 1mm of slack absorbs the profile's own edge-of-bed rounding.
             xm = re.search(r"\bX(-?[0-9.]+)", s); ym = re.search(r"\bY(-?[0-9.]+)", s)
-            if (xm and float(xm.group(1)) > max_x + 1) or (ym and float(ym.group(1)) > max_y + 1):
+            off = ((xm and not (-1 <= float(xm.group(1)) <= max_x + 1))
+                   or (ym and not (-1 <= float(ym.group(1)) <= max_y + 1)))
+            if off:
                 return f"start gcode extrudes off the bed: {s[:60]!r} — real machine_start_gcode missing"
     return None
 
@@ -156,10 +161,21 @@ def main():
     cmd = BIN + ["--load-settings", f"{mach};{pf}", "--load-filaments", fil,
                  "--arrange", "1", "--orient", "1", "--slice", "0",
                  "--outputdir", outdir, "--export-3mf", os.path.basename(a.out), a.stl]
+    out = os.path.join(outdir, os.path.basename(a.out))
+    # Clear any earlier archive FIRST. The checks below all read `out`, so a
+    # stale file from a previous run would let a failed slice verify green and
+    # ship settings that have nothing to do with this invocation.
+    if os.path.exists(out):
+        os.unlink(out)
     r = subprocess.run(cmd, capture_output=True, text=True, env=ENV)
     for t in (mach, pf, fil):
         os.unlink(t)
-    out = os.path.join(outdir, os.path.basename(a.out))
+    # The slicer reports failure by exit status; it also prints config errors and
+    # keeps going far enough to look busy. Observed: a project 3mf whose settings
+    # it rejects exits non-zero having written nothing.
+    if r.returncode != 0:
+        sys.stderr.write((r.stdout or "")[-1500:] + (r.stderr or "")[-1500:])
+        sys.exit(f"slice failed: {BIN[0]} exited {r.returncode}")
     if not os.path.exists(out):
         sys.stderr.write((r.stdout or "")[-1500:] + (r.stderr or "")[-1500:])
         sys.exit("slice failed: no output 3mf produced")
