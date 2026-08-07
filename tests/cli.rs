@@ -224,6 +224,115 @@ fn gcode_without_confirm_is_refused() {
     let _ = std::fs::remove_dir_all(&cfg);
 }
 
+/// Write a `.gcode` sequence next to the throwaway config and return its path.
+fn seq_file(cfg: &Path, name: &str, body: &str) -> String {
+    let p = cfg.join(name);
+    std::fs::write(&p, body).unwrap();
+    p.to_string_lossy().into_owned()
+}
+
+/// A vendor-shaped sequence: comment header, blank lines, trailing `; \n`.
+const SEQ: &str = "; plate swap - v05\n\nG90;\nG28;\n\n; park\nG0 X-10; \\n\n";
+
+#[test]
+fn gcode_from_file_dry_run_resolves_the_steps_with_source_lines() {
+    // --dry-run resolves the file and stops: no config, no printer, no
+    // connection — which is also why this is testable without hardware.
+    let cfg = tmp_cfg("gcode-dry");
+    let path = seq_file(&cfg, "swap.gcode", SEQ);
+    bambu(&cfg)
+        .args(["gcode", "--from-file", &path, "--dry-run", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"count\": 3"))
+        // The source line numbers are the point: 3/4/7, not 1/2/3.
+        .stdout(predicate::str::contains("\"line\": 3"))
+        .stdout(predicate::str::contains("\"line\": 4"))
+        .stdout(predicate::str::contains("\"line\": 7"))
+        .stdout(predicate::str::contains("\"gcode\": \"G0 X-10\""));
+    // Human-readable by default, JSON only with --json (as `calibrate --dry-run`).
+    bambu(&cfg)
+        .args(["gcode", "--from-file", &path, "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("[3/3] line 7: G0 X-10"))
+        .stderr(predicate::str::contains("nothing sent"));
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[test]
+fn gcode_from_file_missing_is_validation_error() {
+    let cfg = tmp_cfg("gcode-missing");
+    bambu(&cfg)
+        .args(["gcode", "--from-file", "/no/such/swap.gcode", "--dry-run"])
+        .assert()
+        .code(3); // VALIDATION
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[test]
+fn gcode_from_file_with_nothing_to_send_is_validation_error() {
+    // Comments and blanks only: silently sending zero lines would look like the
+    // macro ran, so it's an error, not a no-op success.
+    let cfg = tmp_cfg("gcode-empty");
+    let empty = seq_file(&cfg, "empty.gcode", "");
+    let comments = seq_file(
+        &cfg,
+        "comments.gcode",
+        "; header\n\n   \n; and that's all\n",
+    );
+    for path in [&empty, &comments] {
+        bambu(&cfg)
+            .args(["gcode", "--from-file", path, "--dry-run"])
+            .assert()
+            .code(3); // VALIDATION
+    }
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[test]
+fn gcode_from_file_unsafe_lines_are_all_named_and_refused() {
+    // Vetting happens before the plan is shown, so even --dry-run refuses — and
+    // it names EVERY offending line, because the operator confirms the sequence
+    // as a unit rather than fixing one line per attempt.
+    let cfg = tmp_cfg("gcode-unsafe");
+    let path = seq_file(&cfg, "hot.gcode", "M104 S400\nG28\nM109 S500\n");
+    bambu(&cfg)
+        .args(["gcode", "--from-file", &path, "--dry-run"])
+        .assert()
+        .code(3) // VALIDATION
+        .stderr(predicate::str::contains("line 1: M104 S400"))
+        .stderr(predicate::str::contains("line 3: M109 S500"));
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[test]
+fn gcode_takes_a_line_or_a_file_but_not_both_and_not_neither() {
+    let cfg = tmp_cfg("gcode-exclusive");
+    let path = seq_file(&cfg, "swap.gcode", SEQ);
+    // Both: a clap usage error (exit 2), before the file is read.
+    bambu(&cfg)
+        .args(["gcode", "G28", "--from-file", &path, "--dry-run"])
+        .assert()
+        .code(2);
+    // Neither: nothing to send.
+    bambu(&cfg).args(["gcode", "--dry-run"]).assert().code(3); // VALIDATION
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[test]
+fn gcode_from_file_without_confirm_is_refused() {
+    // One --confirm covers the whole sequence; without it nothing connects.
+    let cfg = tmp_cfg("gcode-seq-noconfirm");
+    let path = seq_file(&cfg, "swap.gcode", SEQ);
+    bambu(&cfg)
+        .args(["gcode", "--from-file", &path])
+        .assert()
+        .code(4); // CONFIRM_REQUIRED
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
 #[cfg(feature = "server")]
 #[test]
 fn via_serve_unreachable_is_a_transport_error() {
