@@ -24,7 +24,8 @@ use crate::core::command::{
 use crate::core::park::ParkTuning;
 use crate::core::project::{self, PlateInspection};
 use crate::core::report::ReportState;
-use crate::core::safety::{self, GcodeVerdict, TempLimits};
+use crate::core::safety::TempLimits;
+use crate::core::sequence;
 use crate::core::stage::Stage;
 use crate::core::start::{self, PrintStartParams};
 use crate::core::status::{GcodeState, PrinterStatus};
@@ -163,17 +164,30 @@ enum Command {
         #[command(flatten)]
         args: CalibrateArgs,
     },
-    /// Send a raw G-code line and watch the report (control; needs --confirm).
+    /// Send a raw G-code line — or a whole `.gcode` sequence with --from-file —
+    /// and watch the report (control; needs --confirm).
     Gcode {
-        /// The G-code line, e.g. "G28" (home all axes).
-        line: String,
-        /// Required to actually send a control command.
+        /// The G-code line, e.g. "G28" (home all axes). Omit when using --from-file.
+        line: Option<String>,
+        /// Send every line of this `.gcode` file in order instead of a single
+        /// line. For control macros — parking the head, driving a plate changer
+        /// — not for printing (use `job start` for that). Comments and blank
+        /// lines are skipped; the sequence stops at the first line that fails,
+        /// naming it, so a half-finished motion can be recovered deliberately.
+        #[arg(long, conflicts_with = "line")]
+        from_file: Option<String>,
+        /// Required to actually send a control command. With --from-file this
+        /// covers the whole sequence — the plan is printed first so it can be
+        /// reviewed as a unit.
         #[arg(long)]
         confirm: bool,
         /// Override the static safety check (over-limit temps, cold extrusion).
         #[arg(long)]
         force: bool,
-        /// Watch the report for this many seconds after sending.
+        /// Show what would be sent, without sending it (safe).
+        #[arg(long)]
+        dry_run: bool,
+        /// Watch the report for this many seconds after each line.
         #[arg(long, default_value_t = 30)]
         timeout: u64,
     },
@@ -696,10 +710,20 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
         Command::Calibrate { args } => run_calibrate(cli, args),
         Command::Gcode {
             line,
+            from_file,
             confirm,
             force,
+            dry_run,
             timeout,
-        } => run_gcode(cli, line, *confirm, *force, *timeout),
+        } => run_gcode(
+            cli,
+            line.as_deref(),
+            from_file.as_deref(),
+            *confirm,
+            *force,
+            *dry_run,
+            *timeout,
+        ),
         Command::Reboot { confirm } => run_reboot(cli, *confirm),
         #[cfg(feature = "server")]
         Command::Serve {
@@ -1518,32 +1542,108 @@ fn load_seed_cameras(path: &std::path::Path) -> Result<Vec<SeedCamera>, CliError
 
 fn run_gcode(
     cli: &Cli,
-    line: &str,
+    line: Option<&str>,
+    from_file: Option<&str>,
     confirm: bool,
     force: bool,
+    dry_run: bool,
     timeout_secs: u64,
 ) -> Result<(), CliError> {
+    let steps = match (line, from_file) {
+        (Some(l), None) => vec![sequence::Step {
+            line_no: 1,
+            gcode: l.to_string(),
+        }],
+        (None, Some(path)) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| CliError::new(exit::VALIDATION, format!("reading {path}: {e}")))?;
+            let steps = sequence::parse(&text);
+            if steps.is_empty() {
+                return Err(CliError::new(
+                    exit::VALIDATION,
+                    format!("{path} has no G-code to send (only comments/blank lines)"),
+                ));
+            }
+            steps
+        }
+        _ => {
+            return Err(CliError::new(
+                exit::VALIDATION,
+                "give either a G-code line or --from-file",
+            ));
+        }
+    };
+
+    // Static safety guard: block recognised-dangerous lines (over-limit temps,
+    // cold extrusion) unless explicitly overridden with --force. A sequence is
+    // vetted as a whole so every problem is visible before it starts moving.
+    if !force {
+        let bad = sequence::vet(&steps, &TempLimits::default());
+        if !bad.is_empty() {
+            let detail = bad
+                .iter()
+                .map(|u| format!("line {}: {} ({})", u.step.line_no, u.step.gcode, u.reason))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(CliError::new(
+                exit::VALIDATION,
+                format!("refusing unsafe G-code: {detail}"),
+            ));
+        }
+    }
+
+    if dry_run {
+        print_json(&serde_json::json!({
+            "source": from_file.map_or("argument", |p| p),
+            "steps": steps.iter().map(|s| serde_json::json!({
+                "line": s.line_no, "gcode": s.gcode,
+            })).collect::<Vec<_>>(),
+            "count": steps.len(),
+        }));
+        return Ok(());
+    }
     if !confirm {
         return Err(CliError::new(
             exit::CONFIRM_REQUIRED,
-            "refusing to send a control command without --confirm",
+            "refusing to send a control command without --confirm (try --dry-run first)",
         ));
     }
-    // Static safety guard: block recognised-dangerous lines (over-limit temps,
-    // cold extrusion) unless explicitly overridden with --force.
-    if !force && let GcodeVerdict::Block(reason) = safety::check_gcode(line, &TempLimits::default())
-    {
-        return Err(CliError::new(
-            exit::VALIDATION,
-            format!("refusing unsafe G-code: {reason}"),
-        ));
-    }
+
     let client = connect_client(cli, timeout_secs)?;
-    eprintln!("sending gcode_line {line:?} …");
-    report_command_outcome(
-        cli,
-        client.send_and_verify(&ProtoCommand::GcodeLine(line.to_string()))?,
-    )
+    let total = steps.len();
+    for (i, step) in steps.iter().enumerate() {
+        if total > 1 {
+            eprintln!(
+                "[{}/{}] line {}: {}",
+                i + 1,
+                total,
+                step.line_no,
+                step.gcode
+            );
+        } else {
+            eprintln!("sending gcode_line {:?} …", step.gcode);
+        }
+        // Stop at the first failure rather than pressing on: the machine is
+        // mid-motion, and the remaining lines assume the earlier ones ran.
+        let outcome = client
+            .send_and_verify(&ProtoCommand::GcodeLine(step.gcode.clone()))
+            .map_err(|e| {
+                let e: CliError = e.into();
+                CliError::new(
+                    e.code,
+                    format!(
+                        "stopped at step {}/{} (line {}: {}): {}",
+                        i + 1,
+                        total,
+                        step.line_no,
+                        step.gcode,
+                        e.message
+                    ),
+                )
+            })?;
+        report_command_outcome(cli, outcome)?;
+    }
+    Ok(())
 }
 
 fn run_file(cli: &Cli, action: &FileAction) -> Result<(), CliError> {

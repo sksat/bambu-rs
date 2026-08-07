@@ -14,6 +14,7 @@ pub mod park;
 pub mod project;
 pub mod report;
 pub mod safety;
+pub mod sequence;
 pub mod session;
 pub mod stage;
 pub mod start;
