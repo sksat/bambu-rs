@@ -109,9 +109,15 @@ pub fn evaluate(
         // Stop is handled above (terminal-state check, error-tolerant).
         Command::Stop => unreachable!("Stop handled before the new-error check"),
         // No observable state effect — caller should not use evaluate() for
-        // these (ACK is the final verdict). The AMS commands are [spec] and
-        // ACK-verified: their physical effect is slow/unobserved, so we stand
-        // behind "the printer accepted it", not "it completed".
+        // these (ACK is the final verdict). The AMS commands stay ACK-verified:
+        // their physical effect is slow or not reported, so we stand behind
+        // "the printer accepted it", not "it completed".
+        //
+        // `AmsFilamentSetting` is the one whose effect IS readable back (the
+        // tray's fields change), but not on this timescale — the tray reports
+        // every field as null for seconds after the write before repopulating,
+        // so polling for the effect here would report a false failure. It stays
+        // ACK-verified deliberately; verify it by re-reading the status later.
         Command::PushAll
         | Command::GetVersion
         | Command::GcodeLine(_)

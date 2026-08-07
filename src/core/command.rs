@@ -52,7 +52,11 @@ impl AmsControl {
 }
 
 /// Parameters for `print.ams_filament_setting` — set a tray's filament profile.
-/// Shapes are from the OpenBambuAPI spec. **[spec]**
+///
+/// Shape is from the OpenBambuAPI spec, but **device-verified** on an A1 mini
+/// AMS Lite: all five fields read back exactly as written, and the tray's bit in
+/// `tray_is_bbl_bits` flips on. Note the tray reports every field as null for a
+/// few seconds afterwards before repopulating.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AmsFilamentSetting {
     /// Index of the AMS unit.
@@ -219,7 +223,8 @@ pub enum Command {
         /// Read RFID on tray insertion.
         tray_read: bool,
     },
-    /// Set a tray's filament profile (`print.ams_filament_setting`). **[spec]**
+    /// Set a tray's filament profile (`print.ams_filament_setting`).
+    /// Device-verified — see [`AmsFilamentSetting`].
     AmsFilamentSetting(Box<AmsFilamentSetting>),
     /// Run printer calibration (`print.calibration`, an `option` bitmask).
     /// (Lidar — bit 0 — is X1-only and intentionally not exposed here.)

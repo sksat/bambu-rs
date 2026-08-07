@@ -2166,6 +2166,20 @@ fn ensure_idle(cli: &Cli) -> Result<(), CliError> {
     }
 }
 
+/// The trailing caveat for an AMS command's "sending …" line: empty when the
+/// command is device-verified, otherwise the spec-derived warning.
+///
+/// Split out so the classification is testable without a printer — it is the
+/// claim this distinction rests on, and a new AMS variant silently inheriting
+/// the wrong side of it would mislead in exactly the direction that matters.
+fn spec_caveat(cmd: &ProtoCommand) -> &'static str {
+    match cmd {
+        // Verified on a real A1 mini AMS Lite: every field reads back as written.
+        ProtoCommand::AmsFilamentSetting(_) => "",
+        _ => " (this AMS command is [spec]; the ACK confirms acceptance)",
+    }
+}
+
 fn run_ams(cli: &Cli, action: &AmsAction) -> Result<(), CliError> {
     // Helper: a plain control command gated on --confirm (ACK-verified).
     let control =
@@ -2177,13 +2191,7 @@ fn run_ams(cli: &Cli, action: &AmsAction) -> Result<(), CliError> {
                 ));
             }
             let client = connect_client(cli, 15)?;
-            // `set-filament` is device-verified (its effect is readable back);
-            // the rest are still spec-derived, so keep warning about those.
-            if !matches!(cmd, ProtoCommand::AmsFilamentSetting(_)) {
-                eprintln!("{what} … (this AMS command is [spec]; the ACK confirms acceptance)");
-            } else {
-                eprintln!("{what} …");
-            }
+            eprintln!("{what} …{}", spec_caveat(&cmd));
             report_command_outcome(cli, client.send_and_verify(&cmd)?)
         };
     match action {
@@ -3295,7 +3303,36 @@ fn fmt_eta(min: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ams_mapping_preview, fmt_eta, subst_capture_tokens, validate_ams_map};
+    use super::{ams_mapping_preview, fmt_eta, spec_caveat, subst_capture_tokens, validate_ams_map};
+
+    #[test]
+    fn only_the_device_verified_ams_command_drops_the_spec_caveat() {
+        use crate::core::command::{AmsControl, AmsFilamentSetting, Command};
+        assert_eq!(
+            spec_caveat(&Command::AmsFilamentSetting(Box::new(AmsFilamentSetting {
+                ams_id: 0,
+                tray_id: 0,
+                tray_color: "000000FF".into(),
+                tray_type: "PLA".into(),
+                tray_info_idx: String::new(),
+                nozzle_temp_min: 190,
+                nozzle_temp_max: 230,
+            }))),
+            "",
+            "set-filament is device-verified — claiming otherwise makes callers \
+             distrust the one AMS command that identifies third-party filament"
+        );
+        for still_spec in [
+            Command::AmsControl(AmsControl::Resume),
+            Command::AmsControl(AmsControl::Reset),
+            Command::AmsControl(AmsControl::Pause),
+        ] {
+            assert!(
+                spec_caveat(&still_spec).contains("[spec]"),
+                "{still_spec:?} is not verified here and must keep saying so"
+            );
+        }
+    }
 
     #[cfg(feature = "server")]
     #[test]
