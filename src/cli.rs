@@ -258,6 +258,17 @@ enum Command {
         /// after any `--camera-url`; all remain editable at runtime.
         #[arg(long, value_name = "PATH")]
         cameras_config: Option<std::path::PathBuf>,
+        /// Serve every configured printer, not just the selected one.
+        ///
+        /// Each gets its own paths under `/api/printers/<name>/...`, its own
+        /// status stream, files, camera and timelapse. The selected (or default)
+        /// printer keeps answering on the unprefixed `/api/...` paths too, so
+        /// nothing already written against them changes.
+        // Refused with --fake rather than ignored: fake mode serves one
+        // synthetic printer and never reads the config, so accepting the pair
+        // would run a command that does not do what the flag promises.
+        #[arg(long, conflicts_with = "fake")]
+        all_printers: bool,
         /// Also emulate the printer in Local Mode, so Bambu Studio (or
         /// OrcaSlicer, or Home Assistant) can connect to THIS host instead of
         /// to the printer. serve holds the one real LAN connection and relays
@@ -846,6 +857,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             interval,
             camera_url,
             cameras_config,
+            all_printers,
             #[cfg(feature = "relay")]
             emulate,
             #[cfg(feature = "relay")]
@@ -867,6 +879,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             *interval,
             camera_url.clone(),
             cameras_config.clone(),
+            *all_printers,
             #[cfg(feature = "relay")]
             emulate.then(|| crate::server::EmulateOpts {
                 host: emulate_host.clone(),
@@ -1651,13 +1664,14 @@ fn run_serve(
     interval: Option<u64>,
     camera_url: Vec<String>,
     cameras_config: Option<std::path::PathBuf>,
+    all_printers: bool,
     #[cfg(feature = "relay")] emulate: Option<crate::server::EmulateOpts>,
 ) -> Result<(), CliError> {
     // Live mode needs a connection target; fake mode doesn't touch the printer.
-    let target = if fake {
-        None
+    let targets = if fake {
+        Vec::new()
     } else {
-        Some(resolve_target(cli)?)
+        serve_targets(cli, all_printers)?
     };
     // Parse each `--camera-url` entry (`label=url` or a bare `url`), then any from
     // `--cameras-config` (which can also carry a stream URL + park tuning). The running
@@ -1708,7 +1722,92 @@ fn run_serve(
         #[cfg(feature = "relay")]
         emulate,
     };
-    crate::server::serve(target, opts).map_err(|e| CliError::new(exit::GENERAL, e.to_string()))
+    crate::server::serve(targets, opts).map_err(|e| CliError::new(exit::GENERAL, e.to_string()))
+}
+
+/// The printers `serve` should stand up, in order — the first is the default.
+///
+/// Without `--all-printers` this is the one printer the usual resolution picks,
+/// so `bambu serve` is unchanged. With it, every configured profile is served,
+/// starting with the selected/default one so the unprefixed `/api/...` paths
+/// keep reaching the printer they always did.
+#[cfg(feature = "server")]
+fn serve_targets(cli: &Cli, all: bool) -> Result<Vec<crate::server::ServeTarget>, CliError> {
+    let path = config::default_config_path()
+        .ok_or_else(|| CliError::new(exit::VALIDATION, "no config path (set $HOME)"))?;
+    let cfg = Config::load_or_default(&path)?;
+    let selected = selected_profile_name(cli, &cfg)?;
+    if !all {
+        return Ok(vec![crate::server::ServeTarget {
+            // An env-only target has no profile name; call it what the flag
+            // would have. This is an API path segment, not a lookup key.
+            name: selected.unwrap_or_else(|| "printer".to_string()),
+            target: resolve_target(cli)?,
+        }]);
+    }
+    all_serve_targets(
+        &cfg,
+        selected,
+        &flag_overrides(cli).over(Overrides::from_env()),
+    )
+}
+
+/// The `--all-printers` half, with the config and overrides already resolved.
+///
+/// Split out because this is the part with the decisions in it — which printer
+/// leads, what an override means, what an empty config means — and none of them
+/// need a filesystem or a printer to check.
+#[cfg(feature = "server")]
+fn all_serve_targets(
+    cfg: &Config,
+    selected: Option<String>,
+    overrides: &Overrides,
+) -> Result<Vec<crate::server::ServeTarget>, CliError> {
+    // A connection override describes ONE machine. Applying `--ip` to every
+    // profile would point them all at the same address; ignoring it silently
+    // would be worse. Refuse, as the sequence lookup does for the same reason.
+    if let Some(what) = [
+        ("--ip / BAMBU_IP", overrides.ip.is_some()),
+        ("--serial / BAMBU_SERIAL", overrides.serial.is_some()),
+        (
+            "--access-code / BAMBU_ACCESS_CODE",
+            overrides.access_code.is_some(),
+        ),
+        ("--model / BAMBU_MODEL", overrides.model.is_some()),
+    ]
+    .into_iter()
+    .find_map(|(name, set)| set.then_some(name))
+    {
+        return Err(CliError::new(
+            exit::VALIDATION,
+            format!(
+                "--all-printers serves every configured profile, so {what} has no single machine \
+                 to apply to — drop it, or drop --all-printers to serve just one"
+            ),
+        ));
+    }
+    if cfg.printers.is_empty() {
+        return Err(CliError::new(
+            exit::VALIDATION,
+            "--all-printers needs configured printers (see `bambu config add`)",
+        ));
+    }
+    // Default first: it is the one the unprefixed paths reach, and putting any
+    // other printer there would silently move every existing caller to a
+    // different machine.
+    let mut names: Vec<String> = cfg.printers.keys().cloned().collect();
+    if let Some(first) = selected {
+        names.retain(|n| *n != first);
+        names.insert(0, first);
+    }
+    names
+        .into_iter()
+        .map(|name| {
+            let target = config::resolve(cfg.profile(&name), &Overrides::default())
+                .map_err(CliError::from)?;
+            Ok(crate::server::ServeTarget { name, target })
+        })
+        .collect()
 }
 
 /// One entry of a `--cameras-config` JSON file — the same shape as `/api/camera/config`,
@@ -4049,6 +4148,108 @@ mod tests {
         InspectedFrom, ams_mapping_preview, fmt_eta, spec_caveat, subst_capture_tokens,
         validate_ams_map,
     };
+
+    // ── which printers `serve --all-printers` stands up ──
+    #[cfg(feature = "server")]
+    mod serve_targets {
+        use super::super::all_serve_targets;
+        use crate::config::{Config, Overrides, Profile};
+
+        fn cfg(names: &[&str], default: Option<&str>) -> Config {
+            let mut cfg = Config {
+                default_printer: default.map(str::to_string),
+                ..Default::default()
+            };
+            for (i, n) in names.iter().enumerate() {
+                cfg.printers.insert(
+                    n.to_string(),
+                    Profile {
+                        ip: format!("192.0.2.{}", i + 1),
+                        serial: format!("S{i}"),
+                        model: "a1mini".to_string(),
+                        mode: "lan".to_string(),
+                        access_code: "00000000".to_string(),
+                        sequences: Default::default(),
+                        hooks: Default::default(),
+                    },
+                );
+            }
+            cfg
+        }
+
+        fn names(cfg: &Config, selected: Option<&str>) -> Vec<String> {
+            all_serve_targets(cfg, selected.map(str::to_string), &Overrides::default())
+                .unwrap()
+                .into_iter()
+                .map(|t| t.name)
+                .collect()
+        }
+
+        #[test]
+        fn the_selected_printer_leads_so_the_unprefixed_paths_keep_their_machine() {
+            // Order is the whole back-compat guarantee: the first entry is what
+            // `/api/status` reaches, so putting anything else there would move
+            // every already-written script to a different printer.
+            let cfg = cfg(&["x1c", "a1mini", "p1s"], Some("a1mini"));
+            assert_eq!(names(&cfg, Some("a1mini")), ["a1mini", "p1s", "x1c"]);
+            assert_eq!(names(&cfg, Some("p1s")), ["p1s", "a1mini", "x1c"]);
+        }
+
+        #[test]
+        fn with_nothing_selected_the_configured_order_stands() {
+            let cfg = cfg(&["x1c", "a1mini"], None);
+            assert_eq!(names(&cfg, None), ["a1mini", "x1c"]);
+        }
+
+        #[test]
+        fn every_profile_is_resolved_from_its_own_config_not_the_selected_ones() {
+            let cfg = cfg(&["a1mini", "x1c"], Some("a1mini"));
+            let ips: Vec<String> =
+                all_serve_targets(&cfg, Some("a1mini".to_string()), &Overrides::default())
+                    .unwrap()
+                    .into_iter()
+                    .map(|t| t.target.ip)
+                    .collect();
+            assert_eq!(ips.len(), 2);
+            assert_ne!(ips[0], ips[1], "each printer keeps its own address");
+        }
+
+        #[test]
+        fn a_connection_override_is_refused_because_it_names_one_machine() {
+            // Applying `--ip` to every profile would point them all at one
+            // address; ignoring it silently would be worse.
+            let cfg = cfg(&["a1mini", "x1c"], Some("a1mini"));
+            for ov in [
+                Overrides {
+                    ip: Some("192.0.2.9".into()),
+                    ..Default::default()
+                },
+                Overrides {
+                    serial: Some("S9".into()),
+                    ..Default::default()
+                },
+                Overrides {
+                    access_code: Some("1".into()),
+                    ..Default::default()
+                },
+                Overrides {
+                    model: Some("a1".into()),
+                    ..Default::default()
+                },
+            ] {
+                let err = all_serve_targets(&cfg, None, &ov).unwrap_err();
+                assert_eq!(err.code, crate::cli::exit::VALIDATION);
+                assert!(err.message.contains("--all-printers"), "{}", err.message);
+            }
+        }
+
+        #[test]
+        fn an_empty_config_says_so_rather_than_serving_nothing() {
+            let err = all_serve_targets(&cfg(&[], None), None, &Overrides::default()).unwrap_err();
+            assert_eq!(err.code, crate::cli::exit::VALIDATION);
+            assert!(err.message.contains("config add"), "{}", err.message);
+        }
+    }
 
     #[test]
     fn the_plan_reports_the_source_it_was_given() {

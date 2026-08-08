@@ -224,7 +224,7 @@ struct Inner {
 /// Owns up to two concurrent captures of the same print — a `smooth` one
 /// (per-layer, synced to the printer's park) and a `plain` one (sampled on a
 /// wall-time interval, head in shot). Each is started/stopped independently.
-/// Lives in `AppState`.
+/// Lives in `PrinterState`.
 #[derive(Default)]
 pub struct TimelapseManager {
     smooth: Mutex<Inner>,
