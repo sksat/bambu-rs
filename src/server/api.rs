@@ -45,6 +45,9 @@ use super::control::{
 use super::files::FakeFiles;
 use super::files::FileStore;
 #[cfg(test)]
+use super::hook::NoHook;
+use super::hook::{HookError, PrePrintHook};
+#[cfg(test)]
 use super::start::FakeStarter;
 use super::start::{StartRequest, Starter};
 use super::timelapse::{
@@ -404,6 +407,15 @@ pub struct PrinterState {
     /// Serve-internal per-layer timelapse capture, driven off `source`'s status
     /// feed and controlled at runtime by camera id. At most one runs at a time.
     pub timelapse: Arc<TimelapseManager>,
+    /// Set while the `pre_print` hook is driving the machine, so the endpoints
+    /// that move something can refuse rather than interleave with a plate
+    /// changer mid-swing. `start_lock` does not cover them: it excludes other
+    /// starts, and a jog is not a start.
+    pub hook_running: Arc<std::sync::atomic::AtomicBool>,
+    /// This printer's `pre_print` sequence, run immediately before a print
+    /// starts — a plate changer's swap, typically. [`super::hook::NoHook`] when the profile
+    /// configures none, which is the common case.
+    pub hook: Arc<dyn PrePrintHook>,
 }
 
 /// A safe absolute path on the printer: starts with `/`, no traversal or scheme.
@@ -433,6 +445,8 @@ impl PrinterState {
             external_cameras: Arc::new(RwLock::new(Vec::new())),
             internal_camera: Arc::new(NoCamera),
             timelapse: Default::default(),
+            hook_running: Default::default(),
+            hook: Arc::new(NoHook),
         }
     }
 }
@@ -664,6 +678,9 @@ async fn gcode(State(st): State<PrinterState>, Json(b): Json<GcodeBody>) -> Resp
     {
         return bad_request(format!("unsafe gcode (use force to override): {reason}"));
     }
+    if let Some(hooked) = require_no_hook(&st) {
+        return hooked;
+    }
     execute(st, ControlAction::Gcode(b.line)).await
 }
 
@@ -722,6 +739,33 @@ fn bad_request(msg: String) -> Response {
 }
 
 // ── Shared control gates ─────────────────────────────────────────────────────
+
+/// Refuse a control action while the pre-print hook is driving the machine.
+///
+/// The hook runs a plate changer for minutes, and `start_lock` only excludes
+/// other *starts* — a jog, a home or a raw G-code line still sees an idle
+/// printer and interleaves with the swap, invalidating the positions it
+/// assumed. So the endpoints that MOVE something honour this too.
+///
+/// Deliberately not applied to `pause`/`resume`/`stop`/`clear-error`/`reboot`:
+/// stopping has to work at exactly the moment something is going wrong, and a
+/// gate that makes the emergency controls unavailable during the one operation
+/// most likely to need them is worse than the interleaving it prevents.
+fn require_no_hook(st: &PrinterState) -> Option<Response> {
+    if !st.hook_running.load(std::sync::atomic::Ordering::SeqCst) {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "the pre-print sequence is running; this would move the machine \
+                          mid-sequence (pause/stop remain available)"
+            })),
+        )
+            .into_response(),
+    )
+}
 
 /// Refuse a control action while the printer is busy (409). The predicate
 /// mirrors `job_start`'s idle guard exactly: any of RUNNING/PAUSE/PREPARE/SLICING
@@ -784,6 +828,9 @@ async fn home(State(st): State<PrinterState>, Json(b): Json<HomeBody>) -> Respon
     if let Some(busy) = require_idle(&st) {
         return busy;
     }
+    if let Some(hooked) = require_no_hook(&st) {
+        return hooked;
+    }
     execute(st, ControlAction::Home(axes)).await
 }
 
@@ -816,6 +863,9 @@ async fn move_axis(State(st): State<PrinterState>, Json(b): Json<MoveBody>) -> R
     }
     if let Some(busy) = require_idle(&st) {
         return busy;
+    }
+    if let Some(hooked) = require_no_hook(&st) {
+        return hooked;
     }
     execute(
         st,
@@ -852,6 +902,9 @@ async fn extrude(State(st): State<PrinterState>, Json(b): Json<ExtrudeBody>) -> 
     }
     if let Some(busy) = require_idle(&st) {
         return busy;
+    }
+    if let Some(hooked) = require_no_hook(&st) {
+        return hooked;
     }
     execute(
         st,
@@ -934,6 +987,9 @@ async fn calibrate(State(st): State<PrinterState>, Json(b): Json<CalibrateBody>)
     if let Some(busy) = require_idle(&st) {
         return busy;
     }
+    if let Some(hooked) = require_no_hook(&st) {
+        return hooked;
+    }
     execute(
         st,
         ControlAction::Calibrate {
@@ -969,6 +1025,9 @@ async fn ams(State(st): State<PrinterState>, Json(b): Json<AmsBody>) -> Response
         if let Some(busy) = require_idle(&st) {
             return busy;
         }
+    }
+    if let Some(hooked) = require_no_hook(&st) {
+        return hooked;
     }
     execute(st, ControlAction::Ams(action)).await
 }
@@ -1025,6 +1084,9 @@ async fn ams_change(State(st): State<PrinterState>, Json(b): Json<AmsChangeBody>
     if let Some(busy) = require_idle(&st) {
         return busy;
     }
+    if let Some(hooked) = require_no_hook(&st) {
+        return hooked;
+    }
     execute(
         st,
         ControlAction::AmsChange {
@@ -1045,6 +1107,9 @@ async fn reboot(State(st): State<PrinterState>, body: Option<Json<ConfirmBody>>)
     if let Some(busy) = require_idle(&st) {
         return busy;
     }
+    if let Some(hooked) = require_no_hook(&st) {
+        return hooked;
+    }
     execute(st, ControlAction::Reboot).await
 }
 
@@ -1055,6 +1120,9 @@ async fn steppers(State(st): State<PrinterState>, body: Option<Json<ConfirmBody>
     }
     if let Some(busy) = require_idle(&st) {
         return busy;
+    }
+    if let Some(hooked) = require_no_hook(&st) {
+        return hooked;
     }
     execute(st, ControlAction::DisableSteppers).await
 }
@@ -1177,6 +1245,9 @@ async fn job_start(State(st): State<PrinterState>, Json(b): Json<StartBody>) -> 
             "bed_type": req.bed_type,
             "timelapse": req.timelapse,
             "has_timelapse_blocks": has_timelapse_blocks,
+            // A preview that omits hardware motion under-reports what a
+            // confirmed start does. `null` when this printer has no hook.
+            "pre_print": st.hook.describe(),
         }}))
         .into_response();
     }
@@ -1199,9 +1270,51 @@ async fn job_start(State(st): State<PrinterState>, Json(b): Json<StartBody>) -> 
     if let Some(busy) = require_idle(&st) {
         return busy;
     }
+    if let Some(failed) = run_pre_print_hook(&st).await {
+        return failed;
+    }
     let starter = st.starter.clone();
     let res = tokio::task::spawn_blocking(move || starter.start(&req)).await;
     verify_response(res)
+}
+
+/// Run the printer's `pre_print` hook, if it has one. `Some(response)` means the
+/// print must NOT be started.
+///
+/// Fired after everything that can refuse the print, and immediately before the
+/// start: a swap that ejects the last plate must not happen for a print that
+/// then fails to start. It returns only once the motion has been observed to
+/// finish — an ACK is not enough, because a print start does not queue behind
+/// the sequence (see `core::settle`).
+async fn run_pre_print_hook(st: &PrinterState) -> Option<Response> {
+    st.hook.describe()?;
+    let hook = st.hook.clone();
+    let running = st.hook_running.clone();
+    running.store(true, std::sync::atomic::Ordering::SeqCst);
+    let outcome = tokio::task::spawn_blocking(move || hook.run()).await;
+    running.store(false, std::sync::atomic::Ordering::SeqCst);
+    match outcome {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => {
+            // Which one to go and fix: a bad sequence file is the operator's
+            // configuration, a refusal or an unfinished motion is the machine.
+            let code = match e {
+                HookError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                HookError::Printer(_) => StatusCode::CONFLICT,
+                HookError::Transport(_) => StatusCode::BAD_GATEWAY,
+            };
+            Some(
+                (
+                    code,
+                    Json(json!({ "error": format!("{e}; print not started") })),
+                )
+                    .into_response(),
+            )
+        }
+        Err(_) => Some(server_error(
+            "the pre-print sequence task failed; print not started".to_string(),
+        )),
+    }
 }
 
 // ── File endpoints ─────────────────────────────────────────────────────────
@@ -2680,6 +2793,7 @@ async fn job_upload_start(
             "md5": md5,
             "has_timelapse_blocks": inspection.as_ref().map(|i| i.has_timelapse_blocks),
             "overwrite": q.overwrite,
+            "pre_print": st.hook.describe(),
         }}))
         .into_response();
     }
@@ -2727,6 +2841,16 @@ async fn job_upload_start(
             return (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response();
         }
         Err(_) => return server_error("upload task failed".to_string()),
+    }
+
+    // The upload above can take minutes. A job started from the printer's screen
+    // in that window must not be driven into by a plate swap, so idle is checked
+    // again before the hook rather than only before the upload.
+    if let Some(busy) = require_idle(&st) {
+        return busy;
+    }
+    if let Some(failed) = run_pre_print_hook(&st).await {
+        return failed;
     }
 
     let req = StartRequest {
@@ -2808,6 +2932,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::hook::fake::RecordingHook;
     use super::*;
     use crate::core::session::VerifyStage;
     use axum_test::TestServer;
@@ -2839,6 +2964,8 @@ mod tests {
             external_cameras: Arc::new(RwLock::new(Vec::new())),
             internal_camera: Arc::new(NoCamera),
             timelapse: Default::default(),
+            hook_running: Default::default(),
+            hook: Arc::new(NoHook),
         };
         TestServer::new(one(state))
     }
@@ -2859,6 +2986,8 @@ mod tests {
             external_cameras: Arc::new(RwLock::new(Vec::new())),
             internal_camera: Arc::new(NoCamera),
             timelapse: Default::default(),
+            hook_running: Default::default(),
+            hook: Arc::new(NoHook),
         }
     }
 
@@ -3090,6 +3219,212 @@ mod tests {
             std::path::Path::new("captures/x1c/no-such-run"),
             "another printer must never resolve into the legacy root"
         );
+    }
+
+    // ── the pre-print hook ──
+    fn with_hook(hook: Arc<dyn PrePrintHook>) -> (TestServer, Arc<dyn PrePrintHook>) {
+        let mut st = printer("a1mini");
+        st.hook = hook.clone();
+        (TestServer::new(one(st)), hook)
+    }
+
+    fn start_body() -> serde_json::Value {
+        json!({ "file": "/cache/x.gcode.3mf", "confirm": true })
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_start_runs_the_hook_first() {
+        let hook = Arc::new(RecordingHook::new("swap"));
+        let (server, _) = with_hook(hook.clone());
+        server
+            .post("/api/job/start")
+            .json(&start_body())
+            .await
+            .assert_status_ok();
+        assert_eq!(hook.runs(), 1, "the swap ran before the print started");
+    }
+
+    #[tokio::test]
+    async fn a_hook_that_fails_stops_the_print() {
+        // The whole point: a swap that didn't finish means the machine may
+        // still be moving, and starting into it is the collision this prevents.
+        let hook = Arc::new(RecordingHook::failing("swap", "the motion never finished"));
+        let (server, _) = with_hook(hook.clone());
+        let res = server.post("/api/job/start").json(&start_body()).await;
+        res.assert_status(StatusCode::CONFLICT);
+        assert!(
+            res.text().contains("print not started"),
+            "the response says the print did NOT start: {}",
+            res.text()
+        );
+        assert_eq!(hook.runs(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_discloses_the_hook_and_runs_nothing() {
+        // Motion the preview hides is motion the operator finds out about by
+        // watching it happen.
+        let hook = Arc::new(RecordingHook::new("swap"));
+        let (server, _) = with_hook(hook.clone());
+        let body: serde_json::Value = server
+            .post("/api/job/start")
+            .json(&json!({ "file": "/cache/x.gcode.3mf", "dry_run": true }))
+            .await
+            .json();
+        assert_eq!(body["plan"]["pre_print"], json!("swap"));
+        assert_eq!(hook.runs(), 0, "a dry run sends nothing");
+    }
+
+    #[tokio::test]
+    async fn a_printer_without_a_hook_starts_exactly_as_before() {
+        let server = serve_printers(vec![printer("a1mini")]);
+        let body: serde_json::Value = server
+            .post("/api/job/start")
+            .json(&json!({ "file": "/cache/x.gcode.3mf", "dry_run": true }))
+            .await
+            .json();
+        assert_eq!(body["plan"]["pre_print"], json!(null));
+        server
+            .post("/api/job/start")
+            .json(&start_body())
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn the_upload_path_runs_the_hook_too() {
+        // Its own ordering and its own failure handling, so its own tests: this
+        // branch can regress independently of the plain start.
+        let hook = Arc::new(RecordingHook::new("swap"));
+        let (server, _) = with_hook(hook.clone());
+        server
+            .post("/api/job/upload-start?name=x.gcode&confirm=true")
+            .bytes(b"G28\n".to_vec().into())
+            .await
+            .assert_status_ok();
+        assert_eq!(hook.runs(), 1, "the swap ran before the print started");
+    }
+
+    #[tokio::test]
+    async fn a_failed_hook_stops_the_upload_path_after_the_upload() {
+        // The file is already on the printer by then — that is fine and
+        // deliberate — but the PRINT must not start.
+        let hook = Arc::new(RecordingHook::failing("swap", "the motion never finished"));
+        let (server, _) = with_hook(hook.clone());
+        let res = server
+            .post("/api/job/upload-start?name=x.gcode&confirm=true")
+            .bytes(b"G28\n".to_vec().into())
+            .await;
+        res.assert_status(StatusCode::CONFLICT);
+        assert!(res.text().contains("print not started"), "{}", res.text());
+        assert_eq!(hook.runs(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_upload_paths_dry_run_discloses_the_hook_and_runs_nothing() {
+        let hook = Arc::new(RecordingHook::new("swap"));
+        let (server, _) = with_hook(hook.clone());
+        let v: serde_json::Value = server
+            .post("/api/job/upload-start?name=x.gcode&dry_run=true")
+            .bytes(b"G28\n".to_vec().into())
+            .await
+            .json();
+        assert_eq!(v["plan"]["pre_print"], json!("swap"));
+        assert_eq!(hook.runs(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_hooks_own_failures_are_classified_for_the_operator() {
+        // Which one to go and fix differs: a bad sequence file is the
+        // operator's configuration, a refusal or an unfinished motion is the
+        // machine, and an unreachable printer is neither.
+        for (err, want) in [
+            (
+                HookError::Config("swap.gcode has no G-code".to_string()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                HookError::Printer("the motion never finished".to_string()),
+                StatusCode::CONFLICT,
+            ),
+            (
+                HookError::Transport("connection refused".to_string()),
+                StatusCode::BAD_GATEWAY,
+            ),
+        ] {
+            let (server, _) = with_hook(Arc::new(RecordingHook::erroring("swap", err)));
+            let res = server.post("/api/job/start").json(&start_body()).await;
+            res.assert_status(want);
+            assert!(res.text().contains("print not started"), "{}", res.text());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_running_hook_refuses_a_jog_but_never_a_stop() {
+        // `start_lock` excludes other STARTS. A jog is not a start, so without
+        // this the dashboard could drive the head into a plate changer
+        // mid-swing. Stopping stays available on purpose: a gate that removes
+        // the emergency controls during the one operation most likely to need
+        // them is worse than the interleaving it prevents.
+        let st = printer("a1mini");
+        let running = st.hook_running.clone();
+        let server = serve_printers(vec![st]);
+        running.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        for (path, body) in [
+            ("/api/home", json!({ "axes": "all" })),
+            ("/api/move", json!({ "axis": "z", "delta": 1.0 })),
+            ("/api/gcode", json!({ "line": "G28", "confirm": true })),
+            // (`/extrude` is gated too, but its cold-nozzle validation answers
+            // first — this codebase validates before it gates, everywhere.)
+            (
+                "/api/calibrate",
+                json!({ "bed_level": true, "confirm": true }),
+            ),
+            ("/api/steppers", json!({ "confirm": true })),
+        ] {
+            let res = server.post(path).json(&body).await;
+            res.assert_status(StatusCode::CONFLICT);
+            assert!(
+                res.text().contains("pre-print sequence is running"),
+                "{path}: {}",
+                res.text()
+            );
+        }
+        // …and the ones that make a runaway stoppable are untouched.
+        for path in ["/api/job/pause", "/api/job/stop", "/api/job/clear-error"] {
+            server
+                .post(path)
+                .json(&json!({ "confirm": true }))
+                .await
+                .assert_status_ok();
+        }
+        running.store(false, std::sync::atomic::Ordering::SeqCst);
+        server
+            .post("/api/home")
+            .json(&json!({ "axes": "all" }))
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn each_printer_runs_only_its_own_hook() {
+        // One machine has a plate changer and the other doesn't; starting on
+        // the plain one must not swing the other one's changer.
+        let (swap, plain) = (
+            Arc::new(RecordingHook::new("swap")),
+            Arc::new(RecordingHook::new("other")),
+        );
+        let (mut a, mut b) = (printer("a1mini"), printer("x1c"));
+        a.hook = swap.clone();
+        b.hook = plain.clone();
+        let server = serve_printers(vec![a, b]);
+        server
+            .post("/api/printers/x1c/job/start")
+            .json(&start_body())
+            .await
+            .assert_status_ok();
+        assert_eq!((swap.runs(), plain.runs()), (0, 1));
     }
 
     // ── reads are always open ──
@@ -3725,6 +4060,8 @@ mod tests {
             external_cameras: Arc::new(RwLock::new(Vec::new())),
             internal_camera: Arc::new(NoCamera),
             timelapse: tl.clone(),
+            hook_running: Default::default(),
+            hook: Arc::new(NoHook),
         };
         (TestServer::new(one(state)), tl)
     }
@@ -3887,6 +4224,8 @@ mod tests {
             external_cameras: Arc::new(RwLock::new(Vec::new())),
             internal_camera: Arc::new(NoCamera),
             timelapse: Default::default(),
+            hook_running: Default::default(),
+            hook: Arc::new(NoHook),
         };
         let server = TestServer::new(one(state));
         let res = server
@@ -3930,6 +4269,8 @@ mod tests {
             external_cameras: Arc::new(RwLock::new(Vec::new())),
             internal_camera: Arc::new(NoCamera),
             timelapse: Default::default(),
+            hook_running: Default::default(),
+            hook: Arc::new(NoHook),
         };
         let server = TestServer::new(one(state));
         let res = server
@@ -4368,6 +4709,8 @@ mod tests {
             external_cameras: Arc::new(RwLock::new(Vec::new())),
             internal_camera: Arc::new(NoCamera),
             timelapse: Default::default(),
+            hook_running: Default::default(),
+            hook: Arc::new(NoHook),
         };
         TestServer::new(one(state))
             .post("/api/job/start")
@@ -4394,6 +4737,8 @@ mod tests {
             external_cameras: Arc::new(RwLock::new(Vec::new())),
             internal_camera: Arc::new(NoCamera),
             timelapse: Default::default(),
+            hook_running: Default::default(),
+            hook: Arc::new(NoHook),
         };
         TestServer::new(one(state))
     }
@@ -4436,6 +4781,8 @@ mod tests {
             external_cameras: Arc::new(RwLock::new(Vec::new())),
             internal_camera: Arc::new(NoCamera),
             timelapse: Default::default(),
+            hook_running: Default::default(),
+            hook: Arc::new(NoHook),
         };
         TestServer::new(one(state))
     }
@@ -4903,6 +5250,8 @@ mod tests {
             external_cameras: Arc::new(RwLock::new(Vec::new())),
             internal_camera: Arc::new(NoCamera),
             timelapse: Default::default(),
+            hook_running: Default::default(),
+            hook: Arc::new(NoHook),
         };
         let mut ws = ws_server(state)
             .get_websocket("/api/ws")

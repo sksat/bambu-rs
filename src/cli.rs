@@ -1812,19 +1812,95 @@ fn serve_targets(cli: &Cli, all: bool) -> Result<Vec<crate::server::ServeTarget>
         .ok_or_else(|| CliError::new(exit::VALIDATION, "no config path (set $HOME)"))?;
     let cfg = Config::load_or_default(&path)?;
     let selected = selected_profile_name(cli, &cfg)?;
+    let dir = path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
     if !all {
+        let hook = match selected.as_deref().and_then(|n| cfg.profile(n)) {
+            Some(p) => {
+                pre_print_hook_spec(&flag_overrides(cli).over(Overrides::from_env()), p, &dir)?
+            }
+            // An env-only target has no profile, so it has no hook either.
+            None => None,
+        };
         return Ok(vec![crate::server::ServeTarget {
             // An env-only target has no profile name; call it what the flag
             // would have. This is an API path segment, not a lookup key.
             name: selected.unwrap_or_else(|| "printer".to_string()),
             target: resolve_target(cli)?,
+            hook,
         }]);
     }
     all_serve_targets(
         &cfg,
         selected,
         &flag_overrides(cli).over(Overrides::from_env()),
+        &dir,
     )
+}
+
+/// Whether the connection this invocation will actually use belongs to a
+/// different machine than `profile` describes.
+///
+/// A macro's coordinates describe what is bolted to ONE printer. The connection
+/// is resolved separately, with flags and `BAMBU_*` winning over the profile, so
+/// a default of printer A plus a `BAMBU_IP` for printer B would send A's
+/// plate-changer motion to B — which has no such accessory. Refuse rather than
+/// reconcile: there is no sensible way to guess which machine the caller meant.
+fn target_mismatch(overrides: &Overrides, profile: &Profile) -> Option<String> {
+    [
+        ("ip", &overrides.ip, &profile.ip),
+        ("serial", &overrides.serial, &profile.serial),
+    ]
+    .into_iter()
+    .find_map(|(what, over, mine)| match over {
+        Some(v) if v != mine => Some(format!("{what}={v} was given (the profile's is {mine})")),
+        _ => None,
+    })
+}
+
+/// Resolve a profile's `pre_print` hook into something `serve` can run.
+///
+/// Checked here, at startup, rather than when a print is about to begin: a hook
+/// naming a sequence that doesn't exist, or a file that doesn't parse, should be
+/// a message when you start the server — not a refused print an hour later with
+/// the plate already ejected.
+#[cfg(feature = "server")]
+fn pre_print_hook_spec(
+    overrides: &Overrides,
+    profile: &Profile,
+    config_dir: &std::path::Path,
+) -> Result<Option<crate::server::PrePrint>, CliError> {
+    let Some(name) = profile.hooks.pre_print.clone() else {
+        return Ok(None);
+    };
+    // Same rule as `--sequence`: a hook is a macro for one machine, and serving
+    // an overridden target would fire it at a printer that has no changer.
+    if let Some(mismatch) = target_mismatch(overrides, profile) {
+        return Err(CliError::new(
+            exit::VALIDATION,
+            format!(
+                "pre-print hook {name:?} belongs to this profile but {mismatch} — a hook \
+                 describes one machine's hardware and must not be run against another. Serve \
+                 that printer, or drop the override"
+            ),
+        ));
+    }
+    let raw = profile.sequence(&name)?;
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let spec = crate::server::PrePrint {
+        path: config::resolve_sequence_path(raw, config_dir, home.as_deref()),
+        settle: profile.hooks.pre_print_timeout(),
+        name,
+    };
+    spec.vet_now().map_err(|e| {
+        CliError::new(
+            exit::VALIDATION,
+            format!("pre-print hook {:?}: {e}", spec.name),
+        )
+    })?;
+    Ok(Some(spec))
 }
 
 /// The `--all-printers` half, with the config and overrides already resolved.
@@ -1837,6 +1913,7 @@ fn all_serve_targets(
     cfg: &Config,
     selected: Option<String>,
     overrides: &Overrides,
+    config_dir: &std::path::Path,
 ) -> Result<Vec<crate::server::ServeTarget>, CliError> {
     // A connection override describes ONE machine. Applying `--ip` to every
     // profile would point them all at the same address; ignoring it silently
@@ -1878,9 +1955,15 @@ fn all_serve_targets(
     names
         .into_iter()
         .map(|name| {
-            let target = config::resolve(cfg.profile(&name), &Overrides::default())
-                .map_err(CliError::from)?;
-            Ok(crate::server::ServeTarget { name, target })
+            let profile = cfg
+                .profile(&name)
+                .ok_or_else(|| CliError::from(ConfigError::UnknownProfile(name.clone())))?;
+            let target =
+                config::resolve(Some(profile), &Overrides::default()).map_err(CliError::from)?;
+            // Overrides are already refused above, so this can only pass — but
+            // the rule lives in one place, not two.
+            let hook = pre_print_hook_spec(overrides, profile, config_dir)?;
+            Ok(crate::server::ServeTarget { name, target, hook })
         })
         .collect()
 }
@@ -1905,6 +1988,8 @@ fn synthetic_identity(cli: &Cli) -> crate::server::ServeTarget {
     eprintln!("synthetic printer identity: serial {serial}, access code {access_code}");
     crate::server::ServeTarget {
         name: "synthetic".to_string(),
+        // A synthetic identity has no profile, so there is nothing to hook.
+        hook: None,
         target: crate::config::ResolvedTarget {
             ip: "127.0.0.1".to_string(),
             serial,
@@ -1975,29 +2060,16 @@ fn resolve_named_sequence(cli: &Cli, name: &str) -> Result<String, CliError> {
         .printers
         .get(&profile_name)
         .ok_or_else(|| CliError::from(ConfigError::UnknownProfile(profile_name.clone())))?;
-    // The macro belongs to THIS machine — its coordinates describe what is
-    // bolted to it. But the connection is resolved separately, with flags and
-    // BAMBU_* winning over the profile, so a default of printer A plus a
-    // BAMBU_IP for printer B would send A's plate-changer motion to B, which
-    // has no such accessory. Refuse rather than reconcile: there is no sensible
-    // way to guess which machine the caller meant.
     let overrides = flag_overrides(cli).over(Overrides::from_env());
-    for (what, over, mine) in [
-        ("ip", &overrides.ip, &profile.ip),
-        ("serial", &overrides.serial, &profile.serial),
-    ] {
-        if let Some(v) = over
-            && v != mine
-        {
-            return Err(CliError::new(
-                exit::VALIDATION,
-                format!(
-                    "--sequence {name:?} belongs to profile '{profile_name}' ({what}={mine}), \
-                     but {what}={v} was given — a sequence describes one machine's hardware \
-                     and must not be sent to another. Select that printer, or use --from-file"
-                ),
-            ));
-        }
+    if let Some(mismatch) = target_mismatch(&overrides, profile) {
+        return Err(CliError::new(
+            exit::VALIDATION,
+            format!(
+                "--sequence {name:?} belongs to profile '{profile_name}' but {mismatch} — a \
+                 sequence describes one machine's hardware and must not be sent to another. \
+                 Select that printer, or use --from-file"
+            ),
+        ));
     }
     let raw = profile.sequence(name)?;
     let config_dir = path.parent().unwrap_or(Path::new("."));
@@ -4261,6 +4333,56 @@ mod tests {
         validate_ams_map,
     };
 
+    #[test]
+    fn a_macro_is_refused_when_the_connection_points_at_another_machine() {
+        // A hook's (and a sequence's) coordinates describe what is bolted to ONE
+        // printer. The connection resolves separately, with flags and BAMBU_*
+        // winning, so profile A plus a BAMBU_IP for B would fire A's
+        // plate-changer motion at B — which has no changer.
+        use super::target_mismatch;
+        use crate::config::{Overrides, Profile};
+        let profile = Profile {
+            ip: "192.0.2.1".into(),
+            serial: "S1".into(),
+            model: "a1mini".into(),
+            mode: "lan".into(),
+            access_code: "0".into(),
+            sequences: Default::default(),
+            hooks: Default::default(),
+        };
+        assert!(target_mismatch(&Overrides::default(), &profile).is_none());
+        // The same machine spelled the same way is not a mismatch.
+        assert!(
+            target_mismatch(
+                &Overrides {
+                    ip: Some("192.0.2.1".into()),
+                    ..Default::default()
+                },
+                &profile
+            )
+            .is_none()
+        );
+        for (what, ov) in [
+            (
+                "ip",
+                Overrides {
+                    ip: Some("192.0.2.9".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "serial",
+                Overrides {
+                    serial: Some("S9".into()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let m = target_mismatch(&ov, &profile).unwrap_or_default();
+            assert!(m.contains(what), "{what}: {m}");
+        }
+    }
+
     // ── which printers `serve --all-printers` stands up ──
     #[cfg(feature = "server")]
     mod serve_targets {
@@ -4290,11 +4412,16 @@ mod tests {
         }
 
         fn names(cfg: &Config, selected: Option<&str>) -> Vec<String> {
-            all_serve_targets(cfg, selected.map(str::to_string), &Overrides::default())
-                .unwrap()
-                .into_iter()
-                .map(|t| t.name)
-                .collect()
+            all_serve_targets(
+                cfg,
+                selected.map(str::to_string),
+                &Overrides::default(),
+                std::path::Path::new("/nonexistent"),
+            )
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect()
         }
 
         #[test]
@@ -4316,12 +4443,16 @@ mod tests {
         #[test]
         fn every_profile_is_resolved_from_its_own_config_not_the_selected_ones() {
             let cfg = cfg(&["a1mini", "x1c"], Some("a1mini"));
-            let ips: Vec<String> =
-                all_serve_targets(&cfg, Some("a1mini".to_string()), &Overrides::default())
-                    .unwrap()
-                    .into_iter()
-                    .map(|t| t.target.ip)
-                    .collect();
+            let ips: Vec<String> = all_serve_targets(
+                &cfg,
+                Some("a1mini".to_string()),
+                &Overrides::default(),
+                std::path::Path::new("/nonexistent"),
+            )
+            .unwrap()
+            .into_iter()
+            .map(|t| t.target.ip)
+            .collect();
             assert_eq!(ips.len(), 2);
             assert_ne!(ips[0], ips[1], "each printer keeps its own address");
         }
@@ -4349,7 +4480,8 @@ mod tests {
                     ..Default::default()
                 },
             ] {
-                let err = all_serve_targets(&cfg, None, &ov).unwrap_err();
+                let err = all_serve_targets(&cfg, None, &ov, std::path::Path::new("/nonexistent"))
+                    .unwrap_err();
                 assert_eq!(err.code, crate::cli::exit::VALIDATION);
                 assert!(err.message.contains("--all-printers"), "{}", err.message);
             }
@@ -4357,7 +4489,13 @@ mod tests {
 
         #[test]
         fn an_empty_config_says_so_rather_than_serving_nothing() {
-            let err = all_serve_targets(&cfg(&[], None), None, &Overrides::default()).unwrap_err();
+            let err = all_serve_targets(
+                &cfg(&[], None),
+                None,
+                &Overrides::default(),
+                std::path::Path::new("/nonexistent"),
+            )
+            .unwrap_err();
             assert_eq!(err.code, crate::cli::exit::VALIDATION);
             assert!(err.message.contains("config add"), "{}", err.message);
         }
