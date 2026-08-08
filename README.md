@@ -114,6 +114,39 @@ clean-timelapse capture, and the usual controls — all over the same single LAN
   <img src="https://raw.githubusercontent.com/sksat/bambu-rs/main/assets/dashboard-demo.gif" alt="bambu serve web dashboard" width="600">
 </p>
 
+## Sharing the printer: `serve --emulate`
+
+A Bambu printer in LAN Mode is happiest with one client at a time, so watching a print in
+Bambu Studio *and* in this dashboard means the two take turns fighting over it. `--emulate`
+makes `bambu serve` answer on MQTT-over-TLS the way the printer does, so you point Studio (or
+OrcaSlicer, or Home Assistant) at **this host** instead. serve keeps the single real
+connection and relays it to everyone.
+
+```bash
+# on the machine that can reach the printer
+bambu serve --emulate --emulate-host 0.0.0.0
+```
+
+Then add a printer in the client by IP — the host running serve — with the printer's **own**
+serial and access code; that is what the relay authenticates against, and what names its
+certificate. Two things it does better than a plain forwarder:
+
+- **Reads are answered from serve's merged state.** A client that connects mid-print asks for
+  a `pushall` and gets the whole picture at once, instead of deltas from whenever it arrived.
+  The printer never sees the poll.
+- **Clients can't be confused for each other.** Every MQTT client numbers its commands from
+  `1`; the relay renumbers them on the way out and puts the original back on the way in, so
+  nobody reads someone else's acknowledgement as the answer to their own command.
+
+Anyone with the printer's access code can drive it through the relay — exactly the people who
+could drive the printer directly, and no others. `--emulate-read-only` narrows that to
+watching only: control commands are refused rather than forwarded.
+
+**Sending a print through the relay does not work yet.** Studio uploads a sliced file to the
+printer's FTP server before it starts a job, and there is no FTP server here — upload to the
+printer directly, or use `bambu job start`. Discovery is deliberately absent too: the real
+printer is announcing the same serial on the same network, so add the relay by IP.
+
 ## Timelapse
 
 The printer's own built-in timelapse works as you'd expect: toggle recording with

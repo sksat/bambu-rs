@@ -118,6 +118,45 @@ dashboard feature が有効なら、CLI に組み込まれた Web dashboard を�
   <img src="assets/dashboard-demo.gif" alt="bambu serve Web dashboard" width="600">
 </p>
 
+## プリンターを共有する: `serve --emulate`
+
+LAN Mode のプリンターは同時に 1 クライアントで使うのが基本です。
+そのため Bambu Studio とこの dashboard で同時に印刷を見ようとすると、2 つが接続を奪い合います。
+`--emulate` を付けると、`bambu serve` がプリンターと同じ MQTT over TLS を話すようになります。
+Studio（や OrcaSlicer、Home Assistant）の接続先を、プリンターではなく**この host** にできます。
+実際のプリンターとの接続は serve が 1 本だけ保持し、それを全員に中継します。
+
+```bash
+# プリンターに到達できるマシンで実行する
+bambu serve --emulate --emulate-host 0.0.0.0
+```
+
+クライアント側では、serve を動かしている host の IP でプリンターを追加します。
+serial と access code はプリンター**本体のもの**を使ってください。
+中継はこの access code で認証し、serial は証明書の名前にもなります。
+
+単なる転送と違うのは次の 2 点です。
+
+- **読み取りは serve がマージ済みの状態から返します。**
+  印刷の途中で接続したクライアントが `pushall` を投げると、その時点の全体像が 1 回で返ります。
+  接続してから届いた差分だけ、という状態になりません。
+  ポーリングがプリンターまで届くこともありません。
+- **クライアント同士が取り違えられません。**
+  MQTT クライアントはどれもコマンド番号を `1` から数えます。
+  中継は送出時に番号を振り直し、応答が返ってきたら元に戻します。
+  他人への応答を自分のコマンドへの応答として読んでしまうことがなくなります。
+
+access code を知っている人は、中継越しにプリンターを操作できます。
+これは直接プリンターを操作できる人と同じ範囲で、それ以上には広がりません。
+監視だけに絞るなら `--emulate-read-only` を使います。
+制御コマンドは転送されず、拒否されます。
+
+**中継経由での印刷開始はまだできません。**
+Studio はジョブを開始する前にスライス済みファイルをプリンターの FTP サーバーへ upload しますが、ここには FTP サーバーがありません。
+upload はプリンターへ直接行うか、`bambu job start` を使ってください。
+探索（discovery）にも意図的に応答しません。
+同じネットワークで実機が同じ serial を広告しているため、IP で追加してください。
+
 ## Timelapse
 
 内蔵カメラによる公式の timelapse はそのまま扱えます（`bambu timelapse enable/disable` で録画の切り替え、`job start --timelapse` で印刷ごとの指定、`bambu timelapse get` で録画済み動画の取得）。
