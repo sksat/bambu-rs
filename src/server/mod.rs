@@ -76,15 +76,6 @@ pub struct ServeOpts {
 /// connected through the relay.
 const EMULATE_REFRESH: Duration = Duration::from_secs(20);
 
-/// The dashboard's four device-facing backends, chosen together: all live, or
-/// all fake. Named because they are only ever swapped as a set.
-type Backends = (
-    Arc<dyn Controller>,
-    Arc<dyn FileStore>,
-    Arc<dyn Starter>,
-    Arc<dyn CameraSource>,
-);
-
 /// Where the emulated printer listens, and what it will pass through.
 #[cfg(feature = "relay")]
 pub struct EmulateOpts {

@@ -60,15 +60,36 @@ fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_bambu"))
 }
 
-/// A port nothing is listening on. Bind, read the number, drop — a classic race
-/// in principle, and in practice the only way to get an ephemeral port without
-/// threading a listener through a child process.
+/// A port nothing is listening on, from below the kernel's ephemeral range.
+///
+/// `bind(":0")` and drop is the obvious version, and it loses a race that is not
+/// theoretical: the kernel hands that very port to the *next* caller asking for
+/// an ephemeral one, and this suite holds six of them across two child processes
+/// while the rest of the test run is doing the same. It cost a `Address already
+/// in use` on a full-suite run.
+///
+/// Numbers here come from a band the kernel never assigns on its own, so nothing
+/// can be given the port between choosing it and the child binding it. A
+/// collision now needs another process to have picked the same number
+/// deliberately. The offsets keep concurrent test binaries — and concurrent
+/// tests inside one binary — out of each other's way.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    use std::sync::atomic::{AtomicU16, Ordering};
+    const BASE: u16 = 20_000;
+    const SPAN: u16 = 10_000;
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+
+    let mine = NEXT.fetch_add(1, Ordering::Relaxed);
+    let start = (std::process::id() as u16).wrapping_add(mine) % SPAN;
+    for i in 0..SPAN {
+        let port = BASE + (start.wrapping_add(i) % SPAN);
+        // Bound and dropped only to ask "is anything here?" — see above for why
+        // that answer keeps until the child binds it.
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no free port in {BASE}..{}", BASE + SPAN);
 }
 
 fn spawn(name: &'static str, args: &[&str]) -> Proc {
