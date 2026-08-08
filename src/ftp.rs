@@ -12,7 +12,9 @@ use suppaftp::{RustlsConnector, RustlsFtpStream};
 
 use crate::config::ResolvedTarget;
 
-const FTPS_PORT: u16 = 990;
+/// Implicit FTPS. `pub` so the emulator's relay can probe the same port before
+/// committing a client to a connect that has no timeout.
+pub const FTPS_PORT: u16 = 990;
 const FTP_USER: &str = "bblp";
 
 /// One entry from a directory listing.
@@ -107,6 +109,22 @@ impl FtpsClient {
         Ok(lines.iter().filter_map(|l| parse_list_line(l)).collect())
     }
 
+    /// List `dir` as the printer's **own raw `LIST` lines**, unparsed.
+    ///
+    /// For `bambu serve --emulate`'s FTP relay: a client asking for a listing
+    /// should get the bytes the printer would have sent it. Re-rendering parsed
+    /// entries would mean inventing the timestamps and permission bits that
+    /// [`FileEntry`] drops, and a client that parses those would be reading our
+    /// invention as the printer's answer.
+    pub fn list_raw(&self, dir: &str) -> Result<Vec<String>, FtpError> {
+        let mut ftp = self.connect()?;
+        let lines = ftp
+            .list(Some(dir))
+            .map_err(|e| FtpError::Ftp(e.to_string()))?;
+        let _ = ftp.quit();
+        Ok(lines)
+    }
+
     /// Upload a local file to `remote_path` on the printer; returns bytes sent.
     pub fn upload(&self, local: &Path, remote_path: &str) -> Result<u64, FtpError> {
         let mut file = std::fs::File::open(local)?;
@@ -147,6 +165,32 @@ impl FtpsClient {
                 Err(e)
             }
         }
+    }
+
+    /// Rename `from` to `to` on the printer (FTP `RNFR`/`RNTO`).
+    pub fn rename(&self, from: &str, to: &str) -> Result<(), FtpError> {
+        let mut ftp = self.connect()?;
+        let result = ftp
+            .rename(from, to)
+            .map_err(|e| FtpError::Ftp(e.to_string()));
+        let _ = ftp.quit();
+        result
+    }
+
+    /// Create a directory on the printer (FTP `MKD`).
+    pub fn mkdir(&self, path: &str) -> Result<(), FtpError> {
+        let mut ftp = self.connect()?;
+        let result = ftp.mkdir(path).map_err(|e| FtpError::Ftp(e.to_string()));
+        let _ = ftp.quit();
+        result
+    }
+
+    /// Remove a directory on the printer (FTP `RMD`).
+    pub fn rmdir(&self, path: &str) -> Result<(), FtpError> {
+        let mut ftp = self.connect()?;
+        let result = ftp.rmdir(path).map_err(|e| FtpError::Ftp(e.to_string()));
+        let _ = ftp.quit();
+        result
     }
 
     /// Delete `remote_path` on the printer (FTP `DELE`).

@@ -59,6 +59,47 @@ impl LiveSource {
         })
     }
 
+    /// Stream status from an existing report feed instead of opening a
+    /// connection of our own.
+    ///
+    /// With `--emulate` on there is already exactly one link to the printer (see
+    /// [`LivePrinterLink`](super::relay::LivePrinterLink)), and the point of the
+    /// relay is that it stays exactly one — a dashboard that called
+    /// [`connect`](Self::connect) alongside it would be the second client the
+    /// whole feature exists to avoid.
+    ///
+    /// The merge happens here rather than upstream because the emulator wants
+    /// the raw messages (it forwards deltas verbatim) while the dashboard wants
+    /// the merged picture.
+    pub fn from_reports(mut reports: tokio::sync::broadcast::Receiver<serde_json::Value>) -> Self {
+        use tokio::sync::broadcast::error::RecvError;
+        Self::spawn(move |tx| {
+            let mut state = crate::core::report::ReportState::new();
+            loop {
+                match reports.blocking_recv() {
+                    Ok(message) => {
+                        // ACKs share the report envelope. Merging them would
+                        // splice `result`/`reason`/`param` into the dashboard's
+                        // state and overwrite the printer's own `sequence_id` —
+                        // and with the relay on, this feed carries the ACKs of
+                        // every other client too.
+                        if !crate::core::report::is_status_report(&message) {
+                            continue;
+                        }
+                        state.apply(message);
+                        if tx.send(PrinterStatus::from_state(state.get())).is_err() {
+                            break; // the source and all subscribers are gone
+                        }
+                    }
+                    // Behind the printer, not broken: the next report merges on
+                    // top of what we have, and a pushall fills any gap.
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        })
+    }
+
     /// Spawn the bridge thread around `run`, handing it the channel sender. The
     /// real MQTT loop lives in [`LiveSource::connect`]; this seam lets tests drive
     /// the channel without a printer.
@@ -109,5 +150,34 @@ mod tests {
         let s = got.expect("worker thread should publish a status");
         assert_eq!(s.gcode_state.as_deref(), Some("RUNNING"));
         assert_eq!(s.mc_percent, Some(42));
+    }
+
+    #[test]
+    fn a_relayed_feed_is_merged_the_same_way_a_direct_connection_would_be() {
+        // The emulator forwards raw messages, so the dashboard's picture is only
+        // right if the deltas are merged on this side.
+        let (tx, rx) = tokio::sync::broadcast::channel(8);
+        let src = LiveSource::from_reports(rx);
+        tx.send(serde_json::json!({"print": {
+            "command": "push_status", "msg": 0, "gcode_state": "RUNNING", "mc_percent": 40,
+        }}))
+        .unwrap();
+        tx.send(serde_json::json!({"print": {
+            "command": "push_status", "msg": 1, "mc_percent": 41,
+        }}))
+        .unwrap();
+
+        let mut got = None;
+        for _ in 0..200 {
+            let s = src.current();
+            if s.mc_percent == Some(41) {
+                got = Some(s);
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let s = got.expect("the delta should have been merged onto the snapshot");
+        // The delta only carried mc_percent; gcode_state must survive it.
+        assert_eq!(s.gcode_state.as_deref(), Some("RUNNING"));
     }
 }

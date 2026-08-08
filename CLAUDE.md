@@ -26,7 +26,10 @@ dashboard.
 - **Extending model/firmware support** means a captured fixture plus a row in the `core::capability`
   registry, not an inline version branch.
 - **One MQTT connection at a time** — a second concurrent client (e.g. the CLI while `serve` runs)
-  makes the A1 mutually disconnect.
+  makes the A1 mutually disconnect. `bambu serve --emulate` is the way out: it presents the
+  printer's own LAN interface (`server/emulate.rs`, protocol in `core/emulate.rs` + `core/mqtt.rs`)
+  and relays every client over the single `LivePrinterLink`. Anything new that needs a live feed
+  inside `serve` should take it from that link, not open its own.
 - **Local checks:** a full build/test is `--features dashboard,ts-rs`; CI also builds a smaller
   feature matrix (`.github/workflows/ci.yml`), so keep the lib-only and dashboard-less builds
   green. After changing a `ts-rs`-exported type, run `pnpm -C web gen:types` and commit, or the

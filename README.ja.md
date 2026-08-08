@@ -118,6 +118,62 @@ dashboard feature が有効なら、CLI に組み込まれた Web dashboard を�
   <img src="assets/dashboard-demo.gif" alt="bambu serve Web dashboard" width="600">
 </p>
 
+## プリンターを共有する: `serve --emulate`
+
+LAN Mode のプリンターは同時に 1 クライアントで使うのが基本です。
+そのため Bambu Studio とこの dashboard で同時に印刷を見ようとすると、2 つが接続を奪い合います。
+`--emulate` を付けると、`bambu serve` がプリンターと同じ MQTT over TLS を話すようになります。
+Studio（や OrcaSlicer、Home Assistant）の接続先を、プリンターではなく**この host** にできます。
+実際のプリンターとの接続は serve が 1 本だけ保持し、それを全員に中継します。
+
+```bash
+# プリンターに到達できるマシンで実行する
+bambu serve --emulate --emulate-host 0.0.0.0
+```
+
+クライアント側では、serve を動かしている host の IP でプリンターを追加します。
+serial と access code はプリンター**本体のもの**を使ってください。
+中継はこの access code で認証し、serial は証明書の名前にもなります。
+
+単なる転送と違うのは次の 2 点です。
+
+- **読み取りは serve がマージ済みの状態から返します。**
+  印刷の途中で接続したクライアントが `pushall` を投げると、その時点の全体像が 1 回で返ります。
+  接続してから届いた差分だけ、という状態になりません。
+  ポーリングがプリンターまで届くこともありません。
+- **クライアント同士が取り違えられません。**
+  MQTT クライアントはどれもコマンド番号を `1` から数えます。
+  中継は送出時に番号を振り直し、応答が返ってきたら元に戻します。
+  他人への応答を自分のコマンドへの応答として読んでしまうことがなくなります。
+
+印刷の送信もできます。
+Studio はジョブを開始する前にスライス済みファイルをプリンターの FTP サーバーへ upload するため、中継は FTP にも応答します。
+ポートは **990** で、これは特権ポートです。
+bind に失敗する場合は、一度だけ capability を与えて再起動してください。
+
+```bash
+sudo setcap cap_net_bind_service=+ep "$(which bambu)"
+```
+
+特権なしで bind できるポートを選ぶ（`--emulate-ftp-port 2990`）か、`--emulate-no-ftp` で FTP を無効にして監視と制御だけを使うこともできます。
+upload は全体を受け取ってから転送します。
+そのため、転送中にクライアントが落ちても、プリンターの SD カードに中途半端なファイルが残りません。
+この SD カードは、この機体で唯一すでに壊れやすいとわかっている部品です。
+
+access code を知っている人は、中継越しにプリンターを操作できます。
+これは直接プリンターを操作できる人と同じ範囲で、それ以上には広がりません。
+監視だけに絞るなら `--emulate-read-only` を使います。
+制御コマンドと upload は転送されず、拒否されます。
+
+**プリンターが落ちたら、中継も落ちます。**
+実機からの報告が 30 秒途切れると、中継は cache から答えるのをやめ、クライアントを切断します。
+1 時間前に止まった印刷の姿を配り続けないためです。
+接続が切れることは、どのクライアントもすでに「プリンターが offline」として扱う信号です。
+プリンターが戻れば、中継も自動的に復帰します。
+
+探索（discovery）には意図的に応答しません。
+同じネットワークで実機が同じ serial を広告しているため、IP で追加してください。
+
 ## Timelapse
 
 内蔵カメラによる公式の timelapse はそのまま扱えます（`bambu timelapse enable/disable` で録画の切り替え、`job start --timelapse` で印刷ごとの指定、`bambu timelapse get` で録画済み動画の取得）。
@@ -175,6 +231,11 @@ bambu ams resume                     # resume | reset | pause | change | set-fil
 [dependencies]
 bambu-rs = { version = "0.1", default-features = false }   # ライブラリのみ。CLI/server の依存は引かない
 ```
+
+feature は `cli`、`server`（HTTP API）、`relay`（プリンターエミュレーション）、`dashboard`（SPA）、`ts-rs` です。
+前の 3 つは既定で有効です。
+`relay` を切ると、プリンターに「なりすます」ための部品（MQTT broker の codec、FTP サーバー、証明書生成の `rcgen`）が外れます。
+プリンターに「話しかける」ための部分はそのまま残ります。
 
 ```rust
 use bambu_rs::client::LanMqttClient;

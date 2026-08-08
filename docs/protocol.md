@@ -248,6 +248,75 @@ unreliable at the time), so whether `gcode_file` is genuinely unsupported on the
 A1 is **inconclusive** — retest on a healthy SD card before concluding. We do
 **not** register a "gcode_file unsupported" quirk. **[observed, inconclusive]**
 
+### Telling an ACK from a report
+
+Both wear the same envelope — `{"print": {…}}` — and the observed ACK carries
+**no `command` key at all**:
+
+```
+report : { "print": { "command": "push_status", "msg": 1, "mc_percent": 41 } }
+ack    : { "print": { "sequence_id": "1", "param": "G28", "result": "success", … } }
+```
+
+So `result` is the discriminator, not a missing `command`: some deltas omit
+`command` too. Anything that merges reports into cached state (`ReportState`, and
+the emulator's `UpstreamCache`) has to skip ACKs, or `result`/`reason`/`param`
+end up spliced into the cached `print` object and travel with every snapshot
+built from it afterwards. **[observed]**
+
+## Emulating the printer (`bambu serve --emulate`)
+
+`serve` can present the printer's own LAN interface — MQTT over TLS on 8883,
+`bblp` + the access code, `device/{serial}/report` and `.../request` — and relay
+to the real machine over the one connection it already holds. What a client
+needs, in the order it asks for it:
+
+- **TLS.** The certificate is not verifiable (self-signed, X.509 v1, CN = the
+  serial), so every LAN client must already be skipping verification. Presenting
+  a *v3 ECDSA* certificate with CN = the serial is accepted in practice — checked
+  against `rumqttc` and a hand-rolled stdlib client, not against Bambu Studio.
+  **[observed for those clients; Studio untested]**
+- **`pushall`.** Answerable from cached merged state: the reply is a
+  `push_status` with `msg: 0` and the printer's own `sequence_id` (a pushall
+  response is *not* an echo — see above), and the client cannot tell it came from
+  a cache. This is what lets N clients poll without the printer seeing any of it.
+- **Two clients, one counter.** Every client numbers its commands from `"1"`, so
+  a relay forwarding ids verbatim lets one client match another's ACK to its own
+  command. Renumbering on the way out and restoring on the way back is what keeps
+  them apart; the printer only ever sees ids the relay allocated.
+- **FTP too, or a print can't be sent.** Studio uploads to FTPS:990 before
+  `project_file`, so the relay answers FTP as well (store-and-forward through the
+  same client the CLI uses). Two things a client notices: the data connection
+  must be closed with a TLS **close_notify** — Python's `ftplib` unwraps its TLS
+  layer after an upload and reports "unexpected EOF in violation of protocol" if
+  the socket is merely dropped — and `LIST` output should be the printer's own
+  lines, since re-rendering them means inventing the timestamps a parsed entry
+  drops. **[observed against `ftplib` and `suppaftp`]**
+- **A relay must be able to say "gone".** The printer pushes a delta every ~2 s
+  unprompted, so silence is the signal; a relay that reconnects quietly while
+  still answering reads from cache shows a client a print that stopped an hour
+  ago. There is no "offline" message in this protocol — dropping the TCP
+  connection is the only thing every client already reads that way, so the relay
+  gives up after 30 s of silence and hangs up.
+- **Subscriptions must be matched as MQTT filters, not strings.** A client
+  subscribing `device/+/report` means this printer's report topic; refusing it
+  leaves a healthy-looking connection that never delivers anything.
+- **Relay everything the capability table says works**, including `RNFR`/`RNTO`
+  and `MKD`/`RMD`. Uploading to a temp name and renaming it into place is a
+  common client idiom, so a relay that refuses rename breaks a send the printer
+  itself would have completed.
+- **The data connection must come from the control connection's host.** The PASV
+  port is open to the whole network for as long as it exists and the first
+  connection wins it: unchecked, a LAN peer with no access code can race a
+  `STOR` and choose the bytes the relay then uploads to the machine.
+- **What is missing.** SSDP is deliberately not answered: the real printer
+  announces the same serial on the same LAN, and a second announcement would
+  just race it.
+- **Unverified:** whether firmware round-trips an arbitrary `sequence_id` string
+  untouched. A relay that renumbers requests should keep its ids below 2^31 in
+  case the id is parsed as a 32-bit integer somewhere — an echo that comes back
+  changed can never be matched to the command it answers.
+
 ## Version inventory (`info.get_version`)
 
 `{"info":{"sequence_id":"N","command":"get_version"}}` is answered (under

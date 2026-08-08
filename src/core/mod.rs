@@ -5,11 +5,17 @@
 
 pub mod capability;
 pub mod command;
+#[cfg(feature = "relay")]
+pub mod emulate;
 #[cfg(test)]
 pub(crate) mod fake;
 pub mod firmware;
+#[cfg(feature = "relay")]
+pub mod ftpd;
 pub mod hms;
 pub mod model;
+#[cfg(feature = "relay")]
+pub mod mqtt;
 pub mod park;
 pub mod project;
 pub mod report;

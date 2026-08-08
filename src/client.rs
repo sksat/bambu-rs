@@ -77,15 +77,10 @@ fn unique_client_id() -> String {
     )
 }
 
-/// The report topic for a serial: `device/{serial}/report`.
-pub fn report_topic(serial: &str) -> String {
-    format!("device/{serial}/report")
-}
-
-/// The request topic for a serial: `device/{serial}/request`.
-pub fn request_topic(serial: &str) -> String {
-    format!("device/{serial}/request")
-}
+// Topic naming is a protocol fact, so it lives in `core::command` alongside the
+// request envelopes, and is re-exported here where every caller already looks
+// for it.
+pub use crate::core::command::{report_topic, request_topic};
 
 /// A one-shot LAN MQTT client.
 pub struct LanMqttClient {
@@ -319,6 +314,105 @@ impl LanMqttClient {
             .build()
             .map_err(|e| ClientError::Runtime(e.to_string()))?;
         rt.block_on(self.watch_async(interval, true, Some(self.timeout), on_update))
+    }
+
+    /// Drive **one long-lived connection** that streams reports out and
+    /// publishes requests in, for as long as both hold up.
+    ///
+    /// This is the connection [`bambu serve --emulate`](crate::server::emulate)
+    /// is built on, and the reason it exists: every other method here is
+    /// connect-per-op, so N clients relayed through N calls would be N
+    /// connections to a printer that would rather have one. Here the printer
+    /// sees a single client no matter how many are downstream.
+    ///
+    /// Every report message is handed to `on_report` raw — merging is the
+    /// caller's business, because a relay has to forward the deltas *and* keep
+    /// the merged picture, and only the caller knows which it wants. Payloads
+    /// arriving on `requests` are published to the request topic at QoS 1,
+    /// verbatim: allocating `sequence_id`s belongs to whoever is multiplexing.
+    ///
+    /// Returns `Ok(())` when `requests` closes (the caller is shutting down)
+    /// and `Err` when the connection breaks — reconnecting is the caller's
+    /// call, since only it knows whether the relay should outlive the printer
+    /// being power-cycled. A request published into a connection that is about
+    /// to break is lost; there is no queue behind it.
+    ///
+    /// **Requests are published with `try_publish`, not `publish`.** rumqttc's
+    /// request channel is bounded (16 here) and is drained *only* by
+    /// `eventloop.poll()` — which is the very thing this loop is not doing
+    /// while it awaits a publish. `publish().await` on a full channel would
+    /// therefore wait for a drain that cannot happen: not an error, not a
+    /// timeout, just a link that stops relaying for every downstream client at
+    /// once and never reconnects, because it never returns `Err`. A full
+    /// channel means the printer is not keeping up, so the honest answer is to
+    /// drop the request and say so — the same thing the layer above does, and
+    /// the client's own ACK timeout is what tells it.
+    #[cfg(feature = "relay")]
+    pub async fn relay<F: FnMut(&Value)>(
+        &self,
+        interval: Option<Duration>,
+        requests: &mut tokio::sync::mpsc::Receiver<Value>,
+        mut on_report: F,
+    ) -> Result<(), ClientError> {
+        enum Step {
+            Report(Result<Event, ClientError>),
+            Request(Option<Value>),
+            Tick,
+        }
+
+        let (client, mut eventloop) = self.connect().await?;
+        let mut ticker = interval.map(|d| {
+            let mut t = tokio::time::interval(d);
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            t
+        });
+        // connect() already sent the first pushall; drop the immediate tick.
+        if let Some(t) = ticker.as_mut() {
+            t.tick().await;
+        }
+
+        loop {
+            let step = match ticker.as_mut() {
+                Some(t) => tokio::select! {
+                    ev = poll(&mut eventloop) => Step::Report(ev),
+                    req = requests.recv() => Step::Request(req),
+                    _ = t.tick() => Step::Tick,
+                },
+                None => tokio::select! {
+                    ev = poll(&mut eventloop) => Step::Report(ev),
+                    req = requests.recv() => Step::Request(req),
+                },
+            };
+            match step {
+                Step::Report(ev) => {
+                    if let Event::Incoming(Packet::Publish(p)) = ev?
+                        && let Ok(json) = serde_json::from_slice::<Value>(&p.payload)
+                    {
+                        on_report(&json);
+                    }
+                }
+                Step::Request(None) => return Ok(()),
+                Step::Request(Some(payload)) => {
+                    // Non-blocking on purpose — see the doc comment.
+                    if let Err(e) = client.try_publish(
+                        request_topic(&self.target.serial),
+                        QoS::AtLeastOnce, // control commands go at QoS 1
+                        false,
+                        payload.to_string(),
+                    ) {
+                        eprintln!("relay: the printer is not keeping up; dropped a request: {e}");
+                    }
+                }
+                Step::Tick => {
+                    let _ = client.try_publish(
+                        request_topic(&self.target.serial),
+                        QoS::AtMostOnce,
+                        false,
+                        Command::PushAll.to_payload("0").to_string(),
+                    );
+                }
+            }
+        }
     }
 
     async fn send_and_watch_async<F: FnMut(&ReportState) -> WatchStep>(
