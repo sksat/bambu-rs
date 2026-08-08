@@ -195,6 +195,27 @@ div.lbl,
   align-items: center;
   gap: 0.6rem;
 }
+/* Matches the theme button: the picker is a peer control, not a form field. */
+.printer {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--fg);
+  background: transparent;
+  border: 1px solid var(--hair);
+  border-radius: 6px;
+  padding: 0.2rem 0.5rem;
+  cursor: pointer;
+  max-width: 14rem;
+}
+.printer:hover {
+  border-color: var(--accent);
+}
+/* The URL names a printer this server does not serve — say so rather than
+   quietly showing the default as if it were selected. */
+.printer--unknown {
+  border-color: var(--warn, #d08b2b);
+  color: var(--warn, #d08b2b);
+}
 .theme {
   font-family: var(--mono);
   font-size: 0.72rem;

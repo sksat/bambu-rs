@@ -760,3 +760,91 @@ test.describe("dashboard (fake mode)", () => {
     await expect(page.getByTestId("tray-0")).toBeVisible();
   });
 });
+
+test.describe("addressing one printer of several", () => {
+  test("no picker when the server has a single printer", async ({ page }) => {
+    // A select with one option is a decision the user does not have.
+    await page.goto("/");
+    await expect(page.getByTestId("state")).toBeVisible();
+    await expect(page.getByTestId("printer")).toHaveCount(0);
+  });
+
+  /** Two printers, so the picker has something to pick. */
+  const twoPrinters = {
+    default: "fake",
+    printers: [
+      { name: "fake", id: "fake", model: "a1mini", default: true, status: { gcode_state: "RUNNING" } },
+      { name: "x1c", id: "x1c", model: "x1c", default: false, status: { gcode_state: "IDLE" } },
+    ],
+  };
+
+  test("the picker lists every printer with its state and switches by URL", async ({ page }) => {
+    // The single-printer `--fake` server never renders the picker, so a picker
+    // that showed wrong labels or navigated to the wrong printer would pass
+    // every other test here. Only `/api/printers` is faked; the page's own
+    // requests still hit the real server.
+    await page.route("**/api/printers", (route) =>
+      route.fulfill({ json: twoPrinters }),
+    );
+    await page.goto("/");
+    await expect(page.getByTestId("state")).toBeVisible();
+
+    const picker = page.getByTestId("printer");
+    await expect(picker).toBeVisible();
+    await expect(picker.locator("option")).toHaveText([/fake — running/, /x1c — idle/]);
+    await expect(picker).toHaveValue("fake");
+
+    // Selecting a non-default printer puts it in the URL…
+    await picker.selectOption("x1c");
+    await expect(page).toHaveURL(/[?&]printer=x1c/);
+
+    // …and selecting the default takes the parameter back out, so the common
+    // case keeps a clean URL and old bookmarks keep working.
+    await expect(page.getByTestId("printer")).toHaveValue("x1c");
+    await page.getByTestId("printer").selectOption("fake");
+    await expect(page).not.toHaveURL(/printer=/);
+  });
+
+  test("a printer this server does not serve is shown as such, not as the default", async ({
+    page,
+  }) => {
+    // Every request is already going to a prefix that 404s. Rendering the
+    // default as selected would hide that and leave nothing to pick to recover.
+    await page.route("**/api/printers", (route) => route.fulfill({ json: twoPrinters }));
+    await page.goto("/?printer=gone");
+    const picker = page.getByTestId("printer");
+    await expect(picker).toBeVisible();
+    await expect(picker).toContainText("not served here");
+    await expect(picker).toHaveClass(/printer--unknown/);
+    // And picking a real one recovers.
+    await picker.selectOption("x1c");
+    await expect(page).toHaveURL(/[?&]printer=x1c/);
+  });
+
+  test("the whole dashboard works over a printer-prefixed API", async ({ page }) => {
+    // The risky half of multi-printer support is that ~45 call sites moved from
+    // "/api/…" to a computed root. `?printer=` sends every one of them to
+    // /api/printers/<id>/… instead, so this exercises the rewrite end to end:
+    // the socket, the telemetry, the file listing and a control action.
+    const bad: string[] = [];
+    page.on("response", (r) => {
+      const u = new URL(r.url());
+      if (u.pathname.startsWith("/api/") && !u.pathname.startsWith("/api/printers/")) {
+        bad.push(u.pathname);
+      }
+    });
+
+    await page.goto("/?printer=fake");
+    await expect(page.getByTestId("state")).toBeVisible();
+    await expect(page.getByTestId("conn")).toContainText("live");
+    await expect(page.getByTestId("nozzle-temp")).toContainText("°C");
+    // A write, not just reads.
+    await page.getByRole("button", { name: "pause", exact: true }).click();
+    await expect(page.getByTestId("toast")).toBeVisible();
+
+    // `/api/printers` itself is server-level and correctly unprefixed; anything
+    // else unprefixed means a call site was missed and is quietly talking to
+    // the default printer instead of the selected one.
+    expect(bad.filter((p) => p !== "/api/printers")).toEqual([]);
+  });
+});

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { sendControl } from "./control";
+import { API } from "./api";
 
 export interface Toast {
   kind: "ok" | "warn" | "err";
@@ -84,18 +85,18 @@ export function useControl() {
       setPassword(pw);
       sessionStorage.setItem("bambu_pw", pw);
     },
-    pause: () => act("pause", "/api/job/pause", { confirm: true }),
-    resume: () => act("resume", "/api/job/resume", { confirm: true }),
+    pause: () => act("pause", `${API}/job/pause`, { confirm: true }),
+    resume: () => act("resume", `${API}/job/resume`, { confirm: true }),
     requestStop: () => setConfirmStop(true),
     cancelStop: () => setConfirmStop(false),
     confirmAndStop: () => {
       setConfirmStop(false);
-      void act("stop", "/api/job/stop", { confirm: true });
+      void act("stop", `${API}/job/stop`, { confirm: true });
     },
-    light: (on: boolean) => act(`light ${on ? "on" : "off"}`, "/api/light", { node: "chamber", on }),
-    speed: (level: string) => act(`speed ${level}`, "/api/speed", { level }),
+    light: (on: boolean) => act(`light ${on ? "on" : "off"}`, `${API}/light`, { node: "chamber", on }),
+    speed: (level: string) => act(`speed ${level}`, `${API}/speed`, { level }),
     gcode: (line: string, force: boolean) =>
-      act(`gcode ${line}`, "/api/gcode", { line, confirm: true, force }),
+      act(`gcode ${line}`, `${API}/gcode`, { line, confirm: true, force }),
 
     // ── machine control ──────────────────────────────────────────────────────
     // Generic confirm dialog plumbing (shared by the confirm-gated writes).
@@ -106,34 +107,34 @@ export function useControl() {
       c?.run();
     },
 
-    home: (axes: "all" | Axis) => act(`home ${axes}`, "/api/home", { axes }),
+    home: (axes: "all" | Axis) => act(`home ${axes}`, `${API}/home`, { axes }),
     jog: (axis: Axis, delta: number, feedrate: number) =>
       act(
         `move ${axis.toUpperCase()} ${delta > 0 ? "+" : ""}${delta}`,
-        "/api/move",
+        `${API}/move`,
         { axis, delta, feedrate },
       ),
     extrude: (delta: number, feedrate: number) =>
-      act(`${delta < 0 ? "retract" : "extrude"} ${Math.abs(delta)}`, "/api/extrude", {
+      act(`${delta < 0 ? "retract" : "extrude"} ${Math.abs(delta)}`, `${API}/extrude`, {
         delta,
         feedrate,
       }),
     // celsius > 0 needs confirm; the caller passes confirm=true once acknowledged.
     setTemp: (part: TempPart, celsius: number, confirm: boolean, force = false) =>
-      act(`${part} ${celsius}°`, "/api/temp", { part, celsius, confirm, force }),
+      act(`${part} ${celsius}°`, `${API}/temp`, { part, celsius, confirm, force }),
     cooldown: (part: TempPart) =>
-      act(`${part} cool`, "/api/temp", { part, celsius: 0, confirm: false, force: false }),
+      act(`${part} cool`, `${API}/temp`, { part, celsius: 0, confirm: false, force: false }),
     // The calibration modal is the deliberate gate (it lists the routines + warns that
     // the printer moves), so this posts directly with confirm:true rather than stacking a
     // second confirm dialog on top of the modal.
     calibrate: (opts: CalibrateOpts) =>
-      act("calibrate", "/api/calibrate", { ...opts, confirm: true }),
+      act("calibrate", `${API}/calibrate`, { ...opts, confirm: true }),
     ams: (action: AmsAction, confirm: boolean) => {
-      if (!confirm) return act(`ams ${action}`, "/api/ams", { action, confirm: false });
+      if (!confirm) return act(`ams ${action}`, `${API}/ams`, { action, confirm: false });
       requestConfirm(
         `AMS ${action}? This interrupts the current spool state.`,
         () => {
-          void act(`ams ${action}`, "/api/ams", { action, confirm: true });
+          void act(`ams ${action}`, `${API}/ams`, { action, confirm: true });
         },
         action,
       );
@@ -152,7 +153,7 @@ export function useControl() {
       requestConfirm(
         `${what} at ${tarTemp}°C? The AMS will move filament along the whole path.`,
         () => {
-          void act(`ams ${label}`, "/api/ams/change", {
+          void act(`ams ${label}`, `${API}/ams/change`, {
             target,
             tar_temp: tarTemp,
             confirm: true,
@@ -165,7 +166,7 @@ export function useControl() {
       requestConfirm(
         "Reboot the printer? It will disconnect while it restarts.",
         () => {
-          void act("reboot", "/api/reboot", { confirm: true });
+          void act("reboot", `${API}/reboot`, { confirm: true });
         },
         "reboot",
       ),
@@ -173,7 +174,7 @@ export function useControl() {
       requestConfirm(
         "Disable the steppers? The axes will be free to move by hand.",
         () => {
-          void act("disable steppers", "/api/steppers", { confirm: true });
+          void act("disable steppers", `${API}/steppers`, { confirm: true });
         },
         "disable steppers",
       ),

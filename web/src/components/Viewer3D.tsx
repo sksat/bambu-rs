@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { API } from "../api";
 
 type Mode = "mesh" | "toolpath";
 type THREE = typeof import("three");
@@ -56,7 +57,7 @@ export function ModelView({ path }: { path: string }) {
         let object: import("three").Object3D;
         let pb: Playback | null = null;
         if (mode === "mesh") {
-          const r = await fetch(`/api/file/mesh?name=${encodeURIComponent(path)}`);
+          const r = await fetch(`${API}/file/mesh?name=${encodeURIComponent(path)}`);
           if (!r.ok) return setStatus(`couldn't load mesh (HTTP ${r.status})`);
           const models = ((await r.json()) as { models?: string[] }).models ?? [];
           if (!models.length) {
@@ -71,8 +72,8 @@ export function ModelView({ path }: { path: string }) {
           object = buildMesh(models, THREE);
         } else {
           const url = is3mf
-            ? `/api/file/gcode?name=${encodeURIComponent(path)}&plate=1`
-            : `/api/file/raw?name=${encodeURIComponent(path)}`;
+            ? `${API}/file/gcode?name=${encodeURIComponent(path)}&plate=1`
+            : `${API}/file/raw?name=${encodeURIComponent(path)}`;
           const r = await fetch(url);
           if (!r.ok) return setStatus(`couldn't load toolpath (HTTP ${r.status})`);
           const built = buildToolpath(await r.text(), THREE);

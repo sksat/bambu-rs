@@ -18,6 +18,7 @@ import {
   type RunState,
 } from "../timelapse";
 import { ParkPlayer } from "./ParkPlayer";
+import { API } from "../api";
 
 // Refresh cadence (the delay AFTER a frame settles before fetching the next). We
 // drive the loop off the <img>'s load/error rather than a fixed timer so a slow
@@ -99,7 +100,7 @@ function CameraView({
   const isPark = view === "park";
   // Live is a continuous stream or a snapshot poll; the park view is the <ParkPlayer>.
   const polling = !stream;
-  const liveSrc = `/api/camera/${id}/${stream ? "stream" : "snapshot"}?t=${ts}`;
+  const liveSrc = `${API}/camera/${id}/${stream ? "stream" : "snapshot"}?t=${ts}`;
   const show = (v: "live" | "park") => {
     setView(v);
     setOffline(false);
@@ -712,7 +713,7 @@ function RecordingsModal({ onClose }: { onClose: () => void }) {
 function RecCam({ runId, c, label }: { runId: string; c: CaptureCam; label: string }) {
   const [open, setOpen] = useState(false);
   const [noThumb, setNoThumb] = useState(false);
-  const base = `/api/capture/${encodeURIComponent(runId)}/${encodeURIComponent(c.id || "default")}`;
+  const base = `${API}/capture/${encodeURIComponent(runId)}/${encodeURIComponent(c.id || "default")}`;
   const thumbUrl = `${base}/thumb.jpg`;
   const mp4Url = `${base}/video.mp4`;
   return (
