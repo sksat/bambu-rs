@@ -507,11 +507,11 @@ fn gcode_sequence_without_a_profile_says_where_sequences_live() {
 }
 
 #[test]
-fn config_add_does_not_destroy_the_profiles_sequences() {
-    // `config add` rebuilds the profile from its flags. Re-running it to fix an
-    // IP must not take the printer's macros with it — this reads the saved TOML
-    // back rather than trusting the in-memory value.
-    let cfg = cfg_with_sequence("seq-add");
+fn config_add_refuses_to_overwrite_and_set_edits_in_place() {
+    // `add` rebuilds the profile from its flags, so overwriting would destroy
+    // everything the flags don't cover — the printer's sequences among them.
+    // It refuses; `set` is the way to change one field.
+    let cfg = cfg_with_sequence("cfg-set");
     bambu(&cfg)
         .args([
             "--printer",
@@ -528,12 +528,58 @@ fn config_add_does_not_destroy_the_profiles_sequences() {
             "a1mini",
         ])
         .assert()
+        .code(3)
+        .stderr(predicate::str::contains("config set"));
+
+    bambu(&cfg)
+        .args(["--printer", "a1", "config", "set", "--ip", "192.0.2.99"])
+        .assert()
         .success();
     let saved = std::fs::read_to_string(cfg.join("bambu-rs/config.toml")).unwrap();
     assert!(saved.contains("192.0.2.99"), "the IP should have changed");
     assert!(
         saved.contains("sequences/swap.gcode"),
-        "the sequence must survive:\n{saved}"
+        "editing one field must leave the rest alone:\n{saved}"
     );
+
+    // --force is the deliberate "replace it whole", and says so by dropping them.
+    bambu(&cfg)
+        .args([
+            "--printer",
+            "a1",
+            "config",
+            "add",
+            "--ip",
+            "192.0.2.1",
+            "--serial",
+            "SB",
+            "--access-code",
+            "11111111",
+            "--model",
+            "a1mini",
+            "--force",
+        ])
+        .assert()
+        .success();
+    let replaced = std::fs::read_to_string(cfg.join("bambu-rs/config.toml")).unwrap();
+    assert!(
+        !replaced.contains("sequences/swap.gcode"),
+        "--force replaces"
+    );
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[test]
+fn config_set_needs_a_field_and_an_existing_profile() {
+    let cfg = cfg_with_sequence("cfg-set-guard");
+    bambu(&cfg)
+        .args(["--printer", "a1", "config", "set"])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("at least one field"));
+    bambu(&cfg)
+        .args(["--printer", "nope", "config", "set", "--ip", "1.2.3.4"])
+        .assert()
+        .code(3);
     let _ = std::fs::remove_dir_all(&cfg);
 }

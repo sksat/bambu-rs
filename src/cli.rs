@@ -251,7 +251,8 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ConfigAction {
-    /// Add or update a profile (named by --printer).
+    /// Create a profile (named by --printer). Refuses to overwrite an existing
+    /// one — use `config set` to change fields, or --force to replace it whole.
     Add {
         #[arg(long)]
         ip: String,
@@ -261,6 +262,28 @@ enum ConfigAction {
         access_code: String,
         #[arg(long)]
         model: String,
+        /// Make this the default profile.
+        #[arg(long)]
+        set_default: bool,
+        /// Replace an existing profile entirely, discarding anything not given
+        /// here (including its sequences).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Change fields of an existing profile, leaving the rest alone.
+    ///
+    /// This is the way to fix an IP after a DHCP change. `add` rebuilds the
+    /// whole profile from its flags, so using it to edit means retyping every
+    /// field and silently dropping anything the flags don't cover.
+    Set {
+        #[arg(long)]
+        ip: Option<String>,
+        #[arg(long)]
+        serial: Option<String>,
+        #[arg(long)]
+        access_code: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
         /// Make this the default profile.
         #[arg(long)]
         set_default: bool,
@@ -794,25 +817,31 @@ fn run_config(cli: &Cli, action: &ConfigAction) -> Result<(), CliError> {
             access_code,
             model,
             set_default,
+            force,
         } => {
             let name = cli.printer.clone().ok_or_else(|| {
                 CliError::new(exit::VALIDATION, "config add needs --printer <name>")
             })?;
+            // `add` builds the profile from its flags, so letting it overwrite
+            // means every field the flags don't cover is destroyed. Refuse, and
+            // point at the command that edits in place; `--force` is the way to
+            // say "replace it, I mean it".
+            if cfg.printers.contains_key(&name) && !force {
+                return Err(CliError::new(
+                    exit::VALIDATION,
+                    format!(
+                        "profile '{name}' already exists — use `config set` to change fields \
+                         (it leaves the rest alone), or --force to replace it entirely"
+                    ),
+                ));
+            }
             let profile = Profile {
                 ip: ip.clone(),
                 serial: serial.clone(),
                 model: model.clone(),
                 mode: "lan".to_string(),
                 access_code: access_code.clone(),
-                // `config add` doubles as "update" — re-running it after a DHCP
-                // change is the documented way to fix an IP. Rebuilding the
-                // profile from flags alone would silently drop this printer's
-                // sequences, and `save()` would then erase them from disk.
-                sequences: cfg
-                    .printers
-                    .get(&name)
-                    .map(|p| p.sequences.clone())
-                    .unwrap_or_default(),
+                sequences: Default::default(),
             };
             cfg.printers.insert(name.clone(), profile);
             if *set_default || cfg.default_printer.is_none() {
@@ -820,6 +849,57 @@ fn run_config(cli: &Cli, action: &ConfigAction) -> Result<(), CliError> {
             }
             cfg.save(&path)?;
             eprintln!("saved profile '{name}' to {}", path.display());
+            Ok(())
+        }
+        ConfigAction::Set {
+            ip,
+            serial,
+            access_code,
+            model,
+            set_default,
+        } => {
+            let name = cli
+                .printer
+                .clone()
+                .or_else(|| cfg.default_printer.clone())
+                .ok_or_else(|| {
+                    CliError::new(exit::VALIDATION, "config set needs --printer <name>")
+                })?;
+            let profile = cfg
+                .printers
+                .get_mut(&name)
+                .ok_or_else(|| CliError::from(ConfigError::UnknownProfile(name.clone())))?;
+            let mut changed: Vec<&str> = Vec::new();
+            for (field, slot, value) in [
+                ("ip", &mut profile.ip, ip),
+                ("serial", &mut profile.serial, serial),
+                ("access_code", &mut profile.access_code, access_code),
+                ("model", &mut profile.model, model),
+            ] {
+                if let Some(v) = value {
+                    *slot = v.clone();
+                    changed.push(field);
+                }
+            }
+            if *set_default {
+                cfg.default_printer = Some(name.clone());
+                changed.push("default");
+            }
+            // Nothing to do is a mistake worth reporting: a typo'd flag would
+            // otherwise look like a successful edit.
+            if changed.is_empty() {
+                return Err(CliError::new(
+                    exit::VALIDATION,
+                    "config set needs at least one field to change \
+                     (--ip / --serial / --access-code / --model / --set-default)",
+                ));
+            }
+            cfg.save(&path)?;
+            eprintln!(
+                "updated {} on profile '{name}' in {}",
+                changed.join(", "),
+                path.display()
+            );
             Ok(())
         }
         ConfigAction::List => {
