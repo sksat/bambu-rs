@@ -1768,6 +1768,7 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
                     inspect_error.as_deref(),
                     ams_mapping.as_deref(),
                     *timelapse,
+                    InspectedFrom::OnPrinter,
                 ));
                 return Ok(());
             }
@@ -1903,6 +1904,8 @@ fn run_job_start_upload(
             None,
             parsed_ams.as_deref(),
             timelapse,
+            // This path inspects the LOCAL bytes — nothing is downloaded.
+            InspectedFrom::LocalUpload,
         );
         plan["upload"] =
             serde_json::json!({ "local": local, "remote": remote, "overwrite": overwrite });
@@ -2107,6 +2110,26 @@ fn inspect_remote_plate(
 /// Build the `--dry-run` plan: the exact command payload plus what the
 /// on-printer file actually contains (so an agent can read the md5/plate and
 /// pass them back as `--expect-md5`/`--expect-plate`).
+/// Where the inspected bytes came from — the plan states this, so it must not
+/// be guessed. Reading it as "downloaded" when it was the local file (or the
+/// reverse) is exactly the confusion the plan exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InspectedFrom {
+    /// Downloaded from the printer: what will actually print.
+    OnPrinter,
+    /// The local file about to be uploaded (`--upload`) — the bytes we send.
+    LocalUpload,
+}
+
+impl InspectedFrom {
+    fn label(self) -> &'static str {
+        match self {
+            Self::OnPrinter => "on-printer file (downloaded for inspection)",
+            Self::LocalUpload => "local file (the bytes about to be uploaded)",
+        }
+    }
+}
+
 fn start_plan_json(
     cmd: &ProtoCommand,
     file: &str,
@@ -2114,6 +2137,7 @@ fn start_plan_json(
     inspect_error: Option<&str>,
     ams_mapping: Option<&[i32]>,
     timelapse_armed: bool,
+    inspected_from: InspectedFrom,
 ) -> serde_json::Value {
     let inspection_json = match (inspection, inspect_error) {
         // Inspected the on-printer file successfully.
@@ -2161,7 +2185,7 @@ fn start_plan_json(
                 // timelapse is armed at print start with --timelapse).
                 "has_timelapse_blocks": i.has_timelapse_blocks,
                 "ams_mapping_preview": ams_preview,
-                "source": "on-printer file (downloaded for inspection)",
+                "source": inspected_from.label(),
                 "warnings": warnings,
             })
         }
@@ -3332,8 +3356,23 @@ fn fmt_eta(min: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ams_mapping_preview, fmt_eta, spec_caveat, subst_capture_tokens, validate_ams_map,
+        InspectedFrom, ams_mapping_preview, fmt_eta, spec_caveat, subst_capture_tokens,
+        validate_ams_map,
     };
+
+    #[test]
+    fn the_two_inspection_sources_are_never_described_the_same_way() {
+        // The plan's `source` is how a reader knows whether the md5 shown is
+        // the printer's copy or the bytes about to be sent. The upload path
+        // used to claim "downloaded", which reads as "already on the printer".
+        let (local, remote) = (
+            InspectedFrom::LocalUpload.label(),
+            InspectedFrom::OnPrinter.label(),
+        );
+        assert_ne!(local, remote);
+        assert!(local.contains("local") && !local.contains("download"));
+        assert!(remote.contains("on-printer"));
+    }
 
     #[test]
     fn only_the_device_verified_ams_command_drops_the_spec_caveat() {
