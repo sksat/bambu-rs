@@ -1607,6 +1607,30 @@ fn resolve_named_sequence(cli: &Cli, name: &str) -> Result<String, CliError> {
         .printers
         .get(&profile_name)
         .ok_or_else(|| CliError::from(ConfigError::UnknownProfile(profile_name.clone())))?;
+    // The macro belongs to THIS machine — its coordinates describe what is
+    // bolted to it. But the connection is resolved separately, with flags and
+    // BAMBU_* winning over the profile, so a default of printer A plus a
+    // BAMBU_IP for printer B would send A's plate-changer motion to B, which
+    // has no such accessory. Refuse rather than reconcile: there is no sensible
+    // way to guess which machine the caller meant.
+    let overrides = flag_overrides(cli).over(Overrides::from_env());
+    for (what, over, mine) in [
+        ("ip", &overrides.ip, &profile.ip),
+        ("serial", &overrides.serial, &profile.serial),
+    ] {
+        if let Some(v) = over
+            && v != mine
+        {
+            return Err(CliError::new(
+                exit::VALIDATION,
+                format!(
+                    "--sequence {name:?} belongs to profile '{profile_name}' ({what}={mine}), \
+                     but {what}={v} was given — a sequence describes one machine's hardware \
+                     and must not be sent to another. Select that printer, or use --from-file"
+                ),
+            ));
+        }
+    }
     let raw = profile.sequence(name)?;
     let config_dir = path.parent().unwrap_or(Path::new("."));
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -3923,6 +3947,13 @@ impl std::fmt::Display for RedactedProfile<'_> {
             f,
             "{}: ip={} serial={} model={} mode={} access_code={}",
             self.name, self.ip, self.serial, self.model, self.mode, self.access_code
-        )
+        )?;
+        // Listed here too, not just under --json: this is the only way to learn
+        // what `--sequence` accepts without guessing a name and reading the
+        // error, and most callers never pass --json.
+        for (name, path) in self.sequences {
+            write!(f, "\n  sequence {name} = {path}")?;
+        }
+        Ok(())
     }
 }
