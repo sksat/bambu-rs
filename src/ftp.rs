@@ -167,6 +167,32 @@ impl FtpsClient {
         }
     }
 
+    /// Rename `from` to `to` on the printer (FTP `RNFR`/`RNTO`).
+    pub fn rename(&self, from: &str, to: &str) -> Result<(), FtpError> {
+        let mut ftp = self.connect()?;
+        let result = ftp
+            .rename(from, to)
+            .map_err(|e| FtpError::Ftp(e.to_string()));
+        let _ = ftp.quit();
+        result
+    }
+
+    /// Create a directory on the printer (FTP `MKD`).
+    pub fn mkdir(&self, path: &str) -> Result<(), FtpError> {
+        let mut ftp = self.connect()?;
+        let result = ftp.mkdir(path).map_err(|e| FtpError::Ftp(e.to_string()));
+        let _ = ftp.quit();
+        result
+    }
+
+    /// Remove a directory on the printer (FTP `RMD`).
+    pub fn rmdir(&self, path: &str) -> Result<(), FtpError> {
+        let mut ftp = self.connect()?;
+        let result = ftp.rmdir(path).map_err(|e| FtpError::Ftp(e.to_string()));
+        let _ = ftp.quit();
+        result
+    }
+
     /// Delete `remote_path` on the printer (FTP `DELE`).
     pub fn delete(&self, remote_path: &str) -> Result<(), FtpError> {
         let mut ftp = self.connect()?;

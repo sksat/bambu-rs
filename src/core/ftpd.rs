@@ -61,6 +61,12 @@ pub enum FtpAction {
     List { path: String, names_only: bool },
     /// Delete `path` on the printer.
     Delete { path: String },
+    /// Rename `from` to `to` on the printer (`RNFR` then `RNTO`).
+    Rename { from: String, to: String },
+    /// Create a directory on the printer.
+    MakeDir { path: String },
+    /// Remove a directory on the printer.
+    RemoveDir { path: String },
     /// The size of `path`, for `SIZE`.
     Size { path: String },
     /// Write this and hang up.
@@ -218,21 +224,26 @@ impl FtpSession {
                 self.rename_from = Some(self.resolve_arg(arg));
                 ok(350, "ready for RNTO")
             }
+            "RNTO" if arg.is_empty() => ok(501, "RNTO needs a path"),
             "RNTO" => match self.rename_from.take() {
                 None => ok(503, "RNFR first"),
-                // Renaming is the one thing the relay cannot pass through
-                // honestly: `suppaftp`'s client API has no rename, so claiming
-                // success would leave the file where it was.
-                Some(_) => ok(502, "rename is not relayed; rename on the printer"),
+                Some(from) => FtpAction::Rename {
+                    from,
+                    to: self.resolve_arg(arg),
+                },
             },
             // Uploads are whole-file through a temp file, so there is nothing to
             // resume into. The printer refuses REST too.
             "REST" => ok(502, "no restart: uploads are whole-file"),
             "ABOR" => ok(226, "nothing to abort"),
-            "MKD" | "XMKD" | "RMD" | "XRMD" => ok(
-                502,
-                "directory changes are not relayed; use the printer directly",
-            ),
+            "MKD" | "XMKD" if arg.is_empty() => ok(501, "MKD needs a path"),
+            "MKD" | "XMKD" => FtpAction::MakeDir {
+                path: self.resolve_arg(arg),
+            },
+            "RMD" | "XRMD" if arg.is_empty() => ok(501, "RMD needs a path"),
+            "RMD" | "XRMD" => FtpAction::RemoveDir {
+                path: self.resolve_arg(arg),
+            },
             other => ok(502, format!("{other} is not implemented")),
         }
     }
@@ -537,14 +548,45 @@ mod tests {
     }
 
     #[test]
-    fn rename_is_refused_rather_than_faked() {
-        // The FTPS client this relays through has no rename, and a 250 that
-        // left the file where it was would be worse than a refusal.
+    fn rename_is_relayed_because_the_printer_supports_it() {
+        // Uploading to a temp name and renaming into place is a common FTP
+        // idiom, and docs/protocol.md records RNFR/RNTO working on the real
+        // printer. Refusing it would break the very flow the relay exists for,
+        // on a client the printer itself would have satisfied.
         let mut s = logged_in();
-        assert_eq!(reply(s.handle("RNFR /cache/a.3mf")).code, 350);
-        assert_eq!(reply(s.handle("RNTO /cache/b.3mf")).code, 502);
-        // Out of sequence.
+        s.handle("CWD /cache");
+        assert_eq!(reply(s.handle("RNFR upload.tmp")).code, 350);
+        assert_eq!(
+            s.handle("RNTO plate.gcode.3mf"),
+            FtpAction::Rename {
+                from: "/cache/upload.tmp".into(),
+                to: "/cache/plate.gcode.3mf".into(),
+            }
+        );
+        // The pair is consumed, so a second RNTO is out of sequence.
         assert_eq!(reply(s.handle("RNTO /cache/b.3mf")).code, 503);
+    }
+
+    #[test]
+    fn directories_can_be_made_and_removed() {
+        // Also in the printer's capability table; a client that creates a
+        // subfolder before uploading should not be stopped by the relay.
+        let mut s = logged_in();
+        assert_eq!(
+            s.handle("MKD /cache/sub"),
+            FtpAction::MakeDir {
+                path: "/cache/sub".into()
+            }
+        );
+        assert_eq!(
+            s.handle("RMD /cache/sub"),
+            FtpAction::RemoveDir {
+                path: "/cache/sub".into()
+            }
+        );
+        // Still a syntax error with no path.
+        assert_eq!(reply(s.handle("MKD")).code, 501);
+        assert_eq!(reply(s.handle("RMD")).code, 501);
     }
 
     #[test]

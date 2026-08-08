@@ -301,6 +301,14 @@ needs, in the order it asks for it:
 - **Subscriptions must be matched as MQTT filters, not strings.** A client
   subscribing `device/+/report` means this printer's report topic; refusing it
   leaves a healthy-looking connection that never delivers anything.
+- **Relay everything the capability table says works**, including `RNFR`/`RNTO`
+  and `MKD`/`RMD`. Uploading to a temp name and renaming it into place is a
+  common client idiom, so a relay that refuses rename breaks a send the printer
+  itself would have completed.
+- **The data connection must come from the control connection's host.** The PASV
+  port is open to the whole network for as long as it exists and the first
+  connection wins it: unchecked, a LAN peer with no access code can race a
+  `STOR` and choose the bytes the relay then uploads to the machine.
 - **What is missing.** SSDP is deliberately not answered: the real printer
   announces the same serial on the same LAN, and a second announcement would
   just race it.

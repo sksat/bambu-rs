@@ -582,6 +582,17 @@ impl SequenceRewriter {
         let (Some(category), Some(original)) = (category(payload), sequence_id(payload)) else {
             return payload.clone();
         };
+        // A `pushing` request is never echoed: its reply is a `push_status`
+        // carrying the printer's own counter. Remapping one would allocate an
+        // id nothing ever answers, leaving an entry outstanding until it is
+        // evicted — and there is nothing to disambiguate anyway, since the
+        // reply is broadcast to every subscriber regardless of who asked.
+        if matches!(
+            classify(payload),
+            RequestKind::PushAll | RequestKind::StopPushing
+        ) {
+            return payload.clone();
+        }
         // Prefixed so a relay id is never mistaken for the printer's own
         // counter, which is a small integer. Fixed width and zero-padded so the
         // BTreeMap orders these by age, which is what makes the eviction below
@@ -1325,6 +1336,18 @@ mod tests {
             Route::Broadcast(m) => assert_eq!(m, report),
             other => panic!("a status report goes to everyone, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_pushall_is_forwarded_unchanged_and_leaves_nothing_outstanding() {
+        // A pushall's reply is a `push_status` carrying the printer's OWN
+        // counter, not an echo — so a rewritten id would never come back, and
+        // the mapping would sit in the outstanding map until evicted. Nothing
+        // to disambiguate either: the reply goes to everyone regardless.
+        let mut seq = SequenceRewriter::new();
+        let req = json!({"pushing": {"sequence_id": "1", "command": "pushall"}});
+        assert_eq!(seq.rewrite_request(1, &req), req);
+        assert_eq!(seq.outstanding(), 0);
     }
 
     #[test]

@@ -55,6 +55,12 @@ pub struct ServeOpts {
     pub emulate: Option<EmulateOpts>,
 }
 
+/// How often the relay refreshes its cache from the printer when the user did
+/// not ask for a poll interval. Gentle — the printer caps `pushall` at about
+/// 1/s, and this is one client's worth of polling no matter how many are
+/// connected through the relay.
+const EMULATE_REFRESH: Duration = Duration::from_secs(20);
+
 /// Where the emulated printer listens, and what it will pass through.
 pub struct EmulateOpts {
     /// Bind host for the emulated MQTT listener. Defaults to loopback like the
@@ -114,6 +120,15 @@ pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<
                         let link = relay::LivePrinterLink::new();
                         let source = Arc::new(LiveSource::from_reports(link.subscribe()));
                         start_emulator(&t, em, Arc::clone(&link)).await?;
+                        // The relay answers clients' `pushall`s from its cache
+                        // rather than forwarding them, so nothing else would
+                        // ever refresh it: seeded once at connect and then fed
+                        // only deltas, which are QoS 0 and therefore lossy. One
+                        // lost delta would leave the cache subtly wrong for the
+                        // rest of the print. A poll bounds that, and the printer
+                        // sees one client's worth of it however many are
+                        // watching.
+                        let interval = interval.or(Some(EMULATE_REFRESH));
                         Arc::clone(&link).connect(t.clone(), interval);
                         source
                     }

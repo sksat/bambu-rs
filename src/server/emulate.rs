@@ -22,6 +22,13 @@
 //! ([`super::ftpd`]), because Bambu Studio uploads the sliced file before it
 //! says `project_file`.
 //!
+//! **One known divergence.** A real printer puts everything on one ordered
+//! stream, but here a command's ACK travels on its client's own channel while
+//! reports travel on the fan-out, so a client can see its ACK slightly out of
+//! order against the surrounding reports. That is the price of the ACK not being
+//! droppable when a client lags, and it is self-correcting: state converges on
+//! the next report either way.
+//!
 //! **No SSDP responder**, deliberately. It would be easy, and it would be wrong:
 //! the real printer is announcing the same serial on the same LAN, so a client
 //! would see two of it and pick whichever answered first. Add the relay by IP.
@@ -79,6 +86,21 @@ const WATCHDOG_TICK: Duration = Duration::from_secs(1);
 /// says nothing holds a task until the OS gives up on the TCP connection, which
 /// can be hours — and it costs the peer nothing to do it again.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Most connections either listener will serve at once.
+///
+/// TLS costs nothing to start and needs no access code, so without a bound a
+/// peer that can merely reach the port can hold tasks, file descriptors and up
+/// to `MAX_PACKET` of buffer each, simply by connecting and going quiet. The
+/// printer this fronts has its own firmware limits; the relay needs its own.
+/// Far above any real setup — a slicer, a dashboard and a home-automation
+/// integration is three.
+const MAX_CONNECTIONS: usize = 64;
+
+/// The payload that asks the printer for a full snapshot.
+fn pushall_request() -> Value {
+    serde_json::json!({"pushing": {"sequence_id": "0", "command": "pushall"}})
+}
 
 /// Where the relay's reports come from and its requests go. Implemented by the
 /// live printer link, and by a test double so the whole emulator can be driven
@@ -216,9 +238,18 @@ impl Emulator {
         loop {
             let message = match reports.recv().await {
                 Ok(m) => m,
-                // We fell behind the printer. The cache still merges everything
-                // that follows, so the gap closes itself on the next snapshot.
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                // We fell behind the printer and those deltas are gone. Merging
+                // the rest onto a cache with a hole in it would serve a subtly
+                // wrong picture indefinitely — nothing else refreshes it, since
+                // a client's pushall is answered from the cache rather than
+                // forwarded. Ask for a full snapshot instead.
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    eprintln!(
+                        "emulate: fell {n} reports behind the printer; asking for a snapshot"
+                    );
+                    self.upstream.send(pushall_request());
+                    continue;
+                }
                 Err(broadcast::error::RecvError::Closed) => return,
             };
             // The printer spoke, so it is alive: reset the watchdog and, if we
@@ -283,6 +314,7 @@ impl Emulator {
         tls: Arc<rustls::ServerConfig>,
     ) -> anyhow::Result<()> {
         let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+        let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
         loop {
             let (socket, peer) = match listener.accept().await {
                 Ok(x) => x,
@@ -294,11 +326,21 @@ impl Emulator {
                     continue;
                 }
             };
+            // Taken before the task is spawned, and held for its whole life, so
+            // the cap bounds connections rather than merely slowing them down.
+            let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+                eprintln!("emulate: refusing {peer}: already serving {MAX_CONNECTIONS} clients");
+                drop(socket);
+                continue;
+            };
             let acceptor = acceptor.clone();
             let this = Arc::clone(&self);
             tokio::spawn(async move {
+                let _slot = slot;
                 let stream =
-                    match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(socket)).await {
+                    match tokio::time::timeout(this.handshake_timeout, acceptor.accept(socket))
+                        .await
+                    {
                         Ok(Ok(s)) => s,
                         Ok(Err(e)) => {
                             eprintln!("emulate: TLS handshake with {peer} failed: {e}");
@@ -363,9 +405,6 @@ impl Emulator {
                         return Ok(()); // clean EOF
                     }
                     buf.extend_from_slice(&chunk[..n]);
-                    if buf.len() > MAX_PACKET {
-                        anyhow::bail!("client sent more than {MAX_PACKET} bytes without a complete packet");
-                    }
                     // One read can carry several packets, or half of one.
                     while let Some((packet, used)) = mqtt::decode(&buf)? {
                         buf.drain(..used);
@@ -390,6 +429,16 @@ impl Emulator {
                             writer.flush().await?;
                             return Ok(());
                         }
+                    }
+                    // Checked on what is LEFT after the complete packets have
+                    // been taken out: a client legitimately pipelining more than
+                    // the cap in one read is fine, a client dribbling bytes that
+                    // never form a packet is not.
+                    if buf.len() > MAX_PACKET {
+                        anyhow::bail!(
+                            "client is holding {} bytes that do not form a packet",
+                            buf.len()
+                        );
                     }
                     writer.flush().await?;
                     // It spoke, so the clock starts again. Recomputed *after*

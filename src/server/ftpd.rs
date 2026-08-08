@@ -62,6 +62,12 @@ pub trait PrinterFiles: Send + Sync + 'static {
     fn upload(&self, local: &Path, remote: &str) -> Result<u64, String>;
     fn download(&self, remote: &str, local: &Path) -> Result<u64, String>;
     fn delete(&self, remote: &str) -> Result<(), String>;
+    /// Uploading to a temp name and renaming into place is a common client
+    /// idiom, and the printer supports it — so the relay must too, or it breaks
+    /// a flow the printer alone would have satisfied.
+    fn rename(&self, from: &str, to: &str) -> Result<(), String>;
+    fn mkdir(&self, path: &str) -> Result<(), String>;
+    fn rmdir(&self, path: &str) -> Result<(), String>;
 }
 
 /// How long to spend finding out whether the printer is answering at all.
@@ -72,6 +78,10 @@ pub trait PrinterFiles: Send + Sync + 'static {
 /// TCP probe first turns that into an immediate, accurate refusal, and it costs
 /// a handshake on a LAN when the printer is up.
 const UPSTREAM_PROBE: Duration = Duration::from_secs(5);
+
+/// Most control connections served at once — the same reasoning as the MQTT
+/// listener's cap, and the same pre-auth exposure.
+const MAX_CONNECTIONS: usize = 64;
 
 /// [`PrinterFiles`] backed by the real printer over FTPS.
 pub struct LivePrinterFiles {
@@ -131,6 +141,18 @@ impl PrinterFiles for LivePrinterFiles {
         self.reachable()?;
         self.client.delete(remote).map_err(|e| e.to_string())
     }
+    fn rename(&self, from: &str, to: &str) -> Result<(), String> {
+        self.reachable()?;
+        self.client.rename(from, to).map_err(|e| e.to_string())
+    }
+    fn mkdir(&self, path: &str) -> Result<(), String> {
+        self.reachable()?;
+        self.client.mkdir(path).map_err(|e| e.to_string())
+    }
+    fn rmdir(&self, path: &str) -> Result<(), String> {
+        self.reachable()?;
+        self.client.rmdir(path).map_err(|e| e.to_string())
+    }
 }
 
 /// The emulated printer's FTP listener.
@@ -166,6 +188,7 @@ impl FtpRelay {
         tls: Arc<rustls::ServerConfig>,
     ) -> anyhow::Result<()> {
         let acceptor = tokio_rustls::TlsAcceptor::from(tls.clone());
+        let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
         loop {
             let (socket, peer) = match listener.accept().await {
                 Ok(x) => x,
@@ -175,11 +198,19 @@ impl FtpRelay {
                     continue;
                 }
             };
+            let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+                eprintln!(
+                    "emulate-ftp: refusing {peer}: already serving {MAX_CONNECTIONS} clients"
+                );
+                drop(socket);
+                continue;
+            };
             let local = socket.local_addr().ok();
             let acceptor = acceptor.clone();
             let tls = tls.clone();
             let this = Arc::clone(&self);
             tokio::spawn(async move {
+                let _slot = slot;
                 // Implicit FTPS: TLS starts immediately, no AUTH TLS step.
                 let stream =
                     match tokio::time::timeout(LOGIN_TIMEOUT, acceptor.accept(socket)).await {
@@ -190,7 +221,7 @@ impl FtpRelay {
                         }
                         Err(_) => return,
                     };
-                if let Err(e) = this.serve_control(stream, local, tls).await {
+                if let Err(e) = this.serve_control(stream, local, Some(peer), tls).await {
                     eprintln!("emulate-ftp: {peer} dropped: {e}");
                 }
             });
@@ -202,6 +233,7 @@ impl FtpRelay {
         self: Arc<Self>,
         mut stream: S,
         local: Option<SocketAddr>,
+        peer: Option<SocketAddr>,
         tls: Arc<rustls::ServerConfig>,
     ) -> anyhow::Result<()>
     where
@@ -233,9 +265,6 @@ impl FtpRelay {
                 return Ok(()); // client hung up
             }
             buf.extend_from_slice(&chunk[..read]);
-            if buf.len() > MAX_LINE {
-                anyhow::bail!("control line longer than {MAX_LINE} bytes");
-            }
 
             // A read can carry several commands, or part of one.
             while let Some(end) = buf.iter().position(|b| *b == b'\n') {
@@ -246,11 +275,27 @@ impl FtpRelay {
                 }
                 let action = session.handle(&line);
                 if self
-                    .run(action, &mut stream, &mut data_listener, local, &acceptor)
+                    .run(
+                        action,
+                        &mut stream,
+                        &mut data_listener,
+                        local,
+                        peer,
+                        &acceptor,
+                    )
                     .await?
                 {
                     return Ok(()); // the action was a close
                 }
+            }
+            // Checked on what is LEFT once the complete lines are gone: a client
+            // pipelining more than the cap in one segment is legitimate, a
+            // client sending bytes that never contain a newline is not.
+            if buf.len() > MAX_LINE {
+                anyhow::bail!(
+                    "client is holding {} bytes with no end of line in them",
+                    buf.len()
+                );
             }
         }
     }
@@ -262,6 +307,7 @@ impl FtpRelay {
         stream: &mut S,
         data_listener: &mut Option<TcpListener>,
         local: Option<SocketAddr>,
+        peer: Option<SocketAddr>,
         acceptor: &tokio_rustls::TlsAcceptor,
     ) -> anyhow::Result<bool>
     where
@@ -340,7 +386,7 @@ impl FtpRelay {
                     return Ok(false);
                 }
                 let reply = self
-                    .store(stream, data_listener, acceptor, &path)
+                    .store(stream, data_listener, acceptor, peer, &path)
                     .await
                     .unwrap_or_else(|e| Reply::new(550, format!("upload failed: {e}")));
                 write_reply(stream, &reply).await?;
@@ -348,7 +394,7 @@ impl FtpRelay {
 
             FtpAction::Retrieve { path } => {
                 let reply = self
-                    .retrieve(stream, data_listener, acceptor, &path)
+                    .retrieve(stream, data_listener, acceptor, peer, &path)
                     .await
                     .unwrap_or_else(|e| Reply::new(550, format!("download failed: {e}")));
                 write_reply(stream, &reply).await?;
@@ -356,7 +402,7 @@ impl FtpRelay {
 
             FtpAction::List { path, names_only } => {
                 let reply = self
-                    .list(stream, data_listener, acceptor, &path, names_only)
+                    .list(stream, data_listener, acceptor, peer, &path, names_only)
                     .await
                     .unwrap_or_else(|e| Reply::new(550, format!("listing failed: {e}")));
                 write_reply(stream, &reply).await?;
@@ -381,6 +427,32 @@ impl FtpRelay {
                 write_reply(stream, &reply).await?;
             }
 
+            FtpAction::Rename { from, to } => {
+                let reply = self
+                    .mutate(move |files| files.rename(&from, &to), "renamed")
+                    .await?;
+                write_reply(stream, &reply).await?;
+            }
+
+            FtpAction::MakeDir { path } => {
+                let shown = path.clone();
+                let reply = self
+                    .mutate(move |files| files.mkdir(&path), "created")
+                    .await?;
+                let reply = match reply.code {
+                    250 => Reply::new(257, format!("\"{shown}\" created")),
+                    _ => reply,
+                };
+                write_reply(stream, &reply).await?;
+            }
+
+            FtpAction::RemoveDir { path } => {
+                let reply = self
+                    .mutate(move |files| files.rmdir(&path), "removed")
+                    .await?;
+                write_reply(stream, &reply).await?;
+            }
+
             FtpAction::Size { path } => {
                 let reply = match self.size_of(&path).await {
                     Ok(Some(n)) => Reply::new(213, n.to_string()),
@@ -393,18 +465,41 @@ impl FtpRelay {
         Ok(false)
     }
 
+    /// Run one write against the printer off the runtime's worker threads,
+    /// honouring the read-only policy. `did` is the past-tense verb for the
+    /// success reply.
+    async fn mutate<F>(&self, op: F, did: &str) -> anyhow::Result<Reply>
+    where
+        F: FnOnce(Arc<dyn PrinterFiles>) -> Result<(), String> + Send + 'static,
+    {
+        if self.read_only {
+            return Ok(Reply::new(
+                550,
+                "refused by the bambu-rs emulator: relay is read-only",
+            ));
+        }
+        let files = Arc::clone(&self.files);
+        Ok(
+            match tokio::task::spawn_blocking(move || op(files)).await? {
+                Ok(()) => Reply::new(250, did.to_string()),
+                Err(e) => Reply::new(550, format!("the printer refused: {e}")),
+            },
+        )
+    }
+
     /// Take an upload in full, then push it to the printer.
     async fn store<S>(
         &self,
         control: &mut S,
         data_listener: &mut Option<TcpListener>,
         acceptor: &tokio_rustls::TlsAcceptor,
+        peer: Option<SocketAddr>,
         path: &str,
     ) -> anyhow::Result<Reply>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     {
-        let mut data = open_data(control, data_listener, acceptor, "sending file").await?;
+        let mut data = open_data(control, data_listener, acceptor, peer, "sending file").await?;
         // A temp file, not memory: a sliced plate is tens of megabytes and
         // several clients could be uploading at once.
         let staged = tempfile::NamedTempFile::new()?;
@@ -456,6 +551,7 @@ impl FtpRelay {
         control: &mut S,
         data_listener: &mut Option<TcpListener>,
         acceptor: &tokio_rustls::TlsAcceptor,
+        peer: Option<SocketAddr>,
         path: &str,
     ) -> anyhow::Result<Reply>
     where
@@ -472,7 +568,7 @@ impl FtpRelay {
             return Ok(Reply::new(550, format!("the printer refused: {e}")));
         }
 
-        let mut data = open_data(control, data_listener, acceptor, "sending file").await?;
+        let mut data = open_data(control, data_listener, acceptor, peer, "sending file").await?;
         let mut file = tokio::fs::File::open(staged.path()).await?;
         let sent = tokio::io::copy(&mut file, &mut data).await?;
         data.shutdown().await?;
@@ -484,6 +580,7 @@ impl FtpRelay {
         control: &mut S,
         data_listener: &mut Option<TcpListener>,
         acceptor: &tokio_rustls::TlsAcceptor,
+        peer: Option<SocketAddr>,
         path: &str,
         names_only: bool,
     ) -> anyhow::Result<Reply>
@@ -506,7 +603,7 @@ impl FtpRelay {
             Err(e) => return Ok(Reply::new(550, format!("the printer refused: {e}"))),
         };
 
-        let mut data = open_data(control, data_listener, acceptor, "sending listing").await?;
+        let mut data = open_data(control, data_listener, acceptor, peer, "sending listing").await?;
         let body: String = lines.iter().map(|l| format!("{l}\r\n")).collect();
         data.write_all(body.as_bytes()).await?;
         data.shutdown().await?;
@@ -537,6 +634,7 @@ async fn open_data<S>(
     control: &mut S,
     data_listener: &mut Option<TcpListener>,
     acceptor: &tokio_rustls::TlsAcceptor,
+    control_peer: Option<SocketAddr>,
     what: &str,
 ) -> anyhow::Result<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>
 where
@@ -547,9 +645,31 @@ where
         anyhow::bail!("transfer without a data connection");
     };
     write_reply(control, &Reply::new(150, what)).await?;
-    let (socket, _) = tokio::time::timeout(DATA_ACCEPT_TIMEOUT, listener.accept())
+    let (socket, from) = tokio::time::timeout(DATA_ACCEPT_TIMEOUT, listener.accept())
         .await
         .map_err(|_| anyhow::anyhow!("the client never opened the data connection"))??;
+
+    // The data port is open to the whole network for the moment it exists, and
+    // whoever connects first gets it. Unchecked, another host on the LAN can
+    // race the client to it — winning a RETR hands them the file, and winning a
+    // STOR lets them choose the bytes this relay then uploads to a machine that
+    // heats and moves. No access code required, just presence and timing. So:
+    // the data connection must come from the same host as the control
+    // connection, which is what every serious FTP server enforces.
+    if let Some(expected) = control_peer.map(|a| a.ip())
+        && from.ip() != expected
+    {
+        drop(socket);
+        write_reply(
+            control,
+            &Reply::new(425, "data connection from a different host; refused"),
+        )
+        .await?;
+        anyhow::bail!(
+            "data connection from {} but control is {expected}",
+            from.ip()
+        );
+    }
     // Implicit FTPS encrypts the data channel too.
     Ok(acceptor.accept(socket).await?)
 }
@@ -576,6 +696,8 @@ mod tests {
     struct FakeFiles {
         uploaded: Mutex<Vec<(String, Vec<u8>)>>,
         stored: Mutex<Vec<(String, Vec<u8>)>>,
+        renamed: Mutex<Vec<(String, String)>>,
+        dirs: Mutex<Vec<String>>,
         fail_upload: bool,
     }
 
@@ -599,6 +721,12 @@ mod tests {
         }
         fn uploads(&self) -> Vec<(String, Vec<u8>)> {
             self.uploaded.lock().unwrap().clone()
+        }
+        fn renames(&self) -> Vec<(String, String)> {
+            self.renamed.lock().unwrap().clone()
+        }
+        fn dirs(&self) -> Vec<String> {
+            self.dirs.lock().unwrap().clone()
         }
     }
 
@@ -640,6 +768,21 @@ mod tests {
         }
         fn delete(&self, remote: &str) -> Result<(), String> {
             self.stored.lock().unwrap().retain(|(n, _)| n != remote);
+            Ok(())
+        }
+        fn rename(&self, from: &str, to: &str) -> Result<(), String> {
+            self.renamed
+                .lock()
+                .unwrap()
+                .push((from.to_string(), to.to_string()));
+            Ok(())
+        }
+        fn mkdir(&self, path: &str) -> Result<(), String> {
+            self.dirs.lock().unwrap().push(format!("mkdir {path}"));
+            Ok(())
+        }
+        fn rmdir(&self, path: &str) -> Result<(), String> {
+            self.dirs.lock().unwrap().push(format!("rmdir {path}"));
             Ok(())
         }
     }
@@ -920,6 +1063,107 @@ mod tests {
         assert_eq!(client.cmd("STOR /cache/x.3mf").await.0, 550);
         assert_eq!(client.cmd("DELE /model/a.gcode.3mf").await.0, 550);
         assert!(files.uploads().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_data_connection_from_another_host_is_refused() {
+        // The PASV port is open to the network for as long as it exists, and
+        // whoever connects first gets it. Unchecked, another host can race the
+        // real client: winning a STOR lets it choose the bytes this relay
+        // uploads to a machine that heats and moves — no access code needed,
+        // just presence and timing.
+        //
+        // Loopback gives us two distinct source addresses (127.0.0.1 and
+        // 127.0.0.2) on the same machine, which is exactly the check.
+        let files = FakeFiles::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tls = crate::tls::emulated_printer_server_config(SERIAL).unwrap();
+        tokio::spawn(
+            FtpRelay::new(CODE, Arc::clone(&files) as Arc<dyn PrinterFiles>).serve(listener, tls),
+        );
+
+        let mut client = TestClient::connect(addr).await;
+        client.login().await;
+        let port = client.pasv().await;
+        client
+            .stream
+            .write_all(b"STOR /cache/evil.3mf\r\n")
+            .await
+            .unwrap();
+        client.stream.flush().await.unwrap();
+
+        // The "attacker" connects from a different source address.
+        let hijack = tokio::net::TcpSocket::new_v4().unwrap();
+        hijack.bind("127.0.0.2:0".parse().unwrap()).unwrap();
+        let taken = hijack
+            .connect(format!("127.0.0.1:{port}").parse().unwrap())
+            .await;
+
+        // 150 goes out before the accept, then the refusal.
+        assert_eq!(client.read_reply().await.0, 150);
+        let (code, line) = client.read_reply().await;
+        assert_eq!(code, 425, "{line}");
+        assert!(line.contains("different host"), "{line}");
+        assert!(
+            files.uploads().is_empty(),
+            "nothing from a stranger may reach the printer"
+        );
+        drop(taken);
+    }
+
+    #[tokio::test]
+    async fn an_upload_can_be_renamed_into_place() {
+        // Upload-to-temp-then-rename is a common client idiom and the printer
+        // supports it (docs/protocol.md), so refusing it here would break a
+        // flow the printer alone would have satisfied.
+        let files = FakeFiles::new();
+        let addr = start(FtpRelay::new(
+            CODE,
+            Arc::clone(&files) as Arc<dyn PrinterFiles>,
+        ))
+        .await;
+        let mut client = TestClient::connect(addr).await;
+        client.login().await;
+        client.cmd("CWD /cache").await;
+        assert_eq!(client.upload("upload.tmp", b"plate bytes").await.0, 226);
+        assert_eq!(client.cmd("RNFR upload.tmp").await.0, 350);
+        assert_eq!(client.cmd("RNTO plate.gcode.3mf").await.0, 250);
+        assert_eq!(
+            files.renames(),
+            vec![(
+                "/cache/upload.tmp".to_string(),
+                "/cache/plate.gcode.3mf".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn directories_are_relayed_and_read_only_refuses_them() {
+        let files = FakeFiles::new();
+        let addr = start(FtpRelay::new(
+            CODE,
+            Arc::clone(&files) as Arc<dyn PrinterFiles>,
+        ))
+        .await;
+        let mut client = TestClient::connect(addr).await;
+        client.login().await;
+        assert_eq!(client.cmd("MKD /cache/sub").await.0, 257);
+        assert_eq!(client.cmd("RMD /cache/sub").await.0, 250);
+        assert_eq!(files.dirs(), vec!["mkdir /cache/sub", "rmdir /cache/sub"]);
+
+        let ro = FakeFiles::new();
+        let ro_addr = start(FtpRelay::read_only(
+            CODE,
+            Arc::clone(&ro) as Arc<dyn PrinterFiles>,
+        ))
+        .await;
+        let mut ro_client = TestClient::connect(ro_addr).await;
+        ro_client.login().await;
+        assert_eq!(ro_client.cmd("MKD /cache/sub").await.0, 550);
+        assert_eq!(ro_client.cmd("RNFR /a").await.0, 350);
+        assert_eq!(ro_client.cmd("RNTO /b").await.0, 550);
+        assert!(ro.dirs().is_empty() && ro.renames().is_empty());
     }
 
     #[tokio::test]
