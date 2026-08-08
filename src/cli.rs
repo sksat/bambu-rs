@@ -1818,6 +1818,7 @@ fn run_gcode(cli: &Cli, req: GcodeRequest<'_>) -> Result<(), CliError> {
                 cli,
                 client.send_and_verify(&ProtoCommand::GcodeLine(steps[0].gcode.clone()))?,
                 GCODE_ACCEPTED_NOTE,
+                false, // a G-code line has no observable effect (core::verify)
             )
         }
         Some(source) => run_gcode_sequence(cli, &client, source, &steps),
@@ -1902,7 +1903,7 @@ fn run_gcode_sequence(
         print_json(&report);
     } else {
         eprintln!(
-            "{}/{} steps accepted — {}",
+            "{}/{} steps verified — {}",
             report.verified, report.total, GCODE_MOTION_NOTE
         );
     }
@@ -3571,6 +3572,7 @@ fn report_command_outcome(cli: &Cli, outcome: CommandOutcome) -> Result<(), CliE
         cli,
         outcome,
         "verified: the printer confirmed the command took effect",
+        true,
     )
 }
 
@@ -3583,10 +3585,18 @@ fn report_command_outcome_as(
     cli: &Cli,
     outcome: CommandOutcome,
     success_line: &str,
+    effect_observed: bool,
 ) -> Result<(), CliError> {
     if want_json(cli) {
         let v = match &outcome {
-            CommandOutcome::Verified => serde_json::json!({ "outcome": "verified" }),
+            // `confirms` says what "verified" covered. Without it an agent
+            // reading `"outcome": "verified"` for a G-code line concludes the
+            // motion happened — the same misreading the human line now guards
+            // against, and machines get no parenthetical to save them.
+            CommandOutcome::Verified => serde_json::json!({
+                "outcome": "verified",
+                "confirms": if effect_observed { "effect" } else { "ack" },
+            }),
             CommandOutcome::Rejected { reason } => {
                 serde_json::json!({ "outcome": "rejected", "reason": reason })
             }
@@ -3612,11 +3622,15 @@ fn report_command_outcome_as(
 }
 
 // What the printer actually told us about a raw G-code line, and what it did
-// not. Kept as constants so the single-line and sequence paths cannot drift
-// into claiming different things about the same guarantee.
+// not. Both keep the shared state word (`verified`, the `CommandOutcome`
+// variant `--json` reports) and let the parenthetical carry what it means here
+// — the bug was the old line ASSERTING the effect happened, not the word. A
+// human line naming a different state than the JSON would just be a second
+// inconsistency. Kept as constants so the single-line and sequence paths
+// cannot drift apart.
 const GCODE_MOTION_NOTE: &str =
     "the printer does not report when the motion finishes, so it may still be running";
-const GCODE_ACCEPTED_NOTE: &str = "accepted: the printer acknowledged the command \
+const GCODE_ACCEPTED_NOTE: &str = "verified: the printer acknowledged the command \
     (a G-code line has no confirmable effect, so the motion may still be running)";
 
 /// The error a *not-confirmed* outcome means — exit code and message; `None`

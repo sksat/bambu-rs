@@ -586,11 +586,11 @@ fn config_set_needs_a_field_and_an_existing_profile() {
 
 #[test]
 fn gcode_json_keeps_the_shared_outcome_vocabulary() {
-    // The human line for a G-code send says "accepted" (a move is still
-    // travelling when it prints), but --json is a contract agents parse. It
-    // must stay verified/rejected/unverified like every other command — a
-    // fourth value no parser knows would be a silent breakage, and the error
-    // paths must keep emitting an object at all.
+    // --json is a contract agents parse: it must stay verified/rejected/
+    // unverified like every other command. A fourth value no parser knows
+    // would be a silent breakage, and the error paths must keep emitting an
+    // object at all. The human line uses the SAME state word and explains what
+    // it means for a G-code line, rather than naming a different state.
     let src = std::fs::read_to_string("src/cli.rs").unwrap();
     assert!(
         !src.contains("\"outcome\": \"accepted\""),

@@ -123,6 +123,13 @@ pub struct Report {
     pub verified: usize,
     /// Whether every step was confirmed — the one field to branch on.
     pub ok: bool,
+    /// What `verified` covered. Always `"ack"` here: a G-code line has no
+    /// observable state effect (see `core::verify`), so the printer's
+    /// acknowledgement is the whole verdict and it never reports when the
+    /// motion finishes. A sequence with `G4` dwells is still moving after the
+    /// last ACK — reading `verified == total` as "done" is the mistake this
+    /// field exists to prevent.
+    pub confirms: &'static str,
     /// Per-step verdicts, in order. Ends at the step that stopped the run, so
     /// it is shorter than `total` unless the run finished.
     pub steps: Vec<StepReport>,
@@ -143,6 +150,7 @@ impl Report {
             source: source.into(),
             total: steps.len(),
             verified,
+            confirms: "ack",
             ok: verified == steps.len(),
             steps: steps
                 .iter()
@@ -254,6 +262,9 @@ G0 X-10; \\n
                 "total": 2,
                 "verified": 2,
                 "ok": true,
+                // Says what "verified" covered — an agent reading `verified == total`
+                // as "the motion finished" is the misread this guards against.
+                "confirms": "ack",
                 "steps": [
                     { "step": 1, "line": 1, "gcode": "G90", "outcome": "verified" },
                     { "step": 2, "line": 2, "gcode": "G28", "outcome": "verified" },
