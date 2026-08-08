@@ -317,7 +317,18 @@ impl FtpRelay {
                 if line.is_empty() {
                     continue;
                 }
+                let was_authenticated = session.is_authenticated();
                 let action = session.handle(&line);
+                // Say so the moment a client gets in, the way the MQTT side
+                // names every client that connects. A session that logs in and
+                // then stores nothing is a real answer to "did this client send
+                // the file through us?" — and an invisible one until now.
+                if !was_authenticated && session.is_authenticated() {
+                    eprintln!(
+                        "emulate-ftp: {} logged in",
+                        peer.map_or_else(|| "a client".to_string(), |p| p.to_string())
+                    );
+                }
                 if self
                     .run(
                         action,
@@ -626,10 +637,23 @@ impl FtpRelay {
         // Blocking FTPS to the printer, off the runtime's worker threads.
         let sent = tokio::task::spawn_blocking(move || files.upload(&local, &remote)).await?;
         match sent {
-            Ok(n) => Ok(Reply::new(
-                226,
-                format!("stored {n} bytes to {path} on the printer"),
-            )),
+            Ok(n) => {
+                // The one line that says a print was actually sent through here.
+                // Without it a clean upload is the quietest thing the relay
+                // does: only failures were logged, so "did the file go through
+                // us or straight to the printer?" had no answer in the log —
+                // and that is exactly the question anyone debugging a client
+                // asks. The MQTT side names every client that connects; this is
+                // the same courtesy for the side that carries the print.
+                eprintln!(
+                    "emulate-ftp: {} stored {n} bytes to {path} on the printer",
+                    peer.map_or_else(|| "a client".to_string(), |p| p.to_string())
+                );
+                Ok(Reply::new(
+                    226,
+                    format!("stored {n} bytes to {path} on the printer"),
+                ))
+            }
             // The client is told the upload failed and where: it uploaded to us
             // successfully, and the printer is the half that refused.
             Err(e) => Ok(Reply::new(
