@@ -395,20 +395,18 @@ malformed line without equals
     }
 
     #[test]
-    fn rewriting_a_profile_must_carry_its_sequences_across() {
-        // `config add` doubles as "update" — the documented fix after a DHCP
-        // change. It rebuilds the Profile from flags, so anything not carried
-        // over is destroyed on the next save. This pins the carry-over that the
-        // CLI does; without it, updating an IP silently wipes the macros.
-        let old = profile_with_sequences();
-        let updated = Profile {
-            ip: "192.0.2.99".into(),
-            sequences: old.sequences.clone(),
-            ..old.clone()
-        };
-        assert_eq!(updated.ip, "192.0.2.99");
-        assert_eq!(updated.sequences, old.sequences);
-        assert!(updated.sequence("swap").is_ok());
+    fn editing_one_field_leaves_the_rest_of_the_profile_alone() {
+        // What `config set` does. The alternative — rebuilding the profile from
+        // flags, as `config add` must — destroys every field the flags don't
+        // cover, which is why `add` no longer overwrites.
+        let mut p = profile_with_sequences();
+        let before = p.clone();
+        p.ip = "192.0.2.99".into();
+        assert_eq!(p.ip, "192.0.2.99");
+        assert_eq!(p.sequences, before.sequences);
+        assert_eq!(p.serial, before.serial);
+        assert_eq!(p.access_code, before.access_code);
+        assert!(p.sequence("swap").is_ok());
     }
 
     #[test]
