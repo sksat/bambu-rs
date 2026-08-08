@@ -155,6 +155,11 @@ Anyone with the printer's access code can drive it through the relay — exactly
 could drive the printer directly, and no others. `--emulate-read-only` narrows that to
 watching: control commands and uploads are refused rather than forwarded.
 
+**If the printer goes away, so does the relay.** After 30 seconds of silence from the machine
+the relay stops answering from its cache and disconnects its clients, rather than keep serving
+a picture of a print that stopped an hour ago. A dropped connection is what every client
+already reads as "printer offline"; it reconnects by itself when the printer comes back.
+
 Discovery is deliberately absent: the real printer is announcing the same serial on the same
 network, so add the relay by IP.
 

@@ -27,6 +27,29 @@ pub fn request_topic(serial: &str) -> String {
     format!("device/{serial}/request")
 }
 
+/// Whether an MQTT subscription `filter` matches `topic` (§4.7).
+///
+/// `+` matches exactly one level, `#` matches the rest (including none) and may
+/// only appear last. A broker that compares filters as plain strings instead
+/// looks fine right up until a client subscribes to `device/+/report`: the
+/// SUBSCRIBE is refused, the connection stays up, and no report ever arrives —
+/// the least debuggable failure this emulator could have.
+pub fn topic_matches(filter: &str, topic: &str) -> bool {
+    let mut topic_levels = topic.split('/');
+    let mut filter_levels = filter.split('/').peekable();
+    while let Some(f) = filter_levels.next() {
+        if f == "#" {
+            // Only legal as the last level, and then it matches everything left.
+            return filter_levels.peek().is_none();
+        }
+        match topic_levels.next() {
+            Some(t) if f == "+" || f == t => {}
+            _ => return false,
+        }
+    }
+    topic_levels.next().is_none()
+}
+
 /// A decoded MQTT 3.1.1 control packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Packet {
@@ -417,6 +440,16 @@ pub fn encode(packet: &Packet) -> Vec<u8> {
 }
 
 fn put_string(out: &mut Vec<u8>, s: &str) {
+    // MQTT strings are length-prefixed with a u16, so anything longer cannot be
+    // encoded — and `as u16` would silently wrap, producing a packet that says
+    // one length and carries another. Nothing this emulator writes comes close
+    // (topics are `device/{serial}/report`), so this is a tripwire rather than a
+    // case to handle.
+    debug_assert!(
+        s.len() <= u16::MAX as usize,
+        "MQTT string longer than a u16 length can describe: {} bytes",
+        s.len()
+    );
     out.extend_from_slice(&(s.len() as u16).to_be_bytes());
     out.extend_from_slice(s.as_bytes());
 }
@@ -502,6 +535,46 @@ mod tests {
             keep_alive: 60,
             clean_session: true,
         })
+    }
+
+    #[test]
+    fn topic_filters_match_the_way_mqtt_says_they_do() {
+        let report = "device/0309FA/report";
+        // Exact, and the wildcards a client might reasonably use.
+        for filter in [
+            "device/0309FA/report",
+            "device/+/report",
+            "device/0309FA/+",
+            "#",
+            "device/#",
+            "device/0309FA/#",
+        ] {
+            assert!(topic_matches(filter, report), "{filter} should match");
+        }
+        // Different serial, different topic, wrong depth.
+        for filter in [
+            "device/OTHER/report",
+            "device/0309FA/request",
+            "device/0309FA",
+            "device/0309FA/report/extra",
+            "+/report",
+            "other/#",
+        ] {
+            assert!(!topic_matches(filter, report), "{filter} should not match");
+        }
+    }
+
+    #[test]
+    fn a_hash_is_only_a_wildcard_as_the_last_level() {
+        // `device/#/report` is malformed; treating the `#` as "match the rest"
+        // would make it match things it must not.
+        assert!(!topic_matches("device/#/report", "device/0309FA/report"));
+    }
+
+    #[test]
+    fn a_trailing_hash_also_matches_the_parent_itself() {
+        // §4.7.1.2: `sport/#` matches `sport`.
+        assert!(topic_matches("device/#", "device"));
     }
 
     #[test]

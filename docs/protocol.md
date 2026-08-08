@@ -292,9 +292,22 @@ needs, in the order it asks for it:
   the socket is merely dropped — and `LIST` output should be the printer's own
   lines, since re-rendering them means inventing the timestamps a parsed entry
   drops. **[observed against `ftplib` and `suppaftp`]**
+- **A relay must be able to say "gone".** The printer pushes a delta every ~2 s
+  unprompted, so silence is the signal; a relay that reconnects quietly while
+  still answering reads from cache shows a client a print that stopped an hour
+  ago. There is no "offline" message in this protocol — dropping the TCP
+  connection is the only thing every client already reads that way, so the relay
+  gives up after 30 s of silence and hangs up.
+- **Subscriptions must be matched as MQTT filters, not strings.** A client
+  subscribing `device/+/report` means this printer's report topic; refusing it
+  leaves a healthy-looking connection that never delivers anything.
 - **What is missing.** SSDP is deliberately not answered: the real printer
   announces the same serial on the same LAN, and a second announcement would
   just race it.
+- **Unverified:** whether firmware round-trips an arbitrary `sequence_id` string
+  untouched. A relay that renumbers requests should keep its ids below 2^31 in
+  case the id is parsed as a 32-bit integer somewhere — an echo that comes back
+  changed can never be matched to the command it answers.
 
 ## Version inventory (`info.get_version`)
 

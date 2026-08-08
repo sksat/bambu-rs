@@ -3,8 +3,15 @@
 //! Listens on MQTT-over-TLS the way a printer in LAN Mode does, so Bambu Studio
 //! (or OrcaSlicer, or Home Assistant) can be pointed at this host instead of at
 //! the machine. Everything those clients say is relayed over the **one**
-//! connection `bambu serve` already holds, so the printer sees a single client
-//! no matter how many are watching.
+//! connection `bambu serve` already holds, however many of them are watching.
+//!
+//! "One connection" is true of the *streaming* path, which is the one that used
+//! to be held open permanently. It is not yet true of everything: the dashboard's
+//! own control, file and job-start calls still connect per operation
+//! ([`LiveController`](super::control::LiveController) and friends), so pressing
+//! a button in the dashboard while emulating still opens a short-lived second
+//! connection. That is the same wart as running the CLI while `serve` is up, and
+//! it goes away when those move onto the link too.
 //!
 //! The protocol decisions all live in [`crate::core::emulate`] and
 //! [`crate::core::mqtt`], where they are driven by unit tests without a socket.
@@ -51,6 +58,20 @@ const READ_CHUNK: usize = 8 * 1024;
 /// rare and small; this deep a queue means the client has stopped reading.
 const DIRECT_DEPTH: usize = 64;
 
+/// How long the printer may go silent before the relay treats it as gone.
+///
+/// An A1 pushes a delta every couple of seconds unprompted, so silence this long
+/// means the link is down — and the relay reconnects forever without telling
+/// anyone. Left alone, a client would keep being served a cached picture of a
+/// machine that has been off for an hour: Studio showing "RUNNING 41%", a Home
+/// Assistant automation firing on an hour-old temperature. Dropping the
+/// connection instead is the one signal every client already understands.
+const STALE_AFTER: Duration = Duration::from_secs(30);
+
+/// How often the watchdog checks. Coarse on purpose: this decides when to call a
+/// printer dead, and being a second late costs nothing.
+const WATCHDOG_TICK: Duration = Duration::from_secs(1);
+
 /// How long a connection may take to get through TLS and say CONNECT.
 ///
 /// Both happen before we know who is on the other end, so both are reachable by
@@ -85,9 +106,16 @@ pub struct Emulator {
     /// These do *not* go through the fan-out: an ACK dropped for lagging is
     /// unrecoverable, because routing it already consumed its mapping.
     clients: Mutex<HashMap<ClientId, mpsc::Sender<Arc<Vec<u8>>>>>,
-    /// How long an unauthenticated peer gets. A field, not a constant, so a
-    /// test can drive the timeout without taking 20 seconds over it.
+    /// Fields, not constants, so a test can drive the timeouts without taking
+    /// half a minute over it.
     handshake_timeout: Duration,
+    stale_after: Duration,
+    /// When the printer last said anything. The watchdog reads it; the pump
+    /// writes it.
+    last_report: Mutex<tokio::time::Instant>,
+    /// `false` once the printer is presumed gone. Client tasks watch this and
+    /// hang up, which is how the silence reaches them.
+    healthy: tokio::sync::watch::Sender<bool>,
     next_client_id: AtomicU64,
     /// Subscribed here rather than in [`pump`](Self::pump), so reports arriving
     /// between construction and the pump task actually being scheduled are not
@@ -96,19 +124,38 @@ pub struct Emulator {
     reports: Mutex<Option<broadcast::Receiver<Value>>>,
 }
 
+/// The two timeouts worth varying, so a test needn't wait out the real ones.
+#[derive(Debug, Clone, Copy)]
+pub struct Tuning {
+    /// How long an unauthenticated peer gets to finish TLS and CONNECT.
+    pub handshake_timeout: Duration,
+    /// How long the printer may go silent before it is presumed gone.
+    pub stale_after: Duration,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self {
+            handshake_timeout: HANDSHAKE_TIMEOUT,
+            stale_after: STALE_AFTER,
+        }
+    }
+}
+
 impl Emulator {
     pub fn new(printer: EmulatedPrinter, upstream: Arc<dyn Upstream>) -> Arc<Self> {
-        Self::with_handshake_timeout(printer, upstream, HANDSHAKE_TIMEOUT)
+        Self::with_tuning(printer, upstream, Tuning::default())
     }
 
-    /// As [`new`](Self::new), with the anonymous-peer window set explicitly.
-    pub fn with_handshake_timeout(
+    /// As [`new`](Self::new), with the timeouts set explicitly.
+    pub fn with_tuning(
         printer: EmulatedPrinter,
         upstream: Arc<dyn Upstream>,
-        handshake_timeout: Duration,
+        tuning: Tuning,
     ) -> Arc<Self> {
         let (fanout, _) = broadcast::channel(FANOUT_DEPTH);
         let reports = Mutex::new(Some(upstream.subscribe()));
+        let (healthy, _) = tokio::sync::watch::channel(true);
         Arc::new(Self {
             printer,
             upstream,
@@ -116,10 +163,44 @@ impl Emulator {
             rewriter: Arc::new(Mutex::new(SequenceRewriter::new())),
             fanout,
             clients: Mutex::new(HashMap::new()),
-            handshake_timeout,
+            handshake_timeout: tuning.handshake_timeout,
+            stale_after: tuning.stale_after,
+            // Started now, not at epoch: the link needs a moment to connect, and
+            // a relay that declared the printer dead before its first report
+            // would hang up on whoever was waiting for it.
+            last_report: Mutex::new(tokio::time::Instant::now()),
+            healthy,
             next_client_id: AtomicU64::new(1),
             reports,
         })
+    }
+
+    /// Watch for the printer going quiet, and tell everyone when it has.
+    ///
+    /// Spawned by [`pump`](Self::pump). Runs forever; recovers by itself when
+    /// the printer comes back, because the pump clears the state it sets.
+    async fn watchdog(self: Arc<Self>) {
+        let mut ticker = tokio::time::interval(WATCHDOG_TICK);
+        loop {
+            ticker.tick().await;
+            let silent_for = self
+                .last_report
+                .lock()
+                .expect("last_report lock poisoned")
+                .elapsed();
+            if silent_for >= self.stale_after && *self.healthy.borrow() {
+                eprintln!(
+                    "emulate: nothing from the printer for {}s — treating it as offline and \
+                     disconnecting clients rather than serving them a stale picture",
+                    silent_for.as_secs()
+                );
+                self.cache
+                    .write()
+                    .expect("cache lock poisoned")
+                    .mark_stale();
+                let _ = self.healthy.send(false);
+            }
+        }
     }
 
     /// Consume the upstream report stream forever: merge it into the cache, then
@@ -131,6 +212,7 @@ impl Emulator {
             .expect("reports lock poisoned")
             .take()
             .unwrap_or_else(|| self.upstream.subscribe());
+        tokio::spawn(Arc::clone(&self).watchdog());
         loop {
             let message = match reports.recv().await {
                 Ok(m) => m,
@@ -139,6 +221,15 @@ impl Emulator {
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => return,
             };
+            // The printer spoke, so it is alive: reset the watchdog and, if we
+            // had given up on it, tell the clients it is back.
+            *self.last_report.lock().expect("last_report lock poisoned") =
+                tokio::time::Instant::now();
+            if !*self.healthy.borrow() {
+                eprintln!("emulate: the printer is answering again");
+                let _ = self.healthy.send(true);
+            }
+            // `apply` clears the stale flag, so reads start being served again.
             self.cache
                 .write()
                 .expect("cache lock poisoned")
@@ -253,6 +344,10 @@ impl Emulator {
         let mut session = ClientSession::new();
         let mut buf: Vec<u8> = Vec::new();
         let mut chunk = [0u8; READ_CHUNK];
+        let mut healthy = self.healthy.subscribe();
+        // Mark the current value seen, so `changed()` only fires on a real
+        // transition rather than immediately.
+        let _ = healthy.borrow_and_update();
         // Absolute, and held ACROSS iterations. Recreating the timeout inside
         // the select each time round would restart it every time any other arm
         // fired — and the fan-out arm fires for every client on every report,
@@ -311,6 +406,15 @@ impl Emulator {
                 Some(bytes) = direct.recv() => {
                     writer.write_all(&bytes).await?;
                     writer.flush().await?;
+                }
+
+                // The printer went away. Hang up rather than keep answering out
+                // of a cache that no longer describes anything — a dropped
+                // connection is what every client already reads as "offline".
+                changed = healthy.changed() => {
+                    if changed.is_err() || !*healthy.borrow_and_update() {
+                        anyhow::bail!("the printer stopped answering; disconnecting");
+                    }
                 }
 
                 // Nothing from this client for too long.
@@ -445,7 +549,15 @@ mod tests {
         printer: EmulatedPrinter,
         upstream: Arc<FakeUpstream>,
     ) -> (Arc<Emulator>, std::net::SocketAddr) {
-        let emulator = Emulator::new(printer, upstream as Arc<dyn Upstream>);
+        start_tuned(printer, upstream, Tuning::default()).await
+    }
+
+    async fn start_tuned(
+        printer: EmulatedPrinter,
+        upstream: Arc<FakeUpstream>,
+        tuning: Tuning,
+    ) -> (Arc<Emulator>, std::net::SocketAddr) {
+        let emulator = Emulator::with_tuning(printer, upstream as Arc<dyn Upstream>, tuning);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let tls = crate::tls::emulated_printer_server_config(SERIAL).unwrap();
@@ -807,10 +919,13 @@ mod tests {
         // second from a real printer — so the deadline never arrived and anyone
         // who could open a socket could hold a task and an fd indefinitely.
         let upstream = FakeUpstream::new();
-        let emulator = Emulator::with_handshake_timeout(
+        let emulator = Emulator::with_tuning(
             EmulatedPrinter::new(SERIAL, CODE),
             Arc::clone(&upstream) as Arc<dyn Upstream>,
-            Duration::from_millis(300),
+            Tuning {
+                handshake_timeout: Duration::from_millis(300),
+                ..Tuning::default()
+            },
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -841,6 +956,89 @@ mod tests {
             "a peer that never authenticates must be disconnected, got {closed:?}"
         );
         chatter.abort();
+    }
+
+    #[tokio::test]
+    async fn a_printer_that_goes_quiet_disconnects_its_clients_instead_of_faking_it() {
+        // The relay reconnects to a dropped printer forever and says nothing.
+        // Without this, a client keeps its connection and keeps being answered
+        // from cache: Studio showing "RUNNING 41%" for a machine that has been
+        // off for an hour, an automation firing on an hour-old temperature.
+        let upstream = FakeUpstream::new();
+        let (emulator, addr) = start_tuned(
+            EmulatedPrinter::new(SERIAL, CODE),
+            Arc::clone(&upstream),
+            Tuning {
+                stale_after: Duration::from_millis(300),
+                ..Tuning::default()
+            },
+        )
+        .await;
+        upstream.push(snapshot());
+        until("the cache to warm up", || {
+            emulator.cache.read().unwrap().is_warm()
+        })
+        .await;
+
+        let mut client = TestClient::connect(addr).await;
+        client.handshake(CODE).await;
+        client.subscribe_reports().await;
+
+        // …and now the printer says nothing at all, ever again.
+        let mut chunk = [0u8; 64];
+        let closed = tokio::time::timeout(Duration::from_secs(5), client.stream.read(&mut chunk))
+            .await
+            .expect("the client should have been disconnected");
+        assert!(
+            matches!(closed, Ok(0) | Err(_)),
+            "a dropped connection is how a client learns the printer is gone, got {closed:?}"
+        );
+        // The cache stops answering too, so a *new* client can't be told a
+        // comfortable lie either.
+        assert!(!emulator.cache.read().unwrap().is_warm());
+    }
+
+    #[tokio::test]
+    async fn the_printer_coming_back_makes_the_relay_serve_again() {
+        // Recovery has to be automatic: nobody is going to restart serve.
+        let upstream = FakeUpstream::new();
+        let (emulator, addr) = start_tuned(
+            EmulatedPrinter::new(SERIAL, CODE),
+            Arc::clone(&upstream),
+            Tuning {
+                stale_after: Duration::from_millis(300),
+                ..Tuning::default()
+            },
+        )
+        .await;
+        upstream.push(snapshot());
+        until("the cache to warm", || {
+            emulator.cache.read().unwrap().is_warm()
+        })
+        .await;
+        until("the printer to be given up on", || {
+            !emulator.cache.read().unwrap().is_warm()
+        })
+        .await;
+
+        // It comes back.
+        upstream.push(snapshot());
+        until("the relay to serve again", || {
+            emulator.cache.read().unwrap().is_warm()
+        })
+        .await;
+
+        // A client connecting now is served normally.
+        let mut client = TestClient::connect(addr).await;
+        client.handshake(CODE).await;
+        client.subscribe_reports().await;
+        client
+            .publish_request(json!({"pushing": {"sequence_id": "1", "command": "pushall"}}))
+            .await;
+        assert_eq!(
+            client.recv_report().await["print"]["gcode_state"],
+            "RUNNING"
+        );
     }
 
     #[tokio::test]

@@ -20,7 +20,9 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
-use crate::core::mqtt::{Connect, ConnectCode, Packet, Publish, report_topic, request_topic};
+use crate::core::mqtt::{
+    Connect, ConnectCode, Packet, Publish, report_topic, request_topic, topic_matches,
+};
 use crate::core::report::{ReportState, is_full_snapshot_message};
 
 /// The username every Bambu LAN client connects with.
@@ -220,7 +222,10 @@ impl ClientSession {
                 self.on_subscribe(packet_id, &filters, printer)
             }
             Packet::Unsubscribe { packet_id, filters } => {
-                if filters.iter().any(|f| *f == printer.report_topic()) {
+                // Matched the same way SUBSCRIBE is, so a client that subscribed
+                // with a wildcard can unsubscribe with the same one.
+                let report = printer.report_topic();
+                if filters.iter().any(|f| topic_matches(f, &report)) {
                     self.wants_reports = false;
                 }
                 Response::send(Packet::UnsubAck { packet_id })
@@ -270,14 +275,18 @@ impl ClientSession {
         let codes = filters
             .iter()
             .map(|(filter, qos)| {
-                if *filter == report {
+                // Matched as an MQTT filter, not compared as a string: a client
+                // subscribing `device/+/report` means our report topic, and
+                // refusing it would leave a healthy-looking connection that
+                // never delivers anything.
+                if topic_matches(filter, &report) {
                     self.wants_reports = true;
                     // Granted at the QoS the client asked for, capped at 1.
                     (*qos).min(1)
                 } else {
-                    // 0x80 = failure (§3.9.3). We front exactly one printer;
-                    // granting a wildcard or a foreign serial would promise data
-                    // that is never coming.
+                    // 0x80 = failure (§3.9.3). We front exactly one printer, so
+                    // a filter that doesn't cover its report topic is a promise
+                    // of data that is never coming.
                     0x80
                 }
             })
@@ -391,17 +400,15 @@ fn sequence_id(payload: &Value) -> Option<&str> {
 /// Build the ACK a read-only relay answers a control command with: the printer's
 /// own failure shape, echoing the sequence id, with a reason that names us —
 /// a client (or the human reading its log) should not have to guess.
+///
+/// No `command` key, because the observed ACK has none (docs/protocol.md): it is
+/// `{sequence_id, param, result, reason}`. Adding one would make our refusals
+/// the only ACKs on the wire shaped differently from the printer's.
 fn refusal_ack(request: &Value) -> Value {
     let category = category(request).unwrap_or("print");
     let mut ack = Map::new();
     if let Some(seq) = sequence_id(request) {
         ack.insert("sequence_id".to_string(), Value::String(seq.to_string()));
-    }
-    if let Some(command) = request
-        .pointer(&format!("/{category}/command"))
-        .and_then(Value::as_str)
-    {
-        ack.insert("command".to_string(), Value::String(command.to_string()));
     }
     ack.insert("result".to_string(), Value::String("fail".to_string()));
     ack.insert(
@@ -427,6 +434,10 @@ pub fn report_publish(serial: &str, message: &Value) -> Publish {
 pub struct UpstreamCache {
     state: ReportState,
     seen_snapshot: bool,
+    /// Set by the I/O layer when the printer has gone quiet for long enough to
+    /// be considered offline. The clock lives out there; this flag is how the
+    /// decision reaches the pure layer.
+    stale: bool,
 }
 
 impl UpstreamCache {
@@ -460,13 +471,28 @@ impl UpstreamCache {
         if is_full_snapshot_message(message) {
             self.seen_snapshot = true;
         }
+        // The printer is talking again, so what we hold describes something
+        // real once more.
+        self.stale = false;
         self.state.apply(message.clone());
     }
 
-    /// Whether a full snapshot has been seen — i.e. whether a read can be served
-    /// from here at all.
+    /// Declare the cached picture no longer live.
+    ///
+    /// The relay reconnects to a dropped printer indefinitely, and while it does
+    /// the cache would happily keep answering reads — a client would see a print
+    /// "running" on a machine that has been off for an hour, and an automation
+    /// would fire on an hour-old temperature. Deciding *when* that has happened
+    /// needs a clock, which is the I/O layer's job; this is where the answer
+    /// lands. Cleared by the next report.
+    pub fn mark_stale(&mut self) {
+        self.stale = true;
+    }
+
+    /// Whether a full snapshot has been seen **and** still describes a live
+    /// printer — i.e. whether a read can be served from here at all.
     pub fn is_warm(&self) -> bool {
-        self.seen_snapshot
+        self.seen_snapshot && !self.stale
     }
 
     /// The merged `push_status` to answer a `pushall` with, or `None` if no full
@@ -478,7 +504,7 @@ impl UpstreamCache {
     /// (a `push_status` carries the printer's counter, not an echo of the
     /// request — see docs/protocol.md).
     pub fn snapshot_reply(&self) -> Option<Value> {
-        if !self.seen_snapshot {
+        if !self.is_warm() {
             return None;
         }
         let mut print = self.state.get().get("print")?.as_object()?.clone();
@@ -560,8 +586,17 @@ impl SequenceRewriter {
         // counter, which is a small integer. Fixed width and zero-padded so the
         // BTreeMap orders these by age, which is what makes the eviction below
         // evict the *oldest*.
-        let id = format!("9{:09}", self.next);
-        self.next += 1;
+        //
+        // The `2` prefix and the wrap keep every id below 2^31. The printer
+        // echoes this back and we match on it, and whether firmware round-trips
+        // an arbitrary 10-digit string untouched is unobserved — if it parses
+        // the id as a 32-bit integer, a larger one could come back changed,
+        // miss the outstanding map, and leave a command unacknowledged forever.
+        // Staying in range costs nothing. The wrap is unreachable in practice
+        // (10^8 commands) and harmless when it isn't: only MAX_OUTSTANDING ids
+        // are live at a time.
+        let id = format!("2{:08}", self.next % 100_000_000);
+        self.next = self.next.wrapping_add(1);
         self.outstanding.insert(
             id.clone(),
             Pending {
@@ -744,15 +779,45 @@ mod tests {
     }
 
     #[test]
+    fn a_wildcard_that_covers_this_printers_report_topic_is_granted() {
+        // A filter comparison by string equality refuses these, and the client
+        // then sits on a healthy connection receiving nothing — the worst
+        // failure this can have, because everything looks fine.
+        for filter in ["device/+/report", "#", "device/#"] {
+            let mut s = connected();
+            let r = s.handle(
+                Packet::Subscribe {
+                    packet_id: 1,
+                    filters: vec![(filter.to_string(), 0)],
+                },
+                &printer(),
+                &UpstreamCache::new(),
+            );
+            assert_eq!(
+                r.send,
+                vec![Packet::SubAck {
+                    packet_id: 1,
+                    codes: vec![0]
+                }],
+                "{filter} covers our report topic"
+            );
+            assert!(s.wants_reports(), "{filter}");
+        }
+    }
+
+    #[test]
     fn subscribing_to_another_serials_topic_is_refused() {
-        // We front exactly one printer. Granting a wildcard or a foreign serial
-        // would promise data we will never deliver, and the client would sit
-        // there waiting for it.
+        // We front exactly one printer. Granting a filter that doesn't cover its
+        // report topic would promise data we will never deliver, and the client
+        // would sit there waiting for it.
         let mut s = connected();
         let r = s.handle(
             Packet::Subscribe {
                 packet_id: 2,
-                filters: vec![("device/SOMEONEELSE/report".into(), 0), ("#".into(), 0)],
+                filters: vec![
+                    ("device/SOMEONEELSE/report".into(), 0),
+                    ("device/SOMEONEELSE/#".into(), 0),
+                ],
             },
             &printer(),
             &UpstreamCache::new(),
@@ -787,6 +852,32 @@ mod tests {
             &UpstreamCache::new(),
         );
         assert_eq!(r.send, vec![Packet::UnsubAck { packet_id: 5 }]);
+        assert!(!s.wants_reports());
+    }
+
+    #[test]
+    fn a_wildcard_subscription_can_be_undone_by_the_same_wildcard() {
+        // Whatever SUBSCRIBE accepts, UNSUBSCRIBE must undo. Matching one as a
+        // filter and the other as a string would leave a client still being
+        // sent reports it had asked to stop.
+        let mut s = connected();
+        s.handle(
+            Packet::Subscribe {
+                packet_id: 1,
+                filters: vec![("device/+/report".into(), 0)],
+            },
+            &printer(),
+            &UpstreamCache::new(),
+        );
+        assert!(s.wants_reports());
+        s.handle(
+            Packet::Unsubscribe {
+                packet_id: 2,
+                filters: vec!["device/+/report".into()],
+            },
+            &printer(),
+            &UpstreamCache::new(),
+        );
         assert!(!s.wants_reports());
     }
 
@@ -958,6 +1049,36 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&p.payload).unwrap();
         assert_eq!(v["print"]["msg"], 0);
         assert_eq!(v["print"]["gcode_state"], "RUNNING");
+    }
+
+    #[test]
+    fn a_stale_cache_stops_answering_reads() {
+        // The printer has been unplugged for an hour and the relay is quietly
+        // reconnecting. Answering a pushall from the cache would show Studio
+        // "RUNNING 41%" and fire a Home Assistant automation on an hour-old
+        // temperature. Once the I/O layer declares the printer gone, the cache
+        // stops pretending.
+        let mut c = cache_with_snapshot();
+        assert!(c.is_warm());
+        c.mark_stale();
+        assert!(!c.is_warm());
+        assert!(c.snapshot_reply().is_none());
+
+        let mut s = connected();
+        let req = json!({"pushing": {"sequence_id": "1", "command": "pushall"}});
+        let r = s.handle(publish_request(req.clone(), None), &printer(), &c);
+        assert_eq!(r.upstream, vec![req], "asked upstream instead of guessing");
+        assert!(r.send.is_empty(), "and answered the client nothing");
+    }
+
+    #[test]
+    fn a_fresh_report_brings_a_stale_cache_back_to_life() {
+        // The printer came back. Nothing should need restarting.
+        let mut c = cache_with_snapshot();
+        c.mark_stale();
+        c.apply(&json!({"print": {"command": "push_status", "msg": 1, "mc_percent": 50}}));
+        assert!(c.is_warm());
+        assert_eq!(c.snapshot_reply().unwrap()["print"]["mc_percent"], 50);
     }
 
     #[test]
@@ -1165,6 +1286,29 @@ mod tests {
             seq.route(&ack_a),
             Route::ToClient { client: 1, .. }
         ));
+    }
+
+    #[test]
+    fn a_forwarded_sequence_id_still_fits_in_32_bits() {
+        // The printer echoes this back and we match on it. Whether firmware
+        // round-trips an arbitrary 10-digit string untouched is *unobserved* —
+        // if it parses the id into a 32-bit integer internally, anything above
+        // 2^31 could come back changed, miss the outstanding map, and leave the
+        // client's command unacknowledged forever. Staying inside the range
+        // costs nothing, so don't take the bet.
+        let mut seq = SequenceRewriter::new();
+        for _ in 0..64 {
+            let fwd = seq.rewrite_request(
+                1,
+                &json!({"print": {"sequence_id": "1", "command": "pause"}}),
+            );
+            let id = fwd["print"]["sequence_id"].as_str().unwrap();
+            let n: u64 = id.parse().expect("ids stay numeric");
+            assert!(
+                n < i32::MAX as u64,
+                "{id} would overflow a signed 32-bit id"
+            );
+        }
     }
 
     #[test]
