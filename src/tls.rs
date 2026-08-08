@@ -34,6 +34,10 @@ pub enum ServerTlsError {
         "cannot emulate a printer with an empty serial: it names the certificate and both MQTT topics"
     )]
     NoSerial,
+    #[error(
+        "the serial is {0} bytes; it names the MQTT topics, which cannot describe a string that long"
+    )]
+    SerialTooLong(usize),
     #[error("generating the emulated printer's certificate: {0}")]
     Certificate(#[from] rcgen::Error),
     #[error("rustls: {0}")]
@@ -64,6 +68,13 @@ pub fn emulated_printer_server_config(
     // topics would be `device//report`. Nothing downstream would notice.
     if serial.is_empty() {
         return Err(ServerTlsError::NoSerial);
+    }
+    // The serial becomes the MQTT topics, and an MQTT string is length-prefixed
+    // with a u16. The encoder clamps rather than emit a packet that lies about
+    // its length, but a truncated topic is a relay nobody can subscribe to — so
+    // refuse here, where there is still someone to tell.
+    if serial.len() > 512 {
+        return Err(ServerTlsError::SerialTooLong(serial.len()));
     }
     // `localhost` alongside the serial so a hostname-checking client works
     // against a relay on the same machine. A client reaching us over the LAN
@@ -160,5 +171,8 @@ mod tests {
         // An empty serial has no name to put in the certificate; rcgen rejects
         // it rather than us shipping an anonymous one.
         assert!(emulated_printer_server_config("").is_err());
+        // And one too long to fit in an MQTT topic is refused here, where there
+        // is still someone to tell, rather than silently truncated on the wire.
+        assert!(emulated_printer_server_config(&"S".repeat(1024)).is_err());
     }
 }

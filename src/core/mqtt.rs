@@ -429,19 +429,35 @@ pub fn encode(packet: &Packet) -> Vec<u8> {
     out
 }
 
+/// The longest string an MQTT length prefix can describe.
+const MAX_STRING: usize = u16::MAX as usize;
+
 fn put_string(out: &mut Vec<u8>, s: &str) {
-    // MQTT strings are length-prefixed with a u16, so anything longer cannot be
-    // encoded — and `as u16` would silently wrap, producing a packet that says
-    // one length and carries another. Nothing this emulator writes comes close
-    // (topics are `device/{serial}/report`), so this is a tripwire rather than a
-    // case to handle.
-    debug_assert!(
-        s.len() <= u16::MAX as usize,
-        "MQTT string longer than a u16 length can describe: {} bytes",
-        s.len()
-    );
-    out.extend_from_slice(&(s.len() as u16).to_be_bytes());
-    out.extend_from_slice(s.as_bytes());
+    // `as u16` on an over-long string wraps, and the packet then *claims* one
+    // length while carrying another — a desynchronised stream the peer can never
+    // recover from, since every subsequent packet boundary is wrong.
+    //
+    // Clamped unconditionally, not with a `debug_assert!`: that is compiled out
+    // of exactly the release binaries where a silently malformed packet would do
+    // its damage. Truncating instead is lossy, but it keeps the length and the
+    // bytes in agreement, which is the property the wire depends on.
+    //
+    // Unreachable in practice — the only strings written here are topics built
+    // from the serial, and an over-long serial is rejected where it enters
+    // (`crate::tls::emulated_printer_server_config`).
+    let bytes = s.as_bytes();
+    let len = if bytes.len() <= MAX_STRING {
+        bytes.len()
+    } else {
+        // Back off to a character boundary so the truncated field is still valid
+        // UTF-8, as MQTT requires of it.
+        (0..=MAX_STRING)
+            .rev()
+            .find(|&i| s.is_char_boundary(i))
+            .unwrap_or(0)
+    };
+    out.extend_from_slice(&(len as u16).to_be_bytes());
+    out.extend_from_slice(&bytes[..len]);
 }
 
 fn put_remaining_length(out: &mut Vec<u8>, mut len: usize) {
@@ -738,6 +754,50 @@ mod tests {
             let (got, used) = decode(&bytes).unwrap().expect("a whole packet");
             assert_eq!(got, want);
             assert_eq!(used, bytes.len());
+        }
+    }
+
+    #[test]
+    fn an_over_long_string_never_produces_a_packet_that_lies_about_its_length() {
+        // A `debug_assert!` here would be compiled out of exactly the release
+        // binaries where a malformed packet does its damage, so the clamp has to
+        // be unconditional — and this test has to pass in release too.
+        let huge = "x".repeat(u16::MAX as usize + 100);
+        let p = Packet::Publish(Publish::at_most_once(huge, b"{}".to_vec()));
+        let bytes = encode(&p);
+
+        // The decoder is the judge: it reads the declared length and must land
+        // exactly on the end of the packet.
+        let (got, used) = decode(&bytes)
+            .unwrap()
+            .expect("a whole, well-formed packet");
+        assert_eq!(
+            used,
+            bytes.len(),
+            "the packet must not lie about its length"
+        );
+        match got {
+            Packet::Publish(pp) => {
+                assert_eq!(pp.topic.len(), u16::MAX as usize);
+                assert_eq!(pp.payload, b"{}");
+            }
+            other => panic!("expected a publish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncation_lands_on_a_character_boundary() {
+        // MQTT strings are UTF-8; splitting a multi-byte character would emit a
+        // field the peer cannot decode.
+        let mut s = "a".repeat(u16::MAX as usize - 1);
+        s.push('あ'); // 3 bytes, straddling the limit
+        let p = Packet::Publish(Publish::at_most_once(s, Vec::new()));
+        let (got, _) = decode(&encode(&p)).unwrap().unwrap();
+        match got {
+            // The 3-byte char cannot fit in the one remaining byte, so it is
+            // dropped whole rather than split.
+            Packet::Publish(pp) => assert_eq!(pp.topic.len(), u16::MAX as usize - 1),
+            other => panic!("expected a publish, got {other:?}"),
         }
     }
 
