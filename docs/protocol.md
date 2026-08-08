@@ -424,11 +424,16 @@ works. On the A1 mini, 2026-08-09:
   The only FTP open on the network is the printer's own, so Studio transferred
   straight to `192.168.0.3:990` and used the relay for MQTT alone. **[observed]**
 
-  How Studio knows an address the user never gave it is **not established**. The
-  printer announces itself over SSDP on the same LAN, which would be enough, but
-  that has not been confirmed. Either way, a relay cannot assume it carries the
-  file: as long as the real printer is directly reachable, Studio may well go
-  round it, and the FTP relay matters for clients that cannot.
+  How Studio knows an address the user never gave it is **not established**.
+  SSDP was the obvious candidate and does not look like the answer: listening on
+  UDP 2021 and 1990 for about two minutes caught **no announcement at all**, so
+  if the printer announces, it is rarer than that or tied to boot. The plainer
+  explanation is that Studio had been connected to this printer directly once
+  before and kept the address — its plugin keeps that state in an encrypted
+  file, so this is not something the config can be read to settle. Either way, a
+  relay cannot assume it carries the file: as long as the real printer is
+  directly reachable, Studio may go round it, and the FTP relay matters for
+  clients that cannot. **[observed: no SSDP in ~2 min; the rest unconfirmed]**
 
 ### Do not date a file by what the printer says **[observed]**
 
