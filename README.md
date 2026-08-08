@@ -138,14 +138,25 @@ certificate. Two things it does better than a plain forwarder:
   `1`; the relay renumbers them on the way out and puts the original back on the way in, so
   nobody reads someone else's acknowledgement as the answer to their own command.
 
+Sending a print works too. Studio uploads the sliced file to the printer's FTP server before
+it starts the job, so the relay answers FTP as well — on port **990**, which is privileged. If
+binding it fails, grant the capability once and restart:
+
+```bash
+sudo setcap cap_net_bind_service=+ep "$(which bambu)"
+```
+
+Or choose a port you can bind without it (`--emulate-ftp-port 2990`), or drop FTP entirely
+with `--emulate-no-ftp` and keep monitoring and control. An upload is taken in full before any
+of it is forwarded, so a client that dies mid-transfer leaves nothing half-written on the
+printer's SD card — the one part of this machine already known to be fragile.
+
 Anyone with the printer's access code can drive it through the relay — exactly the people who
 could drive the printer directly, and no others. `--emulate-read-only` narrows that to
-watching only: control commands are refused rather than forwarded.
+watching: control commands and uploads are refused rather than forwarded.
 
-**Sending a print through the relay does not work yet.** Studio uploads a sliced file to the
-printer's FTP server before it starts a job, and there is no FTP server here — upload to the
-printer directly, or use `bambu job start`. Discovery is deliberately absent too: the real
-printer is announcing the same serial on the same network, so add the relay by IP.
+Discovery is deliberately absent: the real printer is announcing the same serial on the same
+network, so add the relay by IP.
 
 ## Timelapse
 

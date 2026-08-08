@@ -11,15 +11,13 @@
 //! What is here is the part that genuinely needs I/O: accepting TLS, framing
 //! bytes into packets, and the fan-out.
 //!
-//! ## What this is not
+//! This is the MQTT half. Sending a print also needs the FTP half
+//! ([`super::ftpd`]), because Bambu Studio uploads the sliced file before it
+//! says `project_file`.
 //!
-//! - **No FTPS server.** Bambu Studio uploads a sliced file to the printer's
-//!   FTPS:990 before it sends `project_file`, so *sending a print* through the
-//!   relay does not work yet — monitoring and control do. Point Studio's upload
-//!   at the printer directly, or use `bambu job start`.
-//! - **No SSDP responder.** It would be easy, and it would be wrong: the real
-//!   printer is announcing the same serial on the same LAN, so a client would
-//!   see two of it and pick whichever answered first. Add the relay by IP.
+//! **No SSDP responder**, deliberately. It would be easy, and it would be wrong:
+//! the real printer is announcing the same serial on the same LAN, so a client
+//! would see two of it and pick whichever answered first. Add the relay by IP.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

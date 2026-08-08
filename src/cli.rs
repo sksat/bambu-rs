@@ -263,9 +263,20 @@ enum Command {
         #[arg(long, default_value_t = 8883, requires = "emulate")]
         emulate_port: u16,
         /// Relay reads but refuse control: a client can watch the printer
-        /// through this, and cannot move or heat it.
+        /// through this, and cannot move or heat it (and cannot upload).
         #[arg(long, requires = "emulate")]
         emulate_read_only: bool,
+        /// Port for the emulated printer's FTP server, which is what makes
+        /// "send print" from Bambu Studio work: it uploads the sliced file
+        /// before starting the job. 990 is privileged — if binding fails, grant
+        /// the capability with `sudo setcap cap_net_bind_service=+ep $(which
+        /// bambu)` or choose a port your client can be told about.
+        #[arg(long, default_value_t = 990, requires = "emulate")]
+        emulate_ftp_port: u16,
+        /// Don't serve FTP at all. Monitoring and control still relay; sending a
+        /// print does not.
+        #[arg(long, requires = "emulate")]
+        emulate_no_ftp: bool,
     },
 }
 
@@ -813,6 +824,8 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             emulate_host,
             emulate_port,
             emulate_read_only,
+            emulate_ftp_port,
+            emulate_no_ftp,
         } => run_serve(
             cli,
             host,
@@ -825,6 +838,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             emulate.then(|| crate::server::EmulateOpts {
                 host: emulate_host.clone(),
                 port: *emulate_port,
+                ftp_port: (!emulate_no_ftp).then_some(*emulate_ftp_port),
                 read_only: *emulate_read_only,
             }),
         ),

@@ -284,10 +284,17 @@ needs, in the order it asks for it:
   a relay forwarding ids verbatim lets one client match another's ACK to its own
   command. Renumbering on the way out and restoring on the way back is what keeps
   them apart; the printer only ever sees ids the relay allocated.
-- **What is missing.** Studio uploads to FTPS:990 before `project_file`, so
-  starting a print through an MQTT-only relay does not work. SSDP is deliberately
-  not answered: the real printer announces the same serial on the same LAN, and a
-  second announcement would just race it.
+- **FTP too, or a print can't be sent.** Studio uploads to FTPS:990 before
+  `project_file`, so the relay answers FTP as well (store-and-forward through the
+  same client the CLI uses). Two things a client notices: the data connection
+  must be closed with a TLS **close_notify** — Python's `ftplib` unwraps its TLS
+  layer after an upload and reports "unexpected EOF in violation of protocol" if
+  the socket is merely dropped — and `LIST` output should be the printer's own
+  lines, since re-rendering them means inventing the timestamps a parsed entry
+  drops. **[observed against `ftplib` and `suppaftp`]**
+- **What is missing.** SSDP is deliberately not answered: the real printer
+  announces the same serial on the same LAN, and a second announcement would
+  just race it.
 
 ## Version inventory (`info.get_version`)
 

@@ -9,6 +9,7 @@ pub mod emulate;
 #[cfg(test)]
 pub(crate) mod fake;
 pub mod firmware;
+pub mod ftpd;
 pub mod hms;
 pub mod model;
 pub mod mqtt;

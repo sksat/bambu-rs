@@ -13,6 +13,7 @@ pub mod camera;
 pub mod control;
 pub mod emulate;
 pub mod files;
+pub mod ftpd;
 pub mod live;
 pub mod relay;
 pub mod start;
@@ -61,7 +62,15 @@ pub struct EmulateOpts {
     pub host: String,
     /// Bind port. `8883` is where a client looks unless told otherwise.
     pub port: u16,
-    /// Serve reads but refuse anything that would move or heat the machine.
+    /// Where the emulated printer's FTP server listens (`990` by convention),
+    /// or `None` to serve MQTT only.
+    ///
+    /// Without it a client can watch and control a print but not *start* one:
+    /// Bambu Studio uploads the sliced file over FTP first, and that upload goes
+    /// to whichever host it was pointed at.
+    pub ftp_port: Option<u16>,
+    /// Serve reads but refuse anything that would move or heat the machine —
+    /// and, on the FTP side, anything that writes.
     pub read_only: bool,
 }
 
@@ -190,19 +199,46 @@ async fn start_emulator(
         .await
         .map_err(|e| anyhow::anyhow!("binding the emulated printer on {addr}: {e}"))?;
 
+    // Both listeners bound before either is served, so a port clash on FTP
+    // fails at startup rather than after MQTT has come up looking healthy.
+    let ftp = match opts.ftp_port {
+        Some(port) => Some(bind_ftp_relay(target, opts, port).await?),
+        None => None,
+    };
+
     let emulator = emulate::Emulator::new(printer, link);
     tokio::spawn(Arc::clone(&emulator).pump());
-    tokio::spawn(async move {
-        if let Err(e) = emulator.serve(listener, tls).await {
-            eprintln!("emulate: listener stopped: {e}");
+    tokio::spawn({
+        let tls = Arc::clone(&tls);
+        async move {
+            if let Err(e) = emulator.serve(listener, tls).await {
+                eprintln!("emulate: listener stopped: {e}");
+            }
         }
     });
+    if let Some((relay, ftp_listener, ftp_addr)) = ftp {
+        tokio::spawn({
+            let tls = Arc::clone(&tls);
+            async move {
+                if let Err(e) = relay.serve(ftp_listener, tls).await {
+                    eprintln!("emulate-ftp: listener stopped: {e}");
+                }
+            }
+        });
+        eprintln!("emulate: FTP relay on ftps://{ftp_addr} (implicit TLS)");
+    }
 
     eprintln!(
         "emulating printer {} on mqtts://{addr} — point a client at this host \
          with the printer's own serial and access code",
         target.serial
     );
+    if opts.ftp_port.is_none() {
+        eprintln!(
+            "emulate: no FTP relay, so a client can watch and control this printer but \
+             not send it a print"
+        );
+    }
     if opts.read_only {
         eprintln!("emulate: read-only — control commands are refused, not forwarded");
     }
@@ -219,4 +255,36 @@ async fn start_emulator(
         );
     }
     Ok(())
+}
+
+/// Bind the FTP relay's listener, explaining the one failure people actually hit.
+async fn bind_ftp_relay(
+    target: &ResolvedTarget,
+    opts: &EmulateOpts,
+    port: u16,
+) -> anyhow::Result<(Arc<ftpd::FtpRelay>, tokio::net::TcpListener, String)> {
+    let files: Arc<dyn ftpd::PrinterFiles> = Arc::new(ftpd::LivePrinterFiles::new(target.clone()));
+    let relay = if opts.read_only {
+        ftpd::FtpRelay::read_only(&target.access_code, files)
+    } else {
+        ftpd::FtpRelay::new(&target.access_code, files)
+    };
+    let addr = format!("{}:{}", opts.host, port);
+    let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
+        // 990 is where an FTPS client looks, and it is below 1024, so this is
+        // the error nearly everyone meets first. Naming the fixes beats making
+        // them work out that the port is the problem.
+        if e.kind() == std::io::ErrorKind::PermissionDenied && port < 1024 {
+            anyhow::anyhow!(
+                "binding the FTP relay on {addr}: permission denied. Port {port} is \
+                 privileged — grant the binary the capability once with \
+                 `sudo setcap cap_net_bind_service=+ep $(which bambu)`, run as root, or \
+                 pick an unprivileged port with --emulate-ftp-port (the client must be \
+                 told the same one)."
+            )
+        } else {
+            anyhow::anyhow!("binding the FTP relay on {addr}: {e}")
+        }
+    })?;
+    Ok((relay, listener, addr))
 }

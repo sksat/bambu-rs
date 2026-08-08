@@ -383,6 +383,8 @@ fn the_emulate_tuning_flags_require_emulate_itself() {
         vec!["--emulate-host", "0.0.0.0"],
         vec!["--emulate-port", "1883"],
         vec!["--emulate-read-only"],
+        vec!["--emulate-ftp-port", "2990"],
+        vec!["--emulate-no-ftp"],
     ] {
         let mut args = vec!["serve"];
         args.extend(flag);
