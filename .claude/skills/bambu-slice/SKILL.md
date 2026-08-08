@@ -1,6 +1,6 @@
 ---
 name: bambu-slice
-description: Slice a 3D model (STL/STEP/3MF) into a print-ready .gcode.3mf for the Bambu Lab A1 mini, and optionally upload + start the print. ALWAYS use this for any A1-mini slicing — driving OrcaSlicer's CLI directly silently produces WRONG output (it ignores Bambu's profile inheritance and reverts layer height/speeds/temps to defaults), and this skill flattens the profiles and verifies the result. Triggers on natural asks like "slice this for my A1", "get this STL ready to print", "make cube.stl printable on the a1", "print the benchy at 0.12mm on my a1 mini", or "I exported this from Fusion, need it on the bambu a1 mini in matte PLA" — including a freshly downloaded/exported STL or STEP, and choosing a layer height (0.08–0.28mm), nozzle, or filament; no slicer need be named. Do NOT use it when nothing needs slicing: controlling a live print (pause/resume/stop), calibration/bed-leveling, jogging axes, dashboard previews/thumbnails, or sending an already-sliced .gcode.3mf to the printer.
+description: Slice a 3D model (STL/STEP/3MF) into a print-ready .gcode.3mf for the Bambu Lab A1 mini, and optionally upload + start the print. ALWAYS use this for any A1-mini slicing — driving OrcaSlicer's CLI directly silently produces WRONG output (it ignores Bambu's profile inheritance and reverts layer height/speeds/temps to defaults), and this skill flattens the profiles and verifies the result. Triggers on natural asks like "slice this for my A1", "get this STL ready to print", "make cube.stl printable on the a1", "print the benchy at 0.12mm on my a1 mini", or "I exported this from Fusion, need it on the bambu a1 mini in matte PLA" — including a freshly downloaded/exported STL or STEP, and choosing a layer height (0.08–0.28mm), nozzle, or filament; no slicer need be named. Also covers slicing an EXISTING project .3mf (a purchased or Bambu-Studio-authored file with its own plates and per-object settings) — that path deliberately does NOT use the bundled helper, which would re-arrange and re-orient the author's layout. Do NOT use it when nothing needs slicing: controlling a live print (pause/resume/stop), calibration/bed-leveling, jogging axes, dashboard previews/thumbnails, or sending an already-sliced .gcode.3mf to the printer.
 metadata:
   type: reference
 ---
@@ -52,6 +52,11 @@ defaults to **Cool Plate → bed 35 °C**, far too cold for good adhesion (PLA w
 PETG 70 °C on textured PEI).
 
 ## Use the bundled helper (does the flatten + verify for you)
+
+**For a bare model — STL/STEP, or a 3mf that is just geometry.** If the 3mf is a
+*project* with its own plates and per-object settings, skip to
+[Slicing an EXISTING project 3mf](#slicing-an-existing-project-3mf--do-not-use-the-helper);
+the helper re-arranges it.
 
 ```bash
 scripts/slice.py <model.stl> <out.gcode.3mf> [--layer 0.20] \
@@ -111,6 +116,86 @@ unzip -p out.gcode.3mf Metadata/plate_1.gcode | grep -c 'Draw the first line'   
 With no display the slice succeeds but logs `init opengl failed! skip thumbnail
 generating` — the gcode is fine, but the 3mf has **no `Metadata/plate_*.png`** (so
 a dashboard preview is blank). For a thumbnail, run under `xvfb-run -a …`.
+
+## Slicing an EXISTING project 3mf — do NOT use the helper
+
+A `.3mf` you were given (a purchased model, a Bambu Studio project) already
+carries plate layout, per-object orientation, and per-object setting overrides.
+**The helper would destroy all of it**: it passes `--arrange 1 --orient 1`,
+which re-packs and re-orients the objects, and it builds settings from system
+profiles instead of the ones inside the file.
+
+Observed cost: a part whose author set `brim_type = brim_ears` per-object (with
+matching `Metadata/brim_ear_points.txt`) got a plain full-width brim instead —
+48% more first-layer extrusion, visibly not the designed part.
+
+Slice the project's own plates directly, and keep the file's settings:
+
+```bash
+orca-slicer --allow-newer-file --slice N \
+    --outputdir "$PWD/out" --export-3mf out.gcode.3mf project.3mf
+```
+
+`--slice N` is the **plate number** (1-based; `0` = all plates). No
+`--load-settings`, no `--arrange`, no `--orient` — everything comes from the file.
+
+### Orca refuses most Bambu Studio projects (`return -18`)
+
+Bambu Studio writes `-1` for "auto" in some fields; Orca range-checks them and
+bails before slicing:
+
+```
+Param values in 3mf/config error:
+  raft_first_layer_expansion: -1 not in range [0.000000, ...]
+  tree_support_wall_count:    -1 not in range [0.000000,2.000000]
+run found error, return -18, exit...
+```
+
+Nothing in that message says the values are unused or how to proceed. Rewrite
+just those keys **in a copy** — never the original:
+
+```python
+import json, zipfile, shutil
+FIX = {"raft_first_layer_expansion": "2", "tree_support_wall_count": "0"}
+zin = zipfile.ZipFile(src); zout = zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED)
+for item in zin.infolist():
+    data = zin.read(item.filename)
+    if item.filename == "Metadata/project_settings.config":
+        cfg = json.loads(data); cfg.update(FIX)
+        data = json.dumps(cfg, indent=4).encode()
+    zout.writestr(item, data)          # copy every other entry byte-for-byte
+zout.close()
+```
+
+**Check they are actually unused before touching them** — `enable_support` and
+`raft_layers` both `0`, and no per-object override in
+`Metadata/model_settings.config`. If support or a raft IS enabled, these values
+change the print and the substitute must be chosen deliberately.
+
+### Verify a project slice
+
+The per-plate checks below still apply (`Metadata/plate_N.gcode`, layer height,
+no off-bed extrusion in the start gcode). Two more are worth reading:
+
+```bash
+unzip -p out.gcode.3mf Metadata/slice_info.config | grep -E 'weight|prediction|outside'
+```
+
+`outside="false"` proves nothing hangs off the bed.
+
+To confirm *which* objects the plate really contains, count the distinct label
+ids in the gcode — `start printing object` is emitted **once per layer per
+object**, so a plain `grep -c` counts layers, not parts:
+
+```bash
+unzip -p out.gcode.3mf Metadata/plate_N.gcode \
+  | grep -oE 'unique label id: [0-9]+' | sort -u
+```
+
+Cross-check against `slice_info.config`'s `identify_id=` values. They normally
+agree — but if objects were excluded by flipping `printable="0"` in
+`3D/3dmodel.model`, `slice_info` still lists them while the gcode does not.
+The gcode is the truth.
 
 ## Upload + print
 
