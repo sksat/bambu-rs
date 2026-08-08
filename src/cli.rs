@@ -6,6 +6,7 @@
 //! format depends only on the flag); a semantic exit-code scheme; the access
 //! code is never printed.
 
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -178,6 +179,14 @@ enum Command {
         /// so a half-finished motion can be recovered deliberately.
         #[arg(long, conflicts_with = "line")]
         from_file: Option<String>,
+        /// Run one of the selected printer's named sequences (see
+        /// `[printers.<name>.sequences]` in the config, and `config show`).
+        ///
+        /// Macros are per-MACHINE, not per-model: the coordinates depend on what
+        /// is bolted to that unit. Naming the vendor's `.gcode` file in the
+        /// profile is all the support such an accessory needs.
+        #[arg(long, conflicts_with_all = ["line", "from_file"])]
+        sequence: Option<String>,
         /// Required to actually send a control command. With --from-file one
         /// --confirm covers the whole sequence (review it with --dry-run first).
         #[arg(long)]
@@ -648,7 +657,12 @@ impl CliError {
 impl From<ConfigError> for CliError {
     fn from(e: ConfigError) -> Self {
         let code = match e {
-            ConfigError::MissingField(_) | ConfigError::UnknownProfile(_) => exit::VALIDATION,
+            ConfigError::MissingField(_)
+            | ConfigError::UnknownProfile(_)
+            // A name that isn't defined is the caller's mistake, not a fault:
+            // the agent contract is semantic exit codes, so it must read as
+            // validation, not a generic failure.
+            | ConfigError::NoSuchSequence { .. } => exit::VALIDATION,
             _ => exit::GENERAL,
         };
         CliError::new(code, e.to_string())
@@ -725,18 +739,22 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
         Command::Gcode {
             line,
             from_file,
+            sequence,
             confirm,
             force,
             dry_run,
             timeout,
         } => run_gcode(
             cli,
-            line.as_deref(),
-            from_file.as_deref(),
-            *confirm,
-            *force,
-            *dry_run,
-            *timeout,
+            GcodeRequest {
+                line: line.as_deref(),
+                from_file: from_file.as_deref(),
+                sequence_name: sequence.as_deref(),
+                confirm: *confirm,
+                force: *force,
+                dry_run: *dry_run,
+                timeout_secs: *timeout,
+            },
         ),
         Command::Reboot { confirm } => run_reboot(cli, *confirm),
         #[cfg(feature = "server")]
@@ -786,6 +804,15 @@ fn run_config(cli: &Cli, action: &ConfigAction) -> Result<(), CliError> {
                 model: model.clone(),
                 mode: "lan".to_string(),
                 access_code: access_code.clone(),
+                // `config add` doubles as "update" — re-running it after a DHCP
+                // change is the documented way to fix an IP. Rebuilding the
+                // profile from flags alone would silently drop this printer's
+                // sequences, and `save()` would then erase them from disk.
+                sequences: cfg
+                    .printers
+                    .get(&name)
+                    .map(|p| p.sequences.clone())
+                    .unwrap_or_default(),
             };
             cfg.printers.insert(name.clone(), profile);
             if *set_default || cfg.default_printer.is_none() {
@@ -1554,16 +1581,97 @@ fn load_seed_cameras(path: &std::path::Path) -> Result<Vec<SeedCamera>, CliError
     })
 }
 
-fn run_gcode(
-    cli: &Cli,
-    line: Option<&str>,
-    from_file: Option<&str>,
+/// Turn `--sequence <name>` into the file it names, via the selected profile.
+///
+/// Sequences hang off a printer profile, so an env-only connection (`BAMBU_*`
+/// with no config) has nowhere to look them up. That is a supported way to
+/// connect, so say what to do about it rather than reporting a bare lookup
+/// failure — `--from-file` still works there.
+fn resolve_named_sequence(cli: &Cli, name: &str) -> Result<String, CliError> {
+    let path = config::default_config_path()
+        .ok_or_else(|| CliError::new(exit::VALIDATION, "no config path (set $HOME)"))?;
+    let cfg = Config::load_or_default(&path)?;
+    let profile_name = cli
+        .printer
+        .clone()
+        .or_else(|| cfg.default_printer.clone())
+        .ok_or_else(|| {
+            CliError::new(
+                exit::VALIDATION,
+                "--sequence needs a printer profile (sequences are defined per \
+                 printer); pass --printer <name> or set a default. With an \
+                 env-only connection, use --from-file",
+            )
+        })?;
+    let profile = cfg
+        .printers
+        .get(&profile_name)
+        .ok_or_else(|| CliError::from(ConfigError::UnknownProfile(profile_name.clone())))?;
+    // The macro belongs to THIS machine — its coordinates describe what is
+    // bolted to it. But the connection is resolved separately, with flags and
+    // BAMBU_* winning over the profile, so a default of printer A plus a
+    // BAMBU_IP for printer B would send A's plate-changer motion to B, which
+    // has no such accessory. Refuse rather than reconcile: there is no sensible
+    // way to guess which machine the caller meant.
+    let overrides = flag_overrides(cli).over(Overrides::from_env());
+    for (what, over, mine) in [
+        ("ip", &overrides.ip, &profile.ip),
+        ("serial", &overrides.serial, &profile.serial),
+    ] {
+        if let Some(v) = over
+            && v != mine
+        {
+            return Err(CliError::new(
+                exit::VALIDATION,
+                format!(
+                    "--sequence {name:?} belongs to profile '{profile_name}' ({what}={mine}), \
+                     but {what}={v} was given — a sequence describes one machine's hardware \
+                     and must not be sent to another. Select that printer, or use --from-file"
+                ),
+            ));
+        }
+    }
+    let raw = profile.sequence(name)?;
+    let config_dir = path.parent().unwrap_or(Path::new("."));
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    Ok(
+        config::resolve_sequence_path(raw, config_dir, home.as_deref())
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// What to send and how, resolved from the `gcode` flags. The three sources are
+/// mutually exclusive at the clap level; this carries whichever was given.
+struct GcodeRequest<'a> {
+    line: Option<&'a str>,
+    from_file: Option<&'a str>,
+    sequence_name: Option<&'a str>,
     confirm: bool,
     force: bool,
     dry_run: bool,
     timeout_secs: u64,
-) -> Result<(), CliError> {
-    let steps = match (line, from_file) {
+}
+
+fn run_gcode(cli: &Cli, req: GcodeRequest<'_>) -> Result<(), CliError> {
+    let GcodeRequest {
+        line,
+        from_file,
+        sequence_name,
+        confirm,
+        force,
+        dry_run,
+        timeout_secs,
+    } = req;
+    // A named sequence is just a path the profile knows — resolve it here and
+    // the rest is the --from-file path unchanged.
+    let resolved = match sequence_name {
+        Some(name) => Some(resolve_named_sequence(cli, name)?),
+        None => None,
+    };
+    let from_file = from_file.map(str::to_string).or(resolved);
+
+    let steps = match (line, from_file.as_deref()) {
         (Some(l), None) => vec![sequence::Step {
             line_no: 1,
             gcode: l.to_string(),
@@ -1583,10 +1691,11 @@ fn run_gcode(
         _ => {
             return Err(CliError::new(
                 exit::VALIDATION,
-                "give either a G-code line or --from-file",
+                "give a G-code line, --from-file, or --sequence",
             ));
         }
     };
+    let from_file = from_file.as_deref();
 
     // Static safety guard: block recognised-dangerous lines (over-limit temps,
     // cold extrusion) unless explicitly overridden with --force. A sequence is
@@ -3812,6 +3921,10 @@ struct RedactedProfile<'a> {
     model: &'a str,
     mode: &'a str,
     access_code: &'static str,
+    /// Names and paths of this printer's sequences. Nothing secret, and it is
+    /// the only way to discover what `--sequence` accepts without guessing.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    sequences: &'a std::collections::BTreeMap<String, String>,
 }
 
 impl<'a> RedactedProfile<'a> {
@@ -3822,6 +3935,7 @@ impl<'a> RedactedProfile<'a> {
             serial: &p.serial,
             model: &p.model,
             mode: &p.mode,
+            sequences: &p.sequences,
             access_code: "<redacted>",
         }
     }
@@ -3833,6 +3947,13 @@ impl std::fmt::Display for RedactedProfile<'_> {
             f,
             "{}: ip={} serial={} model={} mode={} access_code={}",
             self.name, self.ip, self.serial, self.model, self.mode, self.access_code
-        )
+        )?;
+        // Listed here too, not just under --json: this is the only way to learn
+        // what `--sequence` accepts without guessing a name and reading the
+        // error, and most callers never pass --json.
+        for (name, path) in self.sequences {
+            write!(f, "\n  sequence {name} = {path}")?;
+        }
+        Ok(())
     }
 }

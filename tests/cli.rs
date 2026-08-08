@@ -420,3 +420,120 @@ fn config_add_list_show_roundtrip_redacts_access_code() {
 
     let _ = std::fs::remove_dir_all(&cfg);
 }
+
+/// Write a config with one profile that owns a relative-path sequence, and the
+/// sequence file it names. Returns the config dir.
+fn cfg_with_sequence(tag: &str) -> std::path::PathBuf {
+    let cfg = tmp_cfg(tag);
+    let dir = cfg.join("bambu-rs");
+    std::fs::create_dir_all(dir.join("sequences")).unwrap();
+    std::fs::write(dir.join("sequences/swap.gcode"), SEQ).unwrap();
+    std::fs::write(
+        dir.join("config.toml"),
+        "default_printer = \"a1\"\n\
+         [printers.a1]\n\
+         ip = \"192.0.2.10\"\n\
+         serial = \"SA\"\n\
+         model = \"a1mini\"\n\
+         mode = \"lan\"\n\
+         access_code = \"00000000\"\n\
+         [printers.a1.sequences]\n\
+         swap = \"sequences/swap.gcode\"\n",
+    )
+    .unwrap();
+    cfg
+}
+
+#[test]
+fn gcode_sequence_resolves_through_the_profile_from_any_directory() {
+    let cfg = cfg_with_sequence("seq-resolve");
+    // The path in the config is RELATIVE. Run from a directory that is not the
+    // config dir: anchoring to the cwd would break here, which is the whole
+    // reason it anchors to the config dir instead.
+    let elsewhere = tmp_cfg("seq-resolve-cwd");
+    bambu(&cfg)
+        .current_dir(&elsewhere)
+        .args(["gcode", "--sequence", "swap", "--dry-run", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"count\": 3"))
+        .stdout(predicate::str::contains("sequences/swap.gcode"));
+    let _ = std::fs::remove_dir_all(&cfg);
+    let _ = std::fs::remove_dir_all(&elsewhere);
+}
+
+#[test]
+fn gcode_sequence_unknown_name_lists_the_defined_ones() {
+    let cfg = cfg_with_sequence("seq-unknown");
+    bambu(&cfg)
+        .args(["gcode", "--sequence", "swaap", "--dry-run"])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("swaap"))
+        .stderr(predicate::str::contains("swap"));
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[test]
+fn gcode_sequence_refuses_to_run_on_a_different_machine() {
+    // A sequence describes one machine's hardware. Selecting profile a1 while
+    // pointing the connection elsewhere would send its plate-changer motion to
+    // a printer that has no such accessory.
+    let cfg = cfg_with_sequence("seq-identity");
+    bambu(&cfg)
+        .env("BAMBU_IP", "10.0.0.1")
+        .args(["gcode", "--sequence", "swap", "--dry-run"])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("must not be sent to another"));
+    // Same machine spelled out explicitly is harmless, so it still runs.
+    bambu(&cfg)
+        .env("BAMBU_IP", "192.0.2.10")
+        .args(["gcode", "--sequence", "swap", "--dry-run"])
+        .assert()
+        .success();
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[test]
+fn gcode_sequence_without_a_profile_says_where_sequences_live() {
+    let cfg = tmp_cfg("seq-noprofile"); // no config at all
+    bambu(&cfg)
+        .args(["gcode", "--sequence", "swap", "--dry-run"])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("--from-file"));
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[test]
+fn config_add_does_not_destroy_the_profiles_sequences() {
+    // `config add` rebuilds the profile from its flags. Re-running it to fix an
+    // IP must not take the printer's macros with it — this reads the saved TOML
+    // back rather than trusting the in-memory value.
+    let cfg = cfg_with_sequence("seq-add");
+    bambu(&cfg)
+        .args([
+            "--printer",
+            "a1",
+            "config",
+            "add",
+            "--ip",
+            "192.0.2.99",
+            "--serial",
+            "SA",
+            "--access-code",
+            "00000000",
+            "--model",
+            "a1mini",
+        ])
+        .assert()
+        .success();
+    let saved = std::fs::read_to_string(cfg.join("bambu-rs/config.toml")).unwrap();
+    assert!(saved.contains("192.0.2.99"), "the IP should have changed");
+    assert!(
+        saved.contains("sequences/swap.gcode"),
+        "the sequence must survive:\n{saved}"
+    );
+    let _ = std::fs::remove_dir_all(&cfg);
+}

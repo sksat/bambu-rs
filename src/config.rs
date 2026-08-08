@@ -24,6 +24,70 @@ pub struct Profile {
     pub mode: String,
     /// LAN access code (the 8-digit secret). Redacted from `Debug`.
     pub access_code: String,
+    /// Named `.gcode` sequences for THIS printer: `name -> path`.
+    ///
+    /// A control macro is per-machine, not per-model — the coordinates depend on
+    /// what is bolted to that specific unit. A plate changer's swap motion is a
+    /// fixed run of G-code its vendor ships, so naming the file here is all the
+    /// support such an accessory needs; nothing about it belongs in this crate.
+    ///
+    /// Deliberately no defaults: the right values depend on the physical setup,
+    /// so an unknown name is an error rather than a guess.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sequences: BTreeMap<String, String>,
+}
+
+impl Profile {
+    /// Look up one of this printer's named sequences.
+    ///
+    /// The error lists what IS defined: the caller is usually an agent or a
+    /// script that guessed a name, and "swap not found" alone leaves it to
+    /// guess again.
+    pub fn sequence(&self, name: &str) -> Result<&str, ConfigError> {
+        self.sequences
+            .get(name)
+            .map(String::as_str)
+            .ok_or_else(|| ConfigError::NoSuchSequence {
+                name: name.to_string(),
+                available: if self.sequences.is_empty() {
+                    "none defined for this profile".to_string()
+                } else {
+                    self.sequences
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                },
+            })
+    }
+}
+
+/// Resolve a configured sequence path.
+///
+/// - absolute → unchanged
+/// - `~/…` → relative to `home` (bare prefix only; `~user` is not expanded)
+/// - anything else → relative to **the config file's directory, never the cwd**
+///
+/// cwd-relative would make the same `--sequence swap` work in one directory and
+/// fail in another — the kind of guess this crate's hard-error style exists to
+/// remove — and a future `serve` under systemd runs with `cwd=/`. Anchoring to
+/// the config directory also makes `~/.config/bambu-rs/sequences/swap.gcode` a
+/// self-contained setup you can copy between machines.
+///
+/// Pure: no filesystem access. Whether the file exists is the caller's problem,
+/// checked when the sequence is actually used — a dangling path in one printer's
+/// profile must not break using another.
+pub fn resolve_sequence_path(raw: &str, config_dir: &Path, home: Option<&Path>) -> PathBuf {
+    let p = Path::new(raw);
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    if let Some(rest) = raw.strip_prefix("~/")
+        && let Some(h) = home
+    {
+        return h.join(rest);
+    }
+    config_dir.join(p)
 }
 
 fn default_mode() -> String {
@@ -59,6 +123,8 @@ pub enum ConfigError {
     MissingField(&'static str),
     #[error("no such printer profile: {0}")]
     UnknownProfile(String),
+    #[error("profile has no sequence {name:?} (defined: {available})")]
+    NoSuchSequence { name: String, available: String },
     #[error("config i/o error: {0}")]
     Io(#[from] std::io::Error),
     #[error("config parse error: {0}")]
@@ -272,7 +338,87 @@ malformed line without equals
             model: "a1mini".into(),
             mode: "lan".into(),
             access_code: "00000000".into(),
+            sequences: BTreeMap::new(),
         }
+    }
+
+    fn profile_with_sequences() -> Profile {
+        let mut p = sample_profile();
+        p.sequences
+            .insert("swap".into(), "sequences/swap.gcode".into());
+        p.sequences
+            .insert("load".into(), "sequences/load.gcode".into());
+        p
+    }
+
+    #[test]
+    fn an_unknown_sequence_name_lists_the_ones_that_exist() {
+        // The caller is usually an agent or script that guessed. "not found"
+        // alone leaves it guessing again.
+        let err = profile_with_sequences().sequence("swaap").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("swaap"), "{msg}");
+        assert!(msg.contains("load") && msg.contains("swap"), "{msg}");
+    }
+
+    #[test]
+    fn a_profile_with_no_sequences_says_so_rather_than_listing_nothing() {
+        let msg = sample_profile().sequence("swap").unwrap_err().to_string();
+        assert!(msg.contains("none defined"), "{msg}");
+    }
+
+    #[test]
+    fn sequence_paths_anchor_to_the_config_dir_not_the_cwd() {
+        let cfg_dir = Path::new("/home/u/.config/bambu-rs");
+        let home = Path::new("/home/u");
+        // Absolute wins outright.
+        assert_eq!(
+            resolve_sequence_path("/opt/swap.gcode", cfg_dir, Some(home)),
+            Path::new("/opt/swap.gcode")
+        );
+        // `~/` is expanded — configs are written by hand and people type it.
+        assert_eq!(
+            resolve_sequence_path("~/swapmod/swap.gcode", cfg_dir, Some(home)),
+            Path::new("/home/u/swapmod/swap.gcode")
+        );
+        // The one that matters: relative resolves against the CONFIG dir, so the
+        // same command works from any working directory.
+        assert_eq!(
+            resolve_sequence_path("sequences/swap.gcode", cfg_dir, Some(home)),
+            Path::new("/home/u/.config/bambu-rs/sequences/swap.gcode")
+        );
+        // No home to expand against: don't invent one, leave it config-relative.
+        assert_eq!(
+            resolve_sequence_path("~/swap.gcode", cfg_dir, None),
+            cfg_dir.join("~/swap.gcode")
+        );
+    }
+
+    #[test]
+    fn rewriting_a_profile_must_carry_its_sequences_across() {
+        // `config add` doubles as "update" — the documented fix after a DHCP
+        // change. It rebuilds the Profile from flags, so anything not carried
+        // over is destroyed on the next save. This pins the carry-over that the
+        // CLI does; without it, updating an IP silently wipes the macros.
+        let old = profile_with_sequences();
+        let updated = Profile {
+            ip: "192.0.2.99".into(),
+            sequences: old.sequences.clone(),
+            ..old.clone()
+        };
+        assert_eq!(updated.ip, "192.0.2.99");
+        assert_eq!(updated.sequences, old.sequences);
+        assert!(updated.sequence("swap").is_ok());
+    }
+
+    #[test]
+    fn sequences_survive_a_config_round_trip() {
+        let cfg = Config {
+            default_printer: Some("a1".into()),
+            printers: BTreeMap::from([("a1".to_string(), profile_with_sequences())]),
+        };
+        let back: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert_eq!(back, cfg);
     }
 
     #[test]
