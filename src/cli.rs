@@ -282,6 +282,24 @@ enum Command {
         // would run a command that does not do what the flag promises.
         #[arg(long, conflicts_with = "fake")]
         all_printers: bool,
+        /// Slicer binary for `/api/slice`, instead of auto-detecting one.
+        ///
+        /// Auto-detection looks for `orca-slicer` on PATH, then Bambu Studio at
+        /// /opt/bambustudio-bin. Passing this makes the choice explicit: if the
+        /// path is wrong, serve says so rather than quietly slicing with a
+        /// different install.
+        #[arg(long, value_name = "PATH")]
+        slicer_bin: Option<std::path::PathBuf>,
+        /// Bambu profile bundle to slice from (the directory holding
+        /// `machine/`, `process/` and `filament/`, e.g.
+        /// /opt/orca-slicer/resources/profiles/BBL). Defaults to the bundle
+        /// shipped beside the slicer binary.
+        #[arg(long, value_name = "DIR")]
+        slicer_profiles: Option<std::path::PathBuf>,
+        /// Give up on a slice after this many seconds. A GL-less host can wedge
+        /// the slicer outright; a big model on a slow machine just needs longer.
+        #[arg(long, default_value_t = 600)]
+        slice_timeout_secs: u64,
         /// Also emulate the printer in Local Mode, so Bambu Studio (or
         /// OrcaSlicer, or Home Assistant) can connect to THIS host instead of
         /// to the printer. serve holds the one real LAN connection and relays
@@ -897,6 +915,9 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             camera_url,
             cameras_config,
             all_printers,
+            slicer_bin,
+            slicer_profiles,
+            slice_timeout_secs,
             #[cfg(feature = "relay")]
             emulate,
             #[cfg(feature = "relay")]
@@ -927,6 +948,9 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             camera_url.clone(),
             cameras_config.clone(),
             *all_printers,
+            slicer_bin.clone(),
+            slicer_profiles.clone(),
+            Duration::from_secs(*slice_timeout_secs),
             #[cfg(feature = "relay")]
             emulate.then(|| crate::server::EmulateOpts {
                 host: emulate_host.clone(),
@@ -1715,6 +1739,9 @@ fn run_serve(
     camera_url: Vec<String>,
     cameras_config: Option<std::path::PathBuf>,
     all_printers: bool,
+    slicer_bin: Option<std::path::PathBuf>,
+    slicer_profiles: Option<std::path::PathBuf>,
+    slice_timeout: Duration,
     #[cfg(feature = "relay")] emulate: Option<crate::server::EmulateOpts>,
 ) -> Result<(), CliError> {
     // Live mode needs a connection target; fake mode doesn't touch the printer.
@@ -1794,6 +1821,9 @@ fn run_serve(
         fake,
         interval: interval.map(Duration::from_secs),
         external_cameras,
+        slicer_bin,
+        slicer_profiles,
+        slice_timeout,
         #[cfg(feature = "relay")]
         emulate,
     };

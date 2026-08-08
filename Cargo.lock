@@ -309,6 +309,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "futures-util",
+ "libc",
  "md-5",
  "notalawyer",
  "notalawyer-build",

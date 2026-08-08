@@ -1,10 +1,15 @@
 # Slicing → printing
 
-`bambu-rs` does **not** slice. Slicing is delegated to **Bambu Studio** or
-**OrcaSlicer** (an open-source fork of Bambu Studio with a near-identical CLI),
-which turn a model into a sliced **`.gcode.3mf`**. `bambu` then uploads that file
-and starts the print. This keeps `bambu-rs` focused on the LAN
-control/monitoring path and avoids re-implementing a slicer.
+`bambu-rs` does **not** implement a slicer. Slicing is delegated to **Bambu
+Studio** or **OrcaSlicer** (an open-source fork of Bambu Studio with a
+near-identical CLI), which turn a model into a sliced **`.gcode.3mf`**; `bambu`
+then uploads that file and starts the print. This keeps `bambu-rs` focused on
+the LAN control/monitoring path.
+
+`bambu serve` can *drive* that slicer for you over HTTP — see
+[Slicing through `bambu serve`](#slicing-through-bambu-serve) — which is where
+the two traps below are handled and verified for you rather than left as
+gotchas to reproduce by hand.
 
 ## 1. Slice to `.gcode.3mf` (Bambu Studio / OrcaSlicer CLI)
 
@@ -52,6 +57,55 @@ Key flags (from the Bambu Studio CLI reference):
 > `Metadata/plate_N.gcode`, its `.md5`, plate metadata, and the filament the
 > plate was sliced for (material + temps). Print PETG with a PETG slice — a
 > PLA-temp slice will not print PETG correctly.
+
+## Slicing through `bambu serve`
+
+`bambu serve` exposes the same slicer over HTTP, with the two traps above
+handled: it flattens the `inherits` chains, merges the machine template gcodes,
+and then **verifies the produced gcode** — the layer height must match the
+request, and the start section must not extrude off the bed.
+
+The slicer binary and its profile bundle are auto-detected (`orca-slicer` on
+`$PATH`, else `/opt/bambustudio-bin`); override with `--slicer-bin` and
+`--slicer-profiles`, and cap a run with `--slice-timeout-secs` (default 600). A
+host with no slicer still serves — `GET /api/slice` just reports
+`"available": false` with the reason.
+
+```bash
+B=http://HOST:8088
+# Is slicing available, and what is the slot doing?
+curl -s "$B/api/slice"
+
+# Slice a model. layer / filament / bed_type are REQUIRED: they depend on your
+# intent and on the spool and plate actually fitted, so the server never guesses
+# (a defaulted bed_type means a 35 °C Cool Plate and a print that lifts).
+curl -s -X POST --data-binary @cube.stl \
+  "$B/api/slice?name=cube.stl&layer=0.12&filament=Bambu%20PLA%20Basic%20@BBL%20A1M&bed_type=Textured%20PEI%20Plate"
+
+# Poll until state is "done" (or "failed", with the reason in .job.error)
+curl -s "$B/api/slice" | jq .job
+
+# Then either download it… (password-gated like the slice itself: it hands back
+# a file made from geometry you uploaded, not printer state)
+curl -s -o cube.gcode.3mf -H "authorization: Bearer $PW" "$B/api/slice/result"
+# …or print it straight off the server, without a round trip through a browser:
+curl -s -X POST "$B/api/slice/print" -H 'content-type: application/json' -d '{"dry_run":true}'
+curl -s -X POST "$B/api/slice/print" -H 'content-type: application/json' \
+  -d '{"confirm":true,"use_ams":true,"ams_map":[0]}'
+```
+
+`layer` is judged against the nozzle the printer reports, not a fixed window: a
+0.2 nozzle cannot lay 0.4 mm and a 0.8 can, so the accepted range is derived
+from the diameter. A height with no process profile near it is refused rather
+than sliced on a neighbour's speeds and flow.
+
+Limits, deliberately: one slice at a time per printer (a second is `409`), one
+filament, no timelapse mode, and no queue or persistence across a restart.
+Only models we have **verified** a profile mapping for can be sliced — today
+that is the A1 mini; any other model reports `"available": false` rather than
+slicing against some other machine's bed. An **authored project `.3mf`** (one
+with its own plates and per-object settings) is refused with a message: slicing
+it here would re-arrange and re-orient the author's layout.
 
 ## 2. Upload and print with `bambu`
 

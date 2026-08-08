@@ -166,6 +166,43 @@ fn injects_timelapse_blocks(gcode: &[u8]) -> bool {
         > 1
 }
 
+/// Does this `.3mf` carry an **authored** project — plate layout, per-object
+/// orientation, per-object setting overrides — rather than bare geometry?
+///
+/// Slicing one of these from system profiles destroys the author's work: the
+/// slicer is driven with `--arrange 1 --orient 1`, which re-packs and re-orients
+/// every object. Observed cost: a part whose author set `brim_type = brim_ears`
+/// per-object got a plain full-width brim instead — 48% more first-layer
+/// extrusion, visibly not the designed part. So the server refuses these rather
+/// than quietly ruining them.
+///
+/// Detected by the two settings blobs Bambu Studio / OrcaSlicer write into a
+/// project and never into a plain geometry export.
+pub fn is_authored_project(zip_bytes: &[u8]) -> Result<bool, ProjectError> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes))
+        .map_err(|e| ProjectError::InvalidZip(e.to_string()))?;
+    Ok([
+        "Metadata/project_settings.config",
+        "Metadata/model_settings.config",
+    ]
+    .iter()
+    .any(|name| archive.by_name(name).is_ok()))
+}
+
+/// One plate's gcode as text, or `None` when the `.3mf` has no such plate
+/// (i.e. it is not sliced). Size-capped like every other entry read.
+///
+/// Lossy UTF-8: gcode is ASCII, and a stray byte in a comment must not turn a
+/// verifiable slice into an error.
+pub fn plate_gcode(zip_bytes: &[u8], plate: u32) -> Result<Option<String>, ProjectError> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes))
+        .map_err(|e| ProjectError::InvalidZip(e.to_string()))?;
+    Ok(
+        read_entry(&mut archive, &format!("Metadata/plate_{plate}.gcode"))?
+            .map(|b| String::from_utf8_lossy(&b).into_owned()),
+    )
+}
+
 /// Verify caller-asserted expectations against an inspected plate.
 /// `expect_plate`, when given, must equal the `--plate` actually requested.
 pub fn verify_expectations(
@@ -294,6 +331,42 @@ mod tests {
             zip.finish().unwrap();
         }
         buf
+    }
+
+    #[test]
+    fn an_authored_project_is_told_apart_from_bare_geometry() {
+        let authored = make_3mf(&[
+            ("3D/3dmodel.model", b"<model/>"),
+            (
+                "Metadata/project_settings.config",
+                b"{\"layer_height\":\"0.2\"}",
+            ),
+        ]);
+        assert!(is_authored_project(&authored).unwrap());
+
+        let per_object = make_3mf(&[
+            ("3D/3dmodel.model", b"<model/>"),
+            ("Metadata/model_settings.config", b"<config/>"),
+        ]);
+        assert!(is_authored_project(&per_object).unwrap());
+
+        // A plain geometry export — the only kind we may re-arrange and slice.
+        let bare = make_3mf(&[("3D/3dmodel.model", b"<model/>")]);
+        assert!(!is_authored_project(&bare).unwrap());
+
+        assert!(is_authored_project(b"not a zip").is_err());
+    }
+
+    #[test]
+    fn plate_gcode_reads_the_plate_or_says_it_is_unsliced() {
+        let sliced = make_3mf(&[("Metadata/plate_1.gcode", b"; layer_height = 0.12\n")]);
+        assert_eq!(
+            plate_gcode(&sliced, 1).unwrap().as_deref(),
+            Some("; layer_height = 0.12\n")
+        );
+        assert_eq!(plate_gcode(&sliced, 2).unwrap(), None);
+        let unsliced = make_3mf(&[("3D/3dmodel.model", b"<model/>")]);
+        assert_eq!(plate_gcode(&unsliced, 1).unwrap(), None);
     }
 
     #[test]
