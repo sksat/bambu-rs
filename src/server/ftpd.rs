@@ -670,37 +670,55 @@ where
         )));
     };
     write_reply(control, &Reply::new(150, what)).await?;
-    let (socket, from) = match tokio::time::timeout(DATA_ACCEPT_TIMEOUT, listener.accept()).await {
-        Ok(Ok(pair)) => pair,
-        Ok(Err(e)) => return Err(DataError::Refused(Reply::new(425, format!("accept: {e}")))),
-        Err(_) => {
-            return Err(DataError::Refused(Reply::new(
-                425,
-                "the data connection was never opened",
-            )));
-        }
-    };
-
     // The data port is open to the whole network for the moment it exists, and
     // whoever connects first gets it. Unchecked, another host on the LAN can
     // race the client to it — winning a RETR hands them the file, and winning a
     // STOR lets them choose the bytes this relay then uploads to a machine that
-    // heats and moves. No access code required, just presence and timing. So:
-    // the data connection must come from the same host as the control
-    // connection, which is what every serious FTP server enforces.
-    if let Some(expected) = control_peer.map(|a| a.ip())
-        && from.ip() != expected
-    {
-        drop(socket);
-        eprintln!(
-            "emulate-ftp: refusing a data connection from {} — control is {expected}",
-            from.ip()
-        );
-        return Err(DataError::Refused(Reply::new(
-            425,
-            "data connection from a different host; refused",
-        )));
-    }
+    // heats and moves. No access code required, just presence and timing. So the
+    // data connection must come from the same host as the control connection,
+    // which is what every serious FTP server enforces.
+    //
+    // Dropping a stranger is only half of it: if losing the race also failed the
+    // client's transfer, winning it repeatedly would be an unauthenticated
+    // denial of service — every STOR and RETR answering 425. So keep accepting
+    // until the right host turns up, bounded by one deadline for the whole wait
+    // so an attacker cannot extend it either.
+    let deadline = tokio::time::Instant::now() + DATA_ACCEPT_TIMEOUT;
+    let mut turned_away = 0u32;
+    let socket = loop {
+        let (socket, from) = match tokio::time::timeout_at(deadline, listener.accept()).await {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => return Err(DataError::Refused(Reply::new(425, format!("accept: {e}")))),
+            Err(_) => {
+                return Err(DataError::Refused(Reply::new(
+                    425,
+                    if turned_away > 0 {
+                        format!(
+                            "no data connection from the control host \
+                             ({turned_away} from elsewhere were refused)"
+                        )
+                    } else {
+                        "the data connection was never opened".to_string()
+                    },
+                )));
+            }
+        };
+        match control_peer.map(|a| a.ip()) {
+            Some(expected) if from.ip() != expected => {
+                drop(socket);
+                turned_away += 1;
+                // Once, not per attempt: a flood should not become a log flood.
+                if turned_away == 1 {
+                    eprintln!(
+                        "emulate-ftp: dropping a data connection from {} — control is {expected}; \
+                         still waiting for the right host",
+                        from.ip()
+                    );
+                }
+            }
+            _ => break socket,
+        }
+    };
     // Implicit FTPS encrypts the data channel too.
     Ok(acceptor.accept(socket).await?)
 }
@@ -1137,15 +1155,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_data_connection_from_another_host_is_refused() {
+    async fn a_stranger_racing_the_data_port_is_dropped_and_the_real_transfer_still_works() {
         // The PASV port is open to the network for as long as it exists, and
         // whoever connects first gets it. Unchecked, another host can race the
         // real client: winning a STOR lets it choose the bytes this relay
         // uploads to a machine that heats and moves — no access code needed,
         // just presence and timing.
         //
-        // Loopback gives us two distinct source addresses (127.0.0.1 and
-        // 127.0.0.2) on the same machine, which is exactly the check.
+        // Refusing the stranger is only half of it. If losing the race also
+        // failed the client's transfer, the same race would be an
+        // unauthenticated denial of service: win it repeatedly and every STOR
+        // and RETR answers 425. So the stranger is dropped and the listener
+        // keeps waiting for the host that owns the control connection.
+        //
+        // Loopback gives two distinct source addresses (127.0.0.1 and
+        // 127.0.0.2) on one machine, which is exactly the check.
         let files = FakeFiles::new();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1159,28 +1183,43 @@ mod tests {
         let port = client.pasv().await;
         client
             .stream
-            .write_all(b"STOR /cache/evil.3mf\r\n")
+            .write_all(b"STOR /cache/plate.3mf\r\n")
             .await
             .unwrap();
         client.stream.flush().await.unwrap();
+        assert_eq!(client.read_reply().await.0, 150);
 
-        // The "attacker" connects from a different source address.
+        // The stranger gets there first, from a different source address, and
+        // writes what it would like the printer to build.
         let hijack = tokio::net::TcpSocket::new_v4().unwrap();
         hijack.bind("127.0.0.2:0".parse().unwrap()).unwrap();
-        let taken = hijack
+        if let Ok(mut taken) = hijack
             .connect(format!("127.0.0.1:{port}").parse().unwrap())
-            .await;
+            .await
+        {
+            let _ = taken.write_all(b"attacker bytes").await;
+            let _ = taken.shutdown().await;
+        }
 
-        // 150 goes out before the accept, then the refusal.
-        assert_eq!(client.read_reply().await.0, 150);
+        // The real client then connects and its transfer completes normally.
+        let mut data = client.data_connect(port).await;
+        data.write_all(b"the real plate").await.unwrap();
+        data.shutdown().await.unwrap();
+        let mut rest = Vec::new();
+        let _ = data.read_to_end(&mut rest).await;
+        drop(data);
+
         let (code, line) = client.read_reply().await;
-        assert_eq!(code, 425, "{line}");
-        assert!(line.contains("different host"), "{line}");
-        assert!(
-            files.uploads().is_empty(),
-            "nothing from a stranger may reach the printer"
+        assert_eq!(
+            code, 226,
+            "the stranger must not break the transfer: {line}"
         );
-        drop(taken);
+        let uploads = files.uploads();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(
+            uploads[0].1, b"the real plate",
+            "the printer must receive the client's bytes, never the stranger's"
+        );
     }
 
     #[tokio::test]
