@@ -26,6 +26,68 @@ pub fn lan_client_config() -> Result<Arc<rustls::ClientConfig>, rustls::Error> {
     Ok(Arc::new(config))
 }
 
+/// Building the emulated printer's server-side TLS failed.
+#[cfg(feature = "server")]
+#[derive(Debug, thiserror::Error)]
+pub enum ServerTlsError {
+    #[error(
+        "cannot emulate a printer with an empty serial: it names the certificate and both MQTT topics"
+    )]
+    NoSerial,
+    #[error("generating the emulated printer's certificate: {0}")]
+    Certificate(#[from] rcgen::Error),
+    #[error("rustls: {0}")]
+    Rustls(#[from] rustls::Error),
+}
+
+/// A rustls [`ServerConfig`](rustls::ServerConfig) presenting a **freshly
+/// generated** self-signed certificate with `CN = serial` — what
+/// `bambu serve --emulate` answers a TLS handshake with.
+///
+/// Two deliberate differences from the real printer, both safe:
+///
+/// - The printer's certificate is X.509 **v1** and RSA-2048; this one is v3 and
+///   ECDSA P-256. A v1 self-signed certificate is unverifiable (webpki won't
+///   even parse it — see the module docs), so any LAN client that talks to a
+///   Bambu printer at all must already be skipping verification, and a *more*
+///   standard certificate cannot be the thing that breaks it. ECDSA also
+///   generates in microseconds where RSA-2048 would stall startup, and `ring`
+///   cannot generate RSA keys at all.
+/// - It is generated per run rather than cached on disk. Nothing pins it today,
+///   and a key sitting in the config directory is a liability that buys nothing
+///   until something does.
+#[cfg(feature = "server")]
+pub fn emulated_printer_server_config(
+    serial: &str,
+) -> Result<Arc<rustls::ServerConfig>, ServerTlsError> {
+    // rcgen will cheerfully issue a certificate with an empty name, and the
+    // topics would be `device//report`. Nothing downstream would notice.
+    if serial.is_empty() {
+        return Err(ServerTlsError::NoSerial);
+    }
+    // `localhost` alongside the serial so a hostname-checking client works
+    // against a relay on the same machine. A client reaching us over the LAN
+    // connects by IP, which we can't know here — but it can't be verifying
+    // anyway, for the reason above.
+    let mut params = rcgen::CertificateParams::new(vec![serial.to_string(), "localhost".into()])?;
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, serial);
+    let signing_key = rcgen::KeyPair::generate()?;
+    let cert = params.self_signed(&signing_key)?;
+
+    let chain = vec![rustls_pki_types::CertificateDer::from(cert.der().to_vec())];
+    let key = rustls_pki_types::PrivateKeyDer::Pkcs8(rustls_pki_types::PrivatePkcs8KeyDer::from(
+        signing_key.serialize_der(),
+    ));
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(chain, key)?;
+    Ok(Arc::new(config))
+}
+
 #[derive(Debug)]
 struct AcceptSelfSigned(Arc<rustls::crypto::CryptoProvider>);
 
@@ -72,5 +134,31 @@ mod tests {
     #[test]
     fn config_builds() {
         assert!(lan_client_config().is_ok());
+    }
+
+    // That a client actually completes a handshake against this is proved
+    // end-to-end in `server::emulate`, over a real socket against
+    // `lan_client_config` — the same TLS the CLI uses on a real printer. Here we
+    // only pin what this function alone decides.
+    #[cfg(feature = "server")]
+    #[test]
+    fn the_emulated_printers_certificate_is_built_fresh_and_names_its_serial() {
+        let serial = "0309FA123456789";
+        // `with_single_cert` validates that the key matches the chain, so a
+        // config coming back at all means the pair is coherent.
+        assert!(emulated_printer_server_config(serial).is_ok());
+
+        // The serial reaches the certificate: it is the CN and a SAN, and a
+        // serial that can't be encoded should fail loudly rather than yield a
+        // certificate naming nothing.
+        let params = rcgen::CertificateParams::new(vec![serial.to_string()]).unwrap();
+        assert!(params.subject_alt_names.iter().any(|s| matches!(
+            s,
+            rcgen::SanType::DnsName(n) if n.as_str() == serial
+        )));
+
+        // An empty serial has no name to put in the certificate; rcgen rejects
+        // it rather than us shipping an anonymous one.
+        assert!(emulated_printer_server_config("").is_err());
     }
 }

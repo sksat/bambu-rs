@@ -411,8 +411,29 @@ impl UpstreamCache {
         Self::default()
     }
 
-    /// Merge one upstream report message into the cache.
+    /// Merge one upstream message into the cache — if it is actually a report.
+    ///
+    /// A command ACK wears the same envelope as a report (`{"print": {…}}`), so
+    /// merging everything would splice `result`/`reason` and the ACKed
+    /// `command` into the cached `print` object, and every synthesized snapshot
+    /// after that would carry them. Only `push_status` (and the `get_version`
+    /// inventory) describe the printer's state; everything else is answered
+    /// traffic that is forwarded to clients but not remembered.
+    ///
+    /// The observed ACK (docs/protocol.md) carries **no `command` at all** —
+    /// `{sequence_id, param, result, reason}` — so `result` is the tell, not a
+    /// missing `command`. A delta that omits `command` is still a report.
     pub fn apply(&mut self, message: &Value) {
+        let field = |category: &str, key: &str| message.pointer(&format!("/{category}/{key}"));
+        let command = |category: &str| field(category, "command").and_then(Value::as_str);
+        let is_ack = |category: &str| field(category, "result").is_some();
+        let is_report = (command("print") == Some("push_status")
+            || (message.get("print").is_some() && command("print").is_none()))
+            && !is_ack("print")
+            || command("info") == Some("get_version") && !is_ack("info");
+        if !is_report {
+            return;
+        }
         if is_full_snapshot_message(message) {
             self.seen_snapshot = true;
         }
@@ -879,6 +900,53 @@ mod tests {
         );
         assert_eq!(r.upstream, vec![req]);
         assert!(r.send.is_empty());
+    }
+
+    #[test]
+    fn a_command_ack_never_leaks_into_the_synthesized_snapshot() {
+        // An ACK is `{"print": {sequence_id, command, result, reason}}` — the
+        // same envelope as a report. Merged blindly it would overwrite the
+        // cached `command` and glue `result: "success"` onto every snapshot we
+        // then hand out as a push_status.
+        let mut c = cache_with_snapshot();
+        c.apply(&json!({"print": {
+            "sequence_id": "9", "command": "pause", "result": "success", "reason": "success",
+        }}));
+        let reply = c.snapshot_reply().unwrap();
+        assert_eq!(reply["print"]["command"], "push_status");
+        assert!(reply["print"].get("result").is_none(), "leaked: {reply}");
+        assert!(reply["print"].get("reason").is_none(), "leaked: {reply}");
+        assert_eq!(reply["print"]["gcode_state"], "RUNNING", "state survives");
+    }
+
+    #[test]
+    fn the_observed_ack_shape_which_carries_no_command_is_still_not_a_report() {
+        // docs/protocol.md's captured gcode_line ACK has no `command` key at
+        // all: {"print": {sequence_id, param, result, reason}}. A rule keyed
+        // only on `command` would wave it straight into the cache.
+        let mut c = cache_with_snapshot();
+        c.apply(&json!({"print": {
+            "sequence_id": "1", "param": "G28", "result": "success", "reason": "success",
+        }}));
+        let reply = c.snapshot_reply().unwrap();
+        assert!(reply["print"].get("result").is_none(), "leaked: {reply}");
+        assert!(reply["print"].get("param").is_none(), "leaked: {reply}");
+    }
+
+    #[test]
+    fn a_delta_with_no_command_is_still_treated_as_a_report() {
+        // The other side of that coin: older firmware may omit `command` on a
+        // delta, and dropping those would freeze the cache mid-print.
+        let mut c = cache_with_snapshot();
+        c.apply(&json!({"print": {"msg": 1, "mc_percent": 55}}));
+        assert_eq!(c.snapshot_reply().unwrap()["print"]["mc_percent"], 55);
+    }
+
+    #[test]
+    fn an_ack_under_info_does_not_become_the_version_reply() {
+        let mut c = UpstreamCache::new();
+        c.apply(&json!({"info": {"sequence_id": "2", "command": "resume", "result": "success"}}));
+        assert!(c.version_reply(Some("1")).is_none());
     }
 
     #[test]

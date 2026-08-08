@@ -316,6 +316,96 @@ impl LanMqttClient {
         rt.block_on(self.watch_async(interval, true, Some(self.timeout), on_update))
     }
 
+    /// Drive **one long-lived connection** that streams reports out and
+    /// publishes requests in, for as long as both hold up.
+    ///
+    /// This is the connection [`bambu serve --emulate`](crate::server::emulate)
+    /// is built on, and the reason it exists: every other method here is
+    /// connect-per-op, so N clients relayed through N calls would be N
+    /// connections to a printer that would rather have one. Here the printer
+    /// sees a single client no matter how many are downstream.
+    ///
+    /// Every report message is handed to `on_report` raw — merging is the
+    /// caller's business, because a relay has to forward the deltas *and* keep
+    /// the merged picture, and only the caller knows which it wants. Payloads
+    /// arriving on `requests` are published to the request topic at QoS 1,
+    /// verbatim: allocating `sequence_id`s belongs to whoever is multiplexing.
+    ///
+    /// Returns `Ok(())` when `requests` closes (the caller is shutting down)
+    /// and `Err` when the connection breaks — reconnecting is the caller's
+    /// call, since only it knows whether the relay should outlive the printer
+    /// being power-cycled. A request published into a connection that is about
+    /// to break is lost; there is no queue behind it.
+    #[cfg(feature = "server")]
+    pub async fn relay<F: FnMut(&Value)>(
+        &self,
+        interval: Option<Duration>,
+        requests: &mut tokio::sync::mpsc::Receiver<Value>,
+        mut on_report: F,
+    ) -> Result<(), ClientError> {
+        enum Step {
+            Report(Result<Event, ClientError>),
+            Request(Option<Value>),
+            Tick,
+        }
+
+        let (client, mut eventloop) = self.connect().await?;
+        let mut ticker = interval.map(|d| {
+            let mut t = tokio::time::interval(d);
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            t
+        });
+        // connect() already sent the first pushall; drop the immediate tick.
+        if let Some(t) = ticker.as_mut() {
+            t.tick().await;
+        }
+
+        loop {
+            let step = match ticker.as_mut() {
+                Some(t) => tokio::select! {
+                    ev = poll(&mut eventloop) => Step::Report(ev),
+                    req = requests.recv() => Step::Request(req),
+                    _ = t.tick() => Step::Tick,
+                },
+                None => tokio::select! {
+                    ev = poll(&mut eventloop) => Step::Report(ev),
+                    req = requests.recv() => Step::Request(req),
+                },
+            };
+            match step {
+                Step::Report(ev) => {
+                    if let Event::Incoming(Packet::Publish(p)) = ev?
+                        && let Ok(json) = serde_json::from_slice::<Value>(&p.payload)
+                    {
+                        on_report(&json);
+                    }
+                }
+                Step::Request(None) => return Ok(()),
+                Step::Request(Some(payload)) => {
+                    client
+                        .publish(
+                            request_topic(&self.target.serial),
+                            QoS::AtLeastOnce, // control commands go at QoS 1
+                            false,
+                            payload.to_string(),
+                        )
+                        .await
+                        .map_err(|e| ClientError::Mqtt(e.to_string()))?;
+                }
+                Step::Tick => {
+                    let _ = client
+                        .publish(
+                            request_topic(&self.target.serial),
+                            QoS::AtMostOnce,
+                            false,
+                            Command::PushAll.to_payload("0").to_string(),
+                        )
+                        .await;
+                }
+            }
+        }
+    }
+
     async fn send_and_watch_async<F: FnMut(&ReportState) -> WatchStep>(
         &self,
         commands: &[Command],

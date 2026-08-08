@@ -7,6 +7,13 @@
 //! SUBSCRIBE/SUBACK, UNSUBSCRIBE/UNSUBACK, PINGREQ/PINGRESP, DISCONNECT — and
 //! QoS 2 is rejected rather than half-supported (the printer protocol never uses
 //! it; see [`MqttError::Unsupported`]).
+//!
+//! Both **directions** decode, even though the emulator only ever receives the
+//! client half. Refusing to decode a CONNACK would be a policy decision wearing
+//! a codec's clothes — and it is the session, not the codec, that knows a
+//! server-to-client packet arriving at a broker means a broken client. Decoding
+//! both also means a test can speak to the emulator with this very codec, which
+//! is how [`crate::server::emulate`] proves itself over a real socket.
 
 use std::fmt;
 
@@ -184,16 +191,26 @@ fn decode_body(first: u8, body: &[u8]) -> Result<Packet, MqttError> {
     let mut r = Reader::new(body);
     match packet_type {
         1 => decode_connect(&mut r),
+        2 => decode_connack(&mut r),
         3 => decode_publish(flags, &mut r),
         4 => Ok(Packet::PubAck {
             packet_id: r.u16()?,
         }),
         8 => decode_subscribe(&mut r),
+        9 => Ok(Packet::SubAck {
+            packet_id: r.u16()?,
+            codes: r.rest().to_vec(),
+        }),
         10 => decode_unsubscribe(&mut r),
+        11 => Ok(Packet::UnsubAck {
+            packet_id: r.u16()?,
+        }),
         12 => Ok(Packet::PingReq),
+        13 => Ok(Packet::PingResp),
         14 => Ok(Packet::Disconnect),
-        // A broker never *receives* these; a client sending one is broken.
-        2 | 5 | 6 | 7 | 9 | 11 | 13 => Err(MqttError::Malformed("server-to-client packet type")),
+        // QoS 2's PUBREC/PUBREL/PUBCOMP, which decode_publish already refuses
+        // to get us into.
+        5 | 6 | 7 => Err(MqttError::Unsupported("QoS 2")),
         _ => Err(MqttError::Malformed("unknown packet type")),
     }
 }
@@ -233,6 +250,23 @@ fn decode_connect(r: &mut Reader<'_>) -> Result<Packet, MqttError> {
         keep_alive,
         clean_session: flags & 0x02 != 0,
     }))
+}
+
+fn decode_connack(r: &mut Reader<'_>) -> Result<Packet, MqttError> {
+    let flags = r.u8()?;
+    let code = match r.u8()? {
+        0 => ConnectCode::Accepted,
+        1 => ConnectCode::UnacceptableProtocolVersion,
+        2 => ConnectCode::IdentifierRejected,
+        3 => ConnectCode::ServerUnavailable,
+        4 => ConnectCode::BadCredentials,
+        5 => ConnectCode::NotAuthorized,
+        _ => return Err(MqttError::Malformed("unknown CONNACK return code")),
+    };
+    Ok(Packet::ConnAck {
+        session_present: flags & 0x01 != 0,
+        code,
+    })
 }
 
 fn decode_publish(flags: u8, r: &mut Reader<'_>) -> Result<Packet, MqttError> {
@@ -617,6 +651,39 @@ mod tests {
             }
             other => panic!("expected a connect, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_server_to_client_packets_decode_too_so_a_client_can_use_this_codec() {
+        for want in [
+            Packet::ConnAck {
+                session_present: false,
+                code: ConnectCode::Accepted,
+            },
+            Packet::ConnAck {
+                session_present: true,
+                code: ConnectCode::BadCredentials,
+            },
+            Packet::SubAck {
+                packet_id: 1,
+                codes: vec![0, 0x80],
+            },
+            Packet::UnsubAck { packet_id: 2 },
+            Packet::PingResp,
+        ] {
+            let bytes = encode(&want);
+            let (got, used) = decode(&bytes).unwrap().expect("a whole packet");
+            assert_eq!(got, want);
+            assert_eq!(used, bytes.len());
+        }
+    }
+
+    #[test]
+    fn an_unknown_connack_code_is_malformed() {
+        assert!(matches!(
+            decode(&[0x20, 0x02, 0x00, 0x63]),
+            Err(MqttError::Malformed(_))
+        ));
     }
 
     #[test]

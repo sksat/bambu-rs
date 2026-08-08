@@ -11,6 +11,7 @@ pub mod api;
 pub mod assets;
 pub mod camera;
 pub mod control;
+pub mod emulate;
 pub mod files;
 pub mod live;
 pub mod start;
