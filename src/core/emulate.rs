@@ -26,6 +26,11 @@ use crate::core::report::{ReportState, is_full_snapshot_message};
 /// The username every Bambu LAN client connects with.
 const LAN_USER: &str = "bblp";
 
+/// How many commands may be awaiting an ACK before the oldest are given up on.
+/// Far above any real client's in-flight count — this is a leak backstop, not a
+/// throttle.
+pub const MAX_OUTSTANDING: usize = 1024;
+
 /// Identifies one downstream client for the life of its connection. Assigned by
 /// the I/O layer; only used to route an ACK back to whoever asked.
 pub type ClientId = u64;
@@ -86,10 +91,12 @@ impl EmulatedPrinter {
         self.control
     }
 
-    /// Constant-time-ish credential check. (The access code is 8 digits and the
-    /// attacker is on the LAN with unlimited retries either way; this is about
-    /// not being gratuitously worse than the printer, not about defeating a
-    /// timing oracle.)
+    /// Check a client's credentials against the printer's.
+    ///
+    /// A plain comparison, not a constant-time one. The access code is 8 digits
+    /// — 10^8 guesses, which a LAN attacker can simply make against the printer
+    /// itself — so a timing oracle is not the cheap way in here, and pretending
+    /// otherwise would be security theatre.
     fn authenticates(&self, c: &Connect) -> bool {
         c.username.as_deref() == Some(LAN_USER) && c.password.as_deref() == Some(&self.access_code)
     }
@@ -171,6 +178,12 @@ impl ClientSession {
     /// fan-out should reach it.
     pub fn wants_reports(&self) -> bool {
         self.wants_reports
+    }
+
+    /// Whether the handshake is done. Until it is, the peer is anonymous, which
+    /// is what the I/O layer keys its stricter idle timeout on.
+    pub fn is_connected(&self) -> bool {
+        self.phase == Phase::Connected
     }
 
     /// The client id from CONNECT (empty before the handshake). For logging.
@@ -306,6 +319,10 @@ impl ClientSession {
                 // with an empty snapshot the client would believe.
                 None => response.upstream.push(payload),
             },
+            // Absorbed on purpose — see RequestKind::StopPushing. No reply: the
+            // printer doesn't ACK this either, and the client's own view is
+            // simply that reports stop mattering to it.
+            RequestKind::StopPushing => {}
             RequestKind::GetVersion => match cache.version_reply(sequence_id(&payload)) {
                 Some(reply) => response
                     .send
@@ -332,8 +349,13 @@ impl ClientSession {
 /// reach the machine (and is what the read-only policy blocks).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestKind {
+    /// `pushing.pushall`, or `pushing.start` — both mean "give me the state".
     PushAll,
     GetVersion,
+    /// `pushing.stop`. Absorbed, never forwarded: it would stop the printer
+    /// pushing to the **relay**, which is one client blinding all the others.
+    /// The relay owns its push stream; a downstream client does not.
+    StopPushing,
     Control,
 }
 
@@ -346,7 +368,8 @@ pub fn classify(payload: &Value) -> RequestKind {
             .and_then(Value::as_str)
     };
     match (command("pushing"), command("info")) {
-        (Some("pushall"), _) => RequestKind::PushAll,
+        (Some("pushall" | "start"), _) => RequestKind::PushAll,
+        (Some("stop"), _) => RequestKind::StopPushing,
         (_, Some("get_version")) => RequestKind::GetVersion,
         _ => RequestKind::Control,
     }
@@ -534,7 +557,9 @@ impl SequenceRewriter {
             return payload.clone();
         };
         // Prefixed so a relay id is never mistaken for the printer's own
-        // counter, which is a small integer.
+        // counter, which is a small integer. Fixed width and zero-padded so the
+        // BTreeMap orders these by age, which is what makes the eviction below
+        // evict the *oldest*.
         let id = format!("9{:09}", self.next);
         self.next += 1;
         self.outstanding.insert(
@@ -544,6 +569,13 @@ impl SequenceRewriter {
                 original: original.to_string(),
             },
         );
+        // A command the printer never answers leaves its entry behind, and a
+        // client that never disconnects never triggers `forget_client`. Give up
+        // on the oldest rather than grow forever: its ACK, if it ever comes, is
+        // broadcast instead of delivered — noise, not a hang.
+        while self.outstanding.len() > MAX_OUTSTANDING {
+            self.outstanding.pop_first();
+        }
         let mut out = payload.clone();
         if let Some(obj) = out.get_mut(category).and_then(Value::as_object_mut) {
             obj.insert("sequence_id".to_string(), Value::String(id));
@@ -888,6 +920,47 @@ mod tests {
     }
 
     #[test]
+    fn one_client_cannot_switch_off_everybody_elses_reports() {
+        // `pushing.stop` tells the printer to stop pushing. Forwarded, it would
+        // stop pushing to the RELAY — so one client quietly blinds every other
+        // client and the dashboard. The relay owns its own push stream; a
+        // downstream client's start/stop is about that client, and stops here.
+        let mut s = connected();
+        let r = s.handle(
+            publish_request(
+                json!({"pushing": {"sequence_id": "1", "command": "stop"}}),
+                None,
+            ),
+            &printer(),
+            &cache_with_snapshot(),
+        );
+        assert!(r.upstream.is_empty(), "must never reach the printer");
+        assert!(r.send.is_empty(), "nothing to say about it either");
+    }
+
+    #[test]
+    fn pushing_start_is_answered_like_a_pushall_rather_than_forwarded() {
+        // Same reasoning: the relay is already receiving. What the client wants
+        // is the state, and the cache has it.
+        let mut s = connected();
+        let r = s.handle(
+            publish_request(
+                json!({"pushing": {"sequence_id": "1", "command": "start"}}),
+                None,
+            ),
+            &printer(),
+            &cache_with_snapshot(),
+        );
+        assert!(r.upstream.is_empty());
+        let [Packet::Publish(p)] = r.send.as_slice() else {
+            panic!("expected a snapshot, got {:?}", r.send)
+        };
+        let v: serde_json::Value = serde_json::from_slice(&p.payload).unwrap();
+        assert_eq!(v["print"]["msg"], 0);
+        assert_eq!(v["print"]["gcode_state"], "RUNNING");
+    }
+
+    #[test]
     fn a_pushall_before_the_cache_is_warm_is_forwarded_instead() {
         // Nothing to answer with yet: ask the real printer rather than reply
         // with an empty snapshot the client would believe.
@@ -1133,6 +1206,29 @@ mod tests {
         // A repeat of the same ACK is nobody's now; broadcasting is the safe
         // fallback (a client that doesn't recognise the id ignores it).
         assert!(matches!(seq.route(&ack), Route::Broadcast(_)));
+    }
+
+    #[test]
+    fn outstanding_requests_cannot_pile_up_without_bound() {
+        // A command the printer never ACKs leaves its entry behind, and
+        // `forget_client` only fires when the client goes away. A dashboard left
+        // open for a month must not turn that into a slow leak.
+        let mut seq = SequenceRewriter::new();
+        let mut ids = Vec::new();
+        for i in 0..(MAX_OUTSTANDING + 50) {
+            let fwd = seq.rewrite_request(
+                1,
+                &json!({"print": {"sequence_id": i.to_string(), "command": "pause"}}),
+            );
+            ids.push(fwd["print"]["sequence_id"].as_str().unwrap().to_string());
+        }
+        assert_eq!(seq.outstanding(), MAX_OUTSTANDING);
+
+        // The newest survive; the oldest are the ones given up on.
+        let newest = json!({"print": {"sequence_id": ids.last().unwrap(), "result": "success"}});
+        assert!(matches!(seq.route(&newest), Route::ToClient { .. }));
+        let oldest = json!({"print": {"sequence_id": &ids[0], "result": "success"}});
+        assert!(matches!(seq.route(&oldest), Route::Broadcast(_)));
     }
 
     #[test]

@@ -48,6 +48,14 @@ const MAX_PACKET: usize = 4 * 1024 * 1024;
 /// Read granularity off the socket.
 const READ_CHUNK: usize = 8 * 1024;
 
+/// How long a connection may take to get through TLS and say CONNECT.
+///
+/// Both happen before we know who is on the other end, so both are reachable by
+/// anyone who can open a socket. Without a bound, a peer that connects and then
+/// says nothing holds a task until the OS gives up on the TCP connection, which
+/// can be hours — and it costs the peer nothing to do it again.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Where the relay's reports come from and its requests go. Implemented by the
 /// live printer link, and by a test double so the whole emulator can be driven
 /// without a machine.
@@ -165,13 +173,18 @@ impl Emulator {
             let acceptor = acceptor.clone();
             let this = Arc::clone(&self);
             tokio::spawn(async move {
-                let stream = match acceptor.accept(socket).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("emulate: TLS handshake with {peer} failed: {e}");
-                        return;
-                    }
-                };
+                let stream =
+                    match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(socket)).await {
+                        Ok(Ok(s)) => s,
+                        Ok(Err(e)) => {
+                            eprintln!("emulate: TLS handshake with {peer} failed: {e}");
+                            return;
+                        }
+                        Err(_) => {
+                            eprintln!("emulate: {peer} opened a connection and never started TLS");
+                            return;
+                        }
+                    };
                 let id = this.next_client_id.fetch_add(1, Ordering::Relaxed);
                 if let Err(e) = Arc::clone(&this).serve_client(stream, id).await {
                     eprintln!("emulate: client {peer} dropped: {e}");
@@ -202,7 +215,7 @@ impl Emulator {
         loop {
             tokio::select! {
                 // Bytes from the client.
-                read = read_with_keepalive(&mut reader, &mut chunk, session.keep_alive()) => {
+                read = read_with_deadline(&mut reader, &mut chunk, read_limit(&session)) => {
                     let n = read?;
                     if n == 0 {
                         return Ok(()); // clean EOF
@@ -280,27 +293,39 @@ impl Emulator {
     }
 }
 
-/// Read, giving up if the client goes quiet for longer than MQTT allows.
+/// How long this session may stay silent before we hang up.
 ///
-/// §3.1.2.10: with a non-zero keep-alive the server may disconnect a client that
-/// sends nothing for 1.5× that. Without it, a client that vanishes without a FIN
-/// (an unplugged laptop) holds its slot until the OS notices, which can be
-/// hours.
-async fn read_with_keepalive<R>(
+/// Before CONNECT: a short fixed window, because whoever is out there is still
+/// anonymous. After: MQTT 3.1.1 §3.1.2.10 lets the server disconnect a client
+/// that sends nothing for 1.5× its own keep-alive, which is what catches a
+/// client that vanished without a FIN — an unplugged laptop — long before the
+/// OS does. A client that asked for keep-alive `0` asked for no timeout, and
+/// gets none.
+fn read_limit(session: &ClientSession) -> Option<Duration> {
+    if !session.is_connected() {
+        return Some(HANDSHAKE_TIMEOUT);
+    }
+    match session.keep_alive() {
+        0 => None,
+        secs => Some(Duration::from_millis(u64::from(secs) * 1500)),
+    }
+}
+
+/// Read, giving up if nothing arrives within `limit`.
+async fn read_with_deadline<R>(
     reader: &mut R,
     chunk: &mut [u8],
-    keep_alive: u16,
+    limit: Option<Duration>,
 ) -> anyhow::Result<usize>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    if keep_alive == 0 {
+    let Some(limit) = limit else {
         return Ok(reader.read(chunk).await?);
-    }
-    let limit = Duration::from_millis(u64::from(keep_alive) * 1500);
+    };
     match tokio::time::timeout(limit, reader.read(chunk)).await {
         Ok(n) => Ok(n?),
-        Err(_) => anyhow::bail!("silent for more than 1.5× the {keep_alive}s keep-alive"),
+        Err(_) => anyhow::bail!("silent for {limit:?}"),
     }
 }
 
@@ -666,6 +691,47 @@ mod tests {
                 return;
             }
         }
+    }
+
+    #[test]
+    fn an_anonymous_peer_is_on_a_short_leash_and_a_connected_one_on_its_own() {
+        // Driving the real timeouts would mean a 20-second test; the decision
+        // itself is a pure function of the session, so pin that instead.
+        let printer = EmulatedPrinter::new(SERIAL, CODE);
+        let cache = UpstreamCache::new();
+
+        let fresh = ClientSession::new();
+        assert_eq!(read_limit(&fresh), Some(HANDSHAKE_TIMEOUT));
+
+        let mut connected = ClientSession::new();
+        connected.handle(
+            Packet::Connect(crate::core::mqtt::Connect {
+                client_id: "c".into(),
+                username: Some("bblp".into()),
+                password: Some(CODE.into()),
+                keep_alive: 60,
+                clean_session: true,
+            }),
+            &printer,
+            &cache,
+        );
+        // 1.5x the client's own keep-alive, per §3.1.2.10.
+        assert_eq!(read_limit(&connected), Some(Duration::from_secs(90)));
+
+        let mut no_keepalive = ClientSession::new();
+        no_keepalive.handle(
+            Packet::Connect(crate::core::mqtt::Connect {
+                client_id: "c".into(),
+                username: Some("bblp".into()),
+                password: Some(CODE.into()),
+                keep_alive: 0,
+                clean_session: true,
+            }),
+            &printer,
+            &cache,
+        );
+        // 0 means the client asked for no timeout, and gets none.
+        assert_eq!(read_limit(&no_keepalive), None);
     }
 
     #[tokio::test]
