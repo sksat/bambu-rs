@@ -583,3 +583,20 @@ fn config_set_needs_a_field_and_an_existing_profile() {
         .code(3);
     let _ = std::fs::remove_dir_all(&cfg);
 }
+
+#[test]
+fn gcode_json_keeps_the_shared_outcome_vocabulary() {
+    // The human line for a G-code send says "accepted" (a move is still
+    // travelling when it prints), but --json is a contract agents parse. It
+    // must stay verified/rejected/unverified like every other command — a
+    // fourth value no parser knows would be a silent breakage, and the error
+    // paths must keep emitting an object at all.
+    let src = std::fs::read_to_string("src/cli.rs").unwrap();
+    assert!(
+        !src.contains("\"outcome\": \"accepted\""),
+        "the JSON vocabulary must not grow an `accepted` variant"
+    );
+    // The single-line path reports through the shared reporter, which is what
+    // keeps the JSON identical across commands.
+    assert!(src.contains("report_command_outcome_as("));
+}

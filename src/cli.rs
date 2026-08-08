@@ -1810,22 +1810,15 @@ fn run_gcode(cli: &Cli, req: GcodeRequest<'_>) -> Result<(), CliError> {
     match from_file {
         None => {
             eprintln!("sending gcode_line {:?} …", steps[0].gcode);
-            let outcome =
-                client.send_and_verify(&ProtoCommand::GcodeLine(steps[0].gcode.clone()))?;
-            match command_outcome_error(&outcome) {
-                Some(e) => Err(e),
-                None => {
-                    // NOT "took effect": a G-code line has no observable effect
-                    // to confirm (see `core::verify`), so the ACK is the whole
-                    // verdict. A move is still travelling when this prints.
-                    if want_json(cli) {
-                        print_json(&serde_json::json!({ "outcome": "accepted" }));
-                    } else {
-                        eprintln!("{}", GCODE_ACCEPTED_NOTE);
-                    }
-                    Ok(())
-                }
-            }
+            // NOT "took effect": a G-code line has no observable effect to
+            // confirm (see `core::verify`), so the ACK is the whole verdict and
+            // a move is still travelling when this prints. Only the wording
+            // changes — the JSON verdict stays what every other command emits.
+            report_command_outcome_as(
+                cli,
+                client.send_and_verify(&ProtoCommand::GcodeLine(steps[0].gcode.clone()))?,
+                GCODE_ACCEPTED_NOTE,
+            )
         }
         Some(source) => run_gcode_sequence(cli, &client, source, &steps),
     }
@@ -3574,6 +3567,23 @@ fn connect_client(cli: &Cli, timeout_secs: u64) -> Result<LanMqttClient, CliErro
 /// reads); the exit code is unchanged. Without `--json` the verdict is the exit
 /// code plus a human line (stderr).
 fn report_command_outcome(cli: &Cli, outcome: CommandOutcome) -> Result<(), CliError> {
+    report_command_outcome_as(
+        cli,
+        outcome,
+        "verified: the printer confirmed the command took effect",
+    )
+}
+
+/// As [`report_command_outcome`], with the wording used on success.
+///
+/// Only the human line varies. The JSON stays byte-identical across callers —
+/// it is a contract agents parse, and "this line reads wrong for G-code" is no
+/// reason to invent a fourth outcome value that no parser knows.
+fn report_command_outcome_as(
+    cli: &Cli,
+    outcome: CommandOutcome,
+    success_line: &str,
+) -> Result<(), CliError> {
     if want_json(cli) {
         let v = match &outcome {
             CommandOutcome::Verified => serde_json::json!({ "outcome": "verified" }),
@@ -3593,13 +3603,21 @@ fn report_command_outcome(cli: &Cli, outcome: CommandOutcome) -> Result<(), CliE
     match command_outcome_error(&outcome) {
         None => {
             if !want_json(cli) {
-                eprintln!("verified: the printer confirmed the command took effect");
+                eprintln!("{success_line}");
             }
             Ok(())
         }
         Some(e) => Err(e),
     }
 }
+
+// What the printer actually told us about a raw G-code line, and what it did
+// not. Kept as constants so the single-line and sequence paths cannot drift
+// into claiming different things about the same guarantee.
+const GCODE_MOTION_NOTE: &str =
+    "the printer does not report when the motion finishes, so it may still be running";
+const GCODE_ACCEPTED_NOTE: &str = "accepted: the printer acknowledged the command \
+    (a G-code line has no confirmable effect, so the motion may still be running)";
 
 /// The error a *not-confirmed* outcome means — exit code and message; `None`
 /// when the printer confirmed the command.
@@ -3609,14 +3627,6 @@ fn report_command_outcome(cli: &Cli, outcome: CommandOutcome) -> Result<(), CliE
 /// be able to wrap that message with the step that stopped it. Folding them
 /// into the reporting step would have hidden them behind a bare "the printer
 /// rejected…" with no line number.
-/// What the printer actually told us about a raw G-code line, and what it did
-/// not. Kept as constants so the single-line and sequence paths cannot drift
-/// into claiming different things about the same guarantee.
-const GCODE_MOTION_NOTE: &str =
-    "the printer does not report when the motion finishes, so it may still be running";
-const GCODE_ACCEPTED_NOTE: &str = "accepted: the printer acknowledged the command \
-    (a G-code line has no confirmable effect, so the motion may still be running)";
-
 fn command_outcome_error(outcome: &CommandOutcome) -> Option<CliError> {
     match outcome {
         CommandOutcome::Verified => None,
