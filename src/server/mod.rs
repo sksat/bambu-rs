@@ -11,10 +11,13 @@ pub mod api;
 pub mod assets;
 pub mod camera;
 pub mod control;
+#[cfg(feature = "relay")]
 pub mod emulate;
 pub mod files;
+#[cfg(feature = "relay")]
 pub mod ftpd;
 pub mod live;
+#[cfg(feature = "relay")]
 pub mod relay;
 pub mod start;
 pub mod stream_record;
@@ -27,6 +30,7 @@ use crate::config::ResolvedTarget;
 pub use api::{AppState, FakeSource, PrinterSource};
 pub use camera::{CameraSource, ExternalCamera, LiveCamera, NoCamera};
 pub use control::{Controller, FakeController, LiveController};
+#[cfg(feature = "relay")]
 use emulate::Upstream as _;
 pub use files::{FakeFiles, FileStore, LiveFiles};
 pub use live::LiveSource;
@@ -52,9 +56,11 @@ pub struct ServeOpts {
     /// Emulate a Local-Mode printer so Bambu Studio (and any other LAN client)
     /// can connect *through* this server instead of fighting it for the
     /// printer's attention. `None` = off.
+    #[cfg(feature = "relay")]
     pub emulate: Option<EmulateOpts>,
 }
 
+#[cfg(feature = "relay")]
 /// How often the relay refreshes its cache from the printer when the user did
 /// not ask for a poll interval. Gentle — the printer caps `pushall` at about
 /// 1/s, and this is one client's worth of polling no matter how many are
@@ -62,6 +68,7 @@ pub struct ServeOpts {
 const EMULATE_REFRESH: Duration = Duration::from_secs(20);
 
 /// Where the emulated printer listens, and what it will pass through.
+#[cfg(feature = "relay")]
 pub struct EmulateOpts {
     /// Bind host for the emulated MQTT listener. Defaults to loopback like the
     /// rest of `serve`; a client on another machine needs `0.0.0.0`.
@@ -85,6 +92,8 @@ pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    #[cfg(feature = "relay")]
+    let emulate = opts.emulate;
     let ServeOpts {
         host,
         port,
@@ -92,10 +101,11 @@ pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<
         fake,
         interval,
         external_cameras,
-        emulate,
+        ..
     } = opts;
     // There is nothing to relay to. Better to say so than to stand up a listener
     // that answers every read with an empty snapshot.
+    #[cfg(feature = "relay")]
     if emulate.is_some() && (fake || target.is_none()) {
         anyhow::bail!(
             "--emulate relays a real printer; it has nothing to serve with --fake or without a \
@@ -112,6 +122,10 @@ pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<
                 // With emulation on, the dashboard reads off the same link the
                 // relay uses: standing up a second connection here is exactly
                 // the contention --emulate exists to remove.
+                #[cfg(not(feature = "relay"))]
+                let source: Arc<dyn PrinterSource> =
+                    Arc::new(LiveSource::connect(t.clone(), interval));
+                #[cfg(feature = "relay")]
                 let source: Arc<dyn PrinterSource> = match &emulate {
                     Some(em) => {
                         // Both subscribers first, then connect: the connection's
@@ -191,6 +205,7 @@ pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<
 }
 
 /// Bind the emulated printer's MQTT listener and start serving it.
+#[cfg(feature = "relay")]
 ///
 /// Bound before the HTTP server so a port clash (something else on 8883, or a
 /// second `bambu serve`) fails at startup rather than after the dashboard has
@@ -273,6 +288,7 @@ async fn start_emulator(
 }
 
 /// Bind the FTP relay's listener, explaining the one failure people actually hit.
+#[cfg(feature = "relay")]
 async fn bind_ftp_relay(
     target: &ResolvedTarget,
     opts: &EmulateOpts,

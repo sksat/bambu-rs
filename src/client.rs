@@ -77,10 +77,10 @@ fn unique_client_id() -> String {
     )
 }
 
-// Topic naming is a protocol fact, so it lives in `core::mqtt` (where the
-// emulator also needs it) and is re-exported here, where every caller already
-// looks for it.
-pub use crate::core::mqtt::{report_topic, request_topic};
+// Topic naming is a protocol fact, so it lives in `core::command` alongside the
+// request envelopes, and is re-exported here where every caller already looks
+// for it.
+pub use crate::core::command::{report_topic, request_topic};
 
 /// A one-shot LAN MQTT client.
 pub struct LanMqttClient {
@@ -347,7 +347,7 @@ impl LanMqttClient {
     /// channel means the printer is not keeping up, so the honest answer is to
     /// drop the request and say so — the same thing the layer above does, and
     /// the client's own ACK timeout is what tells it.
-    #[cfg(feature = "server")]
+    #[cfg(feature = "relay")]
     pub async fn relay<F: FnMut(&Value)>(
         &self,
         interval: Option<Duration>,

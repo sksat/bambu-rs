@@ -10,6 +10,19 @@
 
 use serde_json::{Value, json};
 
+/// The report topic for a serial: `device/{serial}/report` (printer → client).
+///
+/// Here rather than beside the MQTT codec because the codec is only built for
+/// the relay, while every client needs to know where to listen.
+pub fn report_topic(serial: &str) -> String {
+    format!("device/{serial}/report")
+}
+
+/// The request topic for a serial: `device/{serial}/request` (client → printer).
+pub fn request_topic(serial: &str) -> String {
+    format!("device/{serial}/request")
+}
+
 /// Monotonic allocator for the `sequence_id` field. Owned by the session/client
 /// — kept out of [`Command`] so commands stay pure, data-only values.
 #[derive(Debug, Default)]

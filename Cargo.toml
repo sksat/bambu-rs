@@ -59,7 +59,7 @@ pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }-v{ versio
 pkg-fmt = "zip"
 
 [features]
-default = ["cli", "server"]
+default = ["cli", "server", "relay"]
 # CLI-only dependencies (clap, etc.) are gated here so library-only consumers don't pull them.
 cli = ["dep:clap", "dep:ctrlc"]
 # The monitoring + control HTTP API server (axum). On by default; a library-only
@@ -79,14 +79,19 @@ server = [
     "tokio/fs",
     "tokio/io-util",
     "dep:ureq",
-    # Printer emulation (`bambu serve --emulate`) is part of the server, not a
-    # feature of its own: it is the reason a second client can watch a print at
-    # all, so making people rebuild for it would be a trap. Both deps are small
-    # and pure-Rust, and a `default-features = false` library consumer gets
-    # neither.
-    "dep:rcgen",
-    "dep:tokio-rustls",
 ]
+# Printer emulation — `bambu serve --emulate` presents the printer's own LAN
+# interfaces (MQTT/TLS and implicit FTPS) and relays every client over the one
+# real connection.
+#
+# **On by default**, because it is the reason a second client can watch a print
+# at all and making people rebuild for it would be a trap. The feature exists so
+# a consumer who only wants to talk *to* a printer can drop the machinery for
+# pretending to *be* one: the MQTT broker codec, the FTP server, and `rcgen`
+# with its own dependency subtree (`time`, `yasna`, …). `tokio-rustls` is listed
+# because this uses it directly, but it arrives with `rumqttc` either way, so
+# turning the feature off does not shed it.
+relay = ["server", "dep:rcgen", "dep:tokio-rustls"]
 # The embedded web dashboard SPA, served by `bambu serve` when enabled. Builds on
 # the API server and embeds `web/dist/` via rust-embed.
 dashboard = ["server", "dep:rust-embed"]

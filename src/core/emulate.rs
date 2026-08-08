@@ -20,9 +20,8 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
-use crate::core::mqtt::{
-    Connect, ConnectCode, Packet, Publish, report_topic, request_topic, topic_matches,
-};
+use crate::core::command::{report_topic, request_topic};
+use crate::core::mqtt::{Connect, ConnectCode, Packet, Publish, topic_matches};
 use crate::core::report::{ReportState, is_full_snapshot_message};
 
 /// The username every Bambu LAN client connects with.

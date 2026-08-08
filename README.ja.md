@@ -232,6 +232,11 @@ bambu ams resume                     # resume | reset | pause | change | set-fil
 bambu-rs = { version = "0.1", default-features = false }   # ライブラリのみ。CLI/server の依存は引かない
 ```
 
+feature は `cli`、`server`（HTTP API）、`relay`（プリンターエミュレーション）、`dashboard`（SPA）、`ts-rs` です。
+前の 3 つは既定で有効です。
+`relay` を切ると、プリンターに「なりすます」ための部品（MQTT broker の codec、FTP サーバー、証明書生成の `rcgen`）が外れます。
+プリンターに「話しかける」ための部分はそのまま残ります。
+
 ```rust
 use bambu_rs::client::LanMqttClient;
 use bambu_rs::config::ResolvedTarget;

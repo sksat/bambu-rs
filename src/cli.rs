@@ -253,17 +253,21 @@ enum Command {
         /// same print at once. Clients authenticate with the printer's own
         /// serial and access code. Monitoring, control and sending a print all
         /// relay (the last needs the FTP server — see --emulate-ftp-port).
+        #[cfg(feature = "relay")]
         #[arg(long)]
         emulate: bool,
         /// Bind host for the emulated printer. Default 127.0.0.1 (this machine
         /// only); use 0.0.0.0 to let a client on the LAN reach it.
+        #[cfg(feature = "relay")]
         #[arg(long, default_value = "127.0.0.1", requires = "emulate")]
         emulate_host: String,
         /// Bind port for the emulated printer. 8883 is where a client looks.
+        #[cfg(feature = "relay")]
         #[arg(long, default_value_t = 8883, requires = "emulate")]
         emulate_port: u16,
         /// Relay reads but refuse control: a client can watch the printer
         /// through this, and cannot move or heat it (and cannot upload).
+        #[cfg(feature = "relay")]
         #[arg(long, requires = "emulate")]
         emulate_read_only: bool,
         /// Port for the emulated printer's FTP server, which is what makes
@@ -271,10 +275,12 @@ enum Command {
         /// before starting the job. 990 is privileged — if binding fails, grant
         /// the capability with `sudo setcap cap_net_bind_service=+ep $(which
         /// bambu)` or choose a port your client can be told about.
+        #[cfg(feature = "relay")]
         #[arg(long, default_value_t = 990, requires = "emulate")]
         emulate_ftp_port: u16,
         /// Don't serve FTP at all. Monitoring and control still relay; sending a
         /// print does not.
+        #[cfg(feature = "relay")]
         #[arg(long, requires = "emulate")]
         emulate_no_ftp: bool,
     },
@@ -820,11 +826,17 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             interval,
             camera_url,
             cameras_config,
+            #[cfg(feature = "relay")]
             emulate,
+            #[cfg(feature = "relay")]
             emulate_host,
+            #[cfg(feature = "relay")]
             emulate_port,
+            #[cfg(feature = "relay")]
             emulate_read_only,
+            #[cfg(feature = "relay")]
             emulate_ftp_port,
+            #[cfg(feature = "relay")]
             emulate_no_ftp,
         } => run_serve(
             cli,
@@ -835,6 +847,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             *interval,
             camera_url.clone(),
             cameras_config.clone(),
+            #[cfg(feature = "relay")]
             emulate.then(|| crate::server::EmulateOpts {
                 host: emulate_host.clone(),
                 port: *emulate_port,
@@ -1617,7 +1630,7 @@ fn run_serve(
     interval: Option<u64>,
     camera_url: Vec<String>,
     cameras_config: Option<std::path::PathBuf>,
-    emulate: Option<crate::server::EmulateOpts>,
+    #[cfg(feature = "relay")] emulate: Option<crate::server::EmulateOpts>,
 ) -> Result<(), CliError> {
     // Live mode needs a connection target; fake mode doesn't touch the printer.
     let target = if fake {
@@ -1671,6 +1684,7 @@ fn run_serve(
         fake,
         interval: interval.map(Duration::from_secs),
         external_cameras,
+        #[cfg(feature = "relay")]
         emulate,
     };
     crate::server::serve(target, opts).map_err(|e| CliError::new(exit::GENERAL, e.to_string()))

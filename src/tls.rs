@@ -27,7 +27,7 @@ pub fn lan_client_config() -> Result<Arc<rustls::ClientConfig>, rustls::Error> {
 }
 
 /// Building the emulated printer's server-side TLS failed.
-#[cfg(feature = "server")]
+#[cfg(feature = "relay")]
 #[derive(Debug, thiserror::Error)]
 pub enum ServerTlsError {
     #[error(
@@ -56,7 +56,7 @@ pub enum ServerTlsError {
 /// - It is generated per run rather than cached on disk. Nothing pins it today,
 ///   and a key sitting in the config directory is a liability that buys nothing
 ///   until something does.
-#[cfg(feature = "server")]
+#[cfg(feature = "relay")]
 pub fn emulated_printer_server_config(
     serial: &str,
 ) -> Result<Arc<rustls::ServerConfig>, ServerTlsError> {
@@ -140,7 +140,7 @@ mod tests {
     // end-to-end in `server::emulate`, over a real socket against
     // `lan_client_config` — the same TLS the CLI uses on a real printer. Here we
     // only pin what this function alone decides.
-    #[cfg(feature = "server")]
+    #[cfg(feature = "relay")]
     #[test]
     fn the_emulated_printers_certificate_is_built_fresh_and_names_its_serial() {
         let serial = "0309FA123456789";

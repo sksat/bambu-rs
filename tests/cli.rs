@@ -354,7 +354,7 @@ fn via_serve_unreachable_is_a_transport_error() {
     let _ = std::fs::remove_dir_all(&cfg);
 }
 
-#[cfg(feature = "server")]
+#[cfg(feature = "relay")]
 #[test]
 fn emulate_needs_a_real_printer_to_relay() {
     // The emulator's whole job is to be a stand-in for a specific machine. With
@@ -373,7 +373,7 @@ fn emulate_needs_a_real_printer_to_relay() {
     let _ = std::fs::remove_dir_all(&cfg);
 }
 
-#[cfg(feature = "server")]
+#[cfg(feature = "relay")]
 #[test]
 fn the_emulate_tuning_flags_require_emulate_itself() {
     // --emulate-host 0.0.0.0 without --emulate would bind nothing and say

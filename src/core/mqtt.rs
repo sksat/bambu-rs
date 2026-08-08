@@ -17,16 +17,6 @@
 
 use std::fmt;
 
-/// The report topic for a serial: `device/{serial}/report` (printer → client).
-pub fn report_topic(serial: &str) -> String {
-    format!("device/{serial}/report")
-}
-
-/// The request topic for a serial: `device/{serial}/request` (client → printer).
-pub fn request_topic(serial: &str) -> String {
-    format!("device/{serial}/request")
-}
-
 /// Whether an MQTT subscription `filter` matches `topic` (§4.7).
 ///
 /// `+` matches exactly one level, `#` matches the rest (including none) and may

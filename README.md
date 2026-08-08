@@ -225,6 +225,11 @@ The protocol and safety logic live in a reusable Rust crate — the `bambu` CLI 
 bambu-rs = { version = "0.1", default-features = false }   # library only — no CLI/server deps
 ```
 
+Features: `cli`, `server` (the HTTP API), `relay` (printer emulation), `dashboard` (the SPA),
+`ts-rs`. The first three are on by default. Turning `relay` off drops the machinery for
+pretending to *be* a printer — the MQTT broker codec, the FTP server, and the `rcgen`
+certificate generator — while leaving everything for talking *to* one.
+
 ```rust
 use bambu_rs::client::LanMqttClient;
 use bambu_rs::config::ResolvedTarget;
