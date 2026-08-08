@@ -285,6 +285,32 @@ server side: a refused SYN leaves nothing in a log or in `ss`. Studio reports it
 as "Failed to publish login request", where "login" is the probe's JSON key and
 not an account login. Neither port answers unprompted; the client speaks first.
 
+### The probe itself
+
+Captured with `tcpdump` on 3000 while Studio added the printer **[observed]**:
+
+```text
+→ a5 a5 3a 00 {"login":{"command":"detect","sequence_id":"20004"}} a7 a7
+← a5 a5 b5 00 {"login":{"command":"detect","sequence_id":"20004",
+               "id":"0309FA432200488","model":"N1","name":"3DP-030-488",
+               "version":"01.07.02.00","bind":"free","connect":"lan",
+               "dev_cap":1}} a7 a7
+```
+
+`a5 a5` magic, a **u16 little-endian length that counts the whole frame** —
+framing included, so 0x3a = 58 for a 52-byte payload, not 52 — then the JSON,
+then `a7 a7`. Getting the length's meaning backwards produces a frame that is
+silently ignored rather than rejected. One exchange per connection, then the
+printer closes; an unrecognised command gets silence, not an error.
+
+`bind` and `connect` are the fields that decide the outcome: Studio refuses a
+device reporting `cloud`, and refuses one already `occupied`. A relay must
+therefore **not** pass those two through from the printer — the printer may well
+say `occupied`, since the relay itself is what is occupying it, and forwarding
+that would make Studio refuse the relay exactly when it is working. Identity —
+`id`, `model`, `name`, `version` — should be passed through, being facts about
+the machine rather than the relay.
+
 ## TLS, as the printer actually presents it
 
 Identical certificate on 8883 and 3002 **[observed]**:
@@ -312,6 +338,11 @@ needs, in the order it asks for it:
   a *v3 ECDSA* certificate with CN = the serial is accepted in practice — checked
   against `rumqttc` and a hand-rolled stdlib client, not against Bambu Studio.
   **[observed for those clients; Studio untested]**
+- **The detect probe, before anything else.** Studio knocks on 3000/3002 first
+  and never reaches MQTT if nothing answers, so the relay serves both — proxying
+  the enquiry to the real printer and rewriting only `bind`/`connect` (see
+  above). `--emulate-no-detect` turns it off; a client already pointed at the
+  relay keeps working, but a new one cannot add it by IP.
 - **`pushall`.** Answerable from cached merged state: the reply is a
   `push_status` with `msg: 0` and the printer's own `sequence_id` (a pushall
   response is *not* an echo — see above), and the client cannot tell it came from

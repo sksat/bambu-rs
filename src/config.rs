@@ -238,6 +238,8 @@ pub fn default_config_path() -> Option<PathBuf> {
 pub const DEFAULT_MQTT_PORT: u16 = 8883;
 /// Implicit FTPS, per the printer.
 pub const DEFAULT_FTPS_PORT: u16 = 990;
+/// Where a printer answers the device-detect probe (plain text).
+pub const DEFAULT_DETECT_PORT: u16 = 3000;
 
 /// Per-invocation overrides (from flags and/or env). Higher precedence than a
 /// stored profile.
@@ -251,6 +253,7 @@ pub struct Overrides {
     /// standard ports — a relay, or a test.
     pub mqtt_port: Option<u16>,
     pub ftps_port: Option<u16>,
+    pub detect_port: Option<u16>,
 }
 
 impl Overrides {
@@ -264,6 +267,7 @@ impl Overrides {
             model: v("BAMBU_MODEL"),
             mqtt_port: v("BAMBU_MQTT_PORT").and_then(|s| s.parse().ok()),
             ftps_port: v("BAMBU_FTPS_PORT").and_then(|s| s.parse().ok()),
+            detect_port: v("BAMBU_DETECT_PORT").and_then(|s| s.parse().ok()),
         }
     }
 
@@ -276,6 +280,7 @@ impl Overrides {
             model: self.model.or(lower.model),
             mqtt_port: self.mqtt_port.or(lower.mqtt_port),
             ftps_port: self.ftps_port.or(lower.ftps_port),
+            detect_port: self.detect_port.or(lower.detect_port),
         }
     }
 }
@@ -341,6 +346,8 @@ pub struct ResolvedTarget {
     pub mqtt_port: u16,
     /// FTPS port, overridable for the same reason.
     pub ftps_port: u16,
+    /// Device-detect port, overridable for the same reason.
+    pub detect_port: u16,
 }
 
 impl std::fmt::Debug for ResolvedTarget {
@@ -352,6 +359,7 @@ impl std::fmt::Debug for ResolvedTarget {
             .field("access_code", &"<redacted>")
             .field("mqtt_port", &self.mqtt_port)
             .field("ftps_port", &self.ftps_port)
+            .field("detect_port", &self.detect_port)
             .finish()
     }
 }
@@ -380,6 +388,7 @@ pub fn resolve(
         model: Model::from_config_str(&model_str),
         mqtt_port: overrides.mqtt_port.unwrap_or(DEFAULT_MQTT_PORT),
         ftps_port: overrides.ftps_port.unwrap_or(DEFAULT_FTPS_PORT),
+        detect_port: overrides.detect_port.unwrap_or(DEFAULT_DETECT_PORT),
     })
 }
 

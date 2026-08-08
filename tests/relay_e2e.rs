@@ -82,6 +82,7 @@ fn spawn(name: &'static str, args: &[&str]) -> Proc {
         .env_remove("BAMBU_MODEL")
         .env_remove("BAMBU_MQTT_PORT")
         .env_remove("BAMBU_FTPS_PORT")
+        .env_remove("BAMBU_DETECT_PORT")
         .env(
             "XDG_CONFIG_HOME",
             std::env::temp_dir().join("bambu-e2e-none"),
@@ -120,6 +121,36 @@ fn wait_for_port(port: u16, what: &str) {
     panic!("{what} never started listening on {port}");
 }
 
+/// Send the device-detect probe to `port` and return the decoded reply.
+///
+/// This is the exchange Bambu Studio's "add printer by IP" performs *before*
+/// MQTT — it is the reason a relay can serve 8883 perfectly and still never be
+/// found.
+fn probe_detect(port: u16) -> serde_json::Value {
+    use bambu_rs::core::detect;
+    use std::io::{Read, Write};
+
+    let mut sock = std::net::TcpStream::connect(("127.0.0.1", port))
+        .unwrap_or_else(|e| panic!("connecting to the detect port {port}: {e}"));
+    sock.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let request = serde_json::json!({"login": {"command": "detect", "sequence_id": "20004"}});
+    sock.write_all(&detect::encode(&request)).unwrap();
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 512];
+    loop {
+        if let Some((reply, _)) = detect::decode(&buf).expect("a well-formed reply") {
+            return reply;
+        }
+        let n = sock
+            .read(&mut chunk)
+            .unwrap_or_else(|e| panic!("reading the detect reply from {port}: {e}"));
+        assert_ne!(n, 0, "the detect port closed without answering");
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
 /// `bambu status --json` against a relay on `port`.
 fn status_via(port: u16) -> (bool, String) {
     let out = bin()
@@ -156,6 +187,8 @@ fn several_client_processes_share_one_printer_through_the_relay() {
     let relay_ftp = free_port();
     let printer_http = free_port();
     let relay_http = free_port();
+    let printer_detect = free_port();
+    let relay_detect = free_port();
 
     // 1. The printer: synthetic, nothing connected to it.
     let printer = spawn(
@@ -176,6 +209,10 @@ fn several_client_processes_share_one_printer_through_the_relay() {
             &printer_mqtt.to_string(),
             "--emulate-ftp-port",
             &printer_ftp.to_string(),
+            "--emulate-detect-port",
+            &printer_detect.to_string(),
+            "--emulate-detect-tls-port",
+            &free_port().to_string(),
         ],
     );
     wait_for_port(printer_mqtt, "the synthetic printer");
@@ -191,6 +228,8 @@ fn several_client_processes_share_one_printer_through_the_relay() {
             &printer_mqtt.to_string(),
             "--ftps-port",
             &printer_ftp.to_string(),
+            "--detect-port",
+            &printer_detect.to_string(),
             "--serial",
             SERIAL,
             "--access-code",
@@ -207,6 +246,10 @@ fn several_client_processes_share_one_printer_through_the_relay() {
             &relay_mqtt.to_string(),
             "--emulate-ftp-port",
             &relay_ftp.to_string(),
+            "--emulate-detect-port",
+            &relay_detect.to_string(),
+            "--emulate-detect-tls-port",
+            &free_port().to_string(),
         ],
     );
     wait_for_port(relay_mqtt, "the relay");
@@ -245,7 +288,24 @@ fn several_client_processes_share_one_printer_through_the_relay() {
         );
     }
 
-    // 5. The property the whole feature exists for, and the one every
+    // 5. The probe Studio makes before it will open MQTT at all. Answering it
+    //    is what makes the relay addable by IP; without it the client gives up
+    //    silently, having sent nothing a server could log.
+    let reply = probe_detect(relay_detect);
+    assert_eq!(reply["login"]["sequence_id"], "20004", "the id is echoed");
+    assert_eq!(reply["login"]["bind"], "free");
+    assert_eq!(reply["login"]["connect"], "lan");
+    //    And the identity came *from the printer*, through the relay — not
+    //    composed by the relay from what it was configured with. Only the
+    //    upstream knows it calls itself "synthetic": a relay that invented an
+    //    answer would still satisfy every assertion above.
+    assert_eq!(
+        reply["login"]["name"], "synthetic",
+        "the relay should pass the printer's own identity through:\n{reply}"
+    );
+    assert_eq!(reply["login"]["id"], SERIAL);
+
+    // 6. The property the whole feature exists for, and the one every
     //    assertion above would still satisfy if it broke: the *printer* saw a
     //    single client throughout. A regression that opened one upstream
     //    connection per downstream client would serve all five of those reads
@@ -281,6 +341,10 @@ fn the_relay_refuses_a_client_with_the_wrong_access_code() {
             &printer_mqtt.to_string(),
             "--emulate-ftp-port",
             &free_port().to_string(),
+            "--emulate-detect-port",
+            &free_port().to_string(),
+            "--emulate-detect-tls-port",
+            &free_port().to_string(),
         ],
     );
     wait_for_port(printer_mqtt, "the synthetic printer");
@@ -307,6 +371,10 @@ fn the_relay_refuses_a_client_with_the_wrong_access_code() {
             "--emulate-port",
             &relay_mqtt.to_string(),
             "--emulate-ftp-port",
+            &free_port().to_string(),
+            "--emulate-detect-port",
+            &free_port().to_string(),
+            "--emulate-detect-tls-port",
             &free_port().to_string(),
         ],
     );

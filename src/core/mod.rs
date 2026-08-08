@@ -6,6 +6,8 @@
 pub mod capability;
 pub mod command;
 #[cfg(feature = "relay")]
+pub mod detect;
+#[cfg(feature = "relay")]
 pub mod emulate;
 #[cfg(test)]
 pub(crate) mod fake;

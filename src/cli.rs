@@ -78,6 +78,10 @@ struct Cli {
     /// privileged, so a relay often cannot have it.
     #[arg(long, global = true, env = "BAMBU_FTPS_PORT")]
     ftps_port: Option<u16>,
+    /// Override the device-detect port (default 3000), for the same reason.
+    /// Only `serve --emulate` uses it, to ask the printer who it is.
+    #[arg(long, global = true, env = "BAMBU_DETECT_PORT")]
+    detect_port: Option<u16>,
     /// Emit machine-readable JSON (default output is human-readable).
     #[arg(long, global = true)]
     json: bool,
@@ -324,6 +328,23 @@ enum Command {
         #[cfg(feature = "relay")]
         #[arg(long, value_name = "FIRST-LAST", requires = "emulate")]
         emulate_pasv_ports: Option<String>,
+        /// Port for the device-detect probe, which is what makes Bambu Studio's
+        /// "add printer by IP" work: it knocks here *before* MQTT and abandons
+        /// the whole attempt, silently, if nothing answers. 3000 is where a
+        /// client looks; moving it means Studio will not find this relay.
+        #[cfg(feature = "relay")]
+        #[arg(long, default_value_t = 3000, requires = "emulate")]
+        emulate_detect_port: u16,
+        /// The TLS variant of the detect port. A real printer serves both.
+        #[cfg(feature = "relay")]
+        #[arg(long, default_value_t = 3002, requires = "emulate")]
+        emulate_detect_tls_port: u16,
+        /// Don't serve the detect probe. Everything else still relays; a client
+        /// already pointed at this host keeps working, but a new one cannot add
+        /// it by IP.
+        #[cfg(feature = "relay")]
+        #[arg(long, requires = "emulate")]
+        emulate_no_detect: bool,
     },
 }
 
@@ -890,6 +911,12 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             emulate_no_ftp,
             #[cfg(feature = "relay")]
             emulate_pasv_ports,
+            #[cfg(feature = "relay")]
+            emulate_detect_port,
+            #[cfg(feature = "relay")]
+            emulate_detect_tls_port,
+            #[cfg(feature = "relay")]
+            emulate_no_detect,
         } => run_serve(
             cli,
             host,
@@ -906,6 +933,8 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
                 port: *emulate_port,
                 ftp_port: (!emulate_no_ftp).then_some(*emulate_ftp_port),
                 pasv_ports: emulate_pasv_ports.clone(),
+                detect_port: (!emulate_no_detect).then_some(*emulate_detect_port),
+                detect_tls_port: (!emulate_no_detect).then_some(*emulate_detect_tls_port),
                 read_only: *emulate_read_only,
             }),
         ),
@@ -1885,6 +1914,7 @@ fn synthetic_identity(cli: &Cli) -> crate::server::ServeTarget {
             ),
             mqtt_port: crate::config::DEFAULT_MQTT_PORT,
             ftps_port: crate::config::DEFAULT_FTPS_PORT,
+            detect_port: crate::config::DEFAULT_DETECT_PORT,
         },
     }
 }
@@ -4152,6 +4182,7 @@ fn flag_overrides(cli: &Cli) -> Overrides {
         model: cli.model.clone(),
         mqtt_port: cli.mqtt_port,
         ftps_port: cli.ftps_port,
+        detect_port: cli.detect_port,
     }
 }
 
