@@ -112,7 +112,14 @@ pub struct Report {
     pub source: String,
     /// Steps in the sequence.
     pub total: usize,
-    /// Steps the printer confirmed.
+    /// Steps the printer **acknowledged**.
+    ///
+    /// For a G-code line that is the whole verdict — `core::verify` classifies
+    /// it as having no observable state effect, so there is nothing to confirm
+    /// beyond the ACK. It does NOT mean the motion finished: the printer never
+    /// reports that, and a sequence with `G4` dwells is still moving well after
+    /// the last ACK. Reading it as "done" is the mistake this doc exists to
+    /// prevent.
     pub verified: usize,
     /// Whether every step was confirmed — the one field to branch on.
     pub ok: bool,

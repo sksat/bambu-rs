@@ -1810,10 +1810,22 @@ fn run_gcode(cli: &Cli, req: GcodeRequest<'_>) -> Result<(), CliError> {
     match from_file {
         None => {
             eprintln!("sending gcode_line {:?} …", steps[0].gcode);
-            report_command_outcome(
-                cli,
-                client.send_and_verify(&ProtoCommand::GcodeLine(steps[0].gcode.clone()))?,
-            )
+            let outcome =
+                client.send_and_verify(&ProtoCommand::GcodeLine(steps[0].gcode.clone()))?;
+            match command_outcome_error(&outcome) {
+                Some(e) => Err(e),
+                None => {
+                    // NOT "took effect": a G-code line has no observable effect
+                    // to confirm (see `core::verify`), so the ACK is the whole
+                    // verdict. A move is still travelling when this prints.
+                    if want_json(cli) {
+                        print_json(&serde_json::json!({ "outcome": "accepted" }));
+                    } else {
+                        eprintln!("{}", GCODE_ACCEPTED_NOTE);
+                    }
+                    Ok(())
+                }
+            }
         }
         Some(source) => run_gcode_sequence(cli, &client, source, &steps),
     }
@@ -1896,7 +1908,10 @@ fn run_gcode_sequence(
     if want_json(cli) {
         print_json(&report);
     } else {
-        eprintln!("{}/{} steps verified", report.verified, report.total);
+        eprintln!(
+            "{}/{} steps accepted — {}",
+            report.verified, report.total, GCODE_MOTION_NOTE
+        );
     }
     // A rejection or a verify timeout is the *common* mid-sequence failure, so
     // it carries the step context just like a dropped connection does.
@@ -3594,6 +3609,14 @@ fn report_command_outcome(cli: &Cli, outcome: CommandOutcome) -> Result<(), CliE
 /// be able to wrap that message with the step that stopped it. Folding them
 /// into the reporting step would have hidden them behind a bare "the printer
 /// rejected…" with no line number.
+/// What the printer actually told us about a raw G-code line, and what it did
+/// not. Kept as constants so the single-line and sequence paths cannot drift
+/// into claiming different things about the same guarantee.
+const GCODE_MOTION_NOTE: &str =
+    "the printer does not report when the motion finishes, so it may still be running";
+const GCODE_ACCEPTED_NOTE: &str = "accepted: the printer acknowledged the command \
+    (a G-code line has no confirmable effect, so the motion may still be running)";
+
 fn command_outcome_error(outcome: &CommandOutcome) -> Option<CliError> {
     match outcome {
         CommandOutcome::Verified => None,
