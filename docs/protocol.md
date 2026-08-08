@@ -333,11 +333,30 @@ RSA suites, however willing it is to skip verification.
 to the real machine over the one connection it already holds. What a client
 needs, in the order it asks for it:
 
-- **TLS.** The certificate is not verifiable (self-signed, X.509 v1, CN = the
-  serial), so every LAN client must already be skipping verification. Presenting
-  a *v3 ECDSA* certificate with CN = the serial is accepted in practice — checked
-  against `rumqttc` and a hand-rolled stdlib client, not against Bambu Studio.
-  **[observed for those clients; Studio untested]**
+- **TLS — and "every client must be skipping verification" is false.** That was
+  the reasoning here, from the printer's own certificate being unverifiable
+  (self-signed, X.509 v1, CN = the serial). `rumqttc` and a hand-rolled stdlib
+  client do accept a v3 ECDSA certificate with CN = the serial. **Bambu Studio
+  does not**: it verifies against the CAs it ships and drops the connection with
+  a TLS `UnknownCA` alert before a byte of MQTT is exchanged. Nothing generated
+  locally can chain to those CAs, so Studio can only be made to accept a relay by
+  trusting its certificate explicitly (`tools/trust_relay_in_studio.sh`).
+  **[observed]**
+
+  What does the verifying is not the Studio binary but
+  `libbambu_networking.so`, a closed-source plugin Studio downloads into
+  `~/.config/BambuStudio/plugins`. It embeds no CA — it exports
+  `bambu_network_set_cert_file` and is handed one — and the only printer CA
+  bundle on a normal install is `resources/cert/printer.cer` (BBL CA, BBL CA2
+  RSA, BBL CA2 ECC). Appending a self-signed certificate there is enough:
+  OpenSSL takes an exactly-matching self-signed certificate in the store as a
+  trust anchor, so no separate CA is needed. **[observed]**
+
+  Which is why the relay's certificate is **kept on disk** and reused across
+  restarts (`<config>/emulate/<serial>.cert.pem`). A pin is worth nothing
+  against an identity that is reinvented every start. Its validity is a plain
+  ten years — rcgen's default of 1975–4096 looks like no real certificate and
+  invites a client to refuse it on dates alone. **[observed]**
 - **The detect probe, before anything else.** Studio knocks on 3000/3002 first
   and never reaches MQTT if nothing answers, so the relay serves both — proxying
   the enquiry to the real printer and rewriting only `bind`/`connect` (see
@@ -383,6 +402,25 @@ needs, in the order it asks for it:
   untouched. A relay that renumbers requests should keep its ids below 2^31 in
   case the id is parsed as a 32-bit integer somewhere — an echo that comes back
   changed can never be matched to the command it answers.
+
+### Bambu Studio through the relay, end to end **[observed]**
+
+With the detect probe answered and the certificate trusted, Studio connects and
+works. On the A1 mini, 2026-08-09:
+
+- Studio attaches as client id `studio_client_id:<4 hex>`; the relay logs it like
+  any other client.
+- **Reads** arrive, and a `bambu status` from the CLI runs *at the same time* —
+  two clients, and the printer still sees exactly one connection. That is the
+  whole feature, and it is only observable from outside: every in-process test
+  would pass just as well against a relay that opened one upstream per client.
+- **Control relays too**: a homing command issued from Studio reached the machine
+  and it moved. That exercises the sequence rewriting against a client nobody
+  here wrote — Studio numbers its own commands from `"1"`, exactly the collision
+  the rewriter exists to prevent.
+- **Not yet tried:** sending a print from Studio. It uploads over FTPS first, and
+  990 is privileged, so the relay needs `cap_net_bind_service` before that path
+  can be exercised at all.
 
 ## Version inventory (`info.get_version`)
 
