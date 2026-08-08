@@ -24,7 +24,8 @@ use crate::core::command::{
 use crate::core::park::ParkTuning;
 use crate::core::project::{self, PlateInspection};
 use crate::core::report::ReportState;
-use crate::core::safety::{self, GcodeVerdict, TempLimits};
+use crate::core::safety::TempLimits;
+use crate::core::sequence;
 use crate::core::stage::Stage;
 use crate::core::start::{self, PrintStartParams};
 use crate::core::status::{GcodeState, PrinterStatus};
@@ -164,17 +165,32 @@ enum Command {
         #[command(flatten)]
         args: CalibrateArgs,
     },
-    /// Send a raw G-code line and watch the report (control; needs --confirm).
+    /// Send a raw G-code line — or a whole `.gcode` sequence with --from-file —
+    /// and watch the report (control; needs --confirm).
     Gcode {
-        /// The G-code line, e.g. "G28" (home all axes).
-        line: String,
-        /// Required to actually send a control command.
+        /// The G-code line, e.g. "G28" (home all axes). Omit when using --from-file.
+        line: Option<String>,
+        /// Send every line of this `.gcode` file in order instead of a single
+        /// line, over one connection, each line verified before the next. For
+        /// control macros — parking the head, driving a plate changer — not for
+        /// printing (use `job start` for that). Comments and blank lines are
+        /// skipped; the sequence stops at the first line that fails, naming it,
+        /// so a half-finished motion can be recovered deliberately.
+        #[arg(long, conflicts_with = "line")]
+        from_file: Option<String>,
+        /// Required to actually send a control command. With --from-file one
+        /// --confirm covers the whole sequence (review it with --dry-run first).
         #[arg(long)]
         confirm: bool,
         /// Override the static safety check (over-limit temps, cold extrusion).
         #[arg(long)]
         force: bool,
-        /// Watch the report for this many seconds after sending.
+        /// Show what would be sent, without sending it (safe).
+        #[arg(long)]
+        dry_run: bool,
+        /// Seconds to wait for the printer to confirm ONE line (and, separately,
+        /// to connect) — not a budget for the whole run: a sequence that dwells
+        /// is legitimately minutes long.
         #[arg(long, default_value_t = 30)]
         timeout: u64,
     },
@@ -708,10 +724,20 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
         Command::Calibrate { args } => run_calibrate(cli, args),
         Command::Gcode {
             line,
+            from_file,
             confirm,
             force,
+            dry_run,
             timeout,
-        } => run_gcode(cli, line, *confirm, *force, *timeout),
+        } => run_gcode(
+            cli,
+            line.as_deref(),
+            from_file.as_deref(),
+            *confirm,
+            *force,
+            *dry_run,
+            *timeout,
+        ),
         Command::Reboot { confirm } => run_reboot(cli, *confirm),
         #[cfg(feature = "server")]
         Command::Serve {
@@ -1530,32 +1556,176 @@ fn load_seed_cameras(path: &std::path::Path) -> Result<Vec<SeedCamera>, CliError
 
 fn run_gcode(
     cli: &Cli,
-    line: &str,
+    line: Option<&str>,
+    from_file: Option<&str>,
     confirm: bool,
     force: bool,
+    dry_run: bool,
     timeout_secs: u64,
 ) -> Result<(), CliError> {
+    let steps = match (line, from_file) {
+        (Some(l), None) => vec![sequence::Step {
+            line_no: 1,
+            gcode: l.to_string(),
+        }],
+        (None, Some(path)) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| CliError::new(exit::VALIDATION, format!("reading {path}: {e}")))?;
+            let steps = sequence::parse(&text);
+            if steps.is_empty() {
+                return Err(CliError::new(
+                    exit::VALIDATION,
+                    format!("{path} has no G-code to send (only comments/blank lines)"),
+                ));
+            }
+            steps
+        }
+        _ => {
+            return Err(CliError::new(
+                exit::VALIDATION,
+                "give either a G-code line or --from-file",
+            ));
+        }
+    };
+
+    // Static safety guard: block recognised-dangerous lines (over-limit temps,
+    // cold extrusion) unless explicitly overridden with --force. A sequence is
+    // vetted as a whole so every problem is visible before it starts moving.
+    if !force {
+        let bad = sequence::vet(&steps, &TempLimits::default());
+        if !bad.is_empty() {
+            let detail = bad
+                .iter()
+                .map(|u| format!("line {}: {} ({})", u.step.line_no, u.step.gcode, u.reason))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(CliError::new(
+                exit::VALIDATION,
+                format!("refusing unsafe G-code: {detail}"),
+            ));
+        }
+    }
+
+    if dry_run {
+        print_gcode_plan(cli, from_file, &steps);
+        return Ok(());
+    }
     if !confirm {
         return Err(CliError::new(
             exit::CONFIRM_REQUIRED,
-            "refusing to send a control command without --confirm",
+            "refusing to send a control command without --confirm (try --dry-run first)",
         ));
     }
-    // Static safety guard: block recognised-dangerous lines (over-limit temps,
-    // cold extrusion) unless explicitly overridden with --force.
-    if !force && let GcodeVerdict::Block(reason) = safety::check_gcode(line, &TempLimits::default())
-    {
-        return Err(CliError::new(
-            exit::VALIDATION,
-            format!("refusing unsafe G-code: {reason}"),
-        ));
-    }
+
     let client = connect_client(cli, timeout_secs)?;
-    eprintln!("sending gcode_line {line:?} …");
-    report_command_outcome(
-        cli,
-        client.send_and_verify(&ProtoCommand::GcodeLine(line.to_string()))?,
-    )
+    match from_file {
+        None => {
+            eprintln!("sending gcode_line {:?} …", steps[0].gcode);
+            report_command_outcome(
+                cli,
+                client.send_and_verify(&ProtoCommand::GcodeLine(steps[0].gcode.clone()))?,
+            )
+        }
+        Some(source) => run_gcode_sequence(cli, &client, source, &steps),
+    }
+}
+
+/// Show what `gcode` would send, without sending it. Human-readable by default,
+/// JSON only with `--json` (the output contract).
+fn print_gcode_plan(cli: &Cli, from_file: Option<&str>, steps: &[sequence::Step]) {
+    let total = steps.len();
+    if want_json(cli) {
+        print_json(&serde_json::json!({
+            "source": from_file.map_or("argument", |p| p),
+            "steps": steps.iter().map(|s| serde_json::json!({
+                "line": s.line_no, "gcode": s.gcode,
+            })).collect::<Vec<_>>(),
+            "count": total,
+        }));
+        return;
+    }
+    match from_file {
+        // The whole plan, because a sequence is confirmed as a unit — this is
+        // the operator's one chance to read it before anything moves.
+        Some(path) => {
+            eprintln!("dry run — {total} steps from {path}:");
+            for (i, s) in steps.iter().enumerate() {
+                eprintln!("  [{}/{}] line {}: {}", i + 1, total, s.line_no, s.gcode);
+            }
+        }
+        None => eprintln!("dry run — would send gcode_line {:?}", steps[0].gcode),
+    }
+    eprintln!("(nothing sent; re-run with --confirm to send)");
+}
+
+/// Send a `--from-file` sequence over one connection and report it as **one**
+/// result.
+///
+/// Every way this can stop — the printer rejecting a line, a line going
+/// unverified, the connection dropping — names the step and the source line it
+/// stopped on, because the machine is left mid-motion and "which line was that?"
+/// is the first thing the operator needs.
+fn run_gcode_sequence(
+    cli: &Cli,
+    client: &LanMqttClient,
+    source: &str,
+    steps: &[sequence::Step],
+) -> Result<(), CliError> {
+    let total = steps.len();
+    let commands = steps
+        .iter()
+        .map(|s| ProtoCommand::GcodeLine(s.gcode.clone()))
+        .collect::<Vec<_>>();
+    // The step being published, so a transport failure can name it too — it
+    // never gets an outcome to be found in. Still `None` means the connection
+    // never came up and nothing was sent, which is not "stopped at step 1".
+    let at = std::cell::Cell::new(None);
+    let outcomes = client
+        .send_sequence(&commands, |i| {
+            at.set(Some(i));
+            let s = &steps[i];
+            eprintln!("[{}/{}] line {}: {}", i + 1, total, s.line_no, s.gcode);
+        })
+        .map_err(|e| {
+            let e: CliError = e.into();
+            match at.get() {
+                None => e,
+                Some(i) => CliError::new(
+                    e.code,
+                    format!(
+                        "stopped at {}: {}",
+                        sequence::step_context(i, total, &steps[i]),
+                        e.message
+                    ),
+                ),
+            }
+        })?;
+
+    // One result for the run: a verdict printed per step would be several
+    // adjacent JSON objects, which is not a document any parser accepts.
+    let report = sequence::Report::new(source, steps, &outcomes);
+    if want_json(cli) {
+        print_json(&report);
+    } else {
+        eprintln!("{}/{} steps verified", report.verified, report.total);
+    }
+    // A rejection or a verify timeout is the *common* mid-sequence failure, so
+    // it carries the step context just like a dropped connection does.
+    match outcomes
+        .iter()
+        .enumerate()
+        .find_map(|(i, o)| command_outcome_error(o).map(|e| (i, e)))
+    {
+        None => Ok(()),
+        Some((i, e)) => Err(CliError::new(
+            e.code,
+            format!(
+                "stopped at {}: {}",
+                sequence::step_context(i, total, &steps[i]),
+                e.message
+            ),
+        )),
+    }
 }
 
 fn run_file(cli: &Cli, action: &FileAction) -> Result<(), CliError> {
@@ -3191,26 +3361,41 @@ fn report_command_outcome(cli: &Cli, outcome: CommandOutcome) -> Result<(), CliE
         };
         print_json(&v);
     }
-    match outcome {
-        CommandOutcome::Verified => {
+    match command_outcome_error(&outcome) {
+        None => {
             if !want_json(cli) {
                 eprintln!("verified: the printer confirmed the command took effect");
             }
             Ok(())
         }
-        CommandOutcome::Rejected { reason } => Err(CliError::new(
+        Some(e) => Err(e),
+    }
+}
+
+/// The error a *not-confirmed* outcome means — exit code and message; `None`
+/// when the printer confirmed the command.
+///
+/// Split out of [`report_command_outcome`] because a rejection and a verify
+/// timeout are the common way a sequence fails half-way, and the caller has to
+/// be able to wrap that message with the step that stopped it. Folding them
+/// into the reporting step would have hidden them behind a bare "the printer
+/// rejected…" with no line number.
+fn command_outcome_error(outcome: &CommandOutcome) -> Option<CliError> {
+    match outcome {
+        CommandOutcome::Verified => None,
+        CommandOutcome::Rejected { reason } => Some(CliError::new(
             exit::DEVICE_REJECTED,
             format!("the printer rejected the command: {reason}"),
         )),
         CommandOutcome::Unverified {
             stage: VerifyStage::Ack,
-        } => Err(CliError::new(
+        } => Some(CliError::new(
             exit::VERIFY_TIMEOUT,
             "command published but not acknowledged within the timeout (unverified)",
         )),
         CommandOutcome::Unverified {
             stage: VerifyStage::Effect,
-        } => Err(CliError::new(
+        } => Some(CliError::new(
             exit::VERIFY_TIMEOUT,
             "command was acknowledged but its effect never showed in the report \
              (the printer's state didn't change — e.g. a print that won't start \

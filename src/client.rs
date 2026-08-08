@@ -426,6 +426,122 @@ impl LanMqttClient {
         })
     }
 
+    /// Connect and wait until the broker accepts the connection, bounded by
+    /// `timeout`.
+    ///
+    /// [`connect`](Self::connect) only queues the subscribe and the pushall —
+    /// the TCP/TLS handshake happens on the first `poll`, so an unreachable
+    /// printer shows up as a poll that never returns, not as a failing
+    /// `connect`. Waiting for the CONNACK here is what actually bounds it, and
+    /// it keeps the connect cost out of the first step's verify budget.
+    async fn connect_ready(&self) -> Result<(AsyncClient, EventLoop), ClientError> {
+        tokio::time::timeout(self.timeout, async {
+            let (client, mut eventloop) = self.connect().await?;
+            loop {
+                if matches!(
+                    poll(&mut eventloop).await?,
+                    Event::Incoming(Packet::ConnAck(_))
+                ) {
+                    return Ok((client, eventloop));
+                }
+            }
+        })
+        .await
+        .unwrap_or(Err(ClientError::Timeout(self.timeout)))
+    }
+
+    async fn send_sequence_async<F: FnMut(usize)>(
+        &self,
+        commands: &[Command],
+        mut before_step: F,
+    ) -> Result<Vec<CommandOutcome>, ClientError> {
+        let (client, mut eventloop) = self.connect_ready().await?;
+        // connect() already used sequence id "0" for the pushall.
+        let mut ids = SequenceIds::new();
+        let _ = ids.next_id();
+
+        let mut outcomes = Vec::with_capacity(commands.len());
+        for (i, cmd) in commands.iter().enumerate() {
+            before_step(i);
+            // A distinct id per step is what keeps the verdicts apart: reusing
+            // one would let a repeat of the previous step's ACK verify the next
+            // command without the printer having answered it.
+            let seq = ids.next_id();
+            client
+                .publish(
+                    request_topic(&self.target.serial),
+                    QoS::AtLeastOnce, // control commands go at QoS 1
+                    false,
+                    cmd.to_payload(&seq).to_string(),
+                )
+                .await
+                .map_err(|e| ClientError::Mqtt(e.to_string()))?;
+
+            // Each step gets its own budget. A sequence's own dwells (`G4 S3`)
+            // make it minutes long, so one deadline for the whole run would
+            // abort a healthy sequence; what needs bounding is a single step
+            // going unanswered.
+            let mut session = VerifySession::new(cmd.clone(), seq.as_str());
+            let deadline = tokio::time::Instant::now() + self.timeout;
+            let outcome = loop {
+                let ev = match tokio::time::timeout_at(deadline, poll(&mut eventloop)).await {
+                    Err(_) => break session.timed_out(),
+                    Ok(ev) => ev?,
+                };
+                if let Event::Incoming(Packet::Publish(p)) = ev
+                    && let Ok(json) = serde_json::from_slice::<Value>(&p.payload)
+                    && let Some(outcome) = session.observe(json)
+                {
+                    break outcome;
+                }
+            };
+            let confirmed = outcome == CommandOutcome::Verified;
+            outcomes.push(outcome);
+            // Stop rather than press on: the machine is mid-motion and the
+            // remaining commands assume the earlier ones ran.
+            if !confirmed {
+                break;
+            }
+        }
+        Ok(outcomes)
+    }
+
+    /// Send `commands` in order over **one** connection, verifying each before
+    /// the next is published.
+    ///
+    /// This is the multi-command counterpart to
+    /// [`send_and_verify`](Self::send_and_verify), which reconnects (and
+    /// re-`pushall`s) per call — looping that would breach the A1/P1
+    /// single-client MQTT limit dozens of times for one macro.
+    ///
+    /// Returns one [`CommandOutcome`] per step **that got a verdict**: the run
+    /// stops at the first step the printer doesn't confirm, so a short vector
+    /// means it stopped at `outcomes.len()`. `before_step` is called with the
+    /// 0-based index just before that step is published — the only way a caller
+    /// can follow progress, and the step index to blame if this returns `Err`.
+    ///
+    /// There is deliberately **no** timeout over the whole run: a real sequence
+    /// dwells (`G4 S3`) for minutes. The bounds are the connect and each step
+    /// (both `timeout`).
+    ///
+    /// Only the first step sees the connect-time `pushall`, so only it can take
+    /// a `print_error` baseline; a later step would read a *pre-existing* fault
+    /// as one it caused. Harmless for the commands this exists for — a
+    /// `gcode_line` has no observable effect, so its ACK is the whole verdict —
+    /// but a sequence of effectful commands needs that baseline carried across
+    /// steps first.
+    pub fn send_sequence<F: FnMut(usize)>(
+        &self,
+        commands: &[Command],
+        before_step: F,
+    ) -> Result<Vec<CommandOutcome>, ClientError> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| ClientError::Runtime(e.to_string()))?;
+        rt.block_on(self.send_sequence_async(commands, before_step))
+    }
+
     async fn send_fire_async(&self, cmd: &Command) -> Result<(), ClientError> {
         let (client, mut eventloop) = self.connect().await?;
         // connect() used sequence id "0" for the pushall; this command gets "1".
