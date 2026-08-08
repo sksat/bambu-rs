@@ -34,12 +34,24 @@
 set -euo pipefail
 
 BUNDLE=${BUNDLE:-/opt/bambustudio-bin/resources/cert/printer.cer}
-CERT_DIR=${CERT_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/bambu-rs/emulate}
 RELAY=${RELAY:-127.0.0.1:8883}
 DRY_RUN=${DRY_RUN:-}
 
 die() { echo "error: $*" >&2; exit 1; }
 note() { echo "$*"; }
+
+# Writing the bundle needs root, but the certificate belongs to whoever runs the
+# relay — and under `sudo` both $HOME and $XDG_CONFIG_HOME are root's. Looking
+# in /root/.config would be wrong every single time.
+if [ -z "${CERT_DIR:-}" ]; then
+  if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+    sudo_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    [ -n "$sudo_home" ] || die "cannot work out $SUDO_USER's home directory; set CERT= or CERT_DIR="
+    CERT_DIR=$sudo_home/.config/bambu-rs/emulate
+  else
+    CERT_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/bambu-rs/emulate
+  fi
+fi
 
 command -v openssl >/dev/null || die "openssl is needed to read and check certificates"
 
@@ -51,7 +63,14 @@ if [ -z "${CERT:-}" ]; then
   found=("$CERT_DIR"/*.cert.pem)
   shopt -u nullglob
   case ${#found[@]} in
-    0) die "no relay certificate under $CERT_DIR — run 'bambu serve --emulate' once, or set CERT=" ;;
+    0)
+      hint="run 'bambu serve --emulate' once, or set CERT="
+      # `sudo -i` discards SUDO_USER, so there is no way to tell whose relay
+      # this is; say that rather than let /root look like the user's mistake.
+      [ "$CERT_DIR" = "/root/.config/bambu-rs/emulate" ] \
+        && hint="that is root's home — with 'sudo -i' pass CERT=/home/<you>/.config/bambu-rs/emulate/<serial>.cert.pem, or use plain 'sudo'"
+      die "no relay certificate under $CERT_DIR — $hint"
+      ;;
     1) CERT=${found[0]} ;;
     *) die "several certificates under $CERT_DIR; pick one with CERT=: ${found[*]}" ;;
   esac
