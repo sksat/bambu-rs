@@ -276,7 +276,14 @@ pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
                         // one we were told to present under.
                         Arc::new(detect::SyntheticDetect {
                             serial: t.serial.clone(),
-                            model: t.model.device_code().unwrap_or("N1").to_string(),
+                            // An unrecognised model reports whatever it was
+                            // configured as, rather than being rounded to some
+                            // real machine it is not.
+                            model: t
+                                .model
+                                .device_code()
+                                .unwrap_or_else(|| t.model.as_str())
+                                .to_string(),
                         }),
                     )
                     .await?;

@@ -97,6 +97,21 @@ pub fn decode(buf: &[u8]) -> Result<Option<(Value, usize)>, DetectError> {
     Ok(Some((value, total)))
 }
 
+/// Whether this frame is the `login`/`detect` enquiry at all.
+///
+/// Separate from [`detect_sequence_id`] on purpose: whether to answer and what
+/// to echo are different questions. Refusing a detect that arrived without a
+/// `sequence_id` would be a client-compatibility guess dressed up as strictness
+/// — the command is the thing being asked, the id is only how the answer is
+/// matched up.
+pub fn is_detect(request: &Value) -> bool {
+    request
+        .get("login")
+        .and_then(|l| l.get("command"))
+        .and_then(Value::as_str)
+        == Some("detect")
+}
+
 /// Whether this is the `login`/`detect` enquiry, and its sequence id if so.
 pub fn detect_sequence_id(request: &Value) -> Option<&str> {
     let login = request.get("login")?;
@@ -282,5 +297,18 @@ mod tests {
             detect_sequence_id(&json!({"print": {"command": "detect"}})),
             None
         );
+        assert!(!is_detect(&json!({"login": {"command": "bind"}})));
+        assert!(!is_detect(&json!({"print": {"command": "detect"}})));
+        assert!(!is_detect(&json!({})));
+    }
+
+    #[test]
+    fn a_detect_without_a_sequence_id_is_still_a_detect() {
+        // Answering is about the command; the id is only how the answer gets
+        // matched up. Conflating the two would refuse a client over a field we
+        // have never actually seen missing — a guess, not strictness.
+        let no_id = json!({"login": {"command": "detect"}});
+        assert!(is_detect(&no_id));
+        assert_eq!(detect_sequence_id(&no_id), None);
     }
 }

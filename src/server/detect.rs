@@ -25,6 +25,14 @@ const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a peer may dawdle over one frame.
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How many probes may be in flight at once.
+///
+/// A probe is one small round trip, so real traffic never approaches this. The
+/// cap is here because the proxied variant occupies a blocking thread while it
+/// waits on the printer: without a bound, a peer opening connections in a loop
+/// would starve the blocking pool that the rest of `serve` also uses.
+const MAX_IN_FLIGHT: usize = 32;
+
 /// Where a detect reply comes from.
 pub trait DetectSource: Send + Sync + 'static {
     /// Answer `request` — the decoded enquiry — with the reply frame's JSON.
@@ -109,6 +117,7 @@ pub async fn serve(
     tls: Option<Arc<rustls::ServerConfig>>,
 ) -> anyhow::Result<()> {
     let acceptor = tls.map(tokio_rustls::TlsAcceptor::from);
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
     loop {
         let (socket, peer) = match listener.accept().await {
             Ok(x) => x,
@@ -118,9 +127,16 @@ pub async fn serve(
                 continue;
             }
         };
+        // Acquired before spawning, so a flood makes the *listener* wait rather
+        // than piling up tasks that would each hold a socket open regardless.
+        let permit = match Arc::clone(&in_flight).acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return Ok(()), // semaphore closed: we are shutting down
+        };
         let source = Arc::clone(&source);
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let outcome = match acceptor {
                 Some(acceptor) => match acceptor.accept(socket).await {
                     Ok(stream) => answer_one(stream, source).await,
@@ -159,7 +175,7 @@ async fn answer_one<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         }
     };
 
-    if detect::detect_sequence_id(&request).is_none() {
+    if !detect::is_detect(&request) {
         // Not the enquiry we know. Saying nothing is what an unknown command
         // gets from the printer, and inventing an answer would be worse.
         anyhow::bail!("not a detect enquiry: {request}");
