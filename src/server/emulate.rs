@@ -615,6 +615,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_third_party_client_implementation_can_talk_to_it() {
+        // Every other test here drives the emulator with the emulator's own
+        // codec, which would happily agree with itself about a wrong byte.
+        // rumqttc is an independent implementation — the same one this crate
+        // uses against real printers — so if the wire format is off, this is
+        // what notices.
+        let upstream = FakeUpstream::new();
+        let (emulator, addr) = start(Arc::clone(&upstream)).await;
+        upstream.push(snapshot());
+        until("the cache to warm up", || {
+            emulator.cache.read().unwrap().is_warm()
+        })
+        .await;
+
+        let mut opts =
+            rumqttc::MqttOptions::new("rumqttc-probe", addr.ip().to_string(), addr.port());
+        opts.set_credentials("bblp", CODE);
+        opts.set_keep_alive(Duration::from_secs(30));
+        opts.set_transport(rumqttc::Transport::Tls(rumqttc::TlsConfiguration::Rustls(
+            crate::tls::lan_client_config().unwrap(),
+        )));
+        let (client, mut eventloop) = rumqttc::AsyncClient::new(opts, 16);
+        client
+            .subscribe(format!("device/{SERIAL}/report"), rumqttc::QoS::AtMostOnce)
+            .await
+            .unwrap();
+        // Ordered behind the SUBSCRIBE on the same connection, so by the time
+        // this is handled the subscription is live and the cache answers it.
+        client
+            .publish(
+                format!("device/{SERIAL}/request"),
+                rumqttc::QoS::AtLeastOnce,
+                false,
+                json!({"pushing": {"sequence_id": "0", "command": "pushall"}}).to_string(),
+            )
+            .await
+            .unwrap();
+
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(10), eventloop.poll())
+                .await
+                .expect("rumqttc should reach a report before this times out")
+                .expect("the connection should stay up");
+            if let rumqttc::Event::Incoming(rumqttc::Packet::Publish(p)) = event {
+                let v: Value = serde_json::from_slice(&p.payload).unwrap();
+                assert_eq!(p.topic, format!("device/{SERIAL}/report"));
+                assert_eq!(v["print"]["msg"], 0);
+                assert_eq!(v["print"]["gcode_state"], "RUNNING");
+                return;
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn a_ping_keeps_the_connection_alive() {
         let (_e, addr) = start(FakeUpstream::new()).await;
         let mut client = TestClient::connect(addr).await;

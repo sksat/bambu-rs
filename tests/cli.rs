@@ -354,6 +354,47 @@ fn via_serve_unreachable_is_a_transport_error() {
     let _ = std::fs::remove_dir_all(&cfg);
 }
 
+#[cfg(feature = "server")]
+#[test]
+fn emulate_needs_a_real_printer_to_relay() {
+    // The emulator's whole job is to be a stand-in for a specific machine. With
+    // --fake there is none, and an emulator answering every read with an empty
+    // snapshot would look to Bambu Studio like a printer that had gone strange
+    // rather than one that was never there.
+    let cfg = tmp_cfg("emulate-fake");
+    bambu(&cfg)
+        .args(["serve", "--fake", "--emulate"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--emulate"));
+    // Nor without any configured printer: same reason, different way of having
+    // nothing to relay. (VALIDATION — no target could be resolved.)
+    bambu(&cfg).args(["serve", "--emulate"]).assert().code(3);
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[cfg(feature = "server")]
+#[test]
+fn the_emulate_tuning_flags_require_emulate_itself() {
+    // --emulate-host 0.0.0.0 without --emulate would bind nothing and say
+    // nothing; clap should reject it instead.
+    let cfg = tmp_cfg("emulate-orphan-flags");
+    for flag in [
+        vec!["--emulate-host", "0.0.0.0"],
+        vec!["--emulate-port", "1883"],
+        vec!["--emulate-read-only"],
+    ] {
+        let mut args = vec!["serve"];
+        args.extend(flag);
+        bambu(&cfg)
+            .args(&args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("--emulate"));
+    }
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
 #[test]
 fn file_ls_without_config_is_validation_error() {
     let cfg = tmp_cfg("file-noconf");

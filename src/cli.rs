@@ -246,6 +246,26 @@ enum Command {
         /// after any `--camera-url`; all remain editable at runtime.
         #[arg(long, value_name = "PATH")]
         cameras_config: Option<std::path::PathBuf>,
+        /// Also emulate the printer in Local Mode, so Bambu Studio (or
+        /// OrcaSlicer, or Home Assistant) can connect to THIS host instead of
+        /// to the printer. serve holds the one real LAN connection and relays
+        /// for everyone, which is how a slicer and this dashboard can watch the
+        /// same print at once. Clients authenticate with the printer's own
+        /// serial and access code. Sending a print still needs the printer
+        /// directly — there is no FTP server yet.
+        #[arg(long)]
+        emulate: bool,
+        /// Bind host for the emulated printer. Default 127.0.0.1 (this machine
+        /// only); use 0.0.0.0 to let a client on the LAN reach it.
+        #[arg(long, default_value = "127.0.0.1", requires = "emulate")]
+        emulate_host: String,
+        /// Bind port for the emulated printer. 8883 is where a client looks.
+        #[arg(long, default_value_t = 8883, requires = "emulate")]
+        emulate_port: u16,
+        /// Relay reads but refuse control: a client can watch the printer
+        /// through this, and cannot move or heat it.
+        #[arg(long, requires = "emulate")]
+        emulate_read_only: bool,
     },
 }
 
@@ -789,6 +809,10 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             interval,
             camera_url,
             cameras_config,
+            emulate,
+            emulate_host,
+            emulate_port,
+            emulate_read_only,
         } => run_serve(
             cli,
             host,
@@ -798,6 +822,11 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             *interval,
             camera_url.clone(),
             cameras_config.clone(),
+            emulate.then(|| crate::server::EmulateOpts {
+                host: emulate_host.clone(),
+                port: *emulate_port,
+                read_only: *emulate_read_only,
+            }),
         ),
     }
 }
@@ -1574,6 +1603,7 @@ fn run_serve(
     interval: Option<u64>,
     camera_url: Vec<String>,
     cameras_config: Option<std::path::PathBuf>,
+    emulate: Option<crate::server::EmulateOpts>,
 ) -> Result<(), CliError> {
     // Live mode needs a connection target; fake mode doesn't touch the printer.
     let target = if fake {
@@ -1627,6 +1657,7 @@ fn run_serve(
         fake,
         interval: interval.map(Duration::from_secs),
         external_cameras,
+        emulate,
     };
     crate::server::serve(target, opts).map_err(|e| CliError::new(exit::GENERAL, e.to_string()))
 }

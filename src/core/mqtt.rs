@@ -210,7 +210,7 @@ fn decode_body(first: u8, body: &[u8]) -> Result<Packet, MqttError> {
         14 => Ok(Packet::Disconnect),
         // QoS 2's PUBREC/PUBREL/PUBCOMP, which decode_publish already refuses
         // to get us into.
-        5 | 6 | 7 => Err(MqttError::Unsupported("QoS 2")),
+        5..=7 => Err(MqttError::Unsupported("QoS 2")),
         _ => Err(MqttError::Malformed("unknown packet type")),
     }
 }
