@@ -418,9 +418,47 @@ works. On the A1 mini, 2026-08-09:
   and it moved. That exercises the sequence rewriting against a client nobody
   here wrote — Studio numbers its own commands from `"1"`, exactly the collision
   the rewriter exists to prevent.
-- **Not yet tried:** sending a print from Studio. It uploads over FTPS first, and
-  990 is privileged, so the relay needs `cap_net_bind_service` before that path
-  can be exercised at all.
+- **Sending a print works, and does not go through the relay.** Studio uploaded
+  two sliced files and printed them while pointed at the relay — but the relay
+  was serving no FTP at the time, and 990 is refused on both of its addresses.
+  The only FTP open on the network is the printer's own, so Studio transferred
+  straight to the printer's own address on 990 (`192.168.0.3` here, which is
+  just what this machine happened to be) and used the relay for MQTT alone.
+  **[observed]**
+
+  How Studio knows an address the user never gave it is **not established**.
+  SSDP was the obvious candidate and does not look like the answer: listening on
+  UDP 2021 and 1990 for about two minutes caught **no announcement at all**, so
+  if the printer announces, it is rarer than that or tied to boot. The plainer
+  explanation is that Studio had been connected to this printer directly once
+  before and kept the address — its plugin keeps that state in an encrypted
+  file, so this is not something the config can be read to settle. Either way, a
+  relay cannot assume it carries the file: as long as the real printer is
+  directly reachable, Studio may go round it, and the FTP relay matters for
+  clients that cannot. **[observed: no SSDP in ~2 min; the rest unconfirmed]**
+
+### Do not date a file by what the printer says **[observed]**
+
+The printer stamps FTP-uploaded files with a clock that is not the wall clock. A
+file uploaded through the relay at 2026-08-09 03:36 local came back as
+
+```
+MDTM /relay-upload-probe.txt -> 20260618015348      (2026-06-18 01:53:48)
+```
+
+and every 3mf on the card carries a date in that same June cluster, whenever it
+was actually sent. This is not a stopped clock: files the *firmware* writes
+itself — `/image`, `/logger` — carry correct current timestamps, and `MDTM`
+reports those accurately. It is specifically what the FTP server records for an
+upload.
+
+Anything asking "did this arrive recently?" has to use something else. Directory
+order works: `NLST` lists in creation order, so a file of known age placed on the
+card locates everything around it.
+
+This cost a wrong conclusion — twice — before an upload of known age was used as
+a control. Reading the timestamps was easy, and checking whether they meant
+anything was the step that got skipped.
 
 ## Version inventory (`info.get_version`)
 
