@@ -204,6 +204,20 @@ pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<
     })
 }
 
+/// Render `host:port` for a human, bracketing an IPv6 literal.
+///
+/// Only for messages — the listeners bind with the `(host, port)` tuple, because
+/// formatting an IPv6 host into a string produces `::1:8883`, which parses as
+/// nothing.
+#[cfg(feature = "relay")]
+fn show_addr(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 /// Bind the emulated printer's MQTT listener and start serving it.
 #[cfg(feature = "relay")]
 ///
@@ -224,8 +238,11 @@ async fn start_emulator(
         printer
     };
     let tls = crate::tls::emulated_printer_server_config(&target.serial)?;
-    let addr = format!("{}:{}", opts.host, opts.port);
-    let listener = tokio::net::TcpListener::bind(&addr)
+    // The tuple form, not "{host}:{port}": formatting an IPv6 host makes `::1`
+    // into the unparseable `::1:8883`, and the loopback notice below explicitly
+    // recognises `::1` as a host someone may pass.
+    let addr = show_addr(&opts.host, opts.port);
+    let listener = tokio::net::TcpListener::bind((opts.host.as_str(), opts.port))
         .await
         .map_err(|e| anyhow::anyhow!("binding the emulated printer on {addr}: {e}"))?;
 
@@ -300,22 +317,24 @@ async fn bind_ftp_relay(
     } else {
         ftpd::FtpRelay::new(&target.access_code, files)
     };
-    let addr = format!("{}:{}", opts.host, port);
-    let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
-        // 990 is where an FTPS client looks, and it is below 1024, so this is
-        // the error nearly everyone meets first. Naming the fixes beats making
-        // them work out that the port is the problem.
-        if e.kind() == std::io::ErrorKind::PermissionDenied && port < 1024 {
-            anyhow::anyhow!(
-                "binding the FTP relay on {addr}: permission denied. Port {port} is \
+    let addr = show_addr(&opts.host, port);
+    let listener = tokio::net::TcpListener::bind((opts.host.as_str(), port))
+        .await
+        .map_err(|e| {
+            // 990 is where an FTPS client looks, and it is below 1024, so this is
+            // the error nearly everyone meets first. Naming the fixes beats making
+            // them work out that the port is the problem.
+            if e.kind() == std::io::ErrorKind::PermissionDenied && port < 1024 {
+                anyhow::anyhow!(
+                    "binding the FTP relay on {addr}: permission denied. Port {port} is \
                  privileged — grant the binary the capability once with \
                  `sudo setcap cap_net_bind_service=+ep $(which bambu)`, run as root, or \
                  pick an unprivileged port with --emulate-ftp-port (the client must be \
                  told the same one)."
-            )
-        } else {
-            anyhow::anyhow!("binding the FTP relay on {addr}: {e}")
-        }
-    })?;
+                )
+            } else {
+                anyhow::anyhow!("binding the FTP relay on {addr}: {e}")
+            }
+        })?;
     Ok((relay, listener, addr))
 }

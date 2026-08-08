@@ -49,6 +49,27 @@ pub fn is_full_snapshot_message(message: &Value) -> bool {
     is_push_status && msg.is_none_or(|m| m == 0)
 }
 
+/// Whether a message describes the printer's **state**, as opposed to answering
+/// a command.
+///
+/// A command ACK wears the same envelope as a report — `{"print": {…}}` — and
+/// the observed one carries **no `command` key at all**, just
+/// `{sequence_id, param, result, reason}` (docs/protocol.md). So `result` is the
+/// tell, not a missing `command`: a delta may legitimately omit `command` too.
+///
+/// Anything that merges messages into cached state has to ask this first.
+/// Merging an ACK splices `result`/`reason`/`param` into the cached `print`
+/// object, where they then ride along in everything built from it afterwards.
+pub fn is_status_report(message: &Value) -> bool {
+    let field = |category: &str, key: &str| message.pointer(&format!("/{category}/{key}"));
+    let command = |category: &str| field(category, "command").and_then(Value::as_str);
+    let is_ack = |category: &str| field(category, "result").is_some();
+    (command("print") == Some("push_status")
+        || (message.get("print").is_some() && command("print").is_none()))
+        && !is_ack("print")
+        || command("info") == Some("get_version") && !is_ack("info")
+}
+
 /// Recursively merge `delta` into `target` (see the module docs for semantics).
 pub fn merge_into(target: &mut Value, delta: &Value) {
     if let (Value::Object(t), Value::Object(d)) = (&mut *target, delta) {

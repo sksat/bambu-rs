@@ -322,8 +322,13 @@ impl FtpRelay {
             FtpAction::Passive(kind) => {
                 // Bound to the interface the client already reached us on, so a
                 // relay listening on one address can't hand out another.
-                let bind = local.map_or("0.0.0.0:0".to_string(), |a| format!("{}:0", a.ip()));
-                match TcpListener::bind(&bind).await {
+                // A SocketAddr, not a formatted string: `format!("{}:0", ip)`
+                // turns an IPv6 address into `::1:0`, which parses as nothing.
+                let bind = local.map_or_else(
+                    || SocketAddr::from(([0, 0, 0, 0], 0)),
+                    |a| SocketAddr::new(a.ip(), 0),
+                );
+                match TcpListener::bind(bind).await {
                     Ok(listener) => {
                         let port = listener.local_addr()?.port();
                         let reply = match kind {
@@ -388,7 +393,12 @@ impl FtpRelay {
                 let reply = self
                     .store(stream, data_listener, acceptor, peer, &path)
                     .await
-                    .unwrap_or_else(|e| Reply::new(550, format!("upload failed: {e}")));
+                    .unwrap_or_else(|e| match e {
+                        // The one place a terminal reply is written, whichever
+                        // way the transfer ended.
+                        DataError::Refused(reply) => reply,
+                        DataError::Io(e) => Reply::new(550, format!("upload failed: {e}")),
+                    });
                 write_reply(stream, &reply).await?;
             }
 
@@ -396,7 +406,12 @@ impl FtpRelay {
                 let reply = self
                     .retrieve(stream, data_listener, acceptor, peer, &path)
                     .await
-                    .unwrap_or_else(|e| Reply::new(550, format!("download failed: {e}")));
+                    .unwrap_or_else(|e| match e {
+                        // The one place a terminal reply is written, whichever
+                        // way the transfer ended.
+                        DataError::Refused(reply) => reply,
+                        DataError::Io(e) => Reply::new(550, format!("download failed: {e}")),
+                    });
                 write_reply(stream, &reply).await?;
             }
 
@@ -404,7 +419,12 @@ impl FtpRelay {
                 let reply = self
                     .list(stream, data_listener, acceptor, peer, &path, names_only)
                     .await
-                    .unwrap_or_else(|e| Reply::new(550, format!("listing failed: {e}")));
+                    .unwrap_or_else(|e| match e {
+                        // The one place a terminal reply is written, whichever
+                        // way the transfer ended.
+                        DataError::Refused(reply) => reply,
+                        DataError::Io(e) => Reply::new(550, format!("listing failed: {e}")),
+                    });
                 write_reply(stream, &reply).await?;
             }
 
@@ -495,7 +515,7 @@ impl FtpRelay {
         acceptor: &tokio_rustls::TlsAcceptor,
         peer: Option<SocketAddr>,
         path: &str,
-    ) -> anyhow::Result<Reply>
+    ) -> Result<Reply, DataError>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     {
@@ -513,7 +533,10 @@ impl FtpRelay {
             }
             total += n as u64;
             if total > MAX_UPLOAD {
-                anyhow::bail!("upload exceeds {MAX_UPLOAD} bytes");
+                return Ok(Reply::new(
+                    552,
+                    format!("upload exceeds the {MAX_UPLOAD}-byte limit"),
+                ));
             }
             out.write_all(&chunk[..n]).await?;
         }
@@ -553,7 +576,7 @@ impl FtpRelay {
         acceptor: &tokio_rustls::TlsAcceptor,
         peer: Option<SocketAddr>,
         path: &str,
-    ) -> anyhow::Result<Reply>
+    ) -> Result<Reply, DataError>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     {
@@ -583,7 +606,7 @@ impl FtpRelay {
         peer: Option<SocketAddr>,
         path: &str,
         names_only: bool,
-    ) -> anyhow::Result<Reply>
+    ) -> Result<Reply, DataError>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     {
@@ -636,18 +659,27 @@ async fn open_data<S>(
     acceptor: &tokio_rustls::TlsAcceptor,
     control_peer: Option<SocketAddr>,
     what: &str,
-) -> anyhow::Result<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>
+) -> Result<tokio_rustls::server::TlsStream<tokio::net::TcpStream>, DataError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
     let Some(listener) = data_listener.take() else {
-        write_reply(control, &Reply::new(425, "use PASV or EPSV first")).await?;
-        anyhow::bail!("transfer without a data connection");
+        return Err(DataError::Refused(Reply::new(
+            425,
+            "use PASV or EPSV first",
+        )));
     };
     write_reply(control, &Reply::new(150, what)).await?;
-    let (socket, from) = tokio::time::timeout(DATA_ACCEPT_TIMEOUT, listener.accept())
-        .await
-        .map_err(|_| anyhow::anyhow!("the client never opened the data connection"))??;
+    let (socket, from) = match tokio::time::timeout(DATA_ACCEPT_TIMEOUT, listener.accept()).await {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => return Err(DataError::Refused(Reply::new(425, format!("accept: {e}")))),
+        Err(_) => {
+            return Err(DataError::Refused(Reply::new(
+                425,
+                "the data connection was never opened",
+            )));
+        }
+    };
 
     // The data port is open to the whole network for the moment it exists, and
     // whoever connects first gets it. Unchecked, another host on the LAN can
@@ -660,18 +692,57 @@ where
         && from.ip() != expected
     {
         drop(socket);
-        write_reply(
-            control,
-            &Reply::new(425, "data connection from a different host; refused"),
-        )
-        .await?;
-        anyhow::bail!(
-            "data connection from {} but control is {expected}",
+        eprintln!(
+            "emulate-ftp: refusing a data connection from {} — control is {expected}",
             from.ip()
         );
+        return Err(DataError::Refused(Reply::new(
+            425,
+            "data connection from a different host; refused",
+        )));
     }
     // Implicit FTPS encrypts the data channel too.
     Ok(acceptor.accept(socket).await?)
+}
+
+/// Why a data transfer could not start.
+///
+/// [`DataError::Refused`] carries the reply the *caller* must write, and is the
+/// reason `open_data` writes none itself: it used to send a 425 and then return
+/// an error the caller turned into a 550, leaving two replies on a control
+/// stream that expects exactly one. The next command then read the stale one and
+/// every reply after that was off by one.
+#[derive(Debug)]
+enum DataError {
+    Refused(Reply),
+    Io(std::io::Error),
+}
+
+impl From<std::io::Error> for DataError {
+    fn from(e: std::io::Error) -> Self {
+        DataError::Io(e)
+    }
+}
+
+impl From<tokio::task::JoinError> for DataError {
+    fn from(e: tokio::task::JoinError) -> Self {
+        DataError::Io(std::io::Error::other(e.to_string()))
+    }
+}
+
+impl From<anyhow::Error> for DataError {
+    fn from(e: anyhow::Error) -> Self {
+        DataError::Io(std::io::Error::other(e.to_string()))
+    }
+}
+
+impl std::fmt::Display for DataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DataError::Refused(r) => write!(f, "{} {}", r.code, r.text),
+            DataError::Io(e) => write!(f, "{e}"),
+        }
+    }
 }
 
 async fn write_reply<S>(stream: &mut S, reply: &Reply) -> anyhow::Result<()>
@@ -1167,15 +1238,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_transfer_without_pasv_is_refused_rather_than_hanging() {
-        let addr = start(FtpRelay::new(
-            CODE,
-            FakeFiles::new() as Arc<dyn PrinterFiles>,
-        ))
-        .await;
+    async fn a_refused_transfer_leaves_exactly_one_reply_on_the_control_stream() {
+        // FTP is strictly one reply per command. This used to write 425 from the
+        // data-channel setup and then 550 from the caller, so the *next* command
+        // read the stale one and every reply after it was off by one — invisible
+        // to a test that only checks the first reply, which is what the earlier
+        // version of this test did.
+        // A file that exists, so RETR reaches the missing-PASV check rather
+        // than being refused earlier for not being there.
+        let files = FakeFiles::with_file("/model/a.3mf", b"bytes");
+        let addr = start(FtpRelay::new(CODE, files as Arc<dyn PrinterFiles>)).await;
         let mut client = TestClient::connect(addr).await;
         client.login().await;
         assert_eq!(client.cmd("STOR /cache/x.3mf").await.0, 425);
+        // If a second reply were queued, this would read it instead of 215.
+        assert_eq!(
+            client.cmd("SYST").await.0,
+            215,
+            "the session should still be in step"
+        );
+        assert_eq!(client.cmd("RETR /model/a.3mf").await.0, 425);
+        assert_eq!(client.cmd("SYST").await.0, 215);
+        assert_eq!(client.cmd("LIST").await.0, 425);
+        assert_eq!(client.cmd("PWD").await.0, 257);
     }
 
     #[tokio::test]

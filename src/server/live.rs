@@ -78,6 +78,14 @@ impl LiveSource {
             loop {
                 match reports.blocking_recv() {
                     Ok(message) => {
+                        // ACKs share the report envelope. Merging them would
+                        // splice `result`/`reason`/`param` into the dashboard's
+                        // state and overwrite the printer's own `sequence_id` —
+                        // and with the relay on, this feed carries the ACKs of
+                        // every other client too.
+                        if !crate::core::report::is_status_report(&message) {
+                            continue;
+                        }
                         state.apply(message);
                         if tx.send(PrinterStatus::from_state(state.get())).is_err() {
                             break; // the source and all subscribers are gone

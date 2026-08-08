@@ -220,7 +220,10 @@ impl Emulator {
                     .write()
                     .expect("cache lock poisoned")
                     .mark_stale();
-                let _ = self.healthy.send(false);
+                // `send` would refuse when no client is connected, leaving the
+                // flag saying "healthy" — and the next client to arrive would be
+                // treated as online against a printer that is not.
+                self.healthy.send_replace(false);
             }
         }
     }
@@ -258,7 +261,7 @@ impl Emulator {
                 tokio::time::Instant::now();
             if !*self.healthy.borrow() {
                 eprintln!("emulate: the printer is answering again");
-                let _ = self.healthy.send(true);
+                self.healthy.send_replace(true);
             }
             // `apply` clears the stale flag, so reads start being served again.
             self.cache
@@ -387,9 +390,13 @@ impl Emulator {
         let mut buf: Vec<u8> = Vec::new();
         let mut chunk = [0u8; READ_CHUNK];
         let mut healthy = self.healthy.subscribe();
-        // Mark the current value seen, so `changed()` only fires on a real
-        // transition rather than immediately.
-        let _ = healthy.borrow_and_update();
+        // Check the value NOW as well as marking it seen: `changed()` only
+        // reports transitions, so a client arriving while the printer is
+        // already known to be offline would otherwise sit connected forever,
+        // never having missed an edge.
+        if !*healthy.borrow_and_update() {
+            anyhow::bail!("the printer is offline; refusing the connection");
+        }
         // Absolute, and held ACROSS iterations. Recreating the timeout inside
         // the select each time round would restart it every time any other arm
         // fired — and the fan-out arm fires for every client on every report,

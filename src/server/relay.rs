@@ -79,6 +79,22 @@ impl LivePrinterLink {
                     Err(e) => {
                         eprintln!("relay: printer link lost ({e}); reconnecting");
                         tokio::time::sleep(RECONNECT_DELAY).await;
+                        // Throw away anything queued while the link was down. A
+                        // `stop` or a jog accepted during the outage would
+                        // otherwise be published on reconnect and move the
+                        // machine seconds or minutes after the client that sent
+                        // it gave up — the client already saw no ACK and has
+                        // moved on, so replaying it is a surprise, not a favour.
+                        let mut dropped = 0;
+                        while requests.try_recv().is_ok() {
+                            dropped += 1;
+                        }
+                        if dropped > 0 {
+                            eprintln!(
+                                "relay: discarded {dropped} request(s) sent while the printer \
+                                 was unreachable rather than replaying them late"
+                            );
+                        }
                     }
                 }
             }

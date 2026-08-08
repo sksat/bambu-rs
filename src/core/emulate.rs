@@ -16,13 +16,13 @@
 //! not be able to tell (beyond the reads being *better* — a merged snapshot on
 //! demand rather than deltas since whenever it connected).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value};
 
 use crate::core::command::{report_topic, request_topic};
 use crate::core::mqtt::{Connect, ConnectCode, Packet, Publish, topic_matches};
-use crate::core::report::{ReportState, is_full_snapshot_message};
+use crate::core::report::{ReportState, is_full_snapshot_message, is_status_report};
 
 /// The username every Bambu LAN client connects with.
 const LAN_USER: &str = "bblp";
@@ -154,7 +154,15 @@ enum Phase {
 /// One downstream client's connection state.
 pub struct ClientSession {
     phase: Phase,
-    wants_reports: bool,
+    /// Every accepted filter that covers this printer's report topic. A set
+    /// rather than a flag because MQTT subscriptions are per-filter: a client
+    /// holding both the exact topic and a wildcard over it, then dropping one,
+    /// is still subscribed.
+    report_filters: BTreeSet<String>,
+    /// Set by `pushing.stop`, cleared by `pushing.start`. Separate from the
+    /// subscription: the client is still subscribed, it has just asked not to
+    /// be pushed to for now.
+    push_paused: bool,
     client_id: String,
     keep_alive: u16,
 }
@@ -169,7 +177,8 @@ impl ClientSession {
     pub fn new() -> Self {
         Self {
             phase: Phase::AwaitingConnect,
-            wants_reports: false,
+            report_filters: BTreeSet::new(),
+            push_paused: false,
             client_id: String::new(),
             keep_alive: 0,
         }
@@ -178,7 +187,7 @@ impl ClientSession {
     /// Whether this client has subscribed to the report topic — i.e. whether the
     /// fan-out should reach it.
     pub fn wants_reports(&self) -> bool {
-        self.wants_reports
+        !self.report_filters.is_empty() && !self.push_paused
     }
 
     /// Whether the handshake is done. Until it is, the peer is anonymous, which
@@ -224,8 +233,10 @@ impl ClientSession {
                 // Matched the same way SUBSCRIBE is, so a client that subscribed
                 // with a wildcard can unsubscribe with the same one.
                 let report = printer.report_topic();
-                if filters.iter().any(|f| topic_matches(f, &report)) {
-                    self.wants_reports = false;
+                for f in &filters {
+                    if topic_matches(f, &report) {
+                        self.report_filters.remove(f);
+                    }
                 }
                 Response::send(Packet::UnsubAck { packet_id })
             }
@@ -279,7 +290,7 @@ impl ClientSession {
                 // refusing it would leave a healthy-looking connection that
                 // never delivers anything.
                 if topic_matches(filter, &report) {
-                    self.wants_reports = true;
+                    self.report_filters.insert(filter.clone());
                     // Granted at the QoS the client asked for, capped at 1.
                     (*qos).min(1)
                 } else {
@@ -316,21 +327,26 @@ impl ClientSession {
         };
 
         match classify(&payload) {
-            RequestKind::PushAll => match cache.snapshot_reply() {
-                // The cache is the *merged* picture, which is strictly better
-                // than what the printer would send (deltas since whenever), and
-                // it spares the machine N clients' polling.
-                Some(reply) => response
-                    .send
-                    .push(Packet::Publish(report_publish(printer.serial(), &reply))),
-                // Nothing cached yet: ask the real printer rather than answer
-                // with an empty snapshot the client would believe.
-                None => response.upstream.push(payload),
-            },
+            RequestKind::PushAll => {
+                // `pushing.start` resumes a stream this client paused; a plain
+                // `pushall` is harmless to apply the same way.
+                self.push_paused = false;
+                match cache.snapshot_reply() {
+                    // The cache is the *merged* picture, which is strictly better
+                    // than what the printer would send (deltas since whenever), and
+                    // it spares the machine N clients' polling.
+                    Some(reply) => response
+                        .send
+                        .push(Packet::Publish(report_publish(printer.serial(), &reply))),
+                    // Nothing cached yet: ask the real printer rather than
+                    // answer with an empty snapshot the client would believe.
+                    None => response.upstream.push(payload),
+                }
+            }
             // Absorbed on purpose — see RequestKind::StopPushing. No reply: the
             // printer doesn't ACK this either, and the client's own view is
             // simply that reports stop mattering to it.
-            RequestKind::StopPushing => {}
+            RequestKind::StopPushing => self.push_paused = true,
             RequestKind::GetVersion => match cache.version_reply(sequence_id(&payload)) {
                 Some(reply) => response
                     .send
@@ -457,22 +473,19 @@ impl UpstreamCache {
     /// `{sequence_id, param, result, reason}` — so `result` is the tell, not a
     /// missing `command`. A delta that omits `command` is still a report.
     pub fn apply(&mut self, message: &Value) {
-        let field = |category: &str, key: &str| message.pointer(&format!("/{category}/{key}"));
-        let command = |category: &str| field(category, "command").and_then(Value::as_str);
-        let is_ack = |category: &str| field(category, "result").is_some();
-        let is_report = (command("print") == Some("push_status")
-            || (message.get("print").is_some() && command("print").is_none()))
-            && !is_ack("print")
-            || command("info") == Some("get_version") && !is_ack("info");
-        if !is_report {
+        if !is_status_report(message) {
             return;
         }
         if is_full_snapshot_message(message) {
             self.seen_snapshot = true;
+            // Only a whole snapshot clears staleness. A single delta merged onto
+            // a picture from before the outage would be served as a full
+            // `pushall` describing a printer that may have rebooted or started a
+            // different job in the meantime — the deltas are merged either way,
+            // but nothing is handed out until the printer has described itself
+            // completely again.
+            self.stale = false;
         }
-        // The printer is talking again, so what we hold describes something
-        // real once more.
-        self.stale = false;
         self.state.apply(message.clone());
     }
 
@@ -866,6 +879,88 @@ mod tests {
     }
 
     #[test]
+    fn unsubscribing_one_of_two_overlapping_filters_keeps_the_reports_coming() {
+        // MQTT subscriptions are per-filter. A client holding both the exact
+        // topic and a wildcard that covers it, then dropping one, is still
+        // subscribed — a single boolean would switch its reports off.
+        let mut s = connected();
+        for filter in [
+            format!("device/{SERIAL}/report"),
+            "device/+/report".to_string(),
+        ] {
+            s.handle(
+                Packet::Subscribe {
+                    packet_id: 1,
+                    filters: vec![(filter, 0)],
+                },
+                &printer(),
+                &UpstreamCache::new(),
+            );
+        }
+        s.handle(
+            Packet::Unsubscribe {
+                packet_id: 2,
+                filters: vec![format!("device/{SERIAL}/report")],
+            },
+            &printer(),
+            &UpstreamCache::new(),
+        );
+        assert!(s.wants_reports(), "the wildcard subscription is still live");
+
+        // Dropping the last one does stop them.
+        s.handle(
+            Packet::Unsubscribe {
+                packet_id: 3,
+                filters: vec!["device/+/report".to_string()],
+            },
+            &printer(),
+            &UpstreamCache::new(),
+        );
+        assert!(!s.wants_reports());
+    }
+
+    #[test]
+    fn pushing_stop_stops_this_clients_reports_without_touching_anyone_elses() {
+        // The client asked to stop being pushed to. We can't forward that (it
+        // would stop the printer pushing to the relay), but ignoring it means
+        // the client keeps receiving what it just asked to stop. Honour it for
+        // this session only.
+        let mut s = connected();
+        s.handle(
+            Packet::Subscribe {
+                packet_id: 1,
+                filters: vec![(format!("device/{SERIAL}/report"), 0)],
+            },
+            &printer(),
+            &UpstreamCache::new(),
+        );
+        assert!(s.wants_reports());
+
+        let r = s.handle(
+            publish_request(
+                json!({"pushing": {"sequence_id": "1", "command": "stop"}}),
+                None,
+            ),
+            &printer(),
+            &cache_with_snapshot(),
+        );
+        assert!(r.upstream.is_empty(), "never reaches the printer");
+        assert!(!s.wants_reports(), "but this client stops being fed");
+
+        // `start` resumes it, and hands over the state it missed.
+        let r = s.handle(
+            publish_request(
+                json!({"pushing": {"sequence_id": "2", "command": "start"}}),
+                None,
+            ),
+            &printer(),
+            &cache_with_snapshot(),
+        );
+        assert!(s.wants_reports());
+        assert_eq!(r.send.len(), 1, "and catches it up with a snapshot");
+    }
+
+    #[test]
     fn a_wildcard_subscription_can_be_undone_by_the_same_wildcard() {
         // Whatever SUBSCRIBE accepts, UNSUBSCRIBE must undo. Matching one as a
         // filter and the other as a string would leave a client still being
@@ -1082,13 +1177,24 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_report_brings_a_stale_cache_back_to_life() {
-        // The printer came back. Nothing should need restarting.
+    fn only_a_whole_snapshot_brings_a_stale_cache_back_to_life() {
+        // A delta merged onto a picture from before the outage would be handed
+        // out as a full `pushall` — describing a printer that may have rebooted
+        // or started a different job while it was away. Merge the delta, but
+        // stay quiet until the printer has described itself completely again.
         let mut c = cache_with_snapshot();
         c.mark_stale();
         c.apply(&json!({"print": {"command": "push_status", "msg": 1, "mc_percent": 50}}));
+        assert!(!c.is_warm(), "one delta is not a fresh picture");
+        assert!(c.snapshot_reply().is_none());
+
+        // The reconnect's pushall is what settles it — and the delta was not
+        // thrown away in the meantime.
+        c.apply(&json!({"print": {
+            "command": "push_status", "msg": 0, "gcode_state": "RUNNING", "mc_percent": 51,
+        }}));
         assert!(c.is_warm());
-        assert_eq!(c.snapshot_reply().unwrap()["print"]["mc_percent"], 50);
+        assert_eq!(c.snapshot_reply().unwrap()["print"]["mc_percent"], 51);
     }
 
     #[test]
