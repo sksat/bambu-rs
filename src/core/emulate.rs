@@ -27,6 +27,12 @@ use crate::core::report::{ReportState, is_full_snapshot_message, is_status_repor
 /// The username every Bambu LAN client connects with.
 const LAN_USER: &str = "bblp";
 
+/// How many recently acknowledged QoS-1 packet ids to remember per client, for
+/// spotting a retransmission. Far more than any client keeps in flight, and far
+/// fewer than the 65536 ids exist, so a legitimately recycled id is never
+/// mistaken for a resend.
+const RECENT_PACKET_IDS: usize = 256;
+
 /// How many commands may be awaiting an ACK before the oldest are given up on.
 /// Far above any real client's in-flight count — this is a leak backstop, not a
 /// throttle.
@@ -163,6 +169,10 @@ pub struct ClientSession {
     /// subscription: the client is still subscribed, it has just asked not to
     /// be pushed to for now.
     push_paused: bool,
+    /// QoS-1 packet ids acknowledged recently, oldest first. A client whose
+    /// PUBACK went missing resends with DUP set; without this the command would
+    /// be relayed a second time and the printer would run it twice.
+    recent_packet_ids: std::collections::VecDeque<u16>,
     client_id: String,
     keep_alive: u16,
 }
@@ -179,6 +189,7 @@ impl ClientSession {
             phase: Phase::AwaitingConnect,
             report_filters: BTreeSet::new(),
             push_paused: false,
+            recent_packet_ids: std::collections::VecDeque::new(),
             client_id: String::new(),
             keep_alive: 0,
         }
@@ -316,6 +327,21 @@ impl ClientSession {
             (1, Some(packet_id)) => Response::send(Packet::PubAck { packet_id }),
             _ => Response::nothing(),
         };
+        // A resend of something already handled: acknowledge it again — the
+        // client is waiting for that — but do not put the command through a
+        // second time. Keyed on DUP as well as the id, because ids cycle and a
+        // *new* command reusing one is not a retransmission.
+        if let (1, Some(packet_id), true) = (p.qos, p.packet_id, p.dup)
+            && self.recent_packet_ids.contains(&packet_id)
+        {
+            return response;
+        }
+        if let (1, Some(packet_id)) = (p.qos, p.packet_id) {
+            self.recent_packet_ids.push_back(packet_id);
+            while self.recent_packet_ids.len() > RECENT_PACKET_IDS {
+                self.recent_packet_ids.pop_front();
+            }
+        }
         if p.topic != printer.request_topic() {
             return response;
         }
@@ -1010,6 +1036,60 @@ mod tests {
         );
         assert_eq!(r.send, vec![Packet::PubAck { packet_id: 9 }]);
         assert_eq!(r.upstream, vec![cmd], "the printer must actually see it");
+    }
+
+    #[test]
+    fn a_retransmitted_command_is_acked_but_not_run_twice() {
+        // A client that misses its PUBACK resends the same PUBLISH with DUP set.
+        // Forwarded again it becomes a second command with a fresh relay
+        // sequence id — indistinguishable, at the printer, from the operator
+        // asking twice. For `pause` that is harmless; for a `gcode_line` that
+        // extrudes or moves, it is not.
+        let mut s = connected();
+        let cmd = json!({"print": {"sequence_id": "3", "command": "gcode_line", "param": "G28"}});
+        let first = s.handle(
+            publish_request(cmd.clone(), Some(9)),
+            &printer(),
+            &UpstreamCache::new(),
+        );
+        assert_eq!(first.upstream, vec![cmd.clone()]);
+
+        let again = Packet::Publish(Publish {
+            topic: format!("device/{SERIAL}/request"),
+            payload: cmd.to_string().into_bytes(),
+            qos: 1,
+            packet_id: Some(9),
+            retain: false,
+            dup: true, // the retransmission flag
+        });
+        let r = s.handle(again, &printer(), &UpstreamCache::new());
+        assert_eq!(
+            r.send,
+            vec![Packet::PubAck { packet_id: 9 }],
+            "still acknowledged, or the client keeps resending"
+        );
+        assert!(r.upstream.is_empty(), "but the machine only hears it once");
+    }
+
+    #[test]
+    fn reusing_a_packet_id_for_a_new_command_is_not_mistaken_for_a_retransmission() {
+        // Packet ids cycle. Only DUP marks a resend, so a fresh command that
+        // happens to reuse an id must go through.
+        let mut s = connected();
+        let first = json!({"print": {"sequence_id": "1", "command": "pause"}});
+        s.handle(
+            publish_request(first, Some(9)),
+            &printer(),
+            &UpstreamCache::new(),
+        );
+
+        let second = json!({"print": {"sequence_id": "2", "command": "resume"}});
+        let r = s.handle(
+            publish_request(second.clone(), Some(9)),
+            &printer(),
+            &UpstreamCache::new(),
+        );
+        assert_eq!(r.upstream, vec![second]);
     }
 
     #[test]

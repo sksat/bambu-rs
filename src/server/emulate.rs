@@ -401,7 +401,13 @@ impl Emulator {
         // the select each time round would restart it every time any other arm
         // fired — and the fan-out arm fires for every client on every report,
         // about once a second, so nothing would ever time out.
-        let mut idle_deadline = deadline_for(&session, self.handshake_timeout);
+        //
+        // The handshake budget runs from the moment the connection opened and is
+        // never extended: a peer that dribbles bytes without ever completing a
+        // CONNECT would otherwise hold a slot forever by staying just inside the
+        // window.
+        let connect_by = tokio::time::Instant::now() + self.handshake_timeout;
+        let mut idle_deadline = Some(connect_by);
 
         loop {
             tokio::select! {
@@ -413,7 +419,9 @@ impl Emulator {
                     }
                     buf.extend_from_slice(&chunk[..n]);
                     // One read can carry several packets, or half of one.
+                    let mut decoded_a_packet = false;
                     while let Some((packet, used)) = mqtt::decode(&buf)? {
+                        decoded_a_packet = true;
                         buf.drain(..used);
                         let response = {
                             let cache = self.cache.read().expect("cache lock poisoned");
@@ -448,10 +456,17 @@ impl Emulator {
                         );
                     }
                     writer.flush().await?;
-                    // It spoke, so the clock starts again. Recomputed *after*
-                    // the packets are handled: a CONNECT among them replaces the
-                    // anonymous window with the client's own keep-alive.
-                    idle_deadline = deadline_for(&session, self.handshake_timeout);
+                    // Only a COMPLETE packet counts as the client speaking —
+                    // MQTT's keep-alive is about control packets, and bytes that
+                    // never form one are exactly what the deadline is for. Until
+                    // CONNECT lands, the original absolute budget stands.
+                    if session.is_connected() {
+                        if decoded_a_packet {
+                            idle_deadline = keep_alive_deadline(&session);
+                        }
+                    } else {
+                        idle_deadline = Some(connect_by);
+                    }
                 }
 
                 // An ACK for something this client asked for. Directed rather
@@ -516,18 +531,13 @@ impl Emulator {
     }
 }
 
-/// How long this session may stay silent before we hang up.
+/// How long a connected session may go without a control packet.
 ///
-/// Before CONNECT: a short fixed window, because whoever is out there is still
-/// anonymous. After: MQTT 3.1.1 §3.1.2.10 lets the server disconnect a client
-/// that sends nothing for 1.5× its own keep-alive, which is what catches a
-/// client that vanished without a FIN — an unplugged laptop — long before the
-/// OS does. A client that asked for keep-alive `0` asked for no timeout, and
-/// gets none.
-fn read_limit(session: &ClientSession, handshake: Duration) -> Option<Duration> {
-    if !session.is_connected() {
-        return Some(handshake);
-    }
+/// MQTT 3.1.1 §3.1.2.10 lets the server disconnect a client that sends nothing
+/// for 1.5× its own keep-alive, which is what catches a client that vanished
+/// without a FIN — an unplugged laptop — long before the OS does. A client that
+/// asked for keep-alive `0` asked for no timeout, and gets none.
+fn keep_alive_limit(session: &ClientSession) -> Option<Duration> {
     match session.keep_alive() {
         0 => None,
         secs => Some(Duration::from_millis(u64::from(secs) * 1500)),
@@ -536,8 +546,8 @@ fn read_limit(session: &ClientSession, handshake: Duration) -> Option<Duration> 
 
 /// The same limit as an absolute instant, so it survives being carried across
 /// loop iterations instead of restarting whenever another branch fires.
-fn deadline_for(session: &ClientSession, handshake: Duration) -> Option<tokio::time::Instant> {
-    read_limit(session, handshake).map(|d| tokio::time::Instant::now() + d)
+fn keep_alive_deadline(session: &ClientSession) -> Option<tokio::time::Instant> {
+    keep_alive_limit(session).map(|d| tokio::time::Instant::now() + d)
 }
 
 /// Complete at `deadline`, or never if there isn't one.
@@ -921,17 +931,16 @@ mod tests {
     }
 
     #[test]
-    fn an_anonymous_peer_is_on_a_short_leash_and_a_connected_one_on_its_own() {
-        // Driving the real timeouts would mean a 20-second test; the decision
-        // itself is a pure function of the session, so pin that instead.
+    fn a_connected_client_gets_the_keep_alive_it_asked_for() {
+        // The anonymous side is an absolute budget driven end-to-end by
+        // `dribbling_bytes_does_not_extend_the_handshake_window`; this pins the
+        // arithmetic for a connected one, which a 90-second test could not.
         let printer = EmulatedPrinter::new(SERIAL, CODE);
         let cache = UpstreamCache::new();
 
-        let fresh = ClientSession::new();
-        assert_eq!(
-            read_limit(&fresh, HANDSHAKE_TIMEOUT),
-            Some(HANDSHAKE_TIMEOUT)
-        );
+        // Before CONNECT there is no keep-alive to honour; the handshake budget
+        // is what governs, and it is not derived from the session.
+        assert_eq!(keep_alive_limit(&ClientSession::new()), None);
 
         let mut connected = ClientSession::new();
         connected.handle(
@@ -946,10 +955,7 @@ mod tests {
             &cache,
         );
         // 1.5x the client's own keep-alive, per §3.1.2.10.
-        assert_eq!(
-            read_limit(&connected, HANDSHAKE_TIMEOUT),
-            Some(Duration::from_secs(90))
-        );
+        assert_eq!(keep_alive_limit(&connected), Some(Duration::from_secs(90)));
 
         let mut no_keepalive = ClientSession::new();
         no_keepalive.handle(
@@ -964,7 +970,7 @@ mod tests {
             &cache,
         );
         // 0 means the client asked for no timeout, and gets none.
-        assert_eq!(read_limit(&no_keepalive, HANDSHAKE_TIMEOUT), None);
+        assert_eq!(keep_alive_limit(&no_keepalive), None);
     }
 
     #[tokio::test]
@@ -1094,6 +1100,59 @@ mod tests {
         assert_eq!(
             client.recv_report().await["print"]["gcode_state"],
             "RUNNING"
+        );
+    }
+
+    #[tokio::test]
+    async fn dribbling_bytes_does_not_extend_the_handshake_window() {
+        // The deadline used to reset on any read at all, so a peer could send
+        // one byte before each expiry and hold a connection slot — and, after
+        // CONNECT, sidestep the keep-alive it negotiated — without ever
+        // completing a packet. The handshake budget is absolute now.
+        let upstream = FakeUpstream::new();
+        let (_e, addr) = start_tuned(
+            EmulatedPrinter::new(SERIAL, CODE),
+            Arc::clone(&upstream),
+            Tuning {
+                handshake_timeout: Duration::from_millis(400),
+                ..Tuning::default()
+            },
+        )
+        .await;
+
+        let mut client = TestClient::connect(addr).await;
+        // A PUBLISH header declaring the largest legal remaining length, then a
+        // byte at a time forever. This is the shape that matters: never a
+        // complete packet, but never a malformed one either, so nothing except
+        // the deadline can end it.
+        let dribble = tokio::spawn(async move {
+            if client
+                .stream
+                .write_all(&[0x30, 0xFF, 0xFF, 0xFF, 0x7F])
+                .await
+                .is_err()
+            {
+                return client;
+            }
+            loop {
+                if client.stream.write_all(b"x").await.is_err() {
+                    return client;
+                }
+                let _ = client.stream.flush().await;
+                tokio::time::sleep(Duration::from_millis(80)).await;
+            }
+        });
+
+        // Well past several deadlines' worth of dribbling.
+        let mut client = tokio::time::timeout(Duration::from_secs(5), dribble)
+            .await
+            .expect("the peer should have been disconnected, not fed more time")
+            .unwrap();
+        let mut chunk = [0u8; 16];
+        let closed = client.stream.read(&mut chunk).await;
+        assert!(
+            matches!(closed, Ok(0) | Err(_)),
+            "the connection should be gone, got {closed:?}"
         );
     }
 
