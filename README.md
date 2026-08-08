@@ -146,8 +146,9 @@ binding it fails, grant the capability once and restart:
 sudo setcap cap_net_bind_service=+ep "$(which bambu)"
 ```
 
-Or choose a port you can bind without it (`--emulate-ftp-port 2990`), or drop FTP entirely
-with `--emulate-no-ftp` and keep monitoring and control. An upload is taken in full before any
+Or choose a port you can bind without it (`--emulate-ftp-port 2990`) — `bambu` itself can be
+told with `--mqtt-port` / `--ftps-port`, though Bambu Studio has no field for it — or drop FTP
+entirely with `--emulate-no-ftp` and keep monitoring and control. An upload is taken in full before any
 of it is forwarded, so a client that dies mid-transfer leaves nothing half-written on the
 printer's SD card — the one part of this machine already known to be fragile.
 
@@ -159,6 +160,19 @@ watching: control commands and uploads are refused rather than forwarded.
 the relay stops answering from its cache and disconnects its clients, rather than keep serving
 a picture of a print that stopped an hour ago. A dropped connection is what every client
 already reads as "printer offline"; it reconnects by itself when the printer comes back.
+
+### Trying it without a printer
+
+`--fake --emulate` serves a **synthetic** printer: it reports a print advancing and answers
+commands, over the real wire protocol, with nothing plugged in.
+
+```bash
+bambu serve --fake --emulate --serial TESTSERIAL01 --access-code 12345678
+```
+
+Point a relay at *that* and the whole chain runs on one machine — which is what
+`tests/relay_e2e.rs` does, spawning a synthetic printer, a relay in front of it, and several
+`bambu status` processes through the relay, all on ephemeral ports.
 
 Discovery is deliberately absent: the real printer is announcing the same serial on the same
 network, so add the relay by IP.

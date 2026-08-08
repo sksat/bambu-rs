@@ -21,6 +21,8 @@ pub mod live;
 pub mod relay;
 pub mod start;
 pub mod stream_record;
+#[cfg(feature = "relay")]
+pub mod synthetic;
 pub mod timelapse;
 
 use std::sync::Arc;
@@ -123,13 +125,15 @@ pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
         external_cameras,
         ..
     } = opts;
-    // There is nothing to relay to. Better to say so than to stand up a listener
-    // that answers every read with an empty snapshot.
+    // There has to be *a* printer, real or synthetic, and an identity to present
+    // it under. Without either, the relay would answer every read with an empty
+    // snapshot, which looks to a client like a printer gone strange rather than
+    // one that was never there.
     #[cfg(feature = "relay")]
-    if emulate.is_some() && (fake || targets.is_empty()) {
+    if emulate.is_some() && targets.is_empty() {
         anyhow::bail!(
-            "--emulate relays a real printer; it has nothing to serve with --fake or without a \
-             configured printer"
+            "--emulate needs a printer to present: configure one, or pass --fake with \
+             --serial/--access-code to relay a synthetic one"
         );
     }
     // One emulated printer per host, not per port: a client looks for a printer
@@ -207,6 +211,22 @@ pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
                 .map_or_else(|| "fake".to_string(), |t| t.name.clone());
             let id = printer_id(&name);
             default = id.clone();
+            // `--fake --emulate`: the same relay, in front of a printer that
+            // isn't there. It is what lets the whole stack be exercised across
+            // processes with no hardware — so the dashboard reads the synthetic
+            // printer's own reports rather than a second, unrelated fake.
+            #[cfg(feature = "relay")]
+            let source: Arc<dyn PrinterSource> = match (&emulate, targets.first()) {
+                (Some(em), Some(ServeTarget { target: t, .. })) => {
+                    let printer = synthetic::SyntheticPrinter::start(tick);
+                    let source = Arc::new(LiveSource::from_reports(printer.subscribe()));
+                    start_emulator(t, em, printer).await?;
+                    source
+                }
+                _ => Arc::new(FakeSource::ramping(tick)),
+            };
+            #[cfg(not(feature = "relay"))]
+            let source: Arc<dyn PrinterSource> = Arc::new(FakeSource::ramping(tick));
             printers.insert(
                 id.clone(),
                 PrinterState {
@@ -214,7 +234,7 @@ pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
                     id,
                     model: None,
                     legacy_captures: true,
-                    source: Arc::new(FakeSource::ramping(tick)),
+                    source,
                     controller: Arc::new(FakeController::verified()),
                     files: Arc::new(FakeFiles),
                     starter: Arc::new(FakeStarter),
@@ -318,7 +338,7 @@ async fn connect_source(
             // no receivers throws it away.
             let link = relay::LivePrinterLink::new();
             let source = Arc::new(LiveSource::from_reports(link.subscribe()));
-            start_emulator(t, em, Arc::clone(&link)).await?;
+            start_emulator(t, em, Arc::clone(&link) as Arc<dyn emulate::Upstream>).await?;
             // The relay answers clients' `pushall`s from its cache rather than
             // forwarding them, so nothing else would ever refresh it: seeded
             // once at connect and then fed only deltas, which are QoS 0 and
@@ -355,7 +375,7 @@ fn show_addr(host: &str, port: u16) -> String {
 async fn start_emulator(
     target: &ResolvedTarget,
     opts: &EmulateOpts,
-    link: Arc<relay::LivePrinterLink>,
+    upstream: Arc<dyn emulate::Upstream>,
 ) -> anyhow::Result<()> {
     use crate::core::emulate::EmulatedPrinter;
 
@@ -381,7 +401,7 @@ async fn start_emulator(
         None => None,
     };
 
-    let emulator = emulate::Emulator::new(printer, link);
+    let emulator = emulate::Emulator::new(printer, upstream);
     tokio::spawn(Arc::clone(&emulator).pump());
     tokio::spawn({
         let tls = Arc::clone(&tls);

@@ -69,6 +69,15 @@ struct Cli {
     /// Override the model (e.g. a1mini).
     #[arg(long, global = true)]
     model: Option<String>,
+    /// Override the MQTT port (default 8883). Only needed to reach a
+    /// `serve --emulate` relay that had to bind elsewhere — a real printer is
+    /// always on 8883.
+    #[arg(long, global = true, env = "BAMBU_MQTT_PORT")]
+    mqtt_port: Option<u16>,
+    /// Override the FTPS port (default 990), for the same reason: 990 is
+    /// privileged, so a relay often cannot have it.
+    #[arg(long, global = true, env = "BAMBU_FTPS_PORT")]
+    ftps_port: Option<u16>,
     /// Emit machine-readable JSON (default output is human-readable).
     #[arg(long, global = true)]
     json: bool,
@@ -1668,6 +1677,22 @@ fn run_serve(
     #[cfg(feature = "relay")] emulate: Option<crate::server::EmulateOpts>,
 ) -> Result<(), CliError> {
     // Live mode needs a connection target; fake mode doesn't touch the printer.
+    // `--fake` alone needs no target — the dashboard gets a ramping fake and
+    // nothing is served on the wire. `--fake --emulate` does need one, because
+    // the emulated printer has to be *some* printer: the serial names its topics
+    // and its certificate, and the access code is what clients authenticate
+    // with. Nothing is connected to; only the identity is borrowed.
+    #[cfg(feature = "relay")]
+    let targets = if fake {
+        emulate
+            .is_some()
+            .then(|| synthetic_identity(cli))
+            .into_iter()
+            .collect()
+    } else {
+        serve_targets(cli, all_printers)?
+    };
+    #[cfg(not(feature = "relay"))]
     let targets = if fake {
         Vec::new()
     } else {
@@ -1808,6 +1833,39 @@ fn all_serve_targets(
             Ok(crate::server::ServeTarget { name, target })
         })
         .collect()
+}
+
+/// The identity a synthetic printer presents under `--fake --emulate`.
+///
+/// Taken from `--serial` / `--access-code` when given, so a test can pick its
+/// own; otherwise obviously-fake constants, printed at startup so nobody has to
+/// guess what to point a client at. These are not the "no baked defaults" kind
+/// of constant — nothing physical depends on them, and a fake printer with no
+/// name would just be harder to connect to.
+#[cfg(feature = "relay")]
+fn synthetic_identity(cli: &Cli) -> crate::server::ServeTarget {
+    let serial = cli
+        .serial
+        .clone()
+        .unwrap_or_else(|| "SYNTHETIC000000".to_string());
+    let access_code = cli
+        .access_code
+        .clone()
+        .unwrap_or_else(|| "00000000".to_string());
+    eprintln!("synthetic printer identity: serial {serial}, access code {access_code}");
+    crate::server::ServeTarget {
+        name: "synthetic".to_string(),
+        target: crate::config::ResolvedTarget {
+            ip: "127.0.0.1".to_string(),
+            serial,
+            access_code,
+            model: crate::core::model::Model::from_config_str(
+                cli.model.as_deref().unwrap_or("a1mini"),
+            ),
+            mqtt_port: crate::config::DEFAULT_MQTT_PORT,
+            ftps_port: crate::config::DEFAULT_FTPS_PORT,
+        },
+    }
 }
 
 /// One entry of a `--cameras-config` JSON file — the same shape as `/api/camera/config`,
@@ -4071,6 +4129,8 @@ fn flag_overrides(cli: &Cli) -> Overrides {
         serial: cli.serial.clone(),
         access_code: cli.access_code.clone(),
         model: cli.model.clone(),
+        mqtt_port: cli.mqtt_port,
+        ftps_port: cli.ftps_port,
     }
 }
 

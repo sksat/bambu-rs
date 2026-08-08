@@ -12,9 +12,6 @@ use suppaftp::{RustlsConnector, RustlsFtpStream};
 
 use crate::config::ResolvedTarget;
 
-/// Implicit FTPS. `pub` so the emulator's relay can probe the same port before
-/// committing a client to a connect that has no timeout.
-pub const FTPS_PORT: u16 = 990;
 const FTP_USER: &str = "bblp";
 
 /// One entry from a directory listing.
@@ -78,7 +75,7 @@ impl FtpsClient {
     fn connect(&self) -> Result<RustlsFtpStream, FtpError> {
         let config = crate::tls::lan_client_config().map_err(|e| FtpError::Tls(e.to_string()))?;
         let mut ftp = RustlsFtpStream::connect_secure_implicit(
-            (self.target.ip.as_str(), FTPS_PORT),
+            (self.target.ip.as_str(), self.target.ftps_port),
             RustlsConnector::from(config),
             &self.target.ip,
         )

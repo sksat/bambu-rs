@@ -91,7 +91,7 @@ pub struct LivePrinterFiles {
 
 impl LivePrinterFiles {
     pub fn new(target: crate::config::ResolvedTarget) -> Self {
-        let addr = format!("{}:{}", target.ip, crate::ftp::FTPS_PORT);
+        let addr = format!("{}:{}", target.ip, target.ftps_port);
         Self {
             client: FtpsClient::new(target),
             addr,

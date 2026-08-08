@@ -234,6 +234,11 @@ pub fn default_config_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/bambu-rs/config.toml"))
 }
 
+/// Where a real printer listens. A relay may be somewhere else.
+pub const DEFAULT_MQTT_PORT: u16 = 8883;
+/// Implicit FTPS, per the printer.
+pub const DEFAULT_FTPS_PORT: u16 = 990;
+
 /// Per-invocation overrides (from flags and/or env). Higher precedence than a
 /// stored profile.
 #[derive(Clone, Default)]
@@ -242,6 +247,10 @@ pub struct Overrides {
     pub serial: Option<String>,
     pub access_code: Option<String>,
     pub model: Option<String>,
+    /// Only set when someone is deliberately not talking to a printer on its
+    /// standard ports — a relay, or a test.
+    pub mqtt_port: Option<u16>,
+    pub ftps_port: Option<u16>,
 }
 
 impl Overrides {
@@ -253,6 +262,8 @@ impl Overrides {
             serial: v("BAMBU_SERIAL"),
             access_code: v("BAMBU_ACCESS_CODE"),
             model: v("BAMBU_MODEL"),
+            mqtt_port: v("BAMBU_MQTT_PORT").and_then(|s| s.parse().ok()),
+            ftps_port: v("BAMBU_FTPS_PORT").and_then(|s| s.parse().ok()),
         }
     }
 
@@ -263,6 +274,8 @@ impl Overrides {
             serial: self.serial.or(lower.serial),
             access_code: self.access_code.or(lower.access_code),
             model: self.model.or(lower.model),
+            mqtt_port: self.mqtt_port.or(lower.mqtt_port),
+            ftps_port: self.ftps_port.or(lower.ftps_port),
         }
     }
 }
@@ -321,6 +334,13 @@ pub struct ResolvedTarget {
     pub serial: String,
     pub access_code: String,
     pub model: Model,
+    /// MQTT port. A real printer is always on [`DEFAULT_MQTT_PORT`]; this is
+    /// overridable so a client can be aimed at a `serve --emulate` relay that
+    /// had to bind somewhere else — 990 is privileged, and an end-to-end test
+    /// wants ephemeral ports it can run several of in parallel.
+    pub mqtt_port: u16,
+    /// FTPS port, overridable for the same reason.
+    pub ftps_port: u16,
 }
 
 impl std::fmt::Debug for ResolvedTarget {
@@ -330,6 +350,8 @@ impl std::fmt::Debug for ResolvedTarget {
             .field("serial", &self.serial)
             .field("model", &self.model)
             .field("access_code", &"<redacted>")
+            .field("mqtt_port", &self.mqtt_port)
+            .field("ftps_port", &self.ftps_port)
             .finish()
     }
 }
@@ -356,6 +378,8 @@ pub fn resolve(
         serial,
         access_code,
         model: Model::from_config_str(&model_str),
+        mqtt_port: overrides.mqtt_port.unwrap_or(DEFAULT_MQTT_PORT),
+        ftps_port: overrides.ftps_port.unwrap_or(DEFAULT_FTPS_PORT),
     })
 }
 
