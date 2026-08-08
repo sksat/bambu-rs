@@ -89,6 +89,9 @@ pub struct EmulateOpts {
     /// Bambu Studio uploads the sliced file over FTP first, and that upload goes
     /// to whichever host it was pointed at.
     pub ftp_port: Option<u16>,
+    /// Passive data ports for the FTP relay, as `"first-last"`. `None` = any
+    /// ephemeral port, which a deny-by-default firewall will block.
+    pub pasv_ports: Option<String>,
     /// Serve reads but refuse anything that would move or heat the machine —
     /// and, on the FTP side, anything that writes.
     pub read_only: bool,
@@ -102,6 +105,30 @@ pub struct EmulateOpts {
 pub struct ServeTarget {
     pub name: String,
     pub target: ResolvedTarget,
+}
+
+/// Parse a `"first-last"` passive port range.
+///
+/// A hard error rather than a shrug: someone passing this is working around a
+/// firewall, and silently ignoring a typo would leave them debugging transfers
+/// that hang for reasons the relay could have named at startup.
+#[cfg(feature = "relay")]
+pub fn parse_pasv_ports(spec: &str) -> anyhow::Result<std::ops::RangeInclusive<u16>> {
+    let (first, last) = spec.split_once('-').ok_or_else(|| {
+        anyhow::anyhow!("passive port range must look like 50000-50100, got {spec:?}")
+    })?;
+    let first: u16 = first
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{first:?} is not a port number"))?;
+    let last: u16 = last
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{last:?} is not a port number"))?;
+    if first == 0 || last < first {
+        anyhow::bail!("passive port range {first}-{last} is empty or starts at zero");
+    }
+    Ok(first..=last)
 }
 
 /// Run the server (blocking; owns its own multi-thread runtime).
@@ -465,6 +492,19 @@ async fn bind_ftp_relay(
     } else {
         ftpd::FtpRelay::new(&target.access_code, files)
     };
+    let pasv = opts
+        .pasv_ports
+        .as_deref()
+        .map(parse_pasv_ports)
+        .transpose()?;
+    if let Some(range) = &pasv {
+        eprintln!(
+            "emulate: FTP passive data ports confined to {}-{}",
+            range.start(),
+            range.end()
+        );
+    }
+    let relay = relay.with_pasv_ports(pasv);
     let addr = show_addr(&opts.host, port);
     let listener = tokio::net::TcpListener::bind((opts.host.as_str(), port))
         .await

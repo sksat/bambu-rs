@@ -356,20 +356,21 @@ fn via_serve_unreachable_is_a_transport_error() {
 
 #[cfg(feature = "relay")]
 #[test]
-fn emulate_needs_a_real_printer_to_relay() {
-    // The emulator's whole job is to be a stand-in for a specific machine. With
-    // --fake there is none, and an emulator answering every read with an empty
-    // snapshot would look to Bambu Studio like a printer that had gone strange
-    // rather than one that was never there.
-    let cfg = tmp_cfg("emulate-fake");
-    bambu(&cfg)
-        .args(["serve", "--fake", "--emulate"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("--emulate"));
-    // Nor without any configured printer: same reason, different way of having
-    // nothing to relay. (VALIDATION — no target could be resolved.)
-    bambu(&cfg).args(["serve", "--emulate"]).assert().code(3);
+fn emulate_needs_a_printer_to_present() {
+    // The emulator stands in for a specific machine, so it needs an identity
+    // and something behind it. Without a configured printer there is neither,
+    // and a relay answering every read with an empty snapshot would look to
+    // Bambu Studio like a printer gone strange rather than one that was never
+    // there.
+    //
+    // `--fake --emulate` is NOT tested here even though this once asserted it
+    // failed: it is now a supported mode that serves a synthetic printer, so
+    // running it would start a server and hang this test — or, on a host that
+    // cannot bind the default ports, "pass" for a reason that has nothing to do
+    // with the behaviour. `tests/relay_e2e.rs` exercises it properly, on
+    // ephemeral ports it chooses itself.
+    let cfg = tmp_cfg("emulate-no-printer");
+    bambu(&cfg).args(["serve", "--emulate"]).assert().code(3); // VALIDATION
     let _ = std::fs::remove_dir_all(&cfg);
 }
 

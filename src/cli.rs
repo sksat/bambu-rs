@@ -315,6 +315,15 @@ enum Command {
         #[cfg(feature = "relay")]
         #[arg(long, requires = "emulate")]
         emulate_no_ftp: bool,
+        /// Confine the FTP relay's passive data ports to this inclusive range,
+        /// e.g. `50000-50100`. A passive transfer opens a second connection on
+        /// a port chosen at the time, so behind a deny-by-default firewall
+        /// every transfer is blocked even with the control port allowed —
+        /// pinning the range lets one rule cover them all. Default: any
+        /// ephemeral port.
+        #[cfg(feature = "relay")]
+        #[arg(long, value_name = "FIRST-LAST", requires = "emulate")]
+        emulate_pasv_ports: Option<String>,
     },
 }
 
@@ -879,6 +888,8 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             emulate_ftp_port,
             #[cfg(feature = "relay")]
             emulate_no_ftp,
+            #[cfg(feature = "relay")]
+            emulate_pasv_ports,
         } => run_serve(
             cli,
             host,
@@ -894,6 +905,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
                 host: emulate_host.clone(),
                 port: *emulate_port,
                 ftp_port: (!emulate_no_ftp).then_some(*emulate_ftp_port),
+                pasv_ports: emulate_pasv_ports.clone(),
                 read_only: *emulate_read_only,
             }),
         ),
