@@ -600,3 +600,131 @@ fn gcode_json_keeps_the_shared_outcome_vocabulary() {
     // keeps the JSON identical across commands.
     assert!(src.contains("report_command_outcome_as("));
 }
+
+#[test]
+fn a_pre_print_hook_is_disclosed_by_dry_run_and_named_in_config_show() {
+    // The hook moves hardware before the print. --dry-run sends nothing, but it
+    // must still say the sequence would run, or the preview under-reports what
+    // --confirm does.
+    let cfg = cfg_with_sequence("hook-dry");
+    let toml = cfg.join("bambu-rs/config.toml");
+    let mut text = std::fs::read_to_string(&toml).unwrap();
+    text.push_str("[printers.a1.hooks]\npre_print = \"swap\"\n");
+    std::fs::write(&toml, text).unwrap();
+
+    bambu(&cfg)
+        .args(["job", "start", "/x.gcode", "--dry-run"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "pre-print sequence \"swap\" would run",
+        ));
+
+    // And it survives a round trip through the config rather than being dropped.
+    bambu(&cfg)
+        .args(["--printer", "a1", "config", "show", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("pre_print"));
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[test]
+fn an_unknown_printer_is_an_error_not_a_silent_absence_of_hooks() {
+    // Looking the profile up and shrugging at a miss would make --dry-run
+    // succeed reporting no hook, while --confirm fails profile validation on
+    // the same arguments.
+    let cfg = cfg_with_sequence("hook-noprofile");
+    bambu(&cfg)
+        .args(["--printer", "nope", "job", "start", "/x.gcode", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("nope"));
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[test]
+fn a_dry_run_will_not_call_an_undefined_hook_runnable() {
+    // `pre_print = "swpa"` fails the moment --confirm runs it. A preview that
+    // announced it anyway would send the operator to the printer expecting a
+    // swap — the preview has to fail where the real run would.
+    let cfg = cfg_with_sequence("hook-typo");
+    let toml = cfg.join("bambu-rs/config.toml");
+    let mut text = std::fs::read_to_string(&toml).unwrap();
+    text.push_str("[printers.a1.hooks]\npre_print = \"swpa\"\n");
+    std::fs::write(&toml, text).unwrap();
+    bambu(&cfg)
+        .args(["job", "start", "/x.gcode", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("swpa"))
+        .stderr(predicate::str::contains("would run").not());
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[test]
+fn no_hooks_suppresses_the_pre_print_sequence() {
+    // Recovery case: the plate is already where you want it, so a swap would
+    // eject it. The plan has to match the run it previews: with --no-hooks the
+    // run sends nothing, so saying the sequence "would run" is simply wrong.
+    let cfg = cfg_with_sequence("hook-skip");
+    let toml = cfg.join("bambu-rs/config.toml");
+    let mut text = std::fs::read_to_string(&toml).unwrap();
+    text.push_str("[printers.a1.hooks]\npre_print = \"swap\"\n");
+    std::fs::write(&toml, text).unwrap();
+    bambu(&cfg)
+        .args(["job", "start", "/x.gcode", "--dry-run", "--no-hooks"])
+        .assert()
+        .success()
+        // Asserting the absence, not just the exit status: the previous version
+        // of this test passed while the disclosure was still printed.
+        .stderr(predicate::str::contains("would run").not());
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+#[test]
+fn a_hook_never_writes_its_own_result_to_stdout() {
+    // The hook delegates to the `gcode` runner, which under --json prints a
+    // sequence report. The job-start result is printed too, and two adjacent
+    // JSON documents are not a document any parser accepts — so the hook path
+    // must be built to emit nothing.
+    let src = std::fs::read_to_string("src/cli.rs").unwrap();
+    let hook = src
+        .split_once("fn run_pre_print_hook")
+        .expect("the hook function")
+        .1
+        .split_once("\nfn ")
+        .expect("its end")
+        .0;
+    assert!(
+        hook.contains("emit_result: false"),
+        "the pre-print hook must not print a result of its own"
+    );
+}
+
+#[test]
+fn the_human_count_is_worded_the_same_whatever_the_wait_did() {
+    // The JSON calls the count `verified` in both cases, so the human line has
+    // to as well — a run that waited is not a different measurement, it just
+    // carries a stronger caveat. Two wordings for one number is the divergence
+    // the `confirms` field was added to end.
+    let src = std::fs::read_to_string("src/cli.rs").unwrap();
+    assert_eq!(
+        src.matches("{}/{} steps ").count(),
+        1,
+        "one format string for the step count, not one per outcome"
+    );
+    assert!(src.contains("{}/{} steps verified"));
+}
+
+#[test]
+fn waiting_for_the_motion_is_not_offered_for_a_single_line() {
+    // --wait needs a sequence: a lone line goes through the single-command path,
+    // which has no wait. Rejected by clap rather than silently ignored.
+    let cfg = cfg_with_sequence("wait-line");
+    bambu(&cfg)
+        .args(["gcode", "G28", "--confirm", "--wait"])
+        .assert()
+        .failure();
+    let _ = std::fs::remove_dir_all(&cfg);
+}

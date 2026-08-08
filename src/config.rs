@@ -12,6 +12,7 @@ use crate::core::model::Model;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// A stored printer profile.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -35,6 +36,62 @@ pub struct Profile {
     /// so an unknown name is an error rather than a guess.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sequences: BTreeMap<String, String>,
+    /// Sequences to run automatically around a print.
+    #[serde(default, skip_serializing_if = "Hooks::is_empty")]
+    pub hooks: Hooks,
+}
+
+/// Sequences fired automatically by `job start`, by the NAME of a sequence
+/// defined above — not a path. Naming the sequence means the same macro is
+/// usable by hand and automatically, and a hook pointing at something that
+/// doesn't exist is caught rather than silently skipped.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Hooks {
+    /// Run just before the print command is sent.
+    ///
+    /// For a plate changer this is where a swap goes: ejecting at the START of
+    /// the next print rather than the end of the previous one gives continuous
+    /// printing with no post-print machinery, and leaves the finished part on
+    /// the bed until you actually ask for the next one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_print: Option<String>,
+    /// Seconds to wait for `pre_print`'s motion to actually finish before
+    /// refusing to start the print. Defaults to [`DEFAULT_SETTLE_SECS`].
+    ///
+    /// A knob rather than a fixed constant because a macro's runtime is a
+    /// property of the machine it drives — a plate swap takes ~90 s, but a
+    /// sequence that heats or shuffles several plates can legitimately run
+    /// longer, and there is no way to run such a hook at all if the ceiling is
+    /// fixed. It has a default, unlike the tuning constants this codebase
+    /// refuses to default, because a wrong value here cannot cause an unsafe
+    /// action: too small only turns into a refusal to print.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_print_timeout_secs: Option<u64>,
+    // TODO: `post_print`. Firing after a print needs something to still be
+    // running when it ends — the CLI only is during `--watch`, so a dropped
+    // ssh session would silently skip it, and a print started from the
+    // printer's own screen has no bambu-rs process at all. That wants the
+    // async job infrastructure `serve` needs anyway (queue, progress, cancel);
+    // doing it in the CLI first would be a second mechanism to throw away.
+    // Note a pre-print swap already covers the continuous-print case.
+}
+
+/// Seconds a pre-print sequence's motion may take before the wait gives up.
+///
+/// Generous on purpose: the verified plate swap takes ~90 s, and the cost of
+/// being too generous is a slow failure, while being too tight refuses a
+/// legitimate print. Shared with `gcode --wait-timeout` so the two cannot drift.
+pub const DEFAULT_SETTLE_SECS: u64 = 600;
+
+impl Hooks {
+    pub fn is_empty(&self) -> bool {
+        self.pre_print.is_none() && self.pre_print_timeout_secs.is_none()
+    }
+
+    /// How long to wait for `pre_print`'s motion, config or default.
+    pub fn pre_print_timeout(&self) -> Duration {
+        Duration::from_secs(self.pre_print_timeout_secs.unwrap_or(DEFAULT_SETTLE_SECS))
+    }
 }
 
 impl Profile {
@@ -339,6 +396,7 @@ malformed line without equals
             mode: "lan".into(),
             access_code: "00000000".into(),
             sequences: BTreeMap::new(),
+            hooks: Hooks::default(),
         }
     }
 
@@ -407,6 +465,44 @@ malformed line without equals
         assert_eq!(p.serial, before.serial);
         assert_eq!(p.access_code, before.access_code);
         assert!(p.sequence("swap").is_ok());
+    }
+
+    #[test]
+    fn a_hook_names_a_sequence_so_the_pair_round_trips() {
+        let mut p = profile_with_sequences();
+        p.hooks.pre_print = Some("swap".into());
+        let cfg = Config {
+            default_printer: Some("a1".into()),
+            printers: BTreeMap::from([("a1".to_string(), p.clone())]),
+        };
+        let back: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert_eq!(back, cfg);
+        // A hook names a sequence, so it must resolve through the same lookup.
+        let hook = back.printers["a1"].hooks.pre_print.clone().unwrap();
+        assert!(back.printers["a1"].sequence(&hook).is_ok());
+    }
+
+    #[test]
+    fn the_hooks_wait_budget_defaults_but_can_be_raised() {
+        // A macro's runtime is a property of the machine it drives, so a hook
+        // that legitimately takes longer than the default must be expressible —
+        // otherwise it simply cannot be used as a hook at all.
+        let mut p = profile_with_sequences();
+        p.hooks.pre_print = Some("swap".into());
+        assert_eq!(
+            p.hooks.pre_print_timeout(),
+            Duration::from_secs(DEFAULT_SETTLE_SECS)
+        );
+
+        p.hooks.pre_print_timeout_secs = Some(1800);
+        assert_eq!(p.hooks.pre_print_timeout(), Duration::from_secs(1800));
+
+        let cfg = Config {
+            default_printer: Some("a1".into()),
+            printers: BTreeMap::from([("a1".to_string(), p)]),
+        };
+        let back: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert_eq!(back, cfg, "the raised budget must survive a round trip");
     }
 
     #[test]

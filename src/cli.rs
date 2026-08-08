@@ -15,7 +15,8 @@ use serde::Serialize;
 
 use crate::camera::{CameraClient, CameraError};
 use crate::client::{
-    ClientError, CommandOutcome, LanMqttClient, StatusSource, VerifyStage, WatchStep,
+    ClientError, CommandOutcome, LanMqttClient, SequenceRun, SettleOutcome, StatusSource,
+    VerifyStage, WatchStep,
 };
 use crate::config::{self, Config, ConfigError, Overrides, Profile, ResolvedTarget};
 use crate::core::capability::{self, ControlAssessment, ControlRefusal};
@@ -202,6 +203,17 @@ enum Command {
         /// is legitimately minutes long.
         #[arg(long, default_value_t = 30)]
         timeout: u64,
+        /// Don't return until the motion has actually finished.
+        ///
+        /// Without this, the command returns at the last acknowledgement — which
+        /// the printer sends on receipt, not on completion, so the machine is
+        /// still moving. Use it before doing anything that assumes the sequence
+        /// is done. Sequences only (`--from-file` / `--sequence`).
+        #[arg(long, requires_all = ["confirm"], conflicts_with = "line")]
+        wait: bool,
+        /// Seconds to wait for the motion under --wait before giving up.
+        #[arg(long, default_value_t = config::DEFAULT_SETTLE_SECS, requires = "wait")]
+        wait_timeout: u64,
     },
     /// Reboot the printer (disruptive; needs --confirm). The printer drops the
     /// connection and restarts (~1–2 min) and may rejoin DHCP on a new IP.
@@ -333,6 +345,10 @@ enum JobAction {
         /// Required to actually start a print.
         #[arg(long)]
         confirm: bool,
+        /// Don't run the profile's pre-print sequence. For recovery: when the
+        /// plate is already where you want it, a swap would eject it.
+        #[arg(long)]
+        no_hooks: bool,
         /// Guard: refuse unless the on-printer file's plate-gcode md5 matches
         /// this (case-insensitive). Get it from `--dry-run`. (.3mf only.)
         #[arg(long)]
@@ -767,6 +783,8 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             force,
             dry_run,
             timeout,
+            wait,
+            wait_timeout,
         } => run_gcode(
             cli,
             GcodeRequest {
@@ -777,6 +795,8 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
                 force: *force,
                 dry_run: *dry_run,
                 timeout_secs: *timeout,
+                settle: wait.then(|| Duration::from_secs(*wait_timeout)),
+                emit_result: true,
             },
         ),
         Command::Reboot { confirm } => run_reboot(cli, *confirm),
@@ -842,6 +862,7 @@ fn run_config(cli: &Cli, action: &ConfigAction) -> Result<(), CliError> {
                 mode: "lan".to_string(),
                 access_code: access_code.clone(),
                 sequences: Default::default(),
+                hooks: Default::default(),
             };
             cfg.printers.insert(name.clone(), profile);
             if *set_default || cfg.default_printer.is_none() {
@@ -1721,6 +1742,105 @@ fn resolve_named_sequence(cli: &Cli, name: &str) -> Result<String, CliError> {
     )
 }
 
+/// Run the profile's `pre_print` hook, if it has one.
+///
+/// Fired after everything that can refuse the print (validation, idle check,
+/// upload) and immediately before the start command: a swap that ejects the
+/// last plate must not happen for a print that then fails to start.
+///
+/// Returns only once the sequence's motion has been **observed to finish** (see
+/// `core::settle`). An ACK is not enough: measured on an A1 mini, the last ACK
+/// lands ~1 s in while the machine keeps moving for another minute, and a print
+/// start does not queue behind it — it begins immediately, mid-swap.
+///
+/// Skipped entirely on `--dry-run` — nothing is sent — but the plan says it
+/// would run, so the motion is never a surprise.
+fn run_pre_print_hook(cli: &Cli, skip: bool) -> Result<(), CliError> {
+    let Some((name, settle)) = pre_print_hook(cli)? else {
+        return Ok(());
+    };
+    if skip {
+        eprintln!("skipping pre-print sequence {name:?} (--no-hooks)");
+        return Ok(());
+    }
+    eprintln!("running pre-print sequence {name:?} …");
+    run_gcode(
+        cli,
+        GcodeRequest {
+            line: None,
+            from_file: None,
+            sequence_name: Some(&name),
+            confirm: true, // the print's own --confirm covers this
+            force: false,
+            dry_run: false,
+            timeout_secs: 30,
+            settle: Some(settle),
+            // The caller prints the job-start result. A hook that also printed
+            // its own would put two JSON documents on stdout under --json, which
+            // is not a document any parser accepts.
+            emit_result: false,
+        },
+    )
+    .map_err(|e| {
+        CliError::new(
+            e.code,
+            format!(
+                "pre-print sequence {name:?} failed, print not started: {}",
+                e.message
+            ),
+        )
+    })
+}
+
+/// Say that the `pre_print` hook would move hardware, so `--dry-run` doesn't
+/// under-report what `--confirm` would do.
+///
+/// Gated on `no_hooks` for the same reason it exists: the plan has to match the
+/// run it is previewing, and with `--no-hooks` that run sends nothing.
+fn disclose_pre_print_hook(cli: &Cli, no_hooks: bool) -> Result<(), CliError> {
+    if no_hooks {
+        return Ok(());
+    }
+    if let Some(h) = pre_print_hook_name(cli)? {
+        // Resolved, not just named: a hook pointing at a sequence that doesn't
+        // exist fails the moment --confirm runs it, and a preview that reported
+        // it as runnable would send the operator to the printer expecting a
+        // swap. Config-only, so the plan stays offline.
+        resolve_named_sequence(cli, &h)
+            .map_err(|e| CliError::new(e.code, format!("pre-print hook {h:?}: {}", e.message)))?;
+        eprintln!("note: pre-print sequence {h:?} would run first");
+    }
+    Ok(())
+}
+
+/// The `pre_print` hook's sequence name for the selected profile, if any.
+/// `None` when there is no config, no profile, or no hook — all ordinary.
+fn pre_print_hook_name(cli: &Cli) -> Result<Option<String>, CliError> {
+    Ok(pre_print_hook(cli)?.map(|(name, _)| name))
+}
+
+/// The `pre_print` hook's sequence name and how long its motion may take.
+fn pre_print_hook(cli: &Cli) -> Result<Option<(String, Duration)>, CliError> {
+    let Some(path) = config::default_config_path() else {
+        return Ok(None);
+    };
+    let cfg = Config::load_or_default(&path)?;
+    // `selected_profile_name`, not a silent lookup: a `--printer` that names
+    // nothing is an error, and swallowing it here would make `--dry-run` succeed
+    // reporting no hook while `--confirm` fails profile validation. An env-only
+    // target legitimately has no profile and still returns None.
+    let Some(profile) =
+        selected_profile_name(cli, &cfg)?.and_then(|n| cfg.printers.get(&n).cloned())
+    else {
+        return Ok(None);
+    };
+    Ok(profile
+        .hooks
+        .pre_print
+        .clone()
+        .map(|name| (name, profile.hooks.pre_print_timeout())))
+}
+
 /// What to send and how, resolved from the `gcode` flags. The three sources are
 /// mutually exclusive at the clap level; this carries whichever was given.
 struct GcodeRequest<'a> {
@@ -1731,6 +1851,12 @@ struct GcodeRequest<'a> {
     force: bool,
     dry_run: bool,
     timeout_secs: u64,
+    /// Wait for the motion to physically finish before returning, bounded by
+    /// this. `None` returns at the last ACK, with the machine possibly moving.
+    settle: Option<Duration>,
+    /// Whether to write the run's result to stdout. `false` for a hook, whose
+    /// caller owns the output contract.
+    emit_result: bool,
 }
 
 fn run_gcode(cli: &Cli, req: GcodeRequest<'_>) -> Result<(), CliError> {
@@ -1742,6 +1868,8 @@ fn run_gcode(cli: &Cli, req: GcodeRequest<'_>) -> Result<(), CliError> {
         force,
         dry_run,
         timeout_secs,
+        settle,
+        emit_result,
     } = req;
     // A named sequence is just a path the profile knows — resolve it here and
     // the rest is the --from-file path unchanged.
@@ -1809,6 +1937,15 @@ fn run_gcode(cli: &Cli, req: GcodeRequest<'_>) -> Result<(), CliError> {
     let client = connect_client(cli, timeout_secs)?;
     match from_file {
         None => {
+            // Not silently ignored: a caller that asked to wait for the motion
+            // and got the ACK instead would draw exactly the wrong conclusion.
+            if settle.is_some() {
+                return Err(CliError::new(
+                    exit::VALIDATION,
+                    "waiting for the motion to finish is only implemented for \
+                     --from-file / --sequence runs",
+                ));
+            }
             eprintln!("sending gcode_line {:?} …", steps[0].gcode);
             // NOT "took effect": a G-code line has no observable effect to
             // confirm (see `core::verify`), so the ACK is the whole verdict and
@@ -1821,7 +1958,7 @@ fn run_gcode(cli: &Cli, req: GcodeRequest<'_>) -> Result<(), CliError> {
                 false, // a G-code line has no observable effect (core::verify)
             )
         }
-        Some(source) => run_gcode_sequence(cli, &client, source, &steps),
+        Some(source) => run_gcode_sequence(cli, &client, source, &steps, settle, emit_result),
     }
 }
 
@@ -1865,6 +2002,8 @@ fn run_gcode_sequence(
     client: &LanMqttClient,
     source: &str,
     steps: &[sequence::Step],
+    settle: Option<Duration>,
+    emit_result: bool,
 ) -> Result<(), CliError> {
     let total = steps.len();
     let commands = steps
@@ -1875,12 +2014,19 @@ fn run_gcode_sequence(
     // never gets an outcome to be found in. Still `None` means the connection
     // never came up and nothing was sent, which is not "stopped at step 1".
     let at = std::cell::Cell::new(None);
-    let outcomes = client
-        .send_sequence(&commands, |i| {
-            at.set(Some(i));
-            let s = &steps[i];
-            eprintln!("[{}/{}] line {}: {}", i + 1, total, s.line_no, s.gcode);
-        })
+    if settle.is_some() {
+        eprintln!("(will wait for the motion to finish before returning)");
+    }
+    let run = client
+        .send_sequence(
+            &commands,
+            |i| {
+                at.set(Some(i));
+                let s = &steps[i];
+                eprintln!("[{}/{}] line {}: {}", i + 1, total, s.line_no, s.gcode);
+            },
+            settle,
+        )
         .map_err(|e| {
             let e: CliError = e.into();
             match at.get() {
@@ -1896,31 +2042,80 @@ fn run_gcode_sequence(
             }
         })?;
 
+    let SequenceRun { outcomes, settled } = run;
+
     // One result for the run: a verdict printed per step would be several
-    // adjacent JSON objects, which is not a document any parser accepts.
-    let report = sequence::Report::new(source, steps, &outcomes);
-    if want_json(cli) {
-        print_json(&report);
-    } else {
-        eprintln!(
-            "{}/{} steps verified — {}",
-            report.verified, report.total, GCODE_MOTION_NOTE
-        );
+    // adjacent JSON objects, which is not a document any parser accepts. A hook
+    // emits nothing at all — its caller owns stdout.
+    let report = sequence::Report::new(source, steps, &outcomes, settled.clone());
+    if emit_result {
+        if want_json(cli) {
+            print_json(&report);
+        } else {
+            // Same word as the JSON's `verified`, always: the count means one
+            // thing, and only the caveat after it differs. Saying "run" here and
+            // "verified" there would put the two contracts back out of step.
+            eprintln!(
+                "{}/{} steps verified — {}",
+                report.verified,
+                report.total,
+                if report.confirms == "settled" {
+                    GCODE_SETTLED_NOTE
+                } else {
+                    GCODE_MOTION_NOTE
+                }
+            );
+        }
     }
     // A rejection or a verify timeout is the *common* mid-sequence failure, so
     // it carries the step context just like a dropped connection does.
-    match outcomes
+    if let Some((i, e)) = outcomes
         .iter()
         .enumerate()
         .find_map(|(i, o)| command_outcome_error(o).map(|e| (i, e)))
     {
-        None => Ok(()),
-        Some((i, e)) => Err(CliError::new(
+        return Err(CliError::new(
             e.code,
             format!(
                 "stopped at {}: {}",
                 sequence::step_context(i, total, &steps[i]),
                 e.message
+            ),
+        ));
+    }
+    // Every line ran, but the machine may not have stopped. Reported after the
+    // per-step errors because a run that died at step 3 is better described by
+    // the step that failed than by the wait that never got its chance.
+    match &settled {
+        None | Some(SettleOutcome::Settled) => Ok(()),
+        Some(o) => Err(CliError::new(
+            match o {
+                // Not a transport timeout: the printer answered fine, it just
+                // hadn't finished moving.
+                SettleOutcome::TimedOut { .. } => exit::VERIFY_TIMEOUT,
+                SettleOutcome::Interrupted { .. } => exit::PRINTER_BUSY,
+                SettleOutcome::NotSent { .. } => exit::DEVICE_REJECTED,
+                // Not a rejection: the printer never answered, which is what
+                // the verify-timeout code means everywhere else.
+                SettleOutcome::NotConfirmed { .. } => exit::VERIFY_TIMEOUT,
+                // The run already failed; its step error is reported above.
+                SettleOutcome::NotReached => exit::GENERAL,
+                // Nothing was wrong with the printer — the sequence and the
+                // wait cannot coexist as written.
+                SettleOutcome::NoSentinel { .. } => exit::VALIDATION,
+                SettleOutcome::Settled => unreachable!("handled above"),
+            },
+            format!(
+                // A takeover found before the first publish sends nothing at
+                // all, and "sequence sent, but …" would have the operator
+                // looking for a half-driven machine that doesn't exist.
+                "{}: {}",
+                if report.verified == 0 && report.total > 0 {
+                    "sequence not started"
+                } else {
+                    "sequence sent, but"
+                },
+                o.failure().expect("non-Settled always has a reason")
             ),
         )),
     }
@@ -2006,6 +2201,7 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
             timelapse,
             dry_run,
             confirm,
+            no_hooks,
             expect_md5,
             expect_plate,
             watch,
@@ -2034,6 +2230,7 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
                     *timelapse,
                     *dry_run,
                     *confirm,
+                    *no_hooks,
                     *watch,
                     *watch_timeout,
                     *interval,
@@ -2128,6 +2325,7 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
             }
 
             if *dry_run {
+                disclose_pre_print_hook(cli, *no_hooks)?;
                 // Real plan: the resolved payload + what the on-printer file holds.
                 print_json(&start_plan_json(
                     &cmd,
@@ -2147,6 +2345,7 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
                 ));
             }
             ensure_idle(cli)?;
+            run_pre_print_hook(cli, *no_hooks)?;
             let client = connect_client(cli, 30)?;
             eprintln!("starting print: {file}");
             let outcome = client.send_and_verify(&cmd)?;
@@ -2195,6 +2394,7 @@ fn run_job_start_upload(
     timelapse: bool,
     dry_run: bool,
     confirm: bool,
+    no_hooks: bool,
     watch: bool,
     watch_timeout: u64,
     interval: Option<u64>,
@@ -2264,6 +2464,7 @@ fn run_job_start_upload(
     let cmd = start::build_command(&params, inspection.as_ref());
 
     if dry_run {
+        disclose_pre_print_hook(cli, no_hooks)?;
         // Plan: the resolved command + what would be uploaded where (nothing is sent).
         let mut plan = start_plan_json(
             &cmd,
@@ -2299,6 +2500,11 @@ fn run_job_start_upload(
     let n = ftps.upload(local_path, &remote)?;
     eprintln!("uploaded {n} bytes to {remote}");
 
+    // Re-check: the upload above can take minutes, and the hook moves hardware.
+    // A job started from the printer's screen (or another client) in that window
+    // would otherwise be driven into by a plate swap.
+    ensure_idle(cli)?;
+    run_pre_print_hook(cli, no_hooks)?;
     let client = connect_client(cli, 30)?;
     eprintln!("starting print: {remote}");
     let outcome = client.send_and_verify(&cmd)?;
@@ -3630,6 +3836,9 @@ fn report_command_outcome_as(
 // cannot drift apart.
 const GCODE_MOTION_NOTE: &str =
     "the printer does not report when the motion finishes, so it may still be running";
+/// The `--wait` counterpart: the one case where the motion *is* known to be over.
+const GCODE_SETTLED_NOTE: &str =
+    "the printer's G-code queue then drained, so the motion has finished";
 const GCODE_ACCEPTED_NOTE: &str = "verified: the printer acknowledged the command \
     (a G-code line has no confirmable effect, so the motion may still be running)";
 
@@ -4052,6 +4261,10 @@ struct RedactedProfile<'a> {
     /// the only way to discover what `--sequence` accepts without guessing.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     sequences: &'a std::collections::BTreeMap<String, String>,
+    /// Sequences that fire on their own around a print. Something that moves
+    /// hardware without being asked belongs in the profile's summary.
+    #[serde(skip_serializing_if = "config::Hooks::is_empty")]
+    hooks: &'a config::Hooks,
 }
 
 impl<'a> RedactedProfile<'a> {
@@ -4063,6 +4276,7 @@ impl<'a> RedactedProfile<'a> {
             model: &p.model,
             mode: &p.mode,
             sequences: &p.sequences,
+            hooks: &p.hooks,
             access_code: "<redacted>",
         }
     }
@@ -4080,6 +4294,9 @@ impl std::fmt::Display for RedactedProfile<'_> {
         // error, and most callers never pass --json.
         for (name, path) in self.sequences {
             write!(f, "\n  sequence {name} = {path}")?;
+        }
+        if let Some(h) = &self.hooks.pre_print {
+            write!(f, "\n  hook pre_print = {h}")?;
         }
         Ok(())
     }
