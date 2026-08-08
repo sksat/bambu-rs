@@ -97,6 +97,27 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 /// integration is three.
 const MAX_CONNECTIONS: usize = 64;
 
+/// Whether a client connection simply ended, as opposed to going wrong.
+///
+/// Most MQTT clients — `rumqttc` among them, which is what this crate uses
+/// against a real printer — close the socket without a TLS `close_notify` when
+/// they are done. rustls reports that as `UnexpectedEof` with a link to its
+/// documentation attached, so logging every one of them prints a paragraph of
+/// alarming-looking text each time a client finishes normally. Observed against
+/// a real A1 mini: three routine `bambu status` calls, three scary log lines.
+pub(crate) fn is_ordinary_disconnect(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+            )
+        })
+    })
+}
+
 /// The payload that asks the printer for a full snapshot.
 fn pushall_request() -> Value {
     serde_json::json!({"pushing": {"sequence_id": "0", "command": "pushall"}})
@@ -355,7 +376,9 @@ impl Emulator {
                         }
                     };
                 let id = this.next_client_id.fetch_add(1, Ordering::Relaxed);
-                if let Err(e) = Arc::clone(&this).serve_client(stream, id).await {
+                if let Err(e) = Arc::clone(&this).serve_client(stream, id).await
+                    && !is_ordinary_disconnect(&e)
+                {
                     eprintln!("emulate: client {peer} dropped: {e}");
                 }
                 // Whatever it was still waiting on, nobody is there to receive it.
@@ -1154,6 +1177,30 @@ mod tests {
             matches!(closed, Ok(0) | Err(_)),
             "the connection should be gone, got {closed:?}"
         );
+    }
+
+    #[test]
+    fn a_client_hanging_up_is_not_reported_as_a_fault() {
+        // Seen against a real A1 mini: three routine `bambu status` calls left
+        // three "dropped: peer closed connection without sending TLS
+        // close_notify <url>" lines. rumqttc does exactly that when it is
+        // finished, so the noise scales with normal use.
+        for kind in [
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::BrokenPipe,
+        ] {
+            let e = anyhow::Error::new(std::io::Error::new(kind, "peer closed"))
+                .context("reading from the client");
+            assert!(is_ordinary_disconnect(&e), "{kind:?} is a normal ending");
+        }
+        // A real fault still gets reported.
+        assert!(!is_ordinary_disconnect(&anyhow::anyhow!(
+            "client sent a malformed packet"
+        )));
+        assert!(!is_ordinary_disconnect(&anyhow::Error::new(
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "bad frame")
+        )));
     }
 
     #[tokio::test]

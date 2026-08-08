@@ -222,7 +222,11 @@ impl FtpRelay {
                         Err(_) => return,
                     };
                 if let Err(e) = this.serve_control(stream, local, Some(peer), tls).await {
-                    eprintln!("emulate-ftp: {peer} dropped: {e}");
+                    // Same as the MQTT side: a client that just hangs up is not
+                    // news. See `emulate::is_ordinary_disconnect`.
+                    if !super::emulate::is_ordinary_disconnect(&e) {
+                        eprintln!("emulate-ftp: {peer} dropped: {e}");
+                    }
                 }
             });
         }
