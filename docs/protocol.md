@@ -264,6 +264,42 @@ the emulator's `UpstreamCache`) has to skip ACKs, or `result`/`reason`/`param`
 end up spliced into the cached `print` object and travel with every snapshot
 built from it afterwards. **[observed]**
 
+## Open ports, and the one that decides whether Studio will talk to you
+
+Scanned on the A1 mini (fw 01.07.02.00) on 2026-08-09. **[observed]**
+
+| port | state | what it is |
+|---|---|---|
+| 322 | closed | RTSPS — X1 only; the A1 uses 6000 |
+| 990 | open | implicit FTPS |
+| **3000** | **open** | plain-TCP device probe |
+| **3002** | **open** | the same probe over TLS |
+| 6000 | open | camera stream |
+| 8883 | open | LAN MQTT |
+
+**3000/3002 were missing from these notes entirely, and they are load-bearing.**
+Bambu Studio's "add printer by IP" dialog probes one of them *before* it opens
+MQTT, and abandons the attempt if the probe fails — so a device that serves
+8883 perfectly is still unreachable that way. The failure is invisible from the
+server side: a refused SYN leaves nothing in a log or in `ss`. Studio reports it
+as "Failed to publish login request", where "login" is the probe's JSON key and
+not an account login. Neither port answers unprompted; the client speaks first.
+
+## TLS, as the printer actually presents it
+
+Identical certificate on 8883 and 3002 **[observed]**:
+
+- **RSA-2048**, `sha256WithRSAEncryption`, X.509 **version 1**
+- `subject=CN=<serial>`, `issuer=C=CN, O=BBL Technologies Co., Ltd, CN=BBL CA`
+- valid 2024-03-25 → 2034-03-23 (10 years, not a sentinel range)
+- **two certificates are sent**, leaf plus CA — not a bare self-signed leaf
+- negotiates TLS 1.2, `ECDHE-RSA-AES256-GCM-SHA384`, peer signature
+  `rsa_pkcs1_sha256`
+
+The key type matters to anything impersonating a printer: `ECDHE-RSA` requires
+an RSA key, so an ECDSA certificate cannot satisfy a client that offers only the
+RSA suites, however willing it is to skip verification.
+
 ## Emulating the printer (`bambu serve --emulate`)
 
 `serve` can present the printer's own LAN interface — MQTT over TLS on 8883,
