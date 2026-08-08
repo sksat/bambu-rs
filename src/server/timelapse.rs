@@ -1054,6 +1054,31 @@ mod tests {
         }
     }
 
+    /// Wait until `cond` holds, failing only after a deadline no healthy run can
+    /// reach.
+    ///
+    /// These tests drive real background workers over real channels, so "has it
+    /// happened yet?" is genuinely a question about wall-clock time — and a
+    /// fixed `sleep` answers it by guessing. Too short and the suite flakes on a
+    /// loaded machine; too long and every run pays for the worst case. Polling
+    /// costs what the short sleep did when the machine is idle, and simply waits
+    /// when it isn't.
+    ///
+    /// Only for asserting that something DOES happen. A test checking that
+    /// nothing happened still has to sit through a real window.
+    async fn eventually(what: &str, mut cond: impl FnMut() -> bool) {
+        const LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+        const STEP: std::time::Duration = std::time::Duration::from_millis(5);
+        let start = std::time::Instant::now();
+        while !cond() {
+            assert!(
+                start.elapsed() < LIMIT,
+                "timed out after {LIMIT:?} waiting for {what}"
+            );
+            tokio::time::sleep(STEP).await;
+        }
+    }
+
     fn one(id: &str, grab: FrameGrab) -> Vec<(String, FrameGrab)> {
         vec![(id.to_string(), grab)]
     }
@@ -1078,17 +1103,19 @@ mod tests {
         mgr.start_smooth(one("ext-0", grab), 1, vec![0], rx, dir.clone())
             .unwrap();
 
-        // Drive: print starts and advances three layers, then finishes.
-        for s in [
-            st("RUNNING", Some(1)),
-            st("RUNNING", Some(2)),
-            st("RUNNING", Some(3)),
-            st("FINISH", Some(3)),
-        ] {
-            tx.send(s).unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        // Drive: print starts and advances three layers, then finishes. Waiting
+        // for each layer's frame before sending the next is not just for
+        // timing — the feed is a `watch`, which keeps only the latest value, so
+        // a worker that fell behind would never see the layer it skipped.
+        for layer in 1..=3 {
+            tx.send(st("RUNNING", Some(layer))).unwrap();
+            eventually(&format!("layer {layer} to be captured"), || {
+                mgr.status_smooth().frames == layer as u64
+            })
+            .await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        tx.send(st("FINISH", Some(3))).unwrap();
+        eventually("the capture to stop", || !mgr.status_smooth().running).await;
 
         let s = mgr.status_smooth();
         assert!(
@@ -1117,15 +1144,15 @@ mod tests {
             dir.clone(),
         )
         .unwrap();
-        for s in [
-            st("RUNNING", Some(1)),
-            st("RUNNING", Some(2)),
-            st("FINISH", Some(2)),
-        ] {
-            tx.send(s).unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        for layer in 1..=2 {
+            tx.send(st("RUNNING", Some(layer))).unwrap();
+            eventually(&format!("both cameras to capture layer {layer}"), || {
+                mgr.status_smooth().frames == layer as u64 * 2
+            })
+            .await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        tx.send(st("FINISH", Some(2))).unwrap();
+        eventually("the capture to stop", || !mgr.status_smooth().running).await;
 
         let s = mgr.status_smooth();
         assert_eq!(s.cameras, vec!["ext-0".to_string(), "ext-1".to_string()]);
@@ -1173,20 +1200,23 @@ mod tests {
     async fn a_failing_grab_counts_failures_and_keeps_going() {
         let dir = std::env::temp_dir().join(format!("bambu-tl-test3-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let (tx, rx) = watch::channel(st("RUNNING", Some(0)));
+        // Idle, not RUNNING(0): starting active means layer 0 is captured before
+        // the loop below sends anything, so `failures >= 1` could be satisfied by
+        // that first capture and each wait would acknowledge the wrong layer.
+        let (tx, rx) = watch::channel(st("IDLE", None));
         let grab: FrameGrab = Arc::new(|| Err("camera offline".to_string()));
         let mgr = TimelapseManager::default();
         mgr.start_smooth(one("ext-0", grab), 1, vec![0], rx, dir.clone())
             .unwrap();
-        for s in [
-            st("RUNNING", Some(1)),
-            st("RUNNING", Some(2)),
-            st("FINISH", Some(2)),
-        ] {
-            tx.send(s).unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        for layer in 1..=2 {
+            tx.send(st("RUNNING", Some(layer))).unwrap();
+            eventually(&format!("layer {layer}'s grab to fail"), || {
+                mgr.status_smooth().failures >= layer as u64
+            })
+            .await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        tx.send(st("FINISH", Some(2))).unwrap();
+        eventually("the capture to stop", || !mgr.status_smooth().running).await;
         let s = mgr.status_smooth();
         assert!(s.failures >= 2, "grab failures are counted");
         assert_eq!(s.frames, 0, "no files on failure");
@@ -1310,20 +1340,17 @@ mod tests {
         // Printing → frames accumulate on the ~20ms clock, NOT per layer (the
         // layer never changes here, yet several frames land).
         tx.send(st("RUNNING", Some(1))).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        let mid = mgr.status_plain().frames;
-        assert!(
-            mid >= 2,
-            "plain samples on its own clock while printing (got {mid})"
-        );
+        eventually("plain to sample on its own clock while printing", || {
+            mgr.status_plain().frames >= 2
+        })
+        .await;
 
         // Finishing stops it promptly (the changed-feed path, not a whole interval).
         tx.send(st("FINISH", Some(1))).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-        assert!(
-            !mgr.status_plain().running,
-            "plain stops when the print finishes"
-        );
+        eventually("plain to stop when the print finishes", || {
+            !mgr.status_plain().running
+        })
+        .await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1338,12 +1365,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bambu-tl-stream-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (tx, rx) = watch::channel(st("RUNNING", Some(1)));
-        let open: StreamOpen = Arc::new(|| {
-            Ok(OpenedCameraStream {
-                content_type: "multipart/x-mixed-replace".to_string(),
-                reader: Box::new(std::io::Cursor::new(b"JPEGDATA".to_vec())),
+        // Counting opens turns "has the recorder started?" into something
+        // observable. Without it the test can only guess, and a guess that comes
+        // up short cancels a recorder that never began — passing while testing
+        // nothing.
+        let opened = Arc::new(AtomicUsize::new(0));
+        let open: StreamOpen = {
+            let opened = opened.clone();
+            Arc::new(move || {
+                opened.fetch_add(1, Ordering::SeqCst);
+                Ok(OpenedCameraStream {
+                    content_type: "multipart/x-mixed-replace".to_string(),
+                    reader: Box::new(std::io::Cursor::new(b"JPEGDATA".to_vec())),
+                })
             })
-        });
+        };
         let caps = vec![PlainCapture::Stream {
             id: "ext-1".to_string(),
             open,
@@ -1352,13 +1388,17 @@ mod tests {
         mgr.start_plain(caps, 20, rx, dir.clone()).unwrap();
         assert!(dir.join("ext-1").is_dir(), "per-camera dir created");
 
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        // Cancelling is only the thing under test once the recorder has actually
+        // started, which the opener now reports.
+        eventually("the recorder to open its stream", || {
+            opened.load(Ordering::SeqCst) >= 1
+        })
+        .await;
         tx.send(st("FINISH", Some(1))).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        assert!(
-            !mgr.status_plain().running,
-            "stream recorder stops cleanly when the print finishes"
-        );
+        eventually("the stream recorder to stop cleanly", || {
+            !mgr.status_plain().running
+        })
+        .await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1396,11 +1436,16 @@ mod tests {
         assert!(mgr.status_smooth().running && mgr.status_plain().running);
 
         tx.send(st("RUNNING", Some(1))).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        eventually("smooth to capture the first layer", || {
+            mgr.status_smooth().frames >= 1
+        })
+        .await;
         tx.send(st("RUNNING", Some(2))).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        eventually("plain to sample its interval", || {
+            mgr.status_plain().frames >= 2
+        })
+        .await;
         assert!(mgr.status_smooth().frames >= 1, "smooth captured layers");
-        assert!(mgr.status_plain().frames >= 2, "plain sampled its interval");
 
         // Stopping one leaves the other running.
         assert!(mgr.stop_smooth());
@@ -1469,24 +1514,35 @@ mod tests {
 
         // Active → one worker per camera, exactly once.
         tx.send(st("RUNNING", Some(1))).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-        assert_eq!(spawned.load(Ordering::SeqCst), 2, "one per camera");
-        tx.send(st("RUNNING", Some(2))).unwrap(); // another active tick
-        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        eventually("one worker per camera to spawn", || {
+            spawned.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        // A second active tick must not respawn. Waiting for the runner to
+        // publish layer 2 proves it saw the tick — the feed is a `watch`, so
+        // finishing straight away could replace the value and the tick would
+        // never happen at all.
+        tx.send(st("RUNNING", Some(2))).unwrap();
+        eventually("the second active tick to be seen", || {
+            mgr.status_park().current_layer == Some(2)
+        })
+        .await;
+
+        // Finish → cancel → the fake workers exit → the slot stops.
+        tx.send(st("FINISH", Some(2))).unwrap();
+        eventually("park to stop when the print finishes", || {
+            !mgr.status_park().running
+        })
+        .await;
+        // Asserted after the runner has exited, so no further spawn is possible:
+        // this is the final count rather than a reading taken during a window
+        // that happened to be long enough.
         assert_eq!(
             spawned.load(Ordering::SeqCst),
             2,
             "spawned once, not per tick"
         );
         assert_eq!(mgr.status_park().frames, 2);
-
-        // Finish → cancel → the fake workers exit → the slot stops.
-        tx.send(st("FINISH", Some(2))).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        assert!(
-            !mgr.status_park().running,
-            "park stops when the print finishes"
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1566,28 +1622,34 @@ mod tests {
         // Active + advancing layers → one worker per camera (once), and the live layer
         // propagates to the workers.
         tx.send(st("RUNNING", Some(7))).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        eventually("one worker per camera to spawn", || {
+            spawned.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        // The worker reading layer 8 back is both the assertion that the live
+        // layer propagates AND the acknowledgment that the second tick happened
+        // — without it, finishing immediately could replace the value in the
+        // `watch` and the tick would be skipped entirely.
         tx.send(st("RUNNING", Some(8))).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        eventually("the latest MQTT layer to reach the workers", || {
+            seen_layer.load(Ordering::SeqCst) == 8
+        })
+        .await;
+
+        // Finish → cancel → the fake workers exit → the slot stops.
+        tx.send(st("FINISH", Some(8))).unwrap();
+        eventually("segment to stop when the print finishes", || {
+            !mgr.status_segment().running
+        })
+        .await;
+        // After the runner has exited nothing else can spawn, so this is the
+        // final count, not a reading from an arbitrary window.
         assert_eq!(
             spawned.load(Ordering::SeqCst),
             2,
             "one per camera, spawned once"
         );
         assert_eq!(mgr.status_segment().frames, 2);
-        assert_eq!(
-            seen_layer.load(Ordering::SeqCst),
-            8,
-            "the worker reads the latest MQTT layer through the shared atomic"
-        );
-
-        // Finish → cancel → the fake workers exit → the slot stops.
-        tx.send(st("FINISH", Some(8))).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-        assert!(
-            !mgr.status_segment().running,
-            "segment stops when the print finishes"
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
