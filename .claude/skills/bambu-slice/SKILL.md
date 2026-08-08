@@ -5,10 +5,15 @@ metadata:
   type: reference
 ---
 
-# Slicing for the Bambu A1 mini (OrcaSlicer CLI) → print
+# Slicing for the Bambu A1 mini (OrcaSlicer / Bambu Studio CLI) → print
 
 Verified on a real A1 mini (OrcaSlicer 2.3.2 at `/usr/bin/orca-slicer`; system
 profiles under `/opt/orca-slicer/resources/profiles/BBL/{machine,process,filament}/`).
+
+**Slicer auto-detect:** the helper prefers OrcaSlicer, and falls back to **Bambu
+Studio** (`/opt/bambustudio-bin`) when OrcaSlicer isn't installed — same BBL
+profiles + CLI flags, but it needs its bundled libs on `LD_LIBRARY_PATH` and
+`LC_ALL=C` (the helper sets both).
 
 ## The one trap you must know
 
@@ -21,6 +26,31 @@ The result *looks* fine and even "works" for 0.2mm by coincidence, but any other
 layer height (or any tuned setting) is quietly wrong. **Never trust the profile
 name — flatten the chain and verify the output.**
 
+## The second trap (cost a failed print): machine start gcode isn't on the inherits chain
+
+On **Bambu Studio**, the A1 mini's long machine gcode blocks — `machine_start_gcode`
+(≈10 KB of heat/wipe/**bed-mesh**/flow-cali/**nozzle-load**), plus `machine_end_gcode`,
+`layer_change_gcode`, `change_filament_gcode`, `time_lapse_gcode` — do **not** live on
+the machine profile's `inherits` chain (`… 0.4 nozzle` → `fdm_bbl_3dp_001_common` →
+`fdm_machine_common`). The chain carries only a **generic fallback** start gcode. The
+real blocks sit in sibling files `<machine> template <key>.json` (e.g. `Bambu Lab A1
+mini 0.4 nozzle template machine_start_gcode.json`), which the GUI merges but a plain
+inherits-walk misses.
+
+Miss them and the slicer emits the generic start, whose prime line is
+`G1 X10.1 Y200.0 … E15 ;Draw the first line` — **Y200 is 20 mm past the 180 mm bed**,
+so the head slams the Y limit (loud thud, lost steps, "weird from the start") and the
+generic prime **skips Bambu's real nozzle-load + flow-cali → under-extrusion, "filament
+won't come out."** Symptom on the real A1: thudding + no filament from layer 0, print
+manually stopped. `print_error` stays 0 (a manual stop, not a firmware fault).
+
+The helper now **merges those template gcodes into the machine profile** and, after
+slicing, **fails loudly if the start section extrudes past the printable area** (the
+real start's out-of-bed wipe moves carry no extrusion, so this is a clean signal). It
+also sets `curr_bed_type` (default **Textured PEI Plate**) — otherwise the merge
+defaults to **Cool Plate → bed 35 °C**, far too cold for good adhesion (PLA wants 65 °C,
+PETG 70 °C on textured PEI).
+
 ## Use the bundled helper (does the flatten + verify for you)
 
 ```bash
@@ -28,33 +58,53 @@ scripts/slice.py <model.stl> <out.gcode.3mf> [--layer 0.20] \
     [--filament "Bambu PLA Basic @BBL A1M"] [--process "<process profile name>"]
 ```
 
-It flattens the machine/process/filament `inherits` chains, slices, and **fails
-loudly if the produced layer height doesn't match the request.** Examples:
+It flattens the machine/process/filament `inherits` chains, merges the machine
+template gcodes, slices, and **fails loudly if the produced layer height doesn't
+match the request, or if the start gcode extrudes off the bed** (the second trap).
+Examples:
 
 ```bash
 scripts/slice.py /tmp/cube.stl /tmp/cube.gcode.3mf --layer 0.12
-# -> OK /tmp/cube.gcode.3mf  layer_height=0.12mm  layers=166  filament='Bambu PLA Basic @BBL A1M'
+# -> OK /tmp/cube.gcode.3mf  layer_height=0.12mm  layers=166  filament='…'  bed=65C  slicer=bambu-studio
 scripts/slice.py /tmp/cube.stl /tmp/cube.gcode.3mf            # 0.20mm PLA default
 ```
 
 - `--layer`: 0.08 / 0.12 / 0.16 / 0.20 / 0.24 / 0.28 (or any value → nearest
   profile with the height forced). Default 0.20.
 - `--filament`: any `… @BBL A1M` name, e.g. `Bambu PETG Basic @BBL A1M`,
-  `Generic PLA @BBL A1M`, `Bambu PLA Matte @BBL A1M`.
+  `Bambu PETG Translucent @BBL A1M`, `Generic PLA @BBL A1M`, `Bambu PLA Matte @BBL A1M`.
 - `--process`: pass an exact process profile to honor its tuning (e.g.
   `0.20mm Strength @BBL A1M`) instead of `--layer`.
 - `--machine`: defaults to `Bambu Lab A1 mini 0.4 nozzle` (use `… 0.6 nozzle`
   etc. for other nozzles; then pick matching `… 0.6 nozzle` profiles).
+- `--bed-type`: default `Textured PEI Plate` (A1 mini stock). Drives the bed temp
+  from the filament profile — leave it unless you actually swapped plates.
+- `--brim`: force an outer brim of N mm (e.g. `--brim 5`) for thin/tall-and-narrow
+  parts prone to lifting. PLA benefits; PETG adheres hard enough that a brim is
+  usually unneeded and harder to peel.
 
-## Manual command (fallback — same trap applies)
+For a headless thumbnail run the helper under `xvfb-run -a …` (see the caveat below;
+on some boxes GL still fails and the 3mf ships without a preview — the gcode is fine).
 
-If you slice by hand, you MUST resolve inheritance (the helper does this) and then
-verify. The lazy `--load-settings "<leaf>.json"` form is only safe for the 0.2mm
-default. Always confirm the real result:
+## Manual command (fallback — BOTH traps apply)
+
+**Use the helper.** Slicing by hand means reproducing both traps yourself: flatten
+the `inherits` chain *and* merge the `<machine> template <key>.json` gcodes. Neither
+is optional, and neither depends on the layer height.
+
+An earlier version of this section said `--load-settings "<leaf>.json"` was "safe for
+the 0.2mm default". **That is wrong** — it only ever addressed the first trap. The
+leaf also lacks the machine gcode templates, so on Bambu Studio that shortcut still
+emits the generic start whose prime line drives 20mm off the bed. A 0.2mm slice made
+that way looks correct in every check below and still crashes the head.
+
+If you slice by hand anyway, verify the real result — including the start gcode:
 
 ```bash
 unzip -p out.gcode.3mf Metadata/plate_1.gcode | grep -m1 '; layer_height'
 unzip -l out.gcode.3mf | grep Metadata/plate_1.gcode   # proves it's sliced, not just a project 3mf
+# the second trap: a generic start gcode gives itself away here
+unzip -p out.gcode.3mf Metadata/plate_1.gcode | grep -c 'Draw the first line'   # must be 0
 ```
 
 ### Headless caveat (thumbnails)
