@@ -129,15 +129,43 @@ Observed cost: a part whose author set `brim_type = brim_ears` per-object (with
 matching `Metadata/brim_ear_points.txt`) got a plain full-width brim instead —
 48% more first-layer extrusion, visibly not the designed part.
 
-Slice the project's own plates directly, and keep the file's settings:
+### First: does the project even target this printer?
+
+The file carries the machine it was authored for. Slicing it unchanged on a
+mismatch emits gcode for **that** printer — and every bed-related check below,
+including `outside="false"`, is then measured against that machine's bed, not
+the A1 mini's 180mm one. Check before anything else:
 
 ```bash
+unzip -p project.3mf Metadata/project_settings.config \
+  | python3 -c 'import json,sys; c=json.load(sys.stdin); print(c["printer_model"], c["nozzle_diameter"])'
+# want: Bambu Lab A1 mini  ['0.4']
+```
+
+Anything else — stop. Converting it is a deliberate act (re-picking the machine
+profile means the layout may no longer fit), not something to do in passing.
+
+### Then: slice the project's own plates
+
+**Prefer Bambu Studio if it is installed.** A BS-authored project is the format
+BS wrote, so it opens as-is; Orca rejects most of them (next section). Only fall
+back to Orca when BS is absent.
+
+```bash
+# Bambu Studio (needs its bundled libs + C locale)
+LD_LIBRARY_PATH=/opt/bambustudio-bin/bin LC_ALL=C \
+  /opt/bambustudio-bin/bin/bambu-studio --allow-newer-file --slice N \
+    --outputdir "$PWD" --export-3mf out.gcode.3mf project.3mf
+
+# OrcaSlicer (same flags; see the -18 caveat below)
 orca-slicer --allow-newer-file --slice N \
-    --outputdir "$PWD/out" --export-3mf out.gcode.3mf project.3mf
+    --outputdir "$PWD" --export-3mf out.gcode.3mf project.3mf
 ```
 
 `--slice N` is the **plate number** (1-based; `0` = all plates). No
 `--load-settings`, no `--arrange`, no `--orient` — everything comes from the file.
+`--outputdir` and the verification commands below must agree on one directory;
+they are written for `$PWD`.
 
 ### Orca refuses most Bambu Studio projects (`return -18`)
 
@@ -151,20 +179,21 @@ Param values in 3mf/config error:
 run found error, return -18, exit...
 ```
 
-Nothing in that message says the values are unused or how to proceed. Rewrite
-just those keys **in a copy** — never the original:
+Nothing in that message says the values are unused or how to proceed. **If Bambu
+Studio is available, use it instead — no rewriting needed.** Otherwise rewrite
+just those keys **in a copy**, never the original:
 
 ```python
-import json, zipfile, shutil
+import json, zipfile
+SRC, DST = "project.3mf", "project-orca.3mf"
 FIX = {"raft_first_layer_expansion": "2", "tree_support_wall_count": "0"}
-zin = zipfile.ZipFile(src); zout = zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED)
-for item in zin.infolist():
-    data = zin.read(item.filename)
-    if item.filename == "Metadata/project_settings.config":
-        cfg = json.loads(data); cfg.update(FIX)
-        data = json.dumps(cfg, indent=4).encode()
-    zout.writestr(item, data)          # copy every other entry byte-for-byte
-zout.close()
+with zipfile.ZipFile(SRC) as zin, zipfile.ZipFile(DST, "w", zipfile.ZIP_DEFLATED) as zout:
+    for item in zin.infolist():
+        data = zin.read(item.filename)
+        if item.filename == "Metadata/project_settings.config":
+            cfg = json.loads(data); cfg.update(FIX)
+            data = json.dumps(cfg, indent=4).encode()
+        zout.writestr(item, data)      # copy every other entry byte-for-byte
 ```
 
 **Check they are actually unused before touching them** — `enable_support` and

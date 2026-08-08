@@ -6,21 +6,36 @@
       "name": "explicit-a1-pla-0.2mm",
       "prompt": "I've got an STL at /tmp/cube.stl that I want to print on my Bambu Lab A1 mini (0.4mm nozzle). Slice it at a 0.2mm layer height in PLA and give me the printable .gcode.3mf.",
       "expected_output": "A .gcode.3mf sliced for the A1 mini (0.4 nozzle, 0.20mm, PLA) containing Metadata/plate_1.gcode.",
-      "files": ["/tmp/cube.stl"]
+      "files": [
+        "/tmp/cube.stl"
+      ]
     },
     {
       "id": 1,
       "name": "implicit-ready-to-print",
       "prompt": "Can you get /tmp/cube.stl ready to print on my A1 mini? I just need the sliced file I can send to the printer.",
       "expected_output": "A .gcode.3mf sliced for the A1 mini using sensible defaults (0.4 nozzle, ~0.2mm, PLA), containing Metadata/plate_1.gcode.",
-      "files": ["/tmp/cube.stl"]
+      "files": [
+        "/tmp/cube.stl"
+      ]
     },
     {
       "id": 2,
       "name": "fine-0.12mm-layer",
       "prompt": "Slice /tmp/cube.stl for the A1 mini but use a fine 0.12mm layer height — give me the .gcode.3mf.",
       "expected_output": "A .gcode.3mf sliced for the A1 mini at 0.12mm layer height, containing Metadata/plate_1.gcode.",
-      "files": ["/tmp/cube.stl"]
+      "files": [
+        "/tmp/cube.stl"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "project-3mf-keeps-author-layout",
+      "prompt": "I bought this model — /tmp/project.3mf. It has several plates already laid out. Slice plate 2 for my A1 mini.",
+      "expected_output": "Plate 2 sliced from the project's OWN settings: the slicer invoked directly with --slice 2 and NO --load-settings/--arrange/--orient, and NOT via scripts/slice.py (which would re-arrange and re-orient the author's layout and drop per-object overrides such as brim_ears). The project's printer_model is checked to be the A1 mini first. Output contains Metadata/plate_2.gcode.",
+      "files": [
+        "/tmp/project.3mf"
+      ]
     }
   ]
 }
