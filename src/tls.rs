@@ -42,6 +42,8 @@ pub enum ServerTlsError {
     Certificate(#[from] rcgen::Error),
     #[error("rustls: {0}")]
     Rustls(#[from] rustls::Error),
+    #[error("storing the emulated printer's identity: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// A rustls [`ServerConfig`](rustls::ServerConfig) presenting a **freshly
@@ -57,12 +59,16 @@ pub enum ServerTlsError {
 ///   standard certificate cannot be the thing that breaks it. ECDSA also
 ///   generates in microseconds where RSA-2048 would stall startup, and `ring`
 ///   cannot generate RSA keys at all.
-/// - It is generated per run rather than cached on disk. Nothing pins it today,
-///   and a key sitting in the config directory is a liability that buys nothing
-///   until something does.
+/// - It is generated per run when `store` is `None`. Give it a directory and the
+///   identity is kept and reused, which is what a client that *pins* the
+///   certificate needs — Bambu Studio verifies a printer against the CAs it
+///   bundles (`resources/cert/printer.cer`: BBL CA and friends), so a relay can
+///   never be trusted by chain, only by being pinned explicitly. A pin against
+///   an identity that changes on every restart would be worse than none.
 #[cfg(feature = "relay")]
 pub fn emulated_printer_server_config(
     serial: &str,
+    store: Option<&std::path::Path>,
 ) -> Result<Arc<rustls::ServerConfig>, ServerTlsError> {
     // rcgen will cheerfully issue a certificate with an empty name, and the
     // topics would be `device//report`. Nothing downstream would notice.
@@ -76,27 +82,108 @@ pub fn emulated_printer_server_config(
     if serial.len() > 512 {
         return Err(ServerTlsError::SerialTooLong(serial.len()));
     }
-    // `localhost` alongside the serial so a hostname-checking client works
-    // against a relay on the same machine. A client reaching us over the LAN
-    // connects by IP, which we can't know here — but it can't be verifying
-    // anyway, for the reason above.
-    let mut params = rcgen::CertificateParams::new(vec![serial.to_string(), "localhost".into()])?;
-    params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, serial);
-    let signing_key = rcgen::KeyPair::generate()?;
-    let cert = params.self_signed(&signing_key)?;
-
-    let chain = vec![rustls_pki_types::CertificateDer::from(cert.der().to_vec())];
-    let key = rustls_pki_types::PrivateKeyDer::Pkcs8(rustls_pki_types::PrivatePkcs8KeyDer::from(
-        signing_key.serialize_der(),
-    ));
+    let (cert_der, key_der) = emulated_printer_identity(serial, store)?;
+    let chain = vec![cert_der];
+    let key = rustls_pki_types::PrivateKeyDer::Pkcs8(key_der);
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
         .with_no_client_auth()
         .with_single_cert(chain, key)?;
     Ok(Arc::new(config))
+}
+
+/// Where the certificate a client pins is kept, and the key that goes with it.
+///
+/// Two files rather than one: a client has to *read* the certificate to trust
+/// it, and the key must never be readable the same way.
+#[cfg(feature = "relay")]
+fn cert_pem_path(dir: &std::path::Path, serial: &str) -> std::path::PathBuf {
+    dir.join(format!("{serial}.cert.pem"))
+}
+
+#[cfg(feature = "relay")]
+fn cert_der_path(dir: &std::path::Path, serial: &str) -> std::path::PathBuf {
+    dir.join(format!("{serial}.cert.der"))
+}
+
+#[cfg(feature = "relay")]
+fn key_path(dir: &std::path::Path, serial: &str) -> std::path::PathBuf {
+    dir.join(format!("{serial}.key.der"))
+}
+
+/// The emulated printer's certificate and private key, reused if `store` has
+/// them and freshly made (and kept) if not.
+///
+/// The certificate is written twice on purpose: the DER is what gets loaded back
+/// on the next start, and the PEM beside it is what a human points a client at.
+/// Converting between them at read time would need a PEM parser to satisfy a
+/// path that runs once per process.
+#[cfg(feature = "relay")]
+pub fn emulated_printer_identity(
+    serial: &str,
+    store: Option<&std::path::Path>,
+) -> Result<
+    (
+        rustls_pki_types::CertificateDer<'static>,
+        rustls_pki_types::PrivatePkcs8KeyDer<'static>,
+    ),
+    ServerTlsError,
+> {
+    if let Some(dir) = store {
+        let (cert, key) = (cert_der_path(dir, serial), key_path(dir, serial));
+        // Both or neither: a half-written pair would fail the key/chain check
+        // inside rustls with nothing pointing at the cause.
+        if cert.is_file() && key.is_file() {
+            return Ok((
+                rustls_pki_types::CertificateDer::from(std::fs::read(cert)?),
+                rustls_pki_types::PrivatePkcs8KeyDer::from(std::fs::read(key)?),
+            ));
+        }
+    }
+
+    // `localhost` alongside the serial so a hostname-checking client works
+    // against a relay on the same machine. A client reaching us over the LAN
+    // connects by IP, which we can't know here.
+    let mut params = rcgen::CertificateParams::new(vec![serial.to_string(), "localhost".into()])?;
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, serial);
+    // rcgen's defaults are 1975 to 4096, which no real certificate looks like
+    // and which a client sanity-checking validity could reasonably refuse. The
+    // printer's own is a plain ten years; match that shape.
+    params.not_before = rcgen::date_time_ymd(2024, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2034, 1, 1);
+    let signing_key = rcgen::KeyPair::generate()?;
+    let cert = params.self_signed(&signing_key)?;
+
+    if let Some(dir) = store {
+        std::fs::create_dir_all(dir)?;
+        write_private(&key_path(dir, serial), &signing_key.serialize_der())?;
+        std::fs::write(cert_der_path(dir, serial), cert.der())?;
+        std::fs::write(cert_pem_path(dir, serial), cert.pem())?;
+    }
+    Ok((
+        rustls_pki_types::CertificateDer::from(cert.der().to_vec()),
+        rustls_pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der()),
+    ))
+}
+
+/// Write a private key so only its owner can read it.
+///
+/// The mode goes on at creation rather than afterwards: a chmod after the fact
+/// leaves the key world-readable for the moment in between.
+#[cfg(feature = "relay")]
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    opts.open(path)?.write_all(bytes)
 }
 
 #[derive(Debug)]
@@ -157,7 +244,7 @@ mod tests {
         let serial = "0309FA123456789";
         // `with_single_cert` validates that the key matches the chain, so a
         // config coming back at all means the pair is coherent.
-        assert!(emulated_printer_server_config(serial).is_ok());
+        assert!(emulated_printer_server_config(serial, None).is_ok());
 
         // The serial reaches the certificate: it is the CN and a SAN, and a
         // serial that can't be encoded should fail loudly rather than yield a
@@ -170,9 +257,73 @@ mod tests {
 
         // An empty serial has no name to put in the certificate; rcgen rejects
         // it rather than us shipping an anonymous one.
-        assert!(emulated_printer_server_config("").is_err());
+        assert!(emulated_printer_server_config("", None).is_err());
         // And one too long to fit in an MQTT topic is refused here, where there
         // is still someone to tell, rather than silently truncated on the wire.
-        assert!(emulated_printer_server_config(&"S".repeat(1024)).is_err());
+        assert!(emulated_printer_server_config(&"S".repeat(1024), None).is_err());
+    }
+
+    #[cfg(feature = "relay")]
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("bambu-tls-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[cfg(feature = "relay")]
+    #[test]
+    fn a_stored_identity_survives_a_restart() {
+        // The whole point: a client that has been told to trust this printer
+        // pins the certificate, and a relay that reinvented itself on every
+        // start would break that pin every time it came back.
+        let dir = scratch("stable");
+        let serial = "0309FA123456789";
+        let first = emulated_printer_identity(serial, Some(&dir)).unwrap();
+        let again = emulated_printer_identity(serial, Some(&dir)).unwrap();
+        assert_eq!(
+            first.0, again.0,
+            "a restart must present the certificate the client already trusts"
+        );
+
+        // Without somewhere to keep it, the old behaviour stands: ephemeral, and
+        // no private key left in the filesystem for a feature nobody asked for.
+        let a = emulated_printer_identity(serial, None).unwrap();
+        let b = emulated_printer_identity(serial, None).unwrap();
+        assert_ne!(
+            a.0, b.0,
+            "with no store there is nothing to be stable about"
+        );
+    }
+
+    #[cfg(feature = "relay")]
+    #[test]
+    fn two_printers_do_not_share_one_identity() {
+        let dir = scratch("distinct");
+        let one = emulated_printer_identity("0309FAAAAAAAAAA", Some(&dir)).unwrap();
+        let two = emulated_printer_identity("0309FBBBBBBBBBB", Some(&dir)).unwrap();
+        assert_ne!(one.0, two.0);
+    }
+
+    #[cfg(all(feature = "relay", unix))]
+    #[test]
+    fn the_private_key_is_not_left_readable_to_everyone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("perms");
+        let serial = "0309FA123456789";
+        emulated_printer_identity(serial, Some(&dir)).unwrap();
+        let mode = std::fs::metadata(key_path(&dir, serial))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the key is a key, not a public file");
+        // The certificate is the opposite: a client has to be able to read it to
+        // trust it, and it is public by nature.
+        let cert_mode = std::fs::metadata(cert_pem_path(&dir, serial))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(cert_mode, 0o644);
     }
 }

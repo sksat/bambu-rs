@@ -453,7 +453,11 @@ async fn start_emulator(
     } else {
         printer
     };
-    let tls = crate::tls::emulated_printer_server_config(&target.serial)?;
+    // Kept on disk, not made afresh: Bambu Studio verifies a printer against the
+    // CAs it bundles, so a relay can only ever be trusted by being pinned — and a
+    // pin is worthless against an identity that changes every restart.
+    let cert_dir = crate::config::default_emulate_cert_dir();
+    let tls = crate::tls::emulated_printer_server_config(&target.serial, cert_dir.as_deref())?;
     // The tuple form, not "{host}:{port}": formatting an IPv6 host makes `::1`
     // into the unparseable `::1:8883`, and the loopback notice below explicitly
     // recognises `::1` as a host someone may pass.
@@ -540,6 +544,15 @@ async fn start_emulator(
          with the printer's own serial and access code",
         target.serial
     );
+    if let Some(dir) = &cert_dir {
+        // Named because a client that checks certificates cannot be talked round
+        // any other way: it has to be handed this file.
+        eprintln!(
+            "emulate: TLS identity {} (stable across restarts; a client that \
+             verifies certificates must be pointed at it)",
+            dir.join(format!("{}.cert.pem", target.serial)).display()
+        );
+    }
     if opts.ftp_port.is_none() {
         eprintln!(
             "emulate: no FTP relay, so a client can watch and control this printer but \

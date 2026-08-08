@@ -121,7 +121,7 @@ notalawyer-clap = { version = "0.3", optional = true }
 # already be skipping verification (see src/tls.rs). `ring` matches the crate's
 # one TLS stack; no `pem`, because the cert is generated per run and handed to
 # rustls as DER without ever being written down.
-rcgen = { version = "0.14.8", default-features = false, features = ["ring"], optional = true }
+rcgen = { version = "0.14.8", default-features = false, features = ["ring", "pem"], optional = true }
 rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls"] }
 rust-embed = { version = "8.11.0", optional = true }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "logging", "tls12"] }

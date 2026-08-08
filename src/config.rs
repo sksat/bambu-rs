@@ -234,6 +234,15 @@ pub fn default_config_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/bambu-rs/config.toml"))
 }
 
+/// Where the emulated printer keeps its TLS identity, beside the config.
+///
+/// It has to outlive the process: a client that trusts this relay does so by
+/// pinning the certificate, and regenerating one per run would break that pin on
+/// every restart.
+pub fn default_emulate_cert_dir() -> Option<PathBuf> {
+    default_config_path().and_then(|p| p.parent().map(|dir| dir.join("emulate")))
+}
+
 /// Where a real printer listens. A relay may be somewhere else.
 pub const DEFAULT_MQTT_PORT: u16 = 8883;
 /// Implicit FTPS, per the printer.

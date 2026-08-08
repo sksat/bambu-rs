@@ -951,7 +951,7 @@ mod tests {
     async fn start(relay: Arc<FtpRelay>) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let tls = crate::tls::emulated_printer_server_config(SERIAL).unwrap();
+        let tls = crate::tls::emulated_printer_server_config(SERIAL, None).unwrap();
         tokio::spawn(relay.serve(listener, tls));
         addr
     }
@@ -1291,7 +1291,7 @@ mod tests {
         let files = FakeFiles::new();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let tls = crate::tls::emulated_printer_server_config(SERIAL).unwrap();
+        let tls = crate::tls::emulated_printer_server_config(SERIAL, None).unwrap();
         tokio::spawn(
             FtpRelay::new(CODE, Arc::clone(&files) as Arc<dyn PrinterFiles>).serve(listener, tls),
         );

@@ -674,7 +674,7 @@ mod tests {
         let emulator = Emulator::with_tuning(printer, upstream as Arc<dyn Upstream>, tuning);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let tls = crate::tls::emulated_printer_server_config(SERIAL).unwrap();
+        let tls = crate::tls::emulated_printer_server_config(SERIAL, None).unwrap();
         tokio::spawn(Arc::clone(&emulator).pump());
         tokio::spawn(Arc::clone(&emulator).serve(listener, tls));
         (emulator, addr)
@@ -1039,7 +1039,7 @@ mod tests {
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let tls = crate::tls::emulated_printer_server_config(SERIAL).unwrap();
+        let tls = crate::tls::emulated_printer_server_config(SERIAL, None).unwrap();
         tokio::spawn(Arc::clone(&emulator).pump());
         tokio::spawn(Arc::clone(&emulator).serve(listener, tls));
 
