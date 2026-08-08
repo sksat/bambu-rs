@@ -26,8 +26,13 @@ pub mod timelapse;
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::collections::BTreeMap;
+
 use crate::config::ResolvedTarget;
-pub use api::{AppState, FakeSource, PrinterSource};
+pub use api::{
+    FakeSource, PrinterSource, PrinterState, ServerState, is_safe_printer_id, printer_id,
+    printer_id_key,
+};
 pub use camera::{CameraSource, ExternalCamera, LiveCamera, NoCamera};
 pub use control::{Controller, FakeController, LiveController};
 #[cfg(feature = "relay")]
@@ -87,8 +92,23 @@ pub struct EmulateOpts {
     pub read_only: bool,
 }
 
+/// A printer to serve, under the profile name it is configured as.
+///
+/// `Debug` redacts through `ResolvedTarget`'s own impl, which never prints the
+/// access code.
+#[derive(Debug)]
+pub struct ServeTarget {
+    pub name: String,
+    pub target: ResolvedTarget,
+}
+
 /// Run the server (blocking; owns its own multi-thread runtime).
-pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<()> {
+///
+/// `targets` is every printer to serve; the first is the default — the one that
+/// also answers on the unprefixed `/api/...` paths. An empty list (or `--fake`)
+/// serves a single fake printer, which is what the dashboard's E2E suite runs
+/// against.
+pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -106,79 +126,150 @@ pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<
     // There is nothing to relay to. Better to say so than to stand up a listener
     // that answers every read with an empty snapshot.
     #[cfg(feature = "relay")]
-    if emulate.is_some() && (fake || target.is_none()) {
+    if emulate.is_some() && (fake || targets.is_empty()) {
         anyhow::bail!(
             "--emulate relays a real printer; it has nothing to serve with --fake or without a \
              configured printer"
         );
     }
-    let external_cameras = Arc::new(std::sync::RwLock::new(external_cameras));
-    rt.block_on(async move {
-        // Live mode bridges the real MQTT monitor (and controls the real device);
-        // otherwise serve a ramping fake so the UI still has moving data.
-        let state = match target {
-            Some(t) if !fake => {
-                eprintln!("connecting to the printer over LAN…");
-                // With emulation on, the dashboard reads off the same link the
-                // relay uses: standing up a second connection here is exactly
-                // the contention --emulate exists to remove.
-                #[cfg(not(feature = "relay"))]
-                let source: Arc<dyn PrinterSource> =
-                    Arc::new(LiveSource::connect(t.clone(), interval));
-                #[cfg(feature = "relay")]
-                let source: Arc<dyn PrinterSource> = match &emulate {
-                    Some(em) => {
-                        // Both subscribers first, then connect: the connection's
-                        // opening `pushall` is the seed for every cached view,
-                        // and a broadcast with no receivers throws it away.
-                        let link = relay::LivePrinterLink::new();
-                        let source = Arc::new(LiveSource::from_reports(link.subscribe()));
-                        start_emulator(&t, em, Arc::clone(&link)).await?;
-                        // The relay answers clients' `pushall`s from its cache
-                        // rather than forwarding them, so nothing else would
-                        // ever refresh it: seeded once at connect and then fed
-                        // only deltas, which are QoS 0 and therefore lossy. One
-                        // lost delta would leave the cache subtly wrong for the
-                        // rest of the print. A poll bounds that, and the printer
-                        // sees one client's worth of it however many are
-                        // watching.
-                        let interval = interval.or(Some(EMULATE_REFRESH));
-                        Arc::clone(&link).connect(t.clone(), interval);
-                        source
-                    }
-                    None => Arc::new(LiveSource::connect(t.clone(), interval)),
-                };
-                AppState {
-                    source,
-                    controller: Arc::new(LiveController::new(t.clone())),
-                    files: Arc::new(LiveFiles::new(t.clone())),
-                    starter: Arc::new(LiveStarter::new(t.clone())),
-                    password,
-                    start_lock: Arc::new(tokio::sync::Mutex::new(())),
-                    external_cameras: external_cameras.clone(),
-                    internal_camera: Arc::new(LiveCamera::new(t)),
-                    timelapse: Default::default(),
-                }
+    // One emulated printer per host, not per port: a client looks for a printer
+    // at `IP:8883` and cannot generally be told otherwise, and the emulator
+    // ships no SSDP responder, so two of them need two addresses on this
+    // machine — not two ports.
+    #[cfg(feature = "relay")]
+    if emulate.is_some() && targets.len() > 1 {
+        anyhow::bail!(
+            "--emulate serves one printer; run a second `bambu serve --printer <name> --emulate` \
+             bound to another address on this host (--emulate-host)"
+        );
+    }
+    // Two profiles for the same machine would open two MQTT clients to it, and
+    // on an A1 those mutually disconnect — leaving BOTH feeds unreliable, which
+    // looks like a flaky printer rather than a configuration mistake.
+    //
+    // Checked on the address as well as the serial: the broker is per-address,
+    // so two profiles that agree on the IP are the same machine even when one
+    // of their serials is a typo — which is exactly the case a serial-only
+    // check would wave through.
+    /// What makes two profiles the same machine, and what to call it.
+    type SameMachine = (&'static str, fn(&ServeTarget) -> &str);
+    let keys: [SameMachine; 2] = [
+        ("serial", |t| t.target.serial.as_str()),
+        ("address", |t| t.target.ip.as_str()),
+    ];
+    for (what, key) in keys {
+        let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
+        for t in &targets {
+            if let Some(first) = seen.insert(key(t), &t.name) {
+                anyhow::bail!(
+                    "profiles {first:?} and {:?} are the same printer (same {what} {}); serving \
+                     both would open two connections to it, which on an A1 disconnects them both",
+                    t.name,
+                    key(t),
+                );
             }
-            _ => {
-                if !fake {
-                    eprintln!(
-                        "note: no printer configured; serving fake data (pass --fake to silence)"
-                    );
-                }
-                let tick = interval.unwrap_or(Duration::from_secs(1));
-                AppState {
+        }
+    }
+    // Two names that sanitise to the same identifier would share a route and a
+    // capture directory. Refuse rather than pick a winner — and compare them
+    // the way a case-insensitive filesystem would, since this crate ships macOS
+    // and Windows builds where `captures/A1` and `captures/a1` are one
+    // directory.
+    let mut by_id: BTreeMap<String, (String, String)> = BTreeMap::new();
+    for t in &targets {
+        let id = printer_id(&t.name);
+        if let Some((first, first_id)) =
+            by_id.insert(printer_id_key(&id), (t.name.clone(), id.clone()))
+        {
+            anyhow::bail!(
+                "profiles {first:?} and {:?} are addressed as {first_id:?} and {id:?}, which name \
+                 the same capture directory on a case-insensitive filesystem; rename one",
+                t.name
+            );
+        }
+    }
+    rt.block_on(async move {
+        // Seeded from flags that name no printer, so they belong to the default
+        // one; the rest start empty and gain cameras at runtime through
+        // `/api/printers/<name>/camera/config`.
+        let mut seed_cameras = Some(external_cameras);
+        let mut printers = BTreeMap::new();
+        let mut default = String::new();
+        if targets.is_empty() || fake {
+            if !fake {
+                eprintln!(
+                    "note: no printer configured; serving fake data (pass --fake to silence)"
+                );
+            }
+            let tick = interval.unwrap_or(Duration::from_secs(1));
+            let name = targets
+                .first()
+                .map_or_else(|| "fake".to_string(), |t| t.name.clone());
+            let id = printer_id(&name);
+            default = id.clone();
+            printers.insert(
+                id.clone(),
+                PrinterState {
+                    name,
+                    id,
+                    model: None,
+                    legacy_captures: true,
                     source: Arc::new(FakeSource::ramping(tick)),
                     controller: Arc::new(FakeController::verified()),
                     files: Arc::new(FakeFiles),
                     starter: Arc::new(FakeStarter),
-                    password,
+                    password: password.clone(),
                     start_lock: Arc::new(tokio::sync::Mutex::new(())),
-                    external_cameras,
+                    external_cameras: Arc::new(std::sync::RwLock::new(
+                        seed_cameras.take().unwrap_or_default(),
+                    )),
                     internal_camera: Arc::new(NoCamera),
                     timelapse: Default::default(),
+                },
+            );
+        } else {
+            eprintln!("connecting to the printer over LAN…");
+            for (i, ServeTarget { name, target: t }) in targets.into_iter().enumerate() {
+                let id = printer_id(&name);
+                if i == 0 {
+                    default = id.clone();
                 }
+                // The seeded cameras come from flags that name no printer, so
+                // they go to the default one; the rest start empty and are
+                // added at runtime through `/api/printers/<name>/camera/config`.
+                let cams = seed_cameras.take().unwrap_or_default();
+                let source = connect_source(
+                    &t,
+                    interval,
+                    #[cfg(feature = "relay")]
+                    &emulate,
+                )
+                .await?;
+                printers.insert(
+                    id.clone(),
+                    PrinterState {
+                        model: Some(t.model.to_string()),
+                        // The default printer inherits the runs recorded before
+                        // captures were namespaced; they were all its own.
+                        legacy_captures: i == 0,
+                        name,
+                        id,
+                        source,
+                        controller: Arc::new(LiveController::new(t.clone())),
+                        files: Arc::new(LiveFiles::new(t.clone())),
+                        starter: Arc::new(LiveStarter::new(t.clone())),
+                        password: password.clone(),
+                        start_lock: Arc::new(tokio::sync::Mutex::new(())),
+                        external_cameras: Arc::new(std::sync::RwLock::new(cams)),
+                        internal_camera: Arc::new(LiveCamera::new(t)),
+                        timelapse: Default::default(),
+                    },
+                );
             }
+        }
+        let state = ServerState {
+            printers: Arc::new(printers),
+            default,
         };
         let addr = format!("{host}:{port}");
         let listener = tokio::net::TcpListener::bind(&addr)
@@ -186,7 +277,7 @@ pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<
             .map_err(|e| anyhow::anyhow!("binding {addr}: {e}"))?;
         let loopback = host.starts_with("127.") || host == "localhost" || host == "::1";
         if !loopback {
-            match &state.password {
+            match &password {
                 Some(_) => eprintln!(
                     "warning: serving on non-loopback {addr}; control requires the password, \
                      reads are open."
@@ -202,6 +293,43 @@ pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<
             .await
             .map_err(|e| anyhow::anyhow!("serving: {e}"))
     })
+}
+
+/// Open this printer's status feed.
+///
+/// With emulation on, the dashboard reads off the same link the relay uses:
+/// standing up a second connection here is exactly the contention `--emulate`
+/// exists to remove.
+async fn connect_source(
+    t: &ResolvedTarget,
+    interval: Option<Duration>,
+    #[cfg(feature = "relay")] emulate: &Option<EmulateOpts>,
+) -> anyhow::Result<Arc<dyn PrinterSource>> {
+    #[cfg(not(feature = "relay"))]
+    {
+        Ok(Arc::new(LiveSource::connect(t.clone(), interval)))
+    }
+    #[cfg(feature = "relay")]
+    match emulate {
+        None => Ok(Arc::new(LiveSource::connect(t.clone(), interval))),
+        Some(em) => {
+            // Both subscribers first, then connect: the connection's opening
+            // `pushall` is the seed for every cached view, and a broadcast with
+            // no receivers throws it away.
+            let link = relay::LivePrinterLink::new();
+            let source = Arc::new(LiveSource::from_reports(link.subscribe()));
+            start_emulator(t, em, Arc::clone(&link)).await?;
+            // The relay answers clients' `pushall`s from its cache rather than
+            // forwarding them, so nothing else would ever refresh it: seeded
+            // once at connect and then fed only deltas, which are QoS 0 and
+            // therefore lossy. One lost delta would leave the cache subtly
+            // wrong for the rest of the print. A poll bounds that, and the
+            // printer sees one client's worth of it however many are watching.
+            let interval = interval.or(Some(EMULATE_REFRESH));
+            Arc::clone(&link).connect(t.clone(), interval);
+            Ok(source)
+        }
+    }
 }
 
 /// Render `host:port` for a human, bracketing an IPv6 literal.

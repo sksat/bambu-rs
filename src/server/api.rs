@@ -9,6 +9,7 @@
 //! real printer: tests and `--fake` use [`FakeSource`]/[`FakeController`]; live
 //! mode uses [`super::LiveSource`]/[`super::control::LiveController`].
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -254,9 +255,133 @@ impl PrinterSource for FakeSource {
     }
 }
 
-/// Shared server state.
+/// Everything the server knows, across every printer it serves.
+///
+/// Only the printer map is here; each printer's own machinery lives in its
+/// [`PrinterState`]. The split is what makes two printers independent: a
+/// `job/start` on one no longer takes a lock the other is waiting on, and a
+/// timelapse on one no longer occupies the only slot.
 #[derive(Clone)]
-pub struct AppState {
+pub struct ServerState {
+    /// Configured printers by name. Ordered so `/api/printers` is stable.
+    pub printers: Arc<BTreeMap<String, PrinterState>>,
+    /// The [`PrinterState::id`] of the one that also answers on the unprefixed
+    /// `/api/...` paths.
+    pub default: String,
+}
+
+/// Safe to use as **both** one URL path segment and one directory name.
+///
+/// An identifier is trusted by two parsers at once, and their failure modes are
+/// unrelated: `..` and `/tmp/x` escape the captures directory, while `{name}`
+/// and `*` are axum route *syntax* — a printer identified as `{name}` would
+/// quietly capture every mistyped printer URL, and other spellings make router
+/// construction panic. Hence an allow-list.
+pub fn is_safe_printer_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && !s.starts_with('.')
+        && !s.ends_with('.')
+        && !is_windows_device_name(s)
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Whether Windows reserves this as a device rather than a name.
+///
+/// `CON`, `NUL`, `COM1` and friends cannot be directories on Windows — and the
+/// reservation applies to the stem, so `CON.txt` is taken too. This crate ships
+/// a Windows build, so a profile innocently named `con` would otherwise pass
+/// every check here and then fail to create `captures/con` on every timelapse,
+/// with nothing pointing at the name as the cause.
+fn is_windows_device_name(s: &str) -> bool {
+    const RESERVED: [&str; 6] = ["CON", "PRN", "AUX", "NUL", "COM", "LPT"];
+    let stem = s.split('.').next().unwrap_or(s).to_ascii_uppercase();
+    RESERVED.contains(&stem.as_str())
+        || (stem.len() == 4
+            && matches!(&stem[..3], "COM" | "LPT")
+            && stem.as_bytes()[3].is_ascii_digit()
+            && stem.as_bytes()[3] != b'0')
+}
+
+/// The identifier a printer is addressed by, derived from its profile name.
+///
+/// Profile names have always been free-form — `config add` stores whatever you
+/// type, and `"Shop A"` is a perfectly reasonable thing to have typed. Those
+/// configs predate this file caring about the name at all, so requiring them to
+/// be renamed would break `bambu serve` for setups that worked yesterday.
+/// Instead the name stays whatever it is and the *identifier* is derived:
+/// ordinary names pass through unchanged, so there is nothing to learn unless
+/// you used something exotic, and `/api/printers` reports both.
+///
+/// The result is safe because it is **checked**, not because the trimming below
+/// happens to be in the right order. Trimming only leading dots first let
+/// `"-.."` come out as `".."` — still a traversal, and one an enumerated test
+/// missed. A predicate applied to the answer cannot miss a spelling nobody
+/// thought of.
+pub fn printer_id(name: &str) -> String {
+    let mapped: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // Both ends, both characters: a leading dot hides the directory (and `..`
+    // escapes it), and a trailing dot is silently dropped by Windows, which
+    // would make two ids name one directory.
+    let trim = |s: &str| s.trim_matches(|c| c == '-' || c == '.').to_string();
+    // Pure ASCII by construction, so truncating bytes cannot split a character.
+    let mut id = trim(&mapped);
+    id.truncate(64);
+    let id = trim(&id);
+    if is_safe_printer_id(&id) {
+        return id;
+    }
+    // A device name is otherwise a perfectly good identifier; an underscore
+    // takes it out of Windows' reserved set while keeping it recognisable, and
+    // keeps two such names distinct instead of collapsing both to the fallback.
+    // Only for that reason, though — appending to whatever else failed turns
+    // `".."` into `"_"`, which is safe but tells the operator nothing.
+    if is_windows_device_name(&id) {
+        let escaped = format!("{id}_");
+        if is_safe_printer_id(&escaped) {
+            return escaped;
+        }
+    }
+    // Nothing usable survived. Callers reject collisions, so falling back
+    // cannot silently merge two printers.
+    "printer".to_string()
+}
+
+/// The key two identifiers must not share.
+///
+/// Case-folded because this crate ships macOS and Windows builds, where
+/// `captures/A1` and `captures/a1` are one directory: distinct routes, mixed
+/// recordings. Comparing ids byte-for-byte would let that through.
+pub fn printer_id_key(id: &str) -> String {
+    id.to_ascii_lowercase()
+}
+
+/// One printer's share of the server.
+#[derive(Clone)]
+pub struct PrinterState {
+    /// Profile name, as configured — free-form, shown to people.
+    pub name: String,
+    /// What this printer is addressed by: its route segment and its capture
+    /// directory. Equal to `name` unless the name needed sanitising (see
+    /// [`printer_id`]). The status report carries no identity of its own, so
+    /// with two printers this is the only way to tell whose reading you have.
+    pub id: String,
+    /// Canonical model name, when known.
+    pub model: Option<String>,
+    /// Whether the runs recorded before captures were namespaced belong to this
+    /// printer. True for exactly one — otherwise every printer would list, and
+    /// serve, the same legacy footage as if it were its own.
+    pub legacy_captures: bool,
     pub source: Arc<dyn PrinterSource>,
     pub controller: Arc<dyn Controller>,
     pub files: Arc<dyn FileStore>,
@@ -291,10 +416,14 @@ fn is_safe_remote_path(p: &str) -> bool {
         && !p.contains(':')
 }
 
-impl AppState {
+impl PrinterState {
     #[cfg(test)]
     pub fn fake() -> Self {
         Self {
+            name: "fake".to_string(),
+            id: "fake".to_string(),
+            model: None,
+            legacy_captures: true,
             source: Arc::new(FakeSource::idle()),
             controller: Arc::new(FakeController::verified()),
             files: Arc::new(FakeFiles),
@@ -308,73 +437,130 @@ impl AppState {
     }
 }
 
-/// Build the API router: open reads, password-gated writes, and — when the
-/// `dashboard` feature is on — the embedded SPA as the fallback.
-pub fn router(state: AppState) -> Router {
+/// One printer's API, with every path built under `prefix`.
+///
+/// A prefix rather than a path parameter: the printer set is fixed when the
+/// server starts, so each one gets its own literal routes. That keeps every
+/// handler's extractors exactly as they were — a `{name}` segment would hand
+/// the nested handlers a second `Path` component and force all of them to be
+/// rewritten — and it leaves the `/api/{*rest}` catch-all below still able to
+/// tell a typo'd endpoint from a real one.
+fn printer_routes(prefix: &str, state: PrinterState) -> Router {
+    let p = |s: &str| format!("{prefix}{s}");
+
     let reads = Router::new()
-        .route("/api/status", get(status))
-        .route("/api/ws", get(status_ws))
-        .route("/api/file", get(list_files))
-        .route("/api/file/thumbnail", get(file_thumbnail))
-        .route("/api/file/raw", get(file_raw))
-        .route("/api/file/gcode", get(file_gcode))
-        .route("/api/file/inspect", get(file_inspect))
-        .route("/api/file/mesh", get(file_mesh))
-        .route("/api/camera", get(cameras_list))
-        .route("/api/camera/{id}/snapshot", get(camera_snapshot))
-        .route("/api/camera/{id}/stream", get(camera_stream))
-        .route("/api/camera/{id}/park", get(park_index))
-        .route("/api/camera/{id}/park/{n}", get(camera_park_frame))
-        .route("/api/timelapse", get(timelapse_status))
-        .route("/api/capture", get(captures_list))
-        .route("/api/capture/{run}/{cam}/video.mp4", get(capture_video))
-        .route("/api/capture/{run}/{cam}/thumb.jpg", get(capture_thumb));
+        .route(&p("/status"), get(status))
+        .route(&p("/ws"), get(status_ws))
+        .route(&p("/file"), get(list_files))
+        .route(&p("/file/thumbnail"), get(file_thumbnail))
+        .route(&p("/file/raw"), get(file_raw))
+        .route(&p("/file/gcode"), get(file_gcode))
+        .route(&p("/file/inspect"), get(file_inspect))
+        .route(&p("/file/mesh"), get(file_mesh))
+        .route(&p("/camera"), get(cameras_list))
+        .route(&p("/camera/{id}/snapshot"), get(camera_snapshot))
+        .route(&p("/camera/{id}/stream"), get(camera_stream))
+        .route(&p("/camera/{id}/park"), get(park_index))
+        .route(&p("/camera/{id}/park/{n}"), get(camera_park_frame))
+        .route(&p("/timelapse"), get(timelapse_status))
+        .route(&p("/capture"), get(captures_list))
+        .route(&p("/capture/{run}/{cam}/video.mp4"), get(capture_video))
+        .route(&p("/capture/{run}/{cam}/thumb.jpg"), get(capture_thumb));
     let writes = Router::new()
-        .route("/api/job/pause", post(job_pause))
-        .route("/api/job/resume", post(job_resume))
-        .route("/api/job/stop", post(job_stop))
-        .route("/api/job/clear-error", post(job_clear_error))
-        .route("/api/job/start", post(job_start))
-        .route("/api/light", post(light))
-        .route("/api/speed", post(speed))
-        .route("/api/gcode", post(gcode))
-        .route("/api/home", post(home))
-        .route("/api/move", post(move_axis))
-        .route("/api/extrude", post(extrude))
-        .route("/api/temp", post(temp))
-        .route("/api/calibrate", post(calibrate))
-        .route("/api/ams", post(ams))
-        .route("/api/ams/change", post(ams_change))
-        .route("/api/reboot", post(reboot))
-        .route("/api/steppers", post(steppers))
+        .route(&p("/job/pause"), post(job_pause))
+        .route(&p("/job/resume"), post(job_resume))
+        .route(&p("/job/stop"), post(job_stop))
+        .route(&p("/job/clear-error"), post(job_clear_error))
+        .route(&p("/job/start"), post(job_start))
+        .route(&p("/light"), post(light))
+        .route(&p("/speed"), post(speed))
+        .route(&p("/gcode"), post(gcode))
+        .route(&p("/home"), post(home))
+        .route(&p("/move"), post(move_axis))
+        .route(&p("/extrude"), post(extrude))
+        .route(&p("/temp"), post(temp))
+        .route(&p("/calibrate"), post(calibrate))
+        .route(&p("/ams"), post(ams))
+        .route(&p("/ams/change"), post(ams_change))
+        .route(&p("/reboot"), post(reboot))
+        .route(&p("/steppers"), post(steppers))
         .route(
-            "/api/camera/config",
+            &p("/camera/config"),
             get(cameras_config_get).post(cameras_config_set),
         )
-        .route("/api/timelapse/start", post(timelapse_start))
-        .route("/api/timelapse/stop", post(timelapse_stop))
+        .route(&p("/timelapse/start"), post(timelapse_start))
+        .route(&p("/timelapse/stop"), post(timelapse_stop))
         // Uploads stream to a temp file, so the cap bounds disk, not memory.
         .route(
-            "/api/file/upload",
+            &p("/file/upload"),
             post(upload_file).layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
         )
         .route(
-            "/api/job/upload-start",
+            &p("/job/upload-start"),
             post(job_upload_start).layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_password,
         ));
-    // Unknown `/api/*` paths 404 as JSON (a typo'd endpoint shouldn't fall through to the
-    // SPA and get HTML 200). Specific routes above are more specific than this catch-all,
-    // so they still win; only unmatched API paths land here.
-    let app = reads
-        .merge(writes)
+    reads.merge(writes).with_state(state)
+}
+
+/// Build the whole API: every configured printer, plus the default one mounted
+/// unprefixed so existing callers keep working.
+pub fn router(server: ServerState) -> Router {
+    let default = server
+        .printers
+        .get(&server.default)
+        .expect("the default printer is one of the configured ones")
+        .clone();
+    // The unprefixed mount is permanent, not a deprecation: one printer and no
+    // prefix stays the common case, and every script, skill and `--via-serve`
+    // call already written targets it.
+    let mut app = printer_routes("/api", default);
+    for (name, st) in server.printers.iter() {
+        app = app.merge(printer_routes(&format!("/api/printers/{name}"), st.clone()));
+    }
+    let app = app
+        .merge(
+            Router::new()
+                .route("/api/printers", get(printers_list))
+                .with_state(server),
+        )
+        // Unknown `/api/*` paths 404 as JSON (a typo'd endpoint shouldn't fall through to the
+        // SPA and get HTML 200). Specific routes above are more specific than this catch-all,
+        // so they still win; only unmatched API paths land here.
         .route("/api/{*rest}", any(api_not_found));
     #[cfg(feature = "dashboard")]
     let app = app.fallback(static_handler);
-    app.with_state(state)
+    app
+}
+
+/// The printers this server serves, in configured order, each with its current
+/// status.
+///
+/// The status is included rather than left to N follow-up requests because an
+/// overview of every machine is the whole reason to run one server for several:
+/// asking per printer would make the common view cost a round trip per printer
+/// and show them at different instants. Each reading is the source's cached
+/// latest, so this costs no printer traffic at all.
+///
+/// `default` marks the one the unprefixed `/api/...` paths reach.
+async fn printers_list(State(st): State<ServerState>) -> Response {
+    let list = st
+        .printers
+        .values()
+        .map(|p| {
+            json!({
+                "name": p.name,
+                "id": p.id,
+                "model": p.model,
+                "default": p.id == st.default,
+                "status": p.source.current(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(json!({ "printers": list, "default": st.default })).into_response()
 }
 
 /// 404 for an unmatched `/api/*` path — JSON, not the SPA fallback's HTML.
@@ -386,7 +572,7 @@ async fn api_not_found() -> Response {
         .into_response()
 }
 
-async fn status(State(st): State<AppState>) -> Json<PrinterStatus> {
+async fn status(State(st): State<PrinterState>) -> Json<PrinterStatus> {
     Json(st.source.current())
 }
 
@@ -411,23 +597,26 @@ struct SpeedBody {
     level: String,
 }
 
-async fn job_pause(State(st): State<AppState>, body: Option<Json<ConfirmBody>>) -> Response {
+async fn job_pause(State(st): State<PrinterState>, body: Option<Json<ConfirmBody>>) -> Response {
     run_confirmed(st, ControlAction::Pause, body).await
 }
-async fn job_resume(State(st): State<AppState>, body: Option<Json<ConfirmBody>>) -> Response {
+async fn job_resume(State(st): State<PrinterState>, body: Option<Json<ConfirmBody>>) -> Response {
     run_confirmed(st, ControlAction::Resume, body).await
 }
-async fn job_stop(State(st): State<AppState>, body: Option<Json<ConfirmBody>>) -> Response {
+async fn job_stop(State(st): State<PrinterState>, body: Option<Json<ConfirmBody>>) -> Response {
     run_confirmed(st, ControlAction::Stop, body).await
 }
 /// Dismiss a print error (`clean_print_error`) — narrow: it only acknowledges
 /// the error popup (the way Studio clears one), it does not stop/resume the job.
 /// Gated by confirm like the other job controls.
-async fn job_clear_error(State(st): State<AppState>, body: Option<Json<ConfirmBody>>) -> Response {
+async fn job_clear_error(
+    State(st): State<PrinterState>,
+    body: Option<Json<ConfirmBody>>,
+) -> Response {
     run_confirmed(st, ControlAction::ClearError, body).await
 }
 
-async fn light(State(st): State<AppState>, Json(b): Json<LightBody>) -> Response {
+async fn light(State(st): State<PrinterState>, Json(b): Json<LightBody>) -> Response {
     let node = match b.node.as_str() {
         "chamber" => LedNode::ChamberLight,
         "work" => LedNode::WorkLight,
@@ -436,7 +625,7 @@ async fn light(State(st): State<AppState>, Json(b): Json<LightBody>) -> Response
     execute(st, ControlAction::Light { node, on: b.on }).await
 }
 
-async fn speed(State(st): State<AppState>, Json(b): Json<SpeedBody>) -> Response {
+async fn speed(State(st): State<PrinterState>, Json(b): Json<SpeedBody>) -> Response {
     let level = match b.level.as_str() {
         "silent" => SpeedLevel::Silent,
         "standard" => SpeedLevel::Standard,
@@ -459,7 +648,7 @@ struct GcodeBody {
 
 /// Send a raw gcode line. Mirrors the CLI `gcode`: requires confirm (428), and
 /// the safety blocklist refuses dangerous lines (400) unless `force`.
-async fn gcode(State(st): State<AppState>, Json(b): Json<GcodeBody>) -> Response {
+async fn gcode(State(st): State<PrinterState>, Json(b): Json<GcodeBody>) -> Response {
     if b.line.trim().is_empty() {
         return bad_request("empty gcode line".to_string());
     }
@@ -480,7 +669,7 @@ async fn gcode(State(st): State<AppState>, Json(b): Json<GcodeBody>) -> Response
 
 /// Require `{"confirm": true}` before running a destructive action (428 if not).
 async fn run_confirmed(
-    st: AppState,
+    st: PrinterState,
     action: ControlAction,
     body: Option<Json<ConfirmBody>>,
 ) -> Response {
@@ -495,7 +684,7 @@ async fn run_confirmed(
 }
 
 /// Run a control action on the blocking pool and map the verify outcome to HTTP.
-async fn execute(st: AppState, action: ControlAction) -> Response {
+async fn execute(st: PrinterState, action: ControlAction) -> Response {
     let controller = st.controller.clone();
     let res = tokio::task::spawn_blocking(move || controller.execute(action)).await;
     verify_response(res)
@@ -537,7 +726,7 @@ fn bad_request(msg: String) -> Response {
 /// Refuse a control action while the printer is busy (409). The predicate
 /// mirrors `job_start`'s idle guard exactly: any of RUNNING/PAUSE/PREPARE/SLICING
 /// (case-insensitive) is "busy". `None` ⇒ idle, run the action.
-fn require_idle(st: &AppState) -> Option<Response> {
+fn require_idle(st: &PrinterState) -> Option<Response> {
     let state = st
         .source
         .current()
@@ -584,7 +773,7 @@ fn default_axes() -> String {
 }
 
 /// Home one or all axes (`G28`). Idle-gated (no confirm).
-async fn home(State(st): State<AppState>, Json(b): Json<HomeBody>) -> Response {
+async fn home(State(st): State<PrinterState>, Json(b): Json<HomeBody>) -> Response {
     let axes = match b.axes.as_str() {
         "all" => HomeAxes::All,
         "x" => HomeAxes::X,
@@ -612,7 +801,7 @@ fn default_move_feedrate() -> u32 {
 
 /// Jog a single axis a relative distance (`G91; G1; G90`). Idle-gated, no
 /// confirm; the distance and feedrate are bounds-checked.
-async fn move_axis(State(st): State<AppState>, Json(b): Json<MoveBody>) -> Response {
+async fn move_axis(State(st): State<PrinterState>, Json(b): Json<MoveBody>) -> Response {
     let axis = match b.axis.as_str() {
         "x" => Axis::X,
         "y" => Axis::Y,
@@ -653,7 +842,7 @@ fn default_extrude_feedrate() -> u32 {
 /// Extrude or retract filament (`M83; G1 E; M82`). Idle-gated, no confirm. The
 /// cold-extrusion guard reads the live nozzle temperature and has **no** force
 /// bypass.
-async fn extrude(State(st): State<AppState>, Json(b): Json<ExtrudeBody>) -> Response {
+async fn extrude(State(st): State<PrinterState>, Json(b): Json<ExtrudeBody>) -> Response {
     let nozzle_temper = st.source.current().nozzle_temper;
     if let GcodeVerdict::Block(reason) = check_extrude(b.delta, nozzle_temper) {
         return bad_request(reason);
@@ -689,7 +878,7 @@ struct TempBody {
 /// 0`) is the abort valve and is always allowed without confirm. A non-zero
 /// setpoint needs confirm (428) and must clear the safety ceiling (400) unless
 /// `force` overrides it, exactly like `/api/gcode`.
-async fn temp(State(st): State<AppState>, Json(b): Json<TempBody>) -> Response {
+async fn temp(State(st): State<PrinterState>, Json(b): Json<TempBody>) -> Response {
     let part = match b.part.as_str() {
         "nozzle" => TempPart::Nozzle,
         "bed" => TempPart::Bed,
@@ -733,7 +922,7 @@ struct CalibrateBody {
 
 /// Run one or more calibrations. Requires at least one flag (400), confirm
 /// (428), and an idle printer (409).
-async fn calibrate(State(st): State<AppState>, Json(b): Json<CalibrateBody>) -> Response {
+async fn calibrate(State(st): State<PrinterState>, Json(b): Json<CalibrateBody>) -> Response {
     if !(b.bed_level || b.vibration || b.motor_noise) {
         return bad_request(
             "select at least one calibration (bed_level/vibration/motor_noise)".to_string(),
@@ -765,7 +954,7 @@ struct AmsBody {
 
 /// AMS control. `resume` clears a pause and is allowed any time (no confirm,
 /// no idle gate); `reset`/`pause` are destructive — confirm (428) + idle (409).
-async fn ams(State(st): State<AppState>, Json(b): Json<AmsBody>) -> Response {
+async fn ams(State(st): State<PrinterState>, Json(b): Json<AmsBody>) -> Response {
     let action = match b.action.as_str() {
         "resume" => AmsControl::Resume,
         "reset" => AmsControl::Reset,
@@ -804,7 +993,7 @@ struct AmsChangeBody {
 /// clamped to the safe ceiling (no force bypass — an AMS change should never
 /// command an unsafe temp), `dry_run` previews the resolved command without
 /// sending, and a real send needs confirm (428) + idle (409).
-async fn ams_change(State(st): State<AppState>, Json(b): Json<AmsChangeBody>) -> Response {
+async fn ams_change(State(st): State<PrinterState>, Json(b): Json<AmsChangeBody>) -> Response {
     // Only meaningful targets: AMS trays, the external spool, or unload.
     if !matches!(b.target, 0..=3 | 254 | 255) {
         return bad_request(format!(
@@ -849,7 +1038,7 @@ async fn ams_change(State(st): State<AppState>, Json(b): Json<AmsChangeBody>) ->
 
 /// Reboot the printer (`system.reboot`). Confirm (428) + idle (409). Fire-and-
 /// forget — there's no ACK to read back, so a success is 202 (Unverified).
-async fn reboot(State(st): State<AppState>, body: Option<Json<ConfirmBody>>) -> Response {
+async fn reboot(State(st): State<PrinterState>, body: Option<Json<ConfirmBody>>) -> Response {
     if let Some(unconfirmed) = need_confirm(body.map(|b| b.confirm).unwrap_or(false)) {
         return unconfirmed;
     }
@@ -860,7 +1049,7 @@ async fn reboot(State(st): State<AppState>, body: Option<Json<ConfirmBody>>) -> 
 }
 
 /// Disable the stepper motors (`M84`). Confirm (428) + idle (409).
-async fn steppers(State(st): State<AppState>, body: Option<Json<ConfirmBody>>) -> Response {
+async fn steppers(State(st): State<PrinterState>, body: Option<Json<ConfirmBody>>) -> Response {
     if let Some(unconfirmed) = need_confirm(body.map(|b| b.confirm).unwrap_or(false)) {
         return unconfirmed;
     }
@@ -899,7 +1088,7 @@ fn default_plate() -> u32 {
 /// Start a print. Safety mirrors the CLI: file/AMS-map validation, a `dry_run`
 /// that returns the resolved plan without sending, a `confirm` gate (428), and
 /// an idle check against the live status (409 if the printer is busy).
-async fn job_start(State(st): State<AppState>, Json(b): Json<StartBody>) -> Response {
+async fn job_start(State(st): State<PrinterState>, Json(b): Json<StartBody>) -> Response {
     let lower = b.file.to_ascii_lowercase();
     // Must be an absolute on-printer path — a relative one like `host/x.3mf`
     // would become `ftp://host/x.3mf` and escape the printer's namespace.
@@ -1023,7 +1212,7 @@ struct ListQuery {
 }
 
 /// List files on the printer (open read). `?dir=` defaults to `/`.
-async fn list_files(State(st): State<AppState>, Query(q): Query<ListQuery>) -> Response {
+async fn list_files(State(st): State<PrinterState>, Query(q): Query<ListQuery>) -> Response {
     let dir = q.dir.unwrap_or_else(|| "/".to_string());
     let files = st.files.clone();
     match tokio::task::spawn_blocking(move || files.list(&dir)).await {
@@ -1045,7 +1234,7 @@ struct ThumbQuery {
 }
 
 /// Serve the embedded plate preview PNG for a `.3mf` (open read). 404 if absent.
-async fn file_thumbnail(State(st): State<AppState>, Query(q): Query<ThumbQuery>) -> Response {
+async fn file_thumbnail(State(st): State<PrinterState>, Query(q): Query<ThumbQuery>) -> Response {
     let remote = if q.name.starts_with('/') {
         q.name.clone()
     } else {
@@ -1080,7 +1269,7 @@ struct RawQuery {
 
 /// Serve a `.3mf`/`.gcode`'s raw bytes for the 3D viewer (open read). Restricted
 /// to those extensions at a safe path; size-capped in [`FileStore::fetch`].
-async fn file_raw(State(st): State<AppState>, Query(q): Query<RawQuery>) -> Response {
+async fn file_raw(State(st): State<PrinterState>, Query(q): Query<RawQuery>) -> Response {
     let remote = if q.name.starts_with('/') {
         q.name.clone()
     } else {
@@ -1116,7 +1305,7 @@ struct GcodeFileQuery {
 /// Why a dedicated endpoint instead of `raw`: three's `3MFLoader` doesn't follow
 /// Bambu's external-component mesh refs (`3D/Objects/*.model`), so a sliced
 /// `.gcode.3mf` renders empty. The embedded gcode toolpath always renders.
-async fn file_gcode(State(st): State<AppState>, Query(q): Query<GcodeFileQuery>) -> Response {
+async fn file_gcode(State(st): State<PrinterState>, Query(q): Query<GcodeFileQuery>) -> Response {
     let remote = if q.name.starts_with('/') {
         q.name.clone()
     } else {
@@ -1155,7 +1344,7 @@ struct InspectQuery {
 /// the moment it opens — without a write-gated dry-run. Best-effort: a non-3mf or
 /// unreadable file returns `{ "inspected": false, ... }` rather than an error status, so
 /// the dialog degrades to "unknown" cleanly.
-async fn file_inspect(State(st): State<AppState>, Query(q): Query<InspectQuery>) -> Response {
+async fn file_inspect(State(st): State<PrinterState>, Query(q): Query<InspectQuery>) -> Response {
     let remote = if q.name.starts_with('/') {
         q.name.clone()
     } else {
@@ -1199,7 +1388,7 @@ struct MeshQuery {
 /// for the 3D viewer's solid-mesh render (open read). The viewer parses the mesh
 /// XML itself because three's `3MFLoader` won't follow Bambu's external-component
 /// refs. Empty `models` when the file embeds no mesh.
-async fn file_mesh(State(st): State<AppState>, Query(q): Query<MeshQuery>) -> Response {
+async fn file_mesh(State(st): State<PrinterState>, Query(q): Query<MeshQuery>) -> Response {
     let remote = if q.name.starts_with('/') {
         q.name.clone()
     } else {
@@ -1232,7 +1421,7 @@ const CAMERA_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// List the available cameras (open read) as `{id, kind, label}`. URLs are never
 /// exposed here — only the proxied snapshot is reachable, by id.
-async fn cameras_list(State(st): State<AppState>) -> Json<serde_json::Value> {
+async fn cameras_list(State(st): State<PrinterState>) -> Json<serde_json::Value> {
     let mut cameras = Vec::new();
     if st.internal_camera.configured() {
         cameras.push(json!({ "id": "internal", "kind": "internal", "label": "built-in camera" }));
@@ -1262,7 +1451,7 @@ async fn cameras_list(State(st): State<AppState>) -> Json<serde_json::Value> {
 /// Proxy a single JPEG for one camera by id (open read). `internal` grabs the
 /// built-in cam over TCP:6000; `ext-{i}` proxies that external camera's URL. 404
 /// for an unknown id / unconfigured source; 502 when the grab fails.
-async fn camera_snapshot(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+async fn camera_snapshot(State(st): State<PrinterState>, Path(id): Path<String>) -> Response {
     if id == "internal" {
         if !st.internal_camera.configured() {
             return StatusCode::NOT_FOUND.into_response();
@@ -1323,7 +1512,7 @@ fn resolve_stream_url(id: &str, externals: &[ExternalCamera]) -> Option<String> 
 /// is relayed chunk-by-chunk through a bounded channel, so a fast camera can't
 /// outrun a slow client into unbounded memory (the reader blocks when the channel
 /// is full; a dropped receiver — client gone — ends it). 502 if the connect fails.
-async fn camera_stream(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+async fn camera_stream(State(st): State<PrinterState>, Path(id): Path<String>) -> Response {
     let Some(url) = resolve_stream_url(&id, &st.external_cameras.read().unwrap()) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -1414,7 +1603,7 @@ fn parse_parks_index(contents: &str) -> Vec<serde_json::Value> {
 /// The source dir for the live park preview: the `park` run if one owns it, else the
 /// `smooth` run (its live per-layer selection publishes the same `park_*.jpg`/`parks.jsonl`
 /// into its dir). Returns `(out_dir, cameras, running)`.
-fn live_park_source(st: &AppState) -> Option<(String, Vec<String>, bool)> {
+fn live_park_source(st: &PrinterState) -> Option<(String, Vec<String>, bool)> {
     // The park preview reads `latest_park.jpg`/`parks.jsonl`, which three slots can produce:
     // `segment` (the dense-stream robust path), `park` (the image-change miner), and a
     // `smooth` run with live selection. Prefer a RUNNING one (so the preview follows the
@@ -1451,7 +1640,7 @@ fn run_dir_epoch(dir: &str) -> u64 {
         .unwrap_or(0)
 }
 
-async fn park_index(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+async fn park_index(State(st): State<PrinterState>, Path(id): Path<String>) -> Response {
     let Some((dir, cameras, running)) = live_park_source(&st) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -1470,7 +1659,7 @@ async fn park_index(State(st): State<AppState>, Path(id): Path<String>) -> Respo
 /// camera (open read). Same gating and lifetime as the [`park_index`] it belongs to. `n`
 /// is numeric, so it can't traverse; an index with no file (out of range / pruned) 404s.
 async fn camera_park_frame(
-    State(st): State<AppState>,
+    State(st): State<PrinterState>,
     Path((id, n)): Path<(String, u64)>,
 ) -> Response {
     let Some((dir, cameras, _)) = live_park_source(&st) else {
@@ -1516,7 +1705,7 @@ fn tuning_json(c: &ExternalCamera) -> serde_json::Value {
 }
 
 /// Serialise the external list (with URLs) for the gated config endpoints.
-fn external_json(st: &AppState) -> Vec<serde_json::Value> {
+fn external_json(st: &PrinterState) -> Vec<serde_json::Value> {
     st.external_cameras
         .read()
         .unwrap()
@@ -1532,7 +1721,7 @@ fn external_json(st: &AppState) -> Vec<serde_json::Value> {
 /// Current external-camera config (gated read) — includes URLs so the dashboard's
 /// manage form can prefill. The built-in camera isn't configurable, so it's not
 /// listed here.
-async fn cameras_config_get(State(st): State<AppState>) -> Json<serde_json::Value> {
+async fn cameras_config_get(State(st): State<PrinterState>) -> Json<serde_json::Value> {
     Json(json!({ "external": external_json(&st) }))
 }
 
@@ -1569,7 +1758,7 @@ struct CamerasConfigBody {
 /// list is in-memory only — it resets on restart; `--camera-url` is the persistent
 /// path. The built-in camera is untouched.
 async fn cameras_config_set(
-    State(st): State<AppState>,
+    State(st): State<PrinterState>,
     Json(b): Json<CamerasConfigBody>,
 ) -> Response {
     let mut next = Vec::with_capacity(b.external.len());
@@ -1694,7 +1883,7 @@ struct TimelapseStopBody {
 /// Combined status for both runs: a back-compat flat view mirroring the smooth
 /// run (so older single-run readers keep working), plus nested `smooth`/`plain`.
 /// Top-level `running` is true if *either* run is active.
-fn timelapse_status_json(st: &AppState) -> serde_json::Value {
+fn timelapse_status_json(st: &PrinterState) -> serde_json::Value {
     let smooth = st.timelapse.status_smooth();
     let plain = st.timelapse.status_plain();
     let park = st.timelapse.status_park();
@@ -1715,7 +1904,7 @@ fn timelapse_status_json(st: &AppState) -> serde_json::Value {
 
 /// Resolve a camera id to a blocking frame-grabber + a stable label, captured at
 /// start so a later `/api/camera/config` edit can't repoint a running capture.
-fn resolve_grab(st: &AppState, camera: &str) -> Option<(String, FrameGrab)> {
+fn resolve_grab(st: &PrinterState, camera: &str) -> Option<(String, FrameGrab)> {
     if camera == "internal" {
         if !st.internal_camera.configured() {
             return None;
@@ -1754,13 +1943,37 @@ fn sanitize_hint(s: &str) -> String {
 
 /// The root all capture runs are written under (relative to the serve's CWD). One place,
 /// so the listing endpoint and the writers agree.
-fn captures_root() -> std::path::PathBuf {
+///
+/// Namespaced by printer: two machines recording at the same second would
+/// otherwise write into the same run directory, and each one's dashboard would
+/// list the other's footage.
+fn captures_root(st: &PrinterState) -> std::path::PathBuf {
+    debug_assert!(is_safe_printer_id(&st.id), "ids are safe by construction");
+    std::path::PathBuf::from("captures").join(&st.id)
+}
+
+/// Locate one run: this printer's namespace first, then the pre-namespacing
+/// root, so a run recorded before the split is still playable.
+fn capture_run_dir(st: &PrinterState, run: &str) -> std::path::PathBuf {
+    let dir = captures_root(st).join(run);
+    if dir.is_dir() || !st.legacy_captures {
+        return dir;
+    }
+    legacy_captures_root().join(run)
+}
+
+/// Where runs were written before captures were namespaced by printer.
+///
+/// Still *listed* for the default printer, so a server that has been recording
+/// for months doesn't appear to have lost everything the day it learns about a
+/// second machine. Nothing new is ever written here.
+fn legacy_captures_root() -> std::path::PathBuf {
     std::path::PathBuf::from("captures")
 }
 
 /// `captures/<epoch>_<print-hint>_<mode>/` — the per-run output dir (per-mode so a
 /// concurrent smooth/plain/park run never mixes frames).
-fn run_out_dir(st: &AppState, mode: &str) -> std::path::PathBuf {
+fn run_out_dir(st: &PrinterState, mode: &str) -> std::path::PathBuf {
     let epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1772,16 +1985,26 @@ fn run_out_dir(st: &AppState, mode: &str) -> std::path::PathBuf {
             .as_deref()
             .unwrap_or("print"),
     );
-    captures_root().join(format!("{epoch}_{hint}_{mode}"))
+    captures_root(st).join(format!("{epoch}_{hint}_{mode}"))
 }
 
 /// List finished/in-progress capture runs on disk (open read): each run's recordings, so
 /// the dashboard can review and download them. Reads `captures/` lazily off the blocking
 /// pool. An absent root → an empty list, never an error.
-async fn captures_list(State(_st): State<AppState>) -> Response {
-    let runs = tokio::task::spawn_blocking(|| crate::captures::list_captures(&captures_root()))
-        .await
-        .unwrap_or_default();
+async fn captures_list(State(st): State<PrinterState>) -> Response {
+    let root = captures_root(&st);
+    let legacy = st.legacy_captures;
+    let runs = tokio::task::spawn_blocking(move || {
+        let mut runs = crate::captures::list_captures(&root);
+        // Pre-namespacing runs live directly under `captures/` and belong to one
+        // printer, not to all of them.
+        if legacy {
+            runs.extend(crate::captures::list_captures(&legacy_captures_root()));
+        }
+        runs
+    })
+    .await
+    .unwrap_or_default();
     Json(json!({ "captures": runs })).into_response()
 }
 
@@ -1811,7 +2034,7 @@ fn default_fps() -> u32 {
 /// `run`/`cam` are validated as plain dir segments (no traversal); a missing `cam` subdir
 /// maps back to the run dir (old single-dir layout). 404 when there's nothing to serve.
 async fn capture_video(
-    State(st): State<AppState>,
+    State(st): State<PrinterState>,
     Path((run, cam)): Path<(String, String)>,
     Query(q): Query<CaptureVideoQuery>,
 ) -> Response {
@@ -1831,7 +2054,7 @@ async fn capture_video(
                 .get(i)
                 .and_then(|c| c.select_tuning)
         });
-    let run_dir = captures_root().join(&run);
+    let run_dir = capture_run_dir(&st, &run);
     let sub = run_dir.join(&cam);
     let cam_dir = if sub.is_dir() { sub } else { run_dir };
     let path = tokio::task::spawn_blocking(move || -> Result<std::path::PathBuf, String> {
@@ -1912,11 +2135,14 @@ async fn capture_video(
 /// Park/Smooth serves its last frame straight off disk (no transcode); a Video extracts a
 /// poster with ffmpeg, cached as `thumb.jpg`. Path-safe like [`capture_video`]; 404 when
 /// there's nothing to show (incl. ffmpeg missing for a Video).
-async fn capture_thumb(Path((run, cam)): Path<(String, String)>) -> Response {
+async fn capture_thumb(
+    State(st): State<PrinterState>,
+    Path((run, cam)): Path<(String, String)>,
+) -> Response {
     if !is_safe_segment(&run) || !is_safe_segment(&cam) {
         return bad_request("invalid capture path".to_string());
     }
-    let run_dir = captures_root().join(&run);
+    let run_dir = capture_run_dir(&st, &run);
     let sub = run_dir.join(&cam);
     let cam_dir = if sub.is_dir() { sub } else { run_dir };
     let path = tokio::task::spawn_blocking(move || -> Result<std::path::PathBuf, String> {
@@ -1975,7 +2201,7 @@ async fn capture_thumb(Path((run, cam)): Path<(String, String)>) -> Response {
 /// none qualify. Each emits `<out>/<id>/latest_park.jpg` per layer, served (open) by
 /// `/api/camera/{id}/park`.
 fn start_park_run(
-    st: &AppState,
+    st: &PrinterState,
     ids: &[String],
     out_dir: std::path::PathBuf,
     rx: watch::Receiver<PrinterStatus>,
@@ -2029,7 +2255,7 @@ fn start_park_run(
 /// none qualify. Output is the same `latest_park.jpg`/`parks.jsonl` layout `park` produces,
 /// served by `/api/camera/{id}/park`.
 fn start_segment_run(
-    st: &AppState,
+    st: &PrinterState,
     ids: &[String],
     window_ms: u64,
     out_dir: std::path::PathBuf,
@@ -2083,7 +2309,7 @@ fn start_segment_run(
 /// 409 if one is already running; 404 for an unknown/unconfigured camera. Frames
 /// land in `./captures/<epoch>_<print-hint>/`.
 async fn timelapse_start(
-    State(st): State<AppState>,
+    State(st): State<PrinterState>,
     Json(b): Json<TimelapseStartBody>,
 ) -> Response {
     // Validate the mode's cadence up front (before resolving cameras), so a bad
@@ -2228,7 +2454,7 @@ async fn timelapse_start(
 /// 400 rather than a silent "all" — a typo must not abort a run the caller meant to keep
 /// going (the slots are independently controlled).
 async fn timelapse_stop(
-    State(st): State<AppState>,
+    State(st): State<PrinterState>,
     body: Option<Json<TimelapseStopBody>>,
 ) -> Response {
     let mode = body
@@ -2263,7 +2489,7 @@ async fn timelapse_stop(
 }
 
 /// Current capture status (open read).
-async fn timelapse_status(State(st): State<AppState>) -> Json<serde_json::Value> {
+async fn timelapse_status(State(st): State<PrinterState>) -> Json<serde_json::Value> {
     Json(timelapse_status_json(&st))
 }
 
@@ -2277,7 +2503,7 @@ struct UploadQuery {
 /// file (not buffered in memory), then handed to the FTPS upload. `?name=` is the
 /// filename and `?dir=` the destination (default `/`).
 async fn upload_file(
-    State(st): State<AppState>,
+    State(st): State<PrinterState>,
     Query(q): Query<UploadQuery>,
     body: Body,
 ) -> Response {
@@ -2364,7 +2590,7 @@ struct UploadStartQuery {
 /// (confirm, idle, the held `start_lock`); the command is built by the shared
 /// `core::start` builder, with the md5 stamped in so the printer verifies the file.
 async fn job_upload_start(
-    State(st): State<AppState>,
+    State(st): State<PrinterState>,
     Query(q): Query<UploadStartQuery>,
     body: Body,
 ) -> Response {
@@ -2519,7 +2745,7 @@ async fn job_upload_start(
 
 /// Upgrade to a WebSocket that pushes a `PrinterStatus` JSON frame on connect and
 /// on every subsequent change.
-async fn status_ws(State(st): State<AppState>, ws: WebSocketUpgrade) -> Response {
+async fn status_ws(State(st): State<PrinterState>, ws: WebSocketUpgrade) -> Response {
     eprintln!("ws: client upgrade accepted");
     ws.on_upgrade(move |socket| async move {
         stream_status(socket, st.source.clone()).await;
@@ -2548,7 +2774,7 @@ async fn stream_status(mut socket: WebSocket, source: Arc<dyn PrinterSource>) {
 /// Gate **write** requests on the optional password. `None` ⇒ control is open
 /// (the default). When set, the password must arrive as `Authorization: Bearer
 /// <password>`. Reads never reach this middleware.
-async fn require_password(State(st): State<AppState>, req: Request, next: Next) -> Response {
+async fn require_password(State(st): State<PrinterState>, req: Request, next: Next) -> Response {
     let Some(pw) = st.password.as_deref() else {
         return next.run(req).await; // no password configured: control is open
     };
@@ -2586,9 +2812,24 @@ mod tests {
     use crate::core::session::VerifyStage;
     use axum_test::TestServer;
 
+    /// Serve one printer as the whole server. It is the default, so the
+    /// unprefixed `/api/...` paths these tests use reach it — which is also the
+    /// back-compat guarantee the router makes to everything already written.
+    fn one(state: PrinterState) -> Router {
+        let id = state.id.clone();
+        router(ServerState {
+            printers: Arc::new(BTreeMap::from([(id.clone(), state)])),
+            default: id,
+        })
+    }
+
     /// Build a test server with a chosen password + controller (idle source).
     fn app(password: Option<&str>, controller: impl Controller + 'static) -> TestServer {
-        let state = AppState {
+        let state = PrinterState {
+            name: "test".to_string(),
+            id: "test".to_string(),
+            model: None,
+            legacy_captures: true,
             source: Arc::new(FakeSource::idle()),
             controller: Arc::new(controller),
             files: Arc::new(FakeFiles),
@@ -2599,7 +2840,256 @@ mod tests {
             internal_camera: Arc::new(NoCamera),
             timelapse: Default::default(),
         };
-        TestServer::new(router(state))
+        TestServer::new(one(state))
+    }
+
+    /// A named printer with its own everything, for the multi-printer tests.
+    fn printer(name: &str) -> PrinterState {
+        PrinterState {
+            name: name.to_string(),
+            id: name.to_string(),
+            model: None,
+            legacy_captures: false,
+            source: Arc::new(FakeSource::idle()),
+            controller: Arc::new(FakeController::verified()),
+            files: Arc::new(FakeFiles),
+            starter: Arc::new(FakeStarter),
+            password: None,
+            start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            external_cameras: Arc::new(RwLock::new(Vec::new())),
+            internal_camera: Arc::new(NoCamera),
+            timelapse: Default::default(),
+        }
+    }
+
+    /// Serve several printers; the first is the default.
+    fn serve_printers(states: Vec<PrinterState>) -> TestServer {
+        let default = states[0].id.clone();
+        let map = states
+            .into_iter()
+            .map(|s| (s.id.clone(), s))
+            .collect::<BTreeMap<_, _>>();
+        TestServer::new(router(ServerState {
+            printers: Arc::new(map),
+            default,
+        }))
+    }
+
+    // ── several printers at once ──
+    #[tokio::test]
+    async fn every_printer_answers_on_its_own_path_and_the_default_also_answers_unprefixed() {
+        let server = serve_printers(vec![printer("a1mini"), printer("x1c")]);
+        for path in [
+            "/api/status",
+            "/api/printers/a1mini/status",
+            "/api/printers/x1c/status",
+        ] {
+            server.get(path).await.assert_status_ok();
+        }
+        // The unprefixed paths are what every existing script, skill and
+        // `--via-serve` call already targets; they must keep working, and keep
+        // reaching the SAME machine they always did.
+        server
+            .get("/api/printers/nope/status")
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_printer_list_carries_each_ones_status_so_an_overview_is_one_request() {
+        let server = serve_printers(vec![printer("a1mini"), printer("x1c")]);
+        let body: serde_json::Value = server.get("/api/printers").await.json();
+        assert_eq!(body["default"], "a1mini");
+        let list = body["printers"].as_array().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0]["name"], "a1mini");
+        assert_eq!(list[0]["default"], json!(true));
+        assert_eq!(list[1]["default"], json!(false));
+        // Watching several machines is the reason to run one server for them;
+        // a status per printer here is what keeps that a single request taken
+        // at a single instant, instead of N round trips at N different ones.
+        assert!(
+            list.iter().all(|p| p["status"].is_object()),
+            "each entry carries its printer's current status: {list:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timelapse_on_one_printer_does_not_occupy_another_printers_slot() {
+        // The manager allows one run per mode, and it used to be one per SERVER
+        // — so a second printer could not record while the first was recording.
+        // Started through the manager rather than the HTTP route because every
+        // route-level rejection (cadence, unknown camera) happens BEFORE the
+        // manager is touched, and would pass just as well with one shared slot.
+        let (a, b) = (printer("a1mini"), printer("x1c"));
+        let a_tl = a.timelapse.clone();
+        assert!(
+            !Arc::ptr_eq(&a.timelapse, &b.timelapse),
+            "each printer owns its manager"
+        );
+        let server = serve_printers(vec![a, b]);
+
+        let dir = std::env::temp_dir().join(format!("bambu-mp-tl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let grab: crate::server::timelapse::FrameGrab =
+            Arc::new(|| Ok(vec![0xff, 0xd8, 0xff, 0x42]));
+        let (_tx, rx) = tokio::sync::watch::channel(PrinterStatus::default());
+        a_tl.start_plain(
+            vec![crate::server::timelapse::PlainCapture::Sample {
+                id: "ext-0".to_string(),
+                grab,
+            }],
+            50,
+            rx,
+            dir.clone(),
+        )
+        .unwrap();
+
+        let a_running = server
+            .get("/api/printers/a1mini/timelapse")
+            .await
+            .json::<serde_json::Value>()["running"]
+            .clone();
+        let b_running = server
+            .get("/api/printers/x1c/timelapse")
+            .await
+            .json::<serde_json::Value>()["running"]
+            .clone();
+        assert_eq!(a_running, json!(true), "a1mini is recording");
+        assert_eq!(
+            b_running,
+            json!(false),
+            "x1c's slot is its own and still free"
+        );
+        a_tl.stop_plain();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_print_start_in_flight_on_one_printer_does_not_block_another() {
+        // `start_lock` used to be process-wide, so starting a print on one
+        // printer answered "a print start is already in progress" for every
+        // other one.
+        let (a, b) = (printer("a1mini"), printer("x1c"));
+        let a_lock = a.start_lock.clone();
+        let server = serve_printers(vec![a, b]);
+        let body = json!({ "file": "/cache/x.gcode.3mf", "confirm": true });
+
+        // Hold a1mini's lock the way a start in flight would.
+        let held = a_lock.lock().await;
+        server
+            .post("/api/printers/a1mini/job/start")
+            .json(&body)
+            .await
+            .assert_status(StatusCode::CONFLICT);
+        server
+            .post("/api/printers/x1c/job/start")
+            .json(&body)
+            .await
+            .assert_status_ok();
+        drop(held);
+        // …and a1mini is startable again once its own start finishes.
+        server
+            .post("/api/printers/a1mini/job/start")
+            .json(&body)
+            .await
+            .assert_status_ok();
+    }
+
+    #[test]
+    fn an_ordinary_profile_name_is_its_own_identifier() {
+        // Nothing to learn in the common case: the URL says what the config says.
+        for name in ["a1mini", "x1-carbon", "shop_2", "p1s.spare", "A1"] {
+            assert_eq!(printer_id(name), name);
+        }
+    }
+
+    #[test]
+    fn a_free_form_profile_name_still_yields_a_safe_identifier() {
+        // `config add` has always stored whatever was typed, so configs like
+        // "Shop A" exist and must keep serving — sanitised, not rejected.
+        assert_eq!(printer_id("Shop A"), "Shop-A");
+        assert_eq!(printer_id("a/b"), "a-b");
+        assert_eq!(printer_id("{name}"), "name");
+        assert_eq!(printer_id(".hidden"), "hidden");
+        // Windows reserves these as devices, stem and all, so `captures/con`
+        // cannot exist there. An underscore keeps the name recognisable and
+        // keeps two such names distinct.
+        for dev in ["con", "CON", "nul", "com1", "LPT9", "aux", "con.txt"] {
+            let id = printer_id(dev);
+            assert!(is_safe_printer_id(&id), "{dev:?} -> {id:?}");
+        }
+        assert_eq!(printer_id("con"), "con_");
+        assert_eq!(printer_id("nul"), "nul_");
+        assert_ne!(printer_id("con"), printer_id("nul"), "kept distinct");
+        assert_eq!(printer_id("console"), "console", "only the exact stem");
+        assert_eq!(printer_id("com0"), "com0", "COM0 is not reserved");
+        for empty in ["..", "プリンタ", "", "-..", "..-", "---", "."] {
+            assert_eq!(printer_id(empty), "printer", "{empty:?}");
+        }
+    }
+
+    #[test]
+    fn no_profile_name_can_produce_an_unsafe_identifier() {
+        // The property, not a list of spellings: an enumerated test passed while
+        // `printer_id("-..")` returned "..", because the leading-dot trim ran
+        // before the hyphen trim and nothing checked the answer. `captures/..`
+        // then writes outside the printer's namespace.
+        let alphabet = ['-', '.', 'c', 'o', 'n', '/', '{', ' '];
+        let mut checked = 0;
+        for a in alphabet {
+            for b in alphabet {
+                for c in alphabet {
+                    for d in alphabet {
+                        let name: String = [a, b, c, d].iter().collect();
+                        let id = printer_id(&name);
+                        assert!(
+                            is_safe_printer_id(&id),
+                            "{name:?} produced an unsafe id {id:?}"
+                        );
+                        // The two shapes that actually escape or hide.
+                        assert!(!id.starts_with('.'), "{name:?} -> {id:?}");
+                        assert!(!id.ends_with('.'), "{name:?} -> {id:?} (Windows drops it)");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, alphabet.len().pow(4));
+    }
+
+    #[test]
+    fn identifiers_that_differ_only_in_case_are_treated_as_one() {
+        // This crate ships macOS and Windows builds, where `captures/A1` and
+        // `captures/a1` are the same directory: two printers' recordings would
+        // land together despite the per-printer split.
+        assert_eq!(
+            printer_id_key(&printer_id("A1")),
+            printer_id_key(&printer_id("a1"))
+        );
+        assert_ne!(printer_id_key("a1mini"), printer_id_key("x1c"));
+    }
+
+    #[test]
+    fn only_the_default_printer_inherits_the_pre_namespacing_captures() {
+        // Every printer writes under its own name; the runs from before the
+        // split belong to one of them, not to all.
+        let (mut d, other) = (printer("a1mini"), printer("x1c"));
+        d.legacy_captures = true;
+        assert_eq!(captures_root(&d), std::path::Path::new("captures/a1mini"));
+        assert_eq!(captures_root(&other), std::path::Path::new("captures/x1c"));
+        // `no-such-run` exists under neither, so this exercises the fallback
+        // branch rather than the on-disk one.
+        assert_eq!(
+            capture_run_dir(&d, "no-such-run"),
+            std::path::Path::new("captures/no-such-run"),
+            "the default printer can still play a run recorded before the split"
+        );
+        assert_eq!(
+            capture_run_dir(&other, "no-such-run"),
+            std::path::Path::new("captures/x1c/no-such-run"),
+            "another printer must never resolve into the legacy root"
+        );
     }
 
     // ── reads are always open ──
@@ -3221,7 +3711,11 @@ mod tests {
         controller: impl Controller + 'static,
     ) -> (TestServer, Arc<TimelapseManager>) {
         let tl: Arc<TimelapseManager> = Default::default();
-        let state = AppState {
+        let state = PrinterState {
+            name: "test".to_string(),
+            id: "test".to_string(),
+            model: None,
+            legacy_captures: true,
             source: Arc::new(FakeSource::idle()),
             controller: Arc::new(controller),
             files: Arc::new(FakeFiles),
@@ -3232,7 +3726,7 @@ mod tests {
             internal_camera: Arc::new(NoCamera),
             timelapse: tl.clone(),
         };
-        (TestServer::new(router(state)), tl)
+        (TestServer::new(one(state)), tl)
     }
 
     fn test_tuning() -> ParkTuning {
@@ -3378,7 +3872,11 @@ mod tests {
 
     #[tokio::test]
     async fn file_inspect_reports_timelapse_capability_open() {
-        let state = AppState {
+        let state = PrinterState {
+            name: "test".to_string(),
+            id: "test".to_string(),
+            model: None,
+            legacy_captures: true,
             source: Arc::new(FakeSource::idle()),
             controller: Arc::new(FakeController::verified()),
             files: Arc::new(OneFile(three_mf_with_timelapse(3))),
@@ -3390,7 +3888,7 @@ mod tests {
             internal_camera: Arc::new(NoCamera),
             timelapse: Default::default(),
         };
-        let server = TestServer::new(router(state));
+        let server = TestServer::new(one(state));
         let res = server
             .get("/api/file/inspect?name=/cube.gcode.3mf&plate=1")
             .await;
@@ -3418,7 +3916,11 @@ mod tests {
 
     #[tokio::test]
     async fn job_start_dry_run_reports_timelapse_block_capability() {
-        let state = AppState {
+        let state = PrinterState {
+            name: "test".to_string(),
+            id: "test".to_string(),
+            model: None,
+            legacy_captures: true,
             source: Arc::new(FakeSource::idle()),
             controller: Arc::new(FakeController::verified()),
             files: Arc::new(OneFile(three_mf_with_timelapse(3))),
@@ -3429,7 +3931,7 @@ mod tests {
             internal_camera: Arc::new(NoCamera),
             timelapse: Default::default(),
         };
-        let server = TestServer::new(router(state));
+        let server = TestServer::new(one(state));
         let res = server
             .post("/api/job/start")
             .json(&json!({ "file": "/cube.gcode.3mf", "plate": 1, "dry_run": true, "timelapse": true }))
@@ -3819,7 +4321,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_confirmed_on_idle_printer_verifies() {
-        // AppState::fake() source is IDLE, so the idle guard passes.
+        // PrinterState::fake() source is IDLE, so the idle guard passes.
         app(None, FakeController::verified())
             .post("/api/job/start")
             .json(&json!({ "file": "/coin.gcode.3mf", "confirm": true }))
@@ -3852,7 +4354,11 @@ mod tests {
     #[tokio::test]
     async fn start_on_busy_printer_is_409() {
         // A RUNNING source → idle guard refuses.
-        let state = AppState {
+        let state = PrinterState {
+            name: "test".to_string(),
+            id: "test".to_string(),
+            model: None,
+            legacy_captures: true,
             source: Arc::new(FakeSource::ramping(Duration::from_millis(50))),
             controller: Arc::new(FakeController::verified()),
             files: Arc::new(FakeFiles),
@@ -3863,7 +4369,7 @@ mod tests {
             internal_camera: Arc::new(NoCamera),
             timelapse: Default::default(),
         };
-        TestServer::new(router(state))
+        TestServer::new(one(state))
             .post("/api/job/start")
             .json(&json!({ "file": "/c.3mf", "confirm": true }))
             .await
@@ -3874,7 +4380,11 @@ mod tests {
 
     /// A test server whose source is RUNNING (busy), to exercise the idle guard.
     fn busy_app(controller: impl Controller + 'static) -> TestServer {
-        let state = AppState {
+        let state = PrinterState {
+            name: "test".to_string(),
+            id: "test".to_string(),
+            model: None,
+            legacy_captures: true,
             source: Arc::new(FakeSource::ramping(Duration::from_millis(50))),
             controller: Arc::new(controller),
             files: Arc::new(FakeFiles),
@@ -3885,7 +4395,7 @@ mod tests {
             internal_camera: Arc::new(NoCamera),
             timelapse: Default::default(),
         };
-        TestServer::new(router(state))
+        TestServer::new(one(state))
     }
 
     /// An idle source reporting a hot nozzle, so the cold-extrude guard passes.
@@ -3912,7 +4422,11 @@ mod tests {
 
     /// A test server with an idle, hot-nozzle source (for extrude success).
     fn hot_app(controller: impl Controller + 'static) -> TestServer {
-        let state = AppState {
+        let state = PrinterState {
+            name: "test".to_string(),
+            id: "test".to_string(),
+            model: None,
+            legacy_captures: true,
             source: Arc::new(HotSource::new()),
             controller: Arc::new(controller),
             files: Arc::new(FakeFiles),
@@ -3923,7 +4437,7 @@ mod tests {
             internal_camera: Arc::new(NoCamera),
             timelapse: Default::default(),
         };
-        TestServer::new(router(state))
+        TestServer::new(one(state))
     }
 
     // ── machine control: home ──
@@ -4357,13 +4871,13 @@ mod tests {
     }
 
     // WebSocket tests need the real HTTP transport (the mocked one can't upgrade).
-    fn ws_server(state: AppState) -> TestServer {
-        TestServer::builder().http_transport().build(router(state))
+    fn ws_server(state: PrinterState) -> TestServer {
+        TestServer::builder().http_transport().build(one(state))
     }
 
     #[tokio::test]
     async fn ws_is_open_and_pushes_initial_status() {
-        let mut ws = ws_server(AppState::fake())
+        let mut ws = ws_server(PrinterState::fake())
             .get_websocket("/api/ws")
             .await
             .into_websocket()
@@ -4375,7 +4889,11 @@ mod tests {
 
     #[tokio::test]
     async fn ws_streams_subsequent_updates_from_a_ramping_source() {
-        let state = AppState {
+        let state = PrinterState {
+            name: "test".to_string(),
+            id: "test".to_string(),
+            model: None,
+            legacy_captures: true,
             source: Arc::new(FakeSource::ramping(Duration::from_millis(5))),
             controller: Arc::new(FakeController::verified()),
             files: Arc::new(FakeFiles),

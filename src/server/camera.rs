@@ -1,5 +1,5 @@
 //! The built-in (printer chamber) camera seam for the server — distinct from the
-//! external IP-camera proxy, which is just a URL on [`super::AppState`]. Live mode
+//! external IP-camera proxy, which is just a URL on [`super::PrinterState`]. Live mode
 //! grabs a JPEG over TCP:6000 (see [`crate::camera`]); fake / no-target mode has
 //! no built-in camera. Abstracted as a trait so the server stays testable without
 //! a real printer.
