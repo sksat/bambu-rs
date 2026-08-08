@@ -350,6 +350,33 @@ pub struct ResolvedTarget {
     pub detect_port: u16,
 }
 
+impl ResolvedTarget {
+    /// A target on a real printer's standard ports.
+    ///
+    /// The three port fields exist for one narrow purpose — aiming a client at a
+    /// `serve --emulate` relay that had to bind elsewhere — and a real printer is
+    /// always on the defaults. Spelling them out at every call site made the
+    /// library's own README examples stop compiling, and would do so again the
+    /// next time a port joined the struct. Overriding one stays a matter of
+    /// assigning to the field afterwards.
+    pub fn new(
+        ip: impl Into<String>,
+        serial: impl Into<String>,
+        access_code: impl Into<String>,
+        model: Model,
+    ) -> Self {
+        Self {
+            ip: ip.into(),
+            serial: serial.into(),
+            access_code: access_code.into(),
+            model,
+            mqtt_port: DEFAULT_MQTT_PORT,
+            ftps_port: DEFAULT_FTPS_PORT,
+            detect_port: DEFAULT_DETECT_PORT,
+        }
+    }
+}
+
 impl std::fmt::Debug for ResolvedTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResolvedTarget")
@@ -395,6 +422,19 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_target_built_the_short_way_lands_on_a_real_printers_ports() {
+        // The point of the constructor: the ports are only ever different when
+        // aiming at a relay, so naming them at every call site is noise that
+        // also breaks source compatibility each time one is added.
+        let t = ResolvedTarget::new("192.0.2.50", "0309ABC", "12345678", Model::A1Mini);
+        assert_eq!(t.mqtt_port, DEFAULT_MQTT_PORT);
+        assert_eq!(t.ftps_port, DEFAULT_FTPS_PORT);
+        assert_eq!(t.detect_port, DEFAULT_DETECT_PORT);
+        assert_eq!(t.ip, "192.0.2.50");
+        assert_eq!(t.model, Model::A1Mini);
+    }
 
     #[test]
     fn parse_dotenv_reads_bambu_keys_only_with_quotes_and_export() {

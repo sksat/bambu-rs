@@ -251,12 +251,12 @@ use bambu_rs::core::command::{Command, ProjectFile};
 use bambu_rs::core::model::Model;
 use bambu_rs::core::session::CommandOutcome;
 
-let client = LanMqttClient::new(ResolvedTarget {
-    ip: "192.0.2.50".into(),
-    serial: "<SERIAL>".into(),
-    access_code: "<CODE>".into(),
-    model: Model::A1Mini,
-});
+let client = LanMqttClient::new(ResolvedTarget::new(
+    "192.0.2.50",
+    "<SERIAL>",
+    "<CODE>",
+    Model::A1Mini,
+));
 
 // Full calibration. `send_and_verify` confirms the routine actually started by
 // re-reading the printer's own report — not just that the publish succeeded.
