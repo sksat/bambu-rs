@@ -22,6 +22,8 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
 use super::emulate::Upstream;
+use super::ftpd::PrinterFiles;
+use crate::ftp::FileEntry;
 
 /// How many reports a subscriber may fall behind before it misses some.
 const DEPTH: usize = 64;
@@ -212,5 +214,103 @@ mod tests {
                 return;
             }
         }
+    }
+}
+
+/// The synthetic printer's file store: entirely in memory.
+///
+/// `--fake --emulate` must not point the FTP relay at a real
+/// [`LivePrinterFiles`](super::ftpd::LivePrinterFiles). The synthetic target's
+/// address is loopback on the default port — which is the relay *itself*, so
+/// one FTP operation would open relay connections into the relay until the
+/// connection cap stopped it. With a custom port it would instead reach
+/// whatever unrelated service happened to be listening.
+#[derive(Default)]
+pub struct SyntheticFiles {
+    files: Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+}
+
+impl SyntheticFiles {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn listing(&self, dir: &str) -> Vec<(String, usize)> {
+        let prefix = if dir.ends_with('/') {
+            dir.to_string()
+        } else {
+            format!("{dir}/")
+        };
+        self.files
+            .lock()
+            .expect("files lock poisoned")
+            .iter()
+            .filter_map(|(path, body)| {
+                let rest = path.strip_prefix(&prefix)?;
+                (!rest.contains('/')).then(|| (rest.to_string(), body.len()))
+            })
+            .collect()
+    }
+}
+
+impl PrinterFiles for SyntheticFiles {
+    fn list_raw(&self, dir: &str) -> Result<Vec<String>, String> {
+        Ok(self
+            .listing(dir)
+            .into_iter()
+            .map(|(name, size)| format!("-rw-rw-rw-   1 root  root  {size:>8} Jan  1 00:00 {name}"))
+            .collect())
+    }
+    fn list_names(&self, dir: &str) -> Result<Vec<String>, String> {
+        Ok(self.listing(dir).into_iter().map(|(n, _)| n).collect())
+    }
+    fn entries(&self, dir: &str) -> Result<Vec<FileEntry>, String> {
+        Ok(self
+            .listing(dir)
+            .into_iter()
+            .map(|(name, size)| FileEntry {
+                name,
+                is_dir: false,
+                size: size as u64,
+            })
+            .collect())
+    }
+    fn upload(&self, local: &std::path::Path, remote: &str) -> Result<u64, String> {
+        let body = std::fs::read(local).map_err(|e| e.to_string())?;
+        let n = body.len() as u64;
+        self.files
+            .lock()
+            .expect("files lock poisoned")
+            .insert(remote.to_string(), body);
+        Ok(n)
+    }
+    fn download(&self, remote: &str, local: &std::path::Path) -> Result<u64, String> {
+        let files = self.files.lock().expect("files lock poisoned");
+        let body = files
+            .get(remote)
+            .ok_or_else(|| format!("no such file: {remote}"))?;
+        std::fs::write(local, body).map_err(|e| e.to_string())?;
+        Ok(body.len() as u64)
+    }
+    fn delete(&self, remote: &str) -> Result<(), String> {
+        self.files
+            .lock()
+            .expect("files lock poisoned")
+            .remove(remote);
+        Ok(())
+    }
+    fn rename(&self, from: &str, to: &str) -> Result<(), String> {
+        let mut files = self.files.lock().expect("files lock poisoned");
+        let body = files
+            .remove(from)
+            .ok_or_else(|| format!("no such file: {from}"))?;
+        files.insert(to.to_string(), body);
+        Ok(())
+    }
+    fn mkdir(&self, _path: &str) -> Result<(), String> {
+        Ok(()) // directories are implied by the paths themselves
+    }
+    fn rmdir(&self, _path: &str) -> Result<(), String> {
+        Ok(())
     }
 }

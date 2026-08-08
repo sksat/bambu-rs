@@ -20,8 +20,9 @@
 //! needs no privileges — which is exactly why the client gained `--mqtt-port`.
 #![cfg(all(feature = "cli", feature = "relay"))]
 
-use std::io::Read;
+use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const SERIAL: &str = "E2ETESTSERIAL01";
@@ -31,6 +32,17 @@ const CODE: &str = "13572468";
 struct Proc {
     child: Child,
     name: &'static str,
+    /// Everything the child has said, collected by a reader thread. A pipe
+    /// nobody drains eventually blocks the writer, and the counts this test
+    /// asserts on live in here.
+    stderr: Arc<Mutex<String>>,
+}
+
+impl Proc {
+    /// What the child has printed to stderr so far.
+    fn stderr(&self) -> String {
+        self.stderr.lock().unwrap().clone()
+    }
 }
 
 impl Drop for Proc {
@@ -38,12 +50,8 @@ impl Drop for Proc {
         let _ = self.child.kill();
         let _ = self.child.wait();
         // Only interesting when something went wrong; a passing run says nothing.
-        if std::thread::panicking()
-            && let Some(mut err) = self.child.stderr.take()
-        {
-            let mut s = String::new();
-            let _ = err.read_to_string(&mut s);
-            eprintln!("--- {} stderr ---\n{s}", self.name);
+        if std::thread::panicking() {
+            eprintln!("--- {} stderr ---\n{}", self.name, self.stderr());
         }
     }
 }
@@ -64,7 +72,7 @@ fn free_port() -> u16 {
 }
 
 fn spawn(name: &'static str, args: &[&str]) -> Proc {
-    let child = bin()
+    let mut child = bin()
         .args(args)
         // A developer's real printer must not leak in and turn this into a
         // test against hardware.
@@ -83,7 +91,21 @@ fn spawn(name: &'static str, args: &[&str]) -> Proc {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap_or_else(|e| panic!("spawning {name}: {e}"));
-    Proc { child, name }
+    let collected = Arc::new(Mutex::new(String::new()));
+    if let Some(err) = child.stderr.take() {
+        let sink = Arc::clone(&collected);
+        std::thread::spawn(move || {
+            for line in BufReader::new(err).lines().map_while(Result::ok) {
+                sink.lock().unwrap().push_str(&line);
+                sink.lock().unwrap().push('\n');
+            }
+        });
+    }
+    Proc {
+        child,
+        name,
+        stderr: collected,
+    }
 }
 
 /// Wait for something to start listening, or fail the test saying what didn't.
@@ -136,7 +158,7 @@ fn several_client_processes_share_one_printer_through_the_relay() {
     let relay_http = free_port();
 
     // 1. The printer: synthetic, nothing connected to it.
-    let _printer = spawn(
+    let printer = spawn(
         "synthetic printer",
         &[
             "--serial",
@@ -222,6 +244,18 @@ fn several_client_processes_share_one_printer_through_the_relay() {
             "concurrent client {i} got no state:\n{out}"
         );
     }
+
+    // 5. The property the whole feature exists for, and the one every
+    //    assertion above would still satisfy if it broke: the *printer* saw a
+    //    single client throughout. A regression that opened one upstream
+    //    connection per downstream client would serve all five of those reads
+    //    perfectly well.
+    let seen = printer.stderr();
+    let connects = seen.matches("connected as").count();
+    assert_eq!(
+        connects, 1,
+        "the printer should have seen exactly one client (the relay), saw {connects}:\n{seen}"
+    );
 }
 
 #[test]

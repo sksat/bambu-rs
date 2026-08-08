@@ -74,6 +74,15 @@ pub struct ServeOpts {
 /// connected through the relay.
 const EMULATE_REFRESH: Duration = Duration::from_secs(20);
 
+/// The dashboard's four device-facing backends, chosen together: all live, or
+/// all fake. Named because they are only ever swapped as a set.
+type Backends = (
+    Arc<dyn Controller>,
+    Arc<dyn FileStore>,
+    Arc<dyn Starter>,
+    Arc<dyn CameraSource>,
+);
+
 /// Where the emulated printer listens, and what it will pass through.
 #[cfg(feature = "relay")]
 pub struct EmulateOpts {
@@ -247,7 +256,7 @@ pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
                 (Some(em), Some(ServeTarget { target: t, .. })) => {
                     let printer = synthetic::SyntheticPrinter::start(tick);
                     let source = Arc::new(LiveSource::from_reports(printer.subscribe()));
-                    start_emulator(t, em, printer).await?;
+                    start_emulator(t, em, printer, synthetic::SyntheticFiles::new()).await?;
                     source
                 }
                 _ => Arc::new(FakeSource::ramping(tick)),
@@ -365,7 +374,13 @@ async fn connect_source(
             // no receivers throws it away.
             let link = relay::LivePrinterLink::new();
             let source = Arc::new(LiveSource::from_reports(link.subscribe()));
-            start_emulator(t, em, Arc::clone(&link) as Arc<dyn emulate::Upstream>).await?;
+            start_emulator(
+                t,
+                em,
+                Arc::clone(&link) as Arc<dyn emulate::Upstream>,
+                Arc::new(ftpd::LivePrinterFiles::new(t.clone())),
+            )
+            .await?;
             // The relay answers clients' `pushall`s from its cache rather than
             // forwarding them, so nothing else would ever refresh it: seeded
             // once at connect and then fed only deltas, which are QoS 0 and
@@ -403,6 +418,7 @@ async fn start_emulator(
     target: &ResolvedTarget,
     opts: &EmulateOpts,
     upstream: Arc<dyn emulate::Upstream>,
+    files: Arc<dyn ftpd::PrinterFiles>,
 ) -> anyhow::Result<()> {
     use crate::core::emulate::EmulatedPrinter;
 
@@ -424,7 +440,7 @@ async fn start_emulator(
     // Both listeners bound before either is served, so a port clash on FTP
     // fails at startup rather than after MQTT has come up looking healthy.
     let ftp = match opts.ftp_port {
-        Some(port) => Some(bind_ftp_relay(target, opts, port).await?),
+        Some(port) => Some(bind_ftp_relay(target, opts, port, files).await?),
         None => None,
     };
 
@@ -485,8 +501,8 @@ async fn bind_ftp_relay(
     target: &ResolvedTarget,
     opts: &EmulateOpts,
     port: u16,
+    files: Arc<dyn ftpd::PrinterFiles>,
 ) -> anyhow::Result<(Arc<ftpd::FtpRelay>, tokio::net::TcpListener, String)> {
-    let files: Arc<dyn ftpd::PrinterFiles> = Arc::new(ftpd::LivePrinterFiles::new(target.clone()));
     let relay = if opts.read_only {
         ftpd::FtpRelay::read_only(&target.access_code, files)
     } else {

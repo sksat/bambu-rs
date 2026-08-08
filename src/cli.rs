@@ -1689,6 +1689,15 @@ fn run_serve(
     #[cfg(feature = "relay")] emulate: Option<crate::server::EmulateOpts>,
 ) -> Result<(), CliError> {
     // Live mode needs a connection target; fake mode doesn't touch the printer.
+    // Zero would reach `tokio::time::interval`, which panics on a zero period
+    // — and only the background producer would die, leaving a server up with
+    // nothing behind it. Refuse it where it can still be explained.
+    if interval == Some(0) {
+        return Err(CliError::new(
+            exit::VALIDATION,
+            "--interval must be at least 1 second",
+        ));
+    }
     // `--fake` alone needs no target — the dashboard gets a ramping fake and
     // nothing is served on the wire. `--fake --emulate` does need one, because
     // the emulated printer has to be *some* printer: the serial names its topics
