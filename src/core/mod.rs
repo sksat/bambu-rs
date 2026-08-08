@@ -5,11 +5,13 @@
 
 pub mod capability;
 pub mod command;
+pub mod emulate;
 #[cfg(test)]
 pub(crate) mod fake;
 pub mod firmware;
 pub mod hms;
 pub mod model;
+pub mod mqtt;
 pub mod park;
 pub mod project;
 pub mod report;

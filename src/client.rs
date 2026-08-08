@@ -77,15 +77,10 @@ fn unique_client_id() -> String {
     )
 }
 
-/// The report topic for a serial: `device/{serial}/report`.
-pub fn report_topic(serial: &str) -> String {
-    format!("device/{serial}/report")
-}
-
-/// The request topic for a serial: `device/{serial}/request`.
-pub fn request_topic(serial: &str) -> String {
-    format!("device/{serial}/request")
-}
+// Topic naming is a protocol fact, so it lives in `core::mqtt` (where the
+// emulator also needs it) and is re-exported here, where every caller already
+// looks for it.
+pub use crate::core::mqtt::{report_topic, request_topic};
 
 /// A one-shot LAN MQTT client.
 pub struct LanMqttClient {
