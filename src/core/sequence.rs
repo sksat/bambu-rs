@@ -16,6 +16,7 @@ use serde::Serialize;
 
 use crate::core::safety::{self, GcodeVerdict, TempLimits};
 use crate::core::session::CommandOutcome;
+use crate::core::settle::SettleOutcome;
 
 /// One line to send, with the 1-based line number it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,15 +122,30 @@ pub struct Report {
     /// the last ACK. Reading it as "done" is the mistake this doc exists to
     /// prevent.
     pub verified: usize,
-    /// Whether every step was confirmed — the one field to branch on.
+    /// Whether the run both finished **and** met whatever it was asked to
+    /// confirm — the one field to branch on. A run that was asked to wait for
+    /// the motion and didn't observe it is not `ok`, however clean its ACKs.
     pub ok: bool,
-    /// What `verified` covered. Always `"ack"` here: a G-code line has no
-    /// observable state effect (see `core::verify`), so the printer's
-    /// acknowledgement is the whole verdict and it never reports when the
-    /// motion finishes. A sequence with `G4` dwells is still moving after the
-    /// last ACK — reading `verified == total` as "done" is the mistake this
-    /// field exists to prevent.
+    /// What `verified` covered.
+    ///
+    /// `"ack"` — the printer acknowledged each line and nothing more. A G-code
+    /// line has no observable state effect (see `core::verify`), and the printer
+    /// never reports when a motion finishes, so a sequence with `G4` dwells or
+    /// long moves is still running after the last ACK. Reading `verified ==
+    /// total` as "done" is the mistake this field exists to prevent.
+    ///
+    /// `"settled"` — the run also waited for the printer's G-code queue to
+    /// drain and observed it (see `core::settle`). Only this one means the
+    /// machine has stopped moving.
     pub confirms: &'static str,
+    /// How the post-sequence wait ended, **absent** when none was asked for.
+    ///
+    /// Separate from `ok` so a caller can tell "didn't wait" from "waited and
+    /// the motion never finished", and tagged rather than boolean so the
+    /// difference between a timeout, a takeover and a refused line survives
+    /// into the JSON instead of living only in stderr.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settle: Option<SettleOutcome>,
     /// Per-step verdicts, in order. Ends at the step that stopped the run, so
     /// it is shorter than `total` unless the run finished.
     pub steps: Vec<StepReport>,
@@ -141,17 +157,30 @@ impl Report {
     /// `outcomes` is allowed to be shorter than `steps`: a run stops at the
     /// first step that isn't confirmed, and a transport drop can end it with no
     /// verdict at all.
-    pub fn new(source: impl Into<String>, steps: &[Step], outcomes: &[CommandOutcome]) -> Self {
+    ///
+    /// `settle` is `None` when the caller never asked to wait for the motion.
+    /// Anything other than [`SettleOutcome::Settled`] makes the run not `ok`,
+    /// however clean its ACKs — the machine may still be moving.
+    pub fn new(
+        source: impl Into<String>,
+        steps: &[Step],
+        outcomes: &[CommandOutcome],
+        settle: Option<SettleOutcome>,
+    ) -> Self {
         let verified = outcomes
             .iter()
             .filter(|o| **o == CommandOutcome::Verified)
             .count();
+        let drained = settle
+            .as_ref()
+            .is_some_and(|s| *s == SettleOutcome::Settled);
         Self {
             source: source.into(),
             total: steps.len(),
             verified,
-            confirms: "ack",
-            ok: verified == steps.len(),
+            confirms: if drained { "settled" } else { "ack" },
+            ok: verified == steps.len() && settle.as_ref().is_none_or(|_| drained),
+            settle,
             steps: steps
                 .iter()
                 .zip(outcomes)
@@ -252,6 +281,7 @@ G0 X-10; \\n
             "/tmp/seq.gcode",
             &steps,
             &[CommandOutcome::Verified, CommandOutcome::Verified],
+            None,
         );
         assert!(r.ok);
         assert_eq!((r.total, r.verified), (2, 2));
@@ -264,6 +294,7 @@ G0 X-10; \\n
                 "ok": true,
                 // Says what "verified" covered — an agent reading `verified == total`
                 // as "the motion finished" is the misread this guards against.
+                // No `settled` key at all: this run never asked to wait.
                 "confirms": "ack",
                 "steps": [
                     { "step": 1, "line": 1, "gcode": "G90", "outcome": "verified" },
@@ -289,6 +320,7 @@ G0 X-10; \\n
                     reason: "busy".into(),
                 },
             ],
+            None,
         );
         assert!(!r.ok);
         assert_eq!((r.total, r.verified, r.steps.len()), (3, 1, 2));
@@ -307,9 +339,100 @@ G0 X-10; \\n
         // A transport drop before the first verdict: nothing is confirmed, and
         // that must not read as a clean run.
         let steps = parse("G90\nG28\n");
-        let r = Report::new("/tmp/seq.gcode", &steps, &[]);
+        let r = Report::new("/tmp/seq.gcode", &steps, &[], None);
         assert!(!r.ok);
         assert_eq!((r.total, r.verified), (2, 0));
         assert!(r.steps.is_empty());
+    }
+
+    #[test]
+    fn a_run_that_waited_for_the_motion_says_so_instead_of_ack() {
+        let steps = parse("G90\nG28\n");
+        let all_acked = [CommandOutcome::Verified, CommandOutcome::Verified];
+        let r = Report::new(
+            "/tmp/seq.gcode",
+            &steps,
+            &all_acked,
+            Some(SettleOutcome::Settled),
+        );
+        assert!(r.ok);
+        assert_eq!(
+            r.confirms, "settled",
+            "the machine was observed to stop — the one case stronger than an ACK"
+        );
+        assert_eq!(
+            serde_json::to_value(&r).unwrap()["settle"],
+            serde_json::json!({ "outcome": "settled" })
+        );
+    }
+
+    #[test]
+    fn a_clean_run_whose_motion_never_finished_is_not_ok() {
+        // Every line acknowledged, but the wait didn't see the queue drain: the
+        // machine may still be moving, so a caller must not treat this as done.
+        // `verified == total` still holds — which is exactly why `ok` exists.
+        let steps = parse("G90\nG28\n");
+        let all_acked = [CommandOutcome::Verified, CommandOutcome::Verified];
+        let r = Report::new(
+            "/tmp/seq.gcode",
+            &steps,
+            &all_acked,
+            Some(SettleOutcome::TimedOut { after_secs: 600 }),
+        );
+        assert_eq!((r.total, r.verified), (2, 2));
+        assert!(!r.ok, "a run that was asked to settle and didn't is not ok");
+        assert_eq!(r.confirms, "ack");
+        // The reason survives into the JSON: "not ok" without it leaves an agent
+        // guessing between still-moving, taken-over, and refused.
+        assert_eq!(
+            serde_json::to_value(&r).unwrap()["settle"],
+            serde_json::json!({ "outcome": "timed_out", "after_secs": 600 })
+        );
+    }
+
+    #[test]
+    fn a_run_refused_before_its_first_line_has_no_step_verdicts_at_all() {
+        // A print found already running is caught before anything is published,
+        // so `verified == 0` with `total` intact. The distinction matters to the
+        // operator: nothing moved, so there is no half-driven machine to recover.
+        let steps = parse("G90\nG28\n");
+        let r = Report::new(
+            "/tmp/seq.gcode",
+            &steps,
+            &[],
+            Some(SettleOutcome::Interrupted {
+                reason: "a print started on the printer while waiting".into(),
+            }),
+        );
+        assert!(!r.ok);
+        assert_eq!((r.total, r.verified), (2, 0));
+        assert!(r.steps.is_empty());
+        assert_eq!(
+            serde_json::to_value(&r).unwrap()["settle"]["outcome"],
+            serde_json::json!("interrupted")
+        );
+    }
+
+    #[test]
+    fn a_wait_that_never_got_its_chance_is_not_the_same_as_no_wait() {
+        // The run stopped at step 2, so the wait never started. Reporting that
+        // as "no wait was asked for" would hide that one was.
+        let steps = parse("G90\nG28\nG0 Y150 F200\n");
+        let r = Report::new(
+            "/tmp/seq.gcode",
+            &steps,
+            &[
+                CommandOutcome::Verified,
+                CommandOutcome::Rejected {
+                    reason: "busy".into(),
+                },
+            ],
+            Some(SettleOutcome::NotReached),
+        );
+        assert!(!r.ok);
+        assert_eq!(
+            serde_json::to_value(&r).unwrap()["settle"],
+            serde_json::json!({ "outcome": "not_reached" })
+        );
     }
 }

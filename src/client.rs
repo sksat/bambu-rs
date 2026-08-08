@@ -20,6 +20,12 @@ use crate::config::ResolvedTarget;
 use crate::core::command::{Command, SequenceIds};
 use crate::core::report::{ReportState, is_full_snapshot_message};
 use crate::core::session::VerifySession;
+use crate::core::settle::{self, Settle, SettleStep};
+
+// The wait's verdict is pure data, so it lives in `core`; re-exported here
+// because callers reach it through `send_sequence`.
+pub use crate::core::settle::SettleOutcome;
+use crate::core::status::GcodeState;
 use crate::core::version::DeviceVersion;
 
 // Verify-result types live in `core` (pure, I/O-free) and are re-exported here so
@@ -56,6 +62,35 @@ pub trait StatusSource {
 pub enum WatchStep {
     Continue,
     Stop,
+}
+
+/// The result of a [`LanMqttClient::send_sequence`] run.
+pub struct SequenceRun {
+    /// One verdict per step **that got one** — short when the run stopped early.
+    pub outcomes: Vec<CommandOutcome>,
+    /// How the post-sequence wait went, or `None` if none was asked for.
+    pub settled: Option<SettleOutcome>,
+}
+
+/// The printer's current activity code from a merged report, if it has one.
+fn stg_cur(state: &ReportState) -> Option<i64> {
+    state.pointer("/print/stg_cur").and_then(Value::as_i64)
+}
+
+/// The printer's coarse job state from a merged report, if it has one.
+fn gcode_state(state: &ReportState) -> Option<GcodeState> {
+    state
+        .pointer("/print/gcode_state")
+        .and_then(Value::as_str)
+        .map(GcodeState::parse)
+}
+
+/// The printer's fault code from a merged report; `0` and absent both mean none.
+fn print_error(state: &ReportState) -> Option<i64> {
+    state
+        .pointer("/print/print_error")
+        .and_then(Value::as_i64)
+        .filter(|e| *e != 0)
 }
 
 /// A per-connection-unique MQTT client id, `bambu-rs-<pid>-<n>`.
@@ -544,51 +579,106 @@ impl LanMqttClient {
         .unwrap_or(Err(ClientError::Timeout(self.timeout)))
     }
 
+    /// Publish one command and wait for its verdict, folding every report seen
+    /// on the way into `state` so a later phase can read the printer's fields.
+    async fn publish_and_verify(
+        &self,
+        client: &AsyncClient,
+        eventloop: &mut EventLoop,
+        seq: &str,
+        cmd: &Command,
+        state: &mut ReportState,
+    ) -> Result<CommandOutcome, ClientError> {
+        client
+            .publish(
+                request_topic(&self.target.serial),
+                QoS::AtLeastOnce, // control commands go at QoS 1
+                false,
+                cmd.to_payload(seq).to_string(),
+            )
+            .await
+            .map_err(|e| ClientError::Mqtt(e.to_string()))?;
+
+        // Each step gets its own budget. A sequence's own dwells (`G4 S3`)
+        // make it minutes long, so one deadline for the whole run would
+        // abort a healthy sequence; what needs bounding is a single step
+        // going unanswered.
+        let mut session = VerifySession::new(cmd.clone(), seq);
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        loop {
+            let ev = match tokio::time::timeout_at(deadline, poll(eventloop)).await {
+                Err(_) => return Ok(session.timed_out()),
+                Ok(ev) => ev?,
+            };
+            if let Event::Incoming(Packet::Publish(p)) = ev
+                && let Ok(json) = serde_json::from_slice::<Value>(&p.payload)
+            {
+                state.apply(json.clone());
+                if let Some(outcome) = session.observe(json) {
+                    return Ok(outcome);
+                }
+            }
+        }
+    }
+
     async fn send_sequence_async<F: FnMut(usize)>(
         &self,
         commands: &[Command],
         mut before_step: F,
-    ) -> Result<Vec<CommandOutcome>, ClientError> {
+        settle: Option<Duration>,
+    ) -> Result<SequenceRun, ClientError> {
         let (client, mut eventloop) = self.connect_ready().await?;
         // connect() already used sequence id "0" for the pushall.
         let mut ids = SequenceIds::new();
         let _ = ids.next_id();
+        // Every report is merged here, so the settle phase can read the
+        // printer's fields without a second connection.
+        let mut state = ReportState::new();
+
+        // A fault the sequence *causes* is only recognisable against a baseline
+        // taken before it runs. Reading it afterwards would file the hook's own
+        // crash under "pre-existing" and let the wait proceed as if nothing had
+        // happened — so this snapshot has to precede the first line, not follow
+        // the last.
+        //
+        // It also answers "is this printer still idle?" on THIS connection. The
+        // caller's own idle check ran over a different one, minutes earlier for
+        // an upload — long enough for a print to have been started from the
+        // screen in between, and driving a plate swap into a running print is
+        // the accident this whole path exists to avoid.
+        let error_before = if settle.is_some() {
+            let seq = ids.next_id();
+            self.refresh_snapshot(&client, &mut eventloop, &seq, &mut state)
+                .await?;
+            // Stricter than the mid-sequence check: nothing has been published
+            // yet, so "not known to be idle" is reason enough to stop.
+            if let Some(why) = settle::blocks_start(gcode_state(&state)) {
+                return Ok(SequenceRun {
+                    outcomes: Vec::new(),
+                    settled: Some(SettleOutcome::Interrupted {
+                        reason: why.to_string(),
+                    }),
+                });
+            }
+            print_error(&state)
+        } else {
+            None
+        };
 
         let mut outcomes = Vec::with_capacity(commands.len());
+        // A job that starts *during* the sequence is the same accident found one
+        // step later: the remaining lines would go to a printer that is now
+        // running someone else's print.
+        let mut took_over = None;
         for (i, cmd) in commands.iter().enumerate() {
             before_step(i);
             // A distinct id per step is what keeps the verdicts apart: reusing
             // one would let a repeat of the previous step's ACK verify the next
             // command without the printer having answered it.
             let seq = ids.next_id();
-            client
-                .publish(
-                    request_topic(&self.target.serial),
-                    QoS::AtLeastOnce, // control commands go at QoS 1
-                    false,
-                    cmd.to_payload(&seq).to_string(),
-                )
-                .await
-                .map_err(|e| ClientError::Mqtt(e.to_string()))?;
-
-            // Each step gets its own budget. A sequence's own dwells (`G4 S3`)
-            // make it minutes long, so one deadline for the whole run would
-            // abort a healthy sequence; what needs bounding is a single step
-            // going unanswered.
-            let mut session = VerifySession::new(cmd.clone(), seq.as_str());
-            let deadline = tokio::time::Instant::now() + self.timeout;
-            let outcome = loop {
-                let ev = match tokio::time::timeout_at(deadline, poll(&mut eventloop)).await {
-                    Err(_) => break session.timed_out(),
-                    Ok(ev) => ev?,
-                };
-                if let Event::Incoming(Packet::Publish(p)) = ev
-                    && let Ok(json) = serde_json::from_slice::<Value>(&p.payload)
-                    && let Some(outcome) = session.observe(json)
-                {
-                    break outcome;
-                }
-            };
+            let outcome = self
+                .publish_and_verify(&client, &mut eventloop, &seq, cmd, &mut state)
+                .await?;
             let confirmed = outcome == CommandOutcome::Verified;
             outcomes.push(outcome);
             // Stop rather than press on: the machine is mid-motion and the
@@ -596,8 +686,219 @@ impl LanMqttClient {
             if !confirmed {
                 break;
             }
+            // Reports merged while awaiting that ACK are the freshest view there
+            // is, so the check costs nothing and catches a takeover one step in
+            // rather than a whole sequence later.
+            if settle.is_some() {
+                took_over = settle::takeover(gcode_state(&state));
+                if took_over.is_some() {
+                    break;
+                }
+            }
         }
-        Ok(outcomes)
+
+        // Only settle a run that actually finished: after a failed step the
+        // machine is already stopped short, and the caller is going to abort.
+        // `NotReached` rather than `None`, so "no wait was asked for" stays
+        // distinguishable from "one was, and never got its chance".
+        let all_ran = outcomes.len() == commands.len()
+            && outcomes.iter().all(|o| *o == CommandOutcome::Verified);
+        let settled = match settle {
+            // A takeover names itself; falling through to `NotReached` would
+            // report the vaguer of the two truths.
+            Some(_) if took_over.is_some() => Some(SettleOutcome::Interrupted {
+                reason: took_over.unwrap_or_default().to_string(),
+            }),
+            None => None,
+            Some(_) if !all_ran => Some(SettleOutcome::NotReached),
+            Some(budget) => {
+                // The sentinel must dodge any stage the sequence sets for
+                // itself: those lines are still queued and would look identical.
+                let claimed = settle::claimed_stages(commands.iter().filter_map(|c| match c {
+                    Command::GcodeLine(l) => Some(l.as_str()),
+                    _ => None,
+                }));
+                Some(
+                    self.settle_async(
+                        &client,
+                        &mut eventloop,
+                        &mut ids,
+                        &mut state,
+                        budget,
+                        &claimed,
+                        error_before,
+                    )
+                    .await?,
+                )
+            }
+        };
+        Ok(SequenceRun { outcomes, settled })
+    }
+
+    /// Merge reports until a **full snapshot** has landed, so the state read
+    /// straight after is the printer's, not whatever happened to be in flight.
+    ///
+    /// The connect-time `pushall` is not enough on its own: nothing waits for
+    /// its response, so a fast sequence can reach the settle phase before the
+    /// snapshot merges — and then a *stale* one arrives mid-wait carrying, say,
+    /// the sentinel a previously-crashed run left behind. Asking again and
+    /// blocking on the answer makes the reading authoritative: TCP order means
+    /// every earlier report has already been merged by the time it arrives.
+    async fn refresh_snapshot(
+        &self,
+        client: &AsyncClient,
+        eventloop: &mut EventLoop,
+        seq: &str,
+        state: &mut ReportState,
+    ) -> Result<(), ClientError> {
+        client
+            .publish(
+                request_topic(&self.target.serial),
+                QoS::AtLeastOnce,
+                false,
+                Command::PushAll.to_payload(seq).to_string(),
+            )
+            .await
+            .map_err(|e| ClientError::Mqtt(e.to_string()))?;
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        loop {
+            let ev = match tokio::time::timeout_at(deadline, poll(eventloop)).await {
+                Err(_) => return Err(ClientError::Timeout(self.timeout)),
+                Ok(ev) => ev?,
+            };
+            if let Event::Incoming(Packet::Publish(p)) = ev
+                && let Ok(json) = serde_json::from_slice::<Value>(&p.payload)
+            {
+                let full = is_full_snapshot_message(&json);
+                state.apply(json);
+                if full {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Wait until the printer's G-code queue has drained (see [`crate::core::settle`]).
+    ///
+    /// Sends `M400` + an out-of-band `stg_cur` sentinel, watches the reports for
+    /// that sentinel, then puts the displayed stage back — restoring even when
+    /// the wait fails, so the machine is never left showing a value no decoder
+    /// knows.
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_async(
+        &self,
+        client: &AsyncClient,
+        eventloop: &mut EventLoop,
+        ids: &mut SequenceIds,
+        state: &mut ReportState,
+        budget: Duration,
+        claimed: &[i64],
+        error_before: Option<i64>,
+    ) -> Result<SettleOutcome, ClientError> {
+        // Establish where the printer *actually* is before choosing a sentinel
+        // it must not already be showing. See `refresh_snapshot`.
+        let seq = ids.next_id();
+        self.refresh_snapshot(client, eventloop, &seq, state)
+            .await?;
+        let Some(stage_now) = stg_cur(state) else {
+            // Without a reading there is no sentinel that can be trusted, and
+            // guessing one risks ending the wait on a value that was already
+            // there. Refusing is the safe direction.
+            return Err(ClientError::Timeout(self.timeout));
+        };
+        // No value left whose appearance would prove anything. Refuse rather
+        // than settle for a compromised one: a sentinel the sequence also
+        // claims can land while the motion is still draining, which is the
+        // whole failure this exists to prevent.
+        let Some(settle) = Settle::after(stage_now, claimed, error_before) else {
+            return Ok(SettleOutcome::NoSentinel {
+                claimed: claimed.to_vec(),
+            });
+        };
+
+        let mut sent_sentinel = false;
+        let mut refused = None;
+        for line in settle.gcode() {
+            let seq = ids.next_id();
+            let outcome = self
+                .publish_and_verify(
+                    client,
+                    eventloop,
+                    &seq,
+                    &Command::GcodeLine(line.clone()),
+                    state,
+                )
+                .await?;
+            if outcome != CommandOutcome::Verified {
+                // Either way the line may still execute and leave the sentinel
+                // showing, so this still needs restoring — but the two are not
+                // the same verdict. A rejection is the printer saying no; an
+                // ACK that never arrived says nothing at all, and reporting it
+                // as a refusal would name a cause that was never observed.
+                sent_sentinel = true;
+                refused = Some(match outcome {
+                    CommandOutcome::Rejected { .. } => SettleOutcome::NotSent { gcode: line },
+                    _ => SettleOutcome::NotConfirmed { gcode: line },
+                });
+                break;
+            }
+            sent_sentinel = true;
+        }
+
+        let result = match refused {
+            Some(o) => o,
+            None => {
+                let deadline = tokio::time::Instant::now() + budget;
+                loop {
+                    // The sentinel may already be in a report that arrived while
+                    // its own ACK was awaited, so classify before blocking.
+                    match settle.observe(stg_cur(state), gcode_state(state), print_error(state)) {
+                        SettleStep::Settled => break SettleOutcome::Settled,
+                        SettleStep::Interrupted(why) => {
+                            break SettleOutcome::Interrupted {
+                                reason: why.to_string(),
+                            };
+                        }
+                        SettleStep::Waiting => {}
+                    }
+                    let ev = match tokio::time::timeout_at(deadline, poll(eventloop)).await {
+                        Err(_) => {
+                            break SettleOutcome::TimedOut {
+                                after_secs: budget.as_secs(),
+                            };
+                        }
+                        Ok(ev) => ev?,
+                    };
+                    if let Event::Incoming(Packet::Publish(p)) = ev
+                        && let Ok(json) = serde_json::from_slice::<Value>(&p.payload)
+                    {
+                        state.apply(json);
+                    }
+                }
+            }
+        };
+
+        // Restore unless someone else now owns the printer: after a takeover the
+        // displayed stage belongs to *their* job, and tidying ours away would
+        // overwrite it. Read that from the printer's CURRENT state, not from the
+        // verdict — `Interrupted` also covers a fault the sequence caused, and
+        // that machine is still ours and still showing our sentinel. Otherwise
+        // best-effort: the wait's verdict is what the caller acts on, so failing
+        // to tidy up must not mask it.
+        let took_over = settle::takeover(gcode_state(state)).is_some();
+        if sent_sentinel && !took_over {
+            let seq = ids.next_id();
+            let _ = self
+                .publish_and_verify(
+                    client,
+                    eventloop,
+                    &seq,
+                    &Command::GcodeLine(Settle::restore_gcode()),
+                    state,
+                )
+                .await;
+        }
+        Ok(result)
     }
 
     /// Send `commands` in order over **one** connection, verifying each before
@@ -624,16 +925,21 @@ impl LanMqttClient {
     /// `gcode_line` has no observable effect, so its ACK is the whole verdict —
     /// but a sequence of effectful commands needs that baseline carried across
     /// steps first.
+    /// With `settle` set, the run does not end at the last ACK: the queue is
+    /// drained and observed first (see [`crate::core::settle`]), bounded by that
+    /// duration. Pass `None` when the caller only needs the commands published —
+    /// the ACKs say nothing about whether the machine has stopped moving.
     pub fn send_sequence<F: FnMut(usize)>(
         &self,
         commands: &[Command],
         before_step: F,
-    ) -> Result<Vec<CommandOutcome>, ClientError> {
+        settle: Option<Duration>,
+    ) -> Result<SequenceRun, ClientError> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| ClientError::Runtime(e.to_string()))?;
-        rt.block_on(self.send_sequence_async(commands, before_step))
+        rt.block_on(self.send_sequence_async(commands, before_step, settle))
     }
 
     async fn send_fire_async(&self, cmd: &Command) -> Result<(), ClientError> {
