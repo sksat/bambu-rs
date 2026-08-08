@@ -2107,9 +2107,6 @@ fn inspect_remote_plate(
     // `dir` drops here (or at any `?` above) -> the temp dir is removed.
 }
 
-/// Build the `--dry-run` plan: the exact command payload plus what the
-/// on-printer file actually contains (so an agent can read the md5/plate and
-/// pass them back as `--expect-md5`/`--expect-plate`).
 /// Where the inspected bytes came from — the plan states this, so it must not
 /// be guessed. Reading it as "downloaded" when it was the local file (or the
 /// reverse) is exactly the confusion the plan exists to prevent.
@@ -2130,6 +2127,10 @@ impl InspectedFrom {
     }
 }
 
+/// Build the `--dry-run` plan: the exact command payload plus what the
+/// inspected file actually contains (so an agent can read the md5/plate and
+/// pass them back as `--expect-md5`/`--expect-plate`). `inspected_from` says
+/// WHICH copy those came from — see [`InspectedFrom`].
 fn start_plan_json(
     cmd: &ProtoCommand,
     file: &str,
@@ -3361,13 +3362,39 @@ mod tests {
     };
 
     #[test]
-    fn the_two_inspection_sources_are_never_described_the_same_way() {
-        // The plan's `source` is how a reader knows whether the md5 shown is
-        // the printer's copy or the bytes about to be sent. The upload path
-        // used to claim "downloaded", which reads as "already on the printer".
+    fn the_plan_reports_the_source_it_was_given() {
+        // Asserted on the PLAN, not on `label()`: the bug was the formatter
+        // hardcoding "on-printer file" while the upload path inspected local
+        // bytes, and a label-only test passes with that bug still in place.
+        use crate::core::command::Command;
+        use crate::core::project::PlateInspection;
+        let insp = PlateInspection {
+            plate: 1,
+            gcode_md5: "abc".into(),
+            sidecar_md5: None,
+            sidecar_matches: true,
+            bed_type: None,
+            filament_colors: vec![],
+            filament_ids: vec![],
+            has_timelapse_blocks: false,
+        };
+        let source_for = |from| {
+            super::start_plan_json(
+                &Command::GcodeFile("/x.gcode".into()),
+                "/x.gcode",
+                Some(&insp),
+                None,
+                None,
+                false,
+                from,
+            )["inspection"]["source"]
+                .as_str()
+                .expect("the plan must always say which copy it inspected")
+                .to_string()
+        };
         let (local, remote) = (
-            InspectedFrom::LocalUpload.label(),
-            InspectedFrom::OnPrinter.label(),
+            source_for(InspectedFrom::LocalUpload),
+            source_for(InspectedFrom::OnPrinter),
         );
         assert_ne!(local, remote);
         assert!(local.contains("local") && !local.contains("download"));
