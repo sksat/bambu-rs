@@ -422,7 +422,9 @@ works. On the A1 mini, 2026-08-09:
   two sliced files and printed them while pointed at the relay — but the relay
   was serving no FTP at the time, and 990 is refused on both of its addresses.
   The only FTP open on the network is the printer's own, so Studio transferred
-  straight to `192.168.0.3:990` and used the relay for MQTT alone. **[observed]**
+  straight to the printer's own address on 990 (`192.168.0.3` here, which is
+  just what this machine happened to be) and used the relay for MQTT alone.
+  **[observed]**
 
   How Studio knows an address the user never gave it is **not established**.
   SSDP was the obvious candidate and does not look like the answer: listening on
