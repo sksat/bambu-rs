@@ -114,8 +114,9 @@ notalawyer-clap = { version = "0.3", optional = true }
 # client. The real printer's cert is X.509 **v1** and rcgen emits v3 — harmless,
 # because a LAN client cannot verify a self-signed v1 cert either and must
 # already be skipping verification (see src/tls.rs). `ring` matches the crate's
-# one TLS stack; `pem` is how the cert is cached between runs.
-rcgen = { version = "0.14.8", default-features = false, features = ["ring", "pem"], optional = true }
+# one TLS stack; no `pem`, because the cert is generated per run and handed to
+# rustls as DER without ever being written down.
+rcgen = { version = "0.14.8", default-features = false, features = ["ring"], optional = true }
 rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls"] }
 rust-embed = { version = "8.11.0", optional = true }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "logging", "tls12"] }

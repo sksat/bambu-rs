@@ -21,6 +21,7 @@
 //!   printer is announcing the same serial on the same LAN, so a client would
 //!   see two of it and pick whichever answered first. Add the relay by IP.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -28,7 +29,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::core::emulate::{
     ClientId, ClientSession, EmulatedPrinter, Route, SequenceRewriter, UpstreamCache,
@@ -47,6 +48,10 @@ const MAX_PACKET: usize = 4 * 1024 * 1024;
 
 /// Read granularity off the socket.
 const READ_CHUNK: usize = 8 * 1024;
+
+/// How many ACKs may be queued for one client before we give up on it. ACKs are
+/// rare and small; this deep a queue means the client has stopped reading.
+const DIRECT_DEPTH: usize = 64;
 
 /// How long a connection may take to get through TLS and say CONNECT.
 ///
@@ -68,21 +73,23 @@ pub trait Upstream: Send + Sync + 'static {
     fn send(&self, payload: Value);
 }
 
-/// One pre-encoded report, and who should get it.
-enum Fanout {
-    /// The printer's own push — everyone subscribed sees it.
-    All(Arc<Vec<u8>>),
-    /// An ACK, which belongs to the one client whose command it answers.
-    One(ClientId, Arc<Vec<u8>>),
-}
-
 /// The emulated printer: a TLS MQTT listener in front of one upstream link.
 pub struct Emulator {
     printer: EmulatedPrinter,
     upstream: Arc<dyn Upstream>,
     cache: Arc<RwLock<UpstreamCache>>,
     rewriter: Arc<Mutex<SequenceRewriter>>,
-    fanout: broadcast::Sender<Arc<Fanout>>,
+    /// The printer's own pushes, pre-encoded once and shared. Lossy by design:
+    /// a client too far behind is resynced from the cache rather than fed a
+    /// backlog of stale deltas.
+    fanout: broadcast::Sender<Arc<Vec<u8>>>,
+    /// Per-client channels for messages addressed to exactly one client — ACKs.
+    /// These do *not* go through the fan-out: an ACK dropped for lagging is
+    /// unrecoverable, because routing it already consumed its mapping.
+    clients: Mutex<HashMap<ClientId, mpsc::Sender<Arc<Vec<u8>>>>>,
+    /// How long an unauthenticated peer gets. A field, not a constant, so a
+    /// test can drive the timeout without taking 20 seconds over it.
+    handshake_timeout: Duration,
     next_client_id: AtomicU64,
     /// Subscribed here rather than in [`pump`](Self::pump), so reports arriving
     /// between construction and the pump task actually being scheduled are not
@@ -93,6 +100,15 @@ pub struct Emulator {
 
 impl Emulator {
     pub fn new(printer: EmulatedPrinter, upstream: Arc<dyn Upstream>) -> Arc<Self> {
+        Self::with_handshake_timeout(printer, upstream, HANDSHAKE_TIMEOUT)
+    }
+
+    /// As [`new`](Self::new), with the anonymous-peer window set explicitly.
+    pub fn with_handshake_timeout(
+        printer: EmulatedPrinter,
+        upstream: Arc<dyn Upstream>,
+        handshake_timeout: Duration,
+    ) -> Arc<Self> {
         let (fanout, _) = broadcast::channel(FANOUT_DEPTH);
         let reports = Mutex::new(Some(upstream.subscribe()));
         Arc::new(Self {
@@ -101,6 +117,8 @@ impl Emulator {
             cache: Arc::new(RwLock::new(UpstreamCache::new())),
             rewriter: Arc::new(Mutex::new(SequenceRewriter::new())),
             fanout,
+            clients: Mutex::new(HashMap::new()),
+            handshake_timeout,
             next_client_id: AtomicU64::new(1),
             reports,
         })
@@ -134,14 +152,31 @@ impl Emulator {
                 .lock()
                 .expect("rewriter lock poisoned")
                 .route(&message);
-            let fanout = match route {
-                Route::Broadcast(m) => Fanout::All(Arc::new(self.encode_report(&m))),
-                Route::ToClient { client, message } => {
-                    Fanout::One(client, Arc::new(self.encode_report(&message)))
+            match route {
+                Route::Broadcast(m) => {
+                    // Err just means nobody is connected right now.
+                    let _ = self.fanout.send(Arc::new(self.encode_report(&m)));
                 }
-            };
-            // Err just means nobody is connected right now.
-            let _ = self.fanout.send(Arc::new(fanout));
+                Route::ToClient { client, message } => {
+                    let bytes = Arc::new(self.encode_report(&message));
+                    let sender = self
+                        .clients
+                        .lock()
+                        .expect("clients lock poisoned")
+                        .get(&client)
+                        .cloned();
+                    // `try_send`, not `send`: the pump is the single reader of
+                    // the printer's stream, and blocking it on one wedged socket
+                    // would stall every other client. A missing sender just
+                    // means the client asked and then left before the printer
+                    // answered.
+                    if let Some(tx) = sender
+                        && let Err(e) = tx.try_send(bytes)
+                    {
+                        eprintln!("emulate: client {client} cannot take its ACK: {e}");
+                    }
+                }
+            }
         }
     }
 
@@ -194,6 +229,10 @@ impl Emulator {
                     .lock()
                     .expect("rewriter lock poisoned")
                     .forget_client(id);
+                this.clients
+                    .lock()
+                    .expect("clients lock poisoned")
+                    .remove(&id);
             });
         }
     }
@@ -208,14 +247,24 @@ impl Emulator {
     {
         let (mut reader, mut writer) = tokio::io::split(stream);
         let mut fanout = self.fanout.subscribe();
+        let (direct_tx, mut direct) = mpsc::channel(DIRECT_DEPTH);
+        self.clients
+            .lock()
+            .expect("clients lock poisoned")
+            .insert(id, direct_tx);
         let mut session = ClientSession::new();
         let mut buf: Vec<u8> = Vec::new();
         let mut chunk = [0u8; READ_CHUNK];
+        // Absolute, and held ACROSS iterations. Recreating the timeout inside
+        // the select each time round would restart it every time any other arm
+        // fired — and the fan-out arm fires for every client on every report,
+        // about once a second, so nothing would ever time out.
+        let mut idle_deadline = deadline_for(&session, self.handshake_timeout);
 
         loop {
             tokio::select! {
                 // Bytes from the client.
-                read = read_with_deadline(&mut reader, &mut chunk, read_limit(&session)) => {
+                read = reader.read(&mut chunk) => {
                     let n = read?;
                     if n == 0 {
                         return Ok(()); // clean EOF
@@ -250,6 +299,28 @@ impl Emulator {
                         }
                     }
                     writer.flush().await?;
+                    // It spoke, so the clock starts again. Recomputed *after*
+                    // the packets are handled: a CONNECT among them replaces the
+                    // anonymous window with the client's own keep-alive.
+                    idle_deadline = deadline_for(&session, self.handshake_timeout);
+                }
+
+                // An ACK for something this client asked for. Directed rather
+                // than broadcast: a client that lagged past the fan-out's depth
+                // would lose it, and the rewriter has already given up the
+                // mapping by then, so nothing could ever re-send it — leaving
+                // Bambu Studio waiting forever on a `pause` it really did issue.
+                Some(bytes) = direct.recv() => {
+                    writer.write_all(&bytes).await?;
+                    writer.flush().await?;
+                }
+
+                // Nothing from this client for too long.
+                () = idle_after(idle_deadline) => {
+                    anyhow::bail!(
+                        "silent past its deadline ({})",
+                        if session.is_connected() { "keep-alive" } else { "handshake" }
+                    );
                 }
 
                 // Reports on their way out.
@@ -259,13 +330,7 @@ impl Emulator {
                             if !session.wants_reports() {
                                 continue; // hasn't subscribed; a real printer would send it nothing
                             }
-                            match &*m {
-                                Fanout::All(bytes) => writer.write_all(bytes).await?,
-                                Fanout::One(target, bytes) if *target == id => {
-                                    writer.write_all(bytes).await?
-                                }
-                                Fanout::One(..) => continue,
-                            }
+                            writer.write_all(&m).await?;
                             writer.flush().await?;
                         }
                         // This client couldn't keep up. Rather than leave it
@@ -301,9 +366,9 @@ impl Emulator {
 /// client that vanished without a FIN — an unplugged laptop — long before the
 /// OS does. A client that asked for keep-alive `0` asked for no timeout, and
 /// gets none.
-fn read_limit(session: &ClientSession) -> Option<Duration> {
+fn read_limit(session: &ClientSession, handshake: Duration) -> Option<Duration> {
     if !session.is_connected() {
-        return Some(HANDSHAKE_TIMEOUT);
+        return Some(handshake);
     }
     match session.keep_alive() {
         0 => None,
@@ -311,21 +376,17 @@ fn read_limit(session: &ClientSession) -> Option<Duration> {
     }
 }
 
-/// Read, giving up if nothing arrives within `limit`.
-async fn read_with_deadline<R>(
-    reader: &mut R,
-    chunk: &mut [u8],
-    limit: Option<Duration>,
-) -> anyhow::Result<usize>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let Some(limit) = limit else {
-        return Ok(reader.read(chunk).await?);
-    };
-    match tokio::time::timeout(limit, reader.read(chunk)).await {
-        Ok(n) => Ok(n?),
-        Err(_) => anyhow::bail!("silent for {limit:?}"),
+/// The same limit as an absolute instant, so it survives being carried across
+/// loop iterations instead of restarting whenever another branch fires.
+fn deadline_for(session: &ClientSession, handshake: Duration) -> Option<tokio::time::Instant> {
+    read_limit(session, handshake).map(|d| tokio::time::Instant::now() + d)
+}
+
+/// Complete at `deadline`, or never if there isn't one.
+async fn idle_after(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -701,7 +762,10 @@ mod tests {
         let cache = UpstreamCache::new();
 
         let fresh = ClientSession::new();
-        assert_eq!(read_limit(&fresh), Some(HANDSHAKE_TIMEOUT));
+        assert_eq!(
+            read_limit(&fresh, HANDSHAKE_TIMEOUT),
+            Some(HANDSHAKE_TIMEOUT)
+        );
 
         let mut connected = ClientSession::new();
         connected.handle(
@@ -716,7 +780,10 @@ mod tests {
             &cache,
         );
         // 1.5x the client's own keep-alive, per §3.1.2.10.
-        assert_eq!(read_limit(&connected), Some(Duration::from_secs(90)));
+        assert_eq!(
+            read_limit(&connected, HANDSHAKE_TIMEOUT),
+            Some(Duration::from_secs(90))
+        );
 
         let mut no_keepalive = ClientSession::new();
         no_keepalive.handle(
@@ -731,7 +798,51 @@ mod tests {
             &cache,
         );
         // 0 means the client asked for no timeout, and gets none.
-        assert_eq!(read_limit(&no_keepalive), None);
+        assert_eq!(read_limit(&no_keepalive, HANDSHAKE_TIMEOUT), None);
+    }
+
+    #[tokio::test]
+    async fn a_silent_anonymous_peer_is_dropped_even_while_reports_are_flowing() {
+        // The bug this pins: the idle timeout used to be rebuilt inside the
+        // select on every iteration, so any other arm firing restarted it. The
+        // fan-out arm fires for every client on every report — about once a
+        // second from a real printer — so the deadline never arrived and anyone
+        // who could open a socket could hold a task and an fd indefinitely.
+        let upstream = FakeUpstream::new();
+        let emulator = Emulator::with_handshake_timeout(
+            EmulatedPrinter::new(SERIAL, CODE),
+            Arc::clone(&upstream) as Arc<dyn Upstream>,
+            Duration::from_millis(300),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tls = crate::tls::emulated_printer_server_config(SERIAL).unwrap();
+        tokio::spawn(Arc::clone(&emulator).pump());
+        tokio::spawn(Arc::clone(&emulator).serve(listener, tls));
+
+        // Reports the whole time, so the fan-out arm keeps waking the task.
+        let chatter = tokio::spawn(async move {
+            loop {
+                upstream.push(snapshot());
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        let mut client = TestClient::connect(addr).await;
+        // TLS is up, and we say nothing at all — never even CONNECT.
+        let mut chunk = [0u8; 64];
+        let closed = tokio::time::timeout(Duration::from_secs(5), client.stream.read(&mut chunk))
+            .await
+            .expect("the emulator should have hung up long before this");
+        // Dropped mid-session, so the peer sees either a clean EOF or a torn
+        // TLS stream depending on timing — both mean "disconnected". What must
+        // NOT happen is bytes: that would be reports going to an unauthenticated
+        // peer, on a connection that was supposed to be gone.
+        assert!(
+            matches!(closed, Ok(0) | Err(_)),
+            "a peer that never authenticates must be disconnected, got {closed:?}"
+        );
+        chatter.abort();
     }
 
     #[tokio::test]

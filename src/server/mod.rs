@@ -99,9 +99,14 @@ pub fn serve(target: Option<ResolvedTarget>, opts: ServeOpts) -> anyhow::Result<
                 // the contention --emulate exists to remove.
                 let source: Arc<dyn PrinterSource> = match &emulate {
                     Some(em) => {
-                        let link = relay::LivePrinterLink::connect(t.clone(), interval);
+                        // Both subscribers first, then connect: the connection's
+                        // opening `pushall` is the seed for every cached view,
+                        // and a broadcast with no receivers throws it away.
+                        let link = relay::LivePrinterLink::new();
+                        let source = Arc::new(LiveSource::from_reports(link.subscribe()));
                         start_emulator(&t, em, Arc::clone(&link)).await?;
-                        Arc::new(LiveSource::from_reports(link.subscribe()))
+                        Arc::clone(&link).connect(t.clone(), interval);
+                        source
                     }
                     None => Arc::new(LiveSource::connect(t.clone(), interval)),
                 };

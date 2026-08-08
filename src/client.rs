@@ -336,6 +336,17 @@ impl LanMqttClient {
     /// call, since only it knows whether the relay should outlive the printer
     /// being power-cycled. A request published into a connection that is about
     /// to break is lost; there is no queue behind it.
+    ///
+    /// **Requests are published with `try_publish`, not `publish`.** rumqttc's
+    /// request channel is bounded (16 here) and is drained *only* by
+    /// `eventloop.poll()` — which is the very thing this loop is not doing
+    /// while it awaits a publish. `publish().await` on a full channel would
+    /// therefore wait for a drain that cannot happen: not an error, not a
+    /// timeout, just a link that stops relaying for every downstream client at
+    /// once and never reconnects, because it never returns `Err`. A full
+    /// channel means the printer is not keeping up, so the honest answer is to
+    /// drop the request and say so — the same thing the layer above does, and
+    /// the client's own ACK timeout is what tells it.
     #[cfg(feature = "server")]
     pub async fn relay<F: FnMut(&Value)>(
         &self,
@@ -382,25 +393,23 @@ impl LanMqttClient {
                 }
                 Step::Request(None) => return Ok(()),
                 Step::Request(Some(payload)) => {
-                    client
-                        .publish(
-                            request_topic(&self.target.serial),
-                            QoS::AtLeastOnce, // control commands go at QoS 1
-                            false,
-                            payload.to_string(),
-                        )
-                        .await
-                        .map_err(|e| ClientError::Mqtt(e.to_string()))?;
+                    // Non-blocking on purpose — see the doc comment.
+                    if let Err(e) = client.try_publish(
+                        request_topic(&self.target.serial),
+                        QoS::AtLeastOnce, // control commands go at QoS 1
+                        false,
+                        payload.to_string(),
+                    ) {
+                        eprintln!("relay: the printer is not keeping up; dropped a request: {e}");
+                    }
                 }
                 Step::Tick => {
-                    let _ = client
-                        .publish(
-                            request_topic(&self.target.serial),
-                            QoS::AtMostOnce,
-                            false,
-                            Command::PushAll.to_payload("0").to_string(),
-                        )
-                        .await;
+                    let _ = client.try_publish(
+                        request_topic(&self.target.serial),
+                        QoS::AtMostOnce,
+                        false,
+                        Command::PushAll.to_payload("0").to_string(),
+                    );
                 }
             }
         }

@@ -6,7 +6,7 @@
 //! and hands its reports to everyone who asks, reconnecting underneath without
 //! any of them noticing.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -35,14 +35,36 @@ const REQUEST_DEPTH: usize = 256;
 pub struct LivePrinterLink {
     reports: broadcast::Sender<Value>,
     requests: mpsc::Sender<Value>,
+    /// The receiving end, parked here until the worker is started. Its presence
+    /// is what makes "built" and "connected" separate states.
+    worker: Mutex<Option<mpsc::Receiver<Value>>>,
 }
 
 impl LivePrinterLink {
+    /// Build the link's channels **without connecting**.
+    ///
+    /// Connecting is a separate step ([`connect`](Self::connect)) so every
+    /// consumer can [`subscribe`](Upstream::subscribe) first. The first thing a
+    /// connection does is ask for a `pushall`, and that reply seeds the whole
+    /// cache; a broadcast channel discards what arrives with no receivers, so
+    /// connecting before the subscribers exist can throw the seed away. With no
+    /// poll interval configured nothing would ask again, and the dashboard
+    /// would spend the rest of the print merging deltas onto an empty state.
+    pub fn new() -> Arc<Self> {
+        let (reports, _) = broadcast::channel(REPORT_DEPTH);
+        let (requests, request_rx) = mpsc::channel(REQUEST_DEPTH);
+        Arc::new(Self {
+            reports,
+            requests,
+            worker: Mutex::new(Some(request_rx)),
+        })
+    }
+
     /// Connect to `target` and keep the link up for as long as the process runs.
     /// `interval` is the `pushall` poll period; `None` relies on the printer's
-    /// own ~2 s push.
-    pub fn connect(target: ResolvedTarget, interval: Option<Duration>) -> Arc<Self> {
-        Self::with_worker(move |reports, mut requests| async move {
+    /// own ~2 s push. Call once, after the subscribers are in place.
+    pub fn connect(self: Arc<Self>, target: ResolvedTarget, interval: Option<Duration>) {
+        self.start(move |reports, mut requests| async move {
             loop {
                 let client = LanMqttClient::new(target.clone());
                 match client
@@ -60,24 +82,23 @@ impl LivePrinterLink {
                     }
                 }
             }
-        })
+        });
     }
 
-    /// Build a link around an arbitrary worker. The real one is
+    /// Start an arbitrary worker on this link's channels. The real one is
     /// [`connect`](Self::connect); this seam lets the plumbing be tested without
-    /// a printer on the other end.
-    fn with_worker<F, Fut>(run: F) -> Arc<Self>
+    /// a printer on the other end. Calling it twice does nothing the second
+    /// time — there is only one request channel to hand over.
+    fn start<F, Fut>(self: Arc<Self>, run: F)
     where
         F: FnOnce(broadcast::Sender<Value>, mpsc::Receiver<Value>) -> Fut,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
-        let (reports, _) = broadcast::channel(REPORT_DEPTH);
-        let (request_tx, request_rx) = mpsc::channel(REQUEST_DEPTH);
-        tokio::spawn(run(reports.clone(), request_rx));
-        Arc::new(Self {
-            reports,
-            requests: request_tx,
-        })
+        let Some(requests) = self.worker.lock().expect("worker lock poisoned").take() else {
+            debug_assert!(false, "LivePrinterLink started twice");
+            return;
+        };
+        tokio::spawn(run(self.reports.clone(), requests));
     }
 }
 
@@ -106,7 +127,8 @@ mod tests {
     async fn a_request_reaches_the_worker_and_its_reply_reaches_every_subscriber() {
         // The link is a two-way pipe with fan-out on the way back; this is that
         // shape, with the printer replaced by an echo.
-        let link = LivePrinterLink::with_worker(|reports, mut requests| async move {
+        let link = LivePrinterLink::new();
+        Arc::clone(&link).start(|reports, mut requests| async move {
             while let Some(req) = requests.recv().await {
                 let _ = reports.send(json!({"print": {
                     "command": "push_status",
@@ -129,10 +151,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nothing_connects_until_the_subscribers_are_in_place() {
+        // The very first thing the link does on connecting is ask for a
+        // `pushall`, and that reply is the seed for the whole cache. A
+        // broadcast channel discards what it receives with no receivers, so a
+        // worker started before the emulator and the dashboard have subscribed
+        // can throw the seed away — after which, with no poll interval, nothing
+        // asks again and the dashboard merges deltas onto an empty state.
+        let link = LivePrinterLink::new();
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&started);
+        let mut rx = link.subscribe();
+        Arc::clone(&link).start(move |reports, _requests| async move {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = reports.send(json!({"print": {"command": "push_status", "msg": 0}}));
+            std::future::pending::<()>().await;
+        });
+
+        // The subscription was made before the worker ran, so the seed lands.
+        let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the connect-time snapshot must not be discarded")
+            .unwrap();
+        assert_eq!(got["print"]["msg"], 0);
+        assert!(started.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn a_subscriber_that_arrives_late_misses_what_it_missed_and_nothing_else() {
         // Reports are a live stream, not a log: a dashboard opened mid-print
         // gets what comes next, and asks for a snapshot if it wants the rest.
-        let link = LivePrinterLink::with_worker(|_reports, mut requests| async move {
+        let link = LivePrinterLink::new();
+        Arc::clone(&link).start(|_reports, mut requests| async move {
             while requests.recv().await.is_some() {}
         });
         let early = link.subscribe();
@@ -150,7 +200,8 @@ mod tests {
     async fn requests_are_dropped_loudly_rather_than_queued_forever_when_nothing_drains_them() {
         // A wedged link must not grow a queue without bound; the depth is the
         // backstop, and overflowing it is reported, not swallowed silently.
-        let link = LivePrinterLink::with_worker(|_reports, requests| async move {
+        let link = LivePrinterLink::new();
+        Arc::clone(&link).start(|_reports, requests| async move {
             // Never drains: hold the receiver open and sleep.
             let _held = requests;
             std::future::pending::<()>().await;
