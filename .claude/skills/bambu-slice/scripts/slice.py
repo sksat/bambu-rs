@@ -132,6 +132,8 @@ def main():
     # merge defaults to "Cool Plate" (35C) -> poor adhesion / warping.
     ap.add_argument("--bed-type", default="Textured PEI Plate")
     ap.add_argument("--brim", help="force an outer brim of this width in mm (e.g. 5)")
+    ap.add_argument("--infill", help="sparse infill density in percent (e.g. 60) — drives how much "
+                                     "filament the part uses; check the result with slice_info.config's weight=")
     a = ap.parse_args()
 
     BIN, PROFILES, ENV = detect_slicer()
@@ -140,6 +142,12 @@ def main():
     bed_ov = {"curr_bed_type": a.bed_type}
     if a.brim is not None:
         bed_ov.update({"brim_type": "outer_only", "brim_width": str(a.brim)})
+    if a.infill is not None:
+        # Percent, as a string like every other value here. The profile's own
+        # pattern and wall count are left alone: density is the knob that moves
+        # weight, and changing more than asked would make the result harder to
+        # reason about.
+        bed_ov["sparse_infill_density"] = f"{float(a.infill):g}%"
 
     if a.process:
         proc = flatten("process", a.process, bed_ov)
