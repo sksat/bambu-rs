@@ -1938,6 +1938,7 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
                     inspect_error.as_deref(),
                     ams_mapping.as_deref(),
                     *timelapse,
+                    InspectedFrom::OnPrinter,
                 ));
                 return Ok(());
             }
@@ -2073,6 +2074,8 @@ fn run_job_start_upload(
             None,
             parsed_ams.as_deref(),
             timelapse,
+            // This path inspects the LOCAL bytes — nothing is downloaded.
+            InspectedFrom::LocalUpload,
         );
         plan["upload"] =
             serde_json::json!({ "local": local, "remote": remote, "overwrite": overwrite });
@@ -2274,9 +2277,30 @@ fn inspect_remote_plate(
     // `dir` drops here (or at any `?` above) -> the temp dir is removed.
 }
 
+/// Where the inspected bytes came from — the plan states this, so it must not
+/// be guessed. Reading it as "downloaded" when it was the local file (or the
+/// reverse) is exactly the confusion the plan exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InspectedFrom {
+    /// Downloaded from the printer: what will actually print.
+    OnPrinter,
+    /// The local file about to be uploaded (`--upload`) — the bytes we send.
+    LocalUpload,
+}
+
+impl InspectedFrom {
+    fn label(self) -> &'static str {
+        match self {
+            Self::OnPrinter => "on-printer file (downloaded for inspection)",
+            Self::LocalUpload => "local file (the bytes about to be uploaded)",
+        }
+    }
+}
+
 /// Build the `--dry-run` plan: the exact command payload plus what the
-/// on-printer file actually contains (so an agent can read the md5/plate and
-/// pass them back as `--expect-md5`/`--expect-plate`).
+/// inspected file actually contains (so an agent can read the md5/plate and
+/// pass them back as `--expect-md5`/`--expect-plate`). `inspected_from` says
+/// WHICH copy those came from — see [`InspectedFrom`].
 fn start_plan_json(
     cmd: &ProtoCommand,
     file: &str,
@@ -2284,6 +2308,7 @@ fn start_plan_json(
     inspect_error: Option<&str>,
     ams_mapping: Option<&[i32]>,
     timelapse_armed: bool,
+    inspected_from: InspectedFrom,
 ) -> serde_json::Value {
     let inspection_json = match (inspection, inspect_error) {
         // Inspected the on-printer file successfully.
@@ -2331,7 +2356,7 @@ fn start_plan_json(
                 // timelapse is armed at print start with --timelapse).
                 "has_timelapse_blocks": i.has_timelapse_blocks,
                 "ams_mapping_preview": ams_preview,
-                "source": "on-printer file (downloaded for inspection)",
+                "source": inspected_from.label(),
                 "warnings": warnings,
             })
         }
@@ -3517,8 +3542,49 @@ fn fmt_eta(min: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ams_mapping_preview, fmt_eta, spec_caveat, subst_capture_tokens, validate_ams_map,
+        InspectedFrom, ams_mapping_preview, fmt_eta, spec_caveat, subst_capture_tokens,
+        validate_ams_map,
     };
+
+    #[test]
+    fn the_plan_reports_the_source_it_was_given() {
+        // Asserted on the PLAN, not on `label()`: the bug was the formatter
+        // hardcoding "on-printer file" while the upload path inspected local
+        // bytes, and a label-only test passes with that bug still in place.
+        use crate::core::command::Command;
+        use crate::core::project::PlateInspection;
+        let insp = PlateInspection {
+            plate: 1,
+            gcode_md5: "abc".into(),
+            sidecar_md5: None,
+            sidecar_matches: true,
+            bed_type: None,
+            filament_colors: vec![],
+            filament_ids: vec![],
+            has_timelapse_blocks: false,
+        };
+        let source_for = |from| {
+            super::start_plan_json(
+                &Command::GcodeFile("/x.gcode".into()),
+                "/x.gcode",
+                Some(&insp),
+                None,
+                None,
+                false,
+                from,
+            )["inspection"]["source"]
+                .as_str()
+                .expect("the plan must always say which copy it inspected")
+                .to_string()
+        };
+        let (local, remote) = (
+            source_for(InspectedFrom::LocalUpload),
+            source_for(InspectedFrom::OnPrinter),
+        );
+        assert_ne!(local, remote);
+        assert!(local.contains("local") && !local.contains("download"));
+        assert!(remote.contains("on-printer"));
+    }
 
     #[test]
     fn only_the_device_verified_ams_command_drops_the_spec_caveat() {
