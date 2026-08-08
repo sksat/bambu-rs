@@ -251,8 +251,8 @@ enum Command {
         /// to the printer. serve holds the one real LAN connection and relays
         /// for everyone, which is how a slicer and this dashboard can watch the
         /// same print at once. Clients authenticate with the printer's own
-        /// serial and access code. Sending a print still needs the printer
-        /// directly — there is no FTP server yet.
+        /// serial and access code. Monitoring, control and sending a print all
+        /// relay (the last needs the FTP server — see --emulate-ftp-port).
         #[arg(long)]
         emulate: bool,
         /// Bind host for the emulated printer. Default 127.0.0.1 (this machine
