@@ -69,6 +69,19 @@ struct Cli {
     /// Override the model (e.g. a1mini).
     #[arg(long, global = true)]
     model: Option<String>,
+    /// Override the MQTT port (default 8883). Only needed to reach a
+    /// `serve --emulate` relay that had to bind elsewhere — a real printer is
+    /// always on 8883.
+    #[arg(long, global = true, env = "BAMBU_MQTT_PORT")]
+    mqtt_port: Option<u16>,
+    /// Override the FTPS port (default 990), for the same reason: 990 is
+    /// privileged, so a relay often cannot have it.
+    #[arg(long, global = true, env = "BAMBU_FTPS_PORT")]
+    ftps_port: Option<u16>,
+    /// Override the device-detect port (default 3000), for the same reason.
+    /// Only `serve --emulate` uses it, to ask the printer who it is.
+    #[arg(long, global = true, env = "BAMBU_DETECT_PORT")]
+    detect_port: Option<u16>,
     /// Emit machine-readable JSON (default output is human-readable).
     #[arg(long, global = true)]
     json: bool,
@@ -306,6 +319,32 @@ enum Command {
         #[cfg(feature = "relay")]
         #[arg(long, requires = "emulate")]
         emulate_no_ftp: bool,
+        /// Confine the FTP relay's passive data ports to this inclusive range,
+        /// e.g. `50000-50100`. A passive transfer opens a second connection on
+        /// a port chosen at the time, so behind a deny-by-default firewall
+        /// every transfer is blocked even with the control port allowed —
+        /// pinning the range lets one rule cover them all. Default: any
+        /// ephemeral port.
+        #[cfg(feature = "relay")]
+        #[arg(long, value_name = "FIRST-LAST", requires = "emulate")]
+        emulate_pasv_ports: Option<String>,
+        /// Port for the device-detect probe, which is what makes Bambu Studio's
+        /// "add printer by IP" work: it knocks here *before* MQTT and abandons
+        /// the whole attempt, silently, if nothing answers. 3000 is where a
+        /// client looks; moving it means Studio will not find this relay.
+        #[cfg(feature = "relay")]
+        #[arg(long, default_value_t = 3000, requires = "emulate")]
+        emulate_detect_port: u16,
+        /// The TLS variant of the detect port. A real printer serves both.
+        #[cfg(feature = "relay")]
+        #[arg(long, default_value_t = 3002, requires = "emulate")]
+        emulate_detect_tls_port: u16,
+        /// Don't serve the detect probe. Everything else still relays; a client
+        /// already pointed at this host keeps working, but a new one cannot add
+        /// it by IP.
+        #[cfg(feature = "relay")]
+        #[arg(long, requires = "emulate")]
+        emulate_no_detect: bool,
     },
 }
 
@@ -870,6 +909,14 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             emulate_ftp_port,
             #[cfg(feature = "relay")]
             emulate_no_ftp,
+            #[cfg(feature = "relay")]
+            emulate_pasv_ports,
+            #[cfg(feature = "relay")]
+            emulate_detect_port,
+            #[cfg(feature = "relay")]
+            emulate_detect_tls_port,
+            #[cfg(feature = "relay")]
+            emulate_no_detect,
         } => run_serve(
             cli,
             host,
@@ -885,6 +932,9 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
                 host: emulate_host.clone(),
                 port: *emulate_port,
                 ftp_port: (!emulate_no_ftp).then_some(*emulate_ftp_port),
+                pasv_ports: emulate_pasv_ports.clone(),
+                detect_port: (!emulate_no_detect).then_some(*emulate_detect_port),
+                detect_tls_port: (!emulate_no_detect).then_some(*emulate_detect_tls_port),
                 read_only: *emulate_read_only,
             }),
         ),
@@ -1668,6 +1718,31 @@ fn run_serve(
     #[cfg(feature = "relay")] emulate: Option<crate::server::EmulateOpts>,
 ) -> Result<(), CliError> {
     // Live mode needs a connection target; fake mode doesn't touch the printer.
+    // Zero would reach `tokio::time::interval`, which panics on a zero period
+    // — and only the background producer would die, leaving a server up with
+    // nothing behind it. Refuse it where it can still be explained.
+    if interval == Some(0) {
+        return Err(CliError::new(
+            exit::VALIDATION,
+            "--interval must be at least 1 second",
+        ));
+    }
+    // `--fake` alone needs no target — the dashboard gets a ramping fake and
+    // nothing is served on the wire. `--fake --emulate` does need one, because
+    // the emulated printer has to be *some* printer: the serial names its topics
+    // and its certificate, and the access code is what clients authenticate
+    // with. Nothing is connected to; only the identity is borrowed.
+    #[cfg(feature = "relay")]
+    let targets = if fake {
+        emulate
+            .is_some()
+            .then(|| synthetic_identity(cli))
+            .into_iter()
+            .collect()
+    } else {
+        serve_targets(cli, all_printers)?
+    };
+    #[cfg(not(feature = "relay"))]
     let targets = if fake {
         Vec::new()
     } else {
@@ -1808,6 +1883,40 @@ fn all_serve_targets(
             Ok(crate::server::ServeTarget { name, target })
         })
         .collect()
+}
+
+/// The identity a synthetic printer presents under `--fake --emulate`.
+///
+/// Taken from `--serial` / `--access-code` when given, so a test can pick its
+/// own; otherwise obviously-fake constants, printed at startup so nobody has to
+/// guess what to point a client at. These are not the "no baked defaults" kind
+/// of constant — nothing physical depends on them, and a fake printer with no
+/// name would just be harder to connect to.
+#[cfg(feature = "relay")]
+fn synthetic_identity(cli: &Cli) -> crate::server::ServeTarget {
+    let serial = cli
+        .serial
+        .clone()
+        .unwrap_or_else(|| "SYNTHETIC000000".to_string());
+    let access_code = cli
+        .access_code
+        .clone()
+        .unwrap_or_else(|| "00000000".to_string());
+    eprintln!("synthetic printer identity: serial {serial}, access code {access_code}");
+    crate::server::ServeTarget {
+        name: "synthetic".to_string(),
+        target: crate::config::ResolvedTarget {
+            ip: "127.0.0.1".to_string(),
+            serial,
+            access_code,
+            model: crate::core::model::Model::from_config_str(
+                cli.model.as_deref().unwrap_or("a1mini"),
+            ),
+            mqtt_port: crate::config::DEFAULT_MQTT_PORT,
+            ftps_port: crate::config::DEFAULT_FTPS_PORT,
+            detect_port: crate::config::DEFAULT_DETECT_PORT,
+        },
+    }
 }
 
 /// One entry of a `--cameras-config` JSON file — the same shape as `/api/camera/config`,
@@ -4071,6 +4180,9 @@ fn flag_overrides(cli: &Cli) -> Overrides {
         serial: cli.serial.clone(),
         access_code: cli.access_code.clone(),
         model: cli.model.clone(),
+        mqtt_port: cli.mqtt_port,
+        ftps_port: cli.ftps_port,
+        detect_port: cli.detect_port,
     }
 }
 

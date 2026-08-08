@@ -159,6 +159,10 @@ pub struct Emulator {
     /// `false` once the printer is presumed gone. Client tasks watch this and
     /// hang up, which is how the silence reaches them.
     healthy: tokio::sync::watch::Sender<bool>,
+    /// How many clients are connected and authenticated right now. Reported so
+    /// an operator can see a client arrive — without it, a client stuck on
+    /// "connecting" is indistinguishable from one that never reached us.
+    connected: AtomicU64,
     next_client_id: AtomicU64,
     /// Subscribed here rather than in [`pump`](Self::pump), so reports arriving
     /// between construction and the pump task actually being scheduled are not
@@ -213,6 +217,7 @@ impl Emulator {
             // would hang up on whoever was waiting for it.
             last_report: Mutex::new(tokio::time::Instant::now()),
             healthy,
+            connected: AtomicU64::new(0),
             next_client_id: AtomicU64::new(1),
             reports,
         })
@@ -376,7 +381,7 @@ impl Emulator {
                         }
                     };
                 let id = this.next_client_id.fetch_add(1, Ordering::Relaxed);
-                if let Err(e) = Arc::clone(&this).serve_client(stream, id).await
+                if let Err(e) = Arc::clone(&this).serve_client(stream, id, peer).await
                     && !is_ordinary_disconnect(&e)
                 {
                     eprintln!("emulate: client {peer} dropped: {e}");
@@ -386,10 +391,17 @@ impl Emulator {
                     .lock()
                     .expect("rewriter lock poisoned")
                     .forget_client(id);
-                this.clients
+                if this
+                    .clients
                     .lock()
                     .expect("clients lock poisoned")
-                    .remove(&id);
+                    .remove(&id)
+                    .is_some()
+                    && this.connected.load(Ordering::Relaxed) > 0
+                {
+                    let n = this.connected.fetch_sub(1, Ordering::Relaxed) - 1;
+                    eprintln!("emulate: {peer} disconnected ({n} client(s) left)");
+                }
             });
         }
     }
@@ -398,7 +410,12 @@ impl Emulator {
     ///
     /// Generic over the stream so this can be driven over anything duplex; in
     /// production it is always a TLS stream.
-    async fn serve_client<S>(self: Arc<Self>, stream: S, id: ClientId) -> anyhow::Result<()>
+    async fn serve_client<S>(
+        self: Arc<Self>,
+        stream: S,
+        id: ClientId,
+        peer: std::net::SocketAddr,
+    ) -> anyhow::Result<()>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     {
@@ -446,10 +463,18 @@ impl Emulator {
                     while let Some((packet, used)) = mqtt::decode(&buf)? {
                         decoded_a_packet = true;
                         buf.drain(..used);
+                        let was_connected = session.is_connected();
                         let response = {
                             let cache = self.cache.read().expect("cache lock poisoned");
                             session.handle(packet, &self.printer, &cache)
                         };
+                        if !was_connected && session.is_connected() {
+                            let n = self.connected.fetch_add(1, Ordering::Relaxed) + 1;
+                            eprintln!(
+                                "emulate: {peer} connected as {:?} ({n} client(s) now)",
+                                session.client_id()
+                            );
+                        }
                         for out in &response.send {
                             writer.write_all(&mqtt::encode(out)).await?;
                         }
@@ -649,7 +674,7 @@ mod tests {
         let emulator = Emulator::with_tuning(printer, upstream as Arc<dyn Upstream>, tuning);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let tls = crate::tls::emulated_printer_server_config(SERIAL).unwrap();
+        let tls = crate::tls::emulated_printer_server_config(SERIAL, None).unwrap();
         tokio::spawn(Arc::clone(&emulator).pump());
         tokio::spawn(Arc::clone(&emulator).serve(listener, tls));
         (emulator, addr)
@@ -1014,7 +1039,7 @@ mod tests {
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let tls = crate::tls::emulated_printer_server_config(SERIAL).unwrap();
+        let tls = crate::tls::emulated_printer_server_config(SERIAL, None).unwrap();
         tokio::spawn(Arc::clone(&emulator).pump());
         tokio::spawn(Arc::clone(&emulator).serve(listener, tls));
 

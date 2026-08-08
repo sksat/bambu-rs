@@ -12,6 +12,8 @@ pub mod assets;
 pub mod camera;
 pub mod control;
 #[cfg(feature = "relay")]
+pub mod detect;
+#[cfg(feature = "relay")]
 pub mod emulate;
 pub mod files;
 #[cfg(feature = "relay")]
@@ -21,6 +23,8 @@ pub mod live;
 pub mod relay;
 pub mod start;
 pub mod stream_record;
+#[cfg(feature = "relay")]
+pub mod synthetic;
 pub mod timelapse;
 
 use std::sync::Arc;
@@ -87,6 +91,18 @@ pub struct EmulateOpts {
     /// Bambu Studio uploads the sliced file over FTP first, and that upload goes
     /// to whichever host it was pointed at.
     pub ftp_port: Option<u16>,
+    /// Passive data ports for the FTP relay, as `"first-last"`. `None` = any
+    /// ephemeral port, which a deny-by-default firewall will block.
+    pub pasv_ports: Option<String>,
+    /// The plain device-detect port (`3000` on a real printer), or `None` to
+    /// leave it unserved.
+    ///
+    /// Bambu Studio's "add printer by IP" probes this *before* MQTT and gives up
+    /// silently if nothing answers, so without it the relay cannot be added by
+    /// IP at all — however well it serves 8883.
+    pub detect_port: Option<u16>,
+    /// The TLS device-detect port (`3002`), or `None`. Same protocol inside.
+    pub detect_tls_port: Option<u16>,
     /// Serve reads but refuse anything that would move or heat the machine —
     /// and, on the FTP side, anything that writes.
     pub read_only: bool,
@@ -100,6 +116,30 @@ pub struct EmulateOpts {
 pub struct ServeTarget {
     pub name: String,
     pub target: ResolvedTarget,
+}
+
+/// Parse a `"first-last"` passive port range.
+///
+/// A hard error rather than a shrug: someone passing this is working around a
+/// firewall, and silently ignoring a typo would leave them debugging transfers
+/// that hang for reasons the relay could have named at startup.
+#[cfg(feature = "relay")]
+pub fn parse_pasv_ports(spec: &str) -> anyhow::Result<std::ops::RangeInclusive<u16>> {
+    let (first, last) = spec.split_once('-').ok_or_else(|| {
+        anyhow::anyhow!("passive port range must look like 50000-50100, got {spec:?}")
+    })?;
+    let first: u16 = first
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{first:?} is not a port number"))?;
+    let last: u16 = last
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{last:?} is not a port number"))?;
+    if first == 0 || last < first {
+        anyhow::bail!("passive port range {first}-{last} is empty or starts at zero");
+    }
+    Ok(first..=last)
 }
 
 /// Run the server (blocking; owns its own multi-thread runtime).
@@ -123,13 +163,15 @@ pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
         external_cameras,
         ..
     } = opts;
-    // There is nothing to relay to. Better to say so than to stand up a listener
-    // that answers every read with an empty snapshot.
+    // There has to be *a* printer, real or synthetic, and an identity to present
+    // it under. Without either, the relay would answer every read with an empty
+    // snapshot, which looks to a client like a printer gone strange rather than
+    // one that was never there.
     #[cfg(feature = "relay")]
-    if emulate.is_some() && (fake || targets.is_empty()) {
+    if emulate.is_some() && targets.is_empty() {
         anyhow::bail!(
-            "--emulate relays a real printer; it has nothing to serve with --fake or without a \
-             configured printer"
+            "--emulate needs a printer to present: configure one, or pass --fake with \
+             --serial/--access-code to relay a synthetic one"
         );
     }
     // One emulated printer per host, not per port: a client looks for a printer
@@ -207,6 +249,41 @@ pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
                 .map_or_else(|| "fake".to_string(), |t| t.name.clone());
             let id = printer_id(&name);
             default = id.clone();
+            // `--fake --emulate`: the same relay, in front of a printer that
+            // isn't there. It is what lets the whole stack be exercised across
+            // processes with no hardware — so the dashboard reads the synthetic
+            // printer's own reports rather than a second, unrelated fake.
+            #[cfg(feature = "relay")]
+            let source: Arc<dyn PrinterSource> = match (&emulate, targets.first()) {
+                (Some(em), Some(ServeTarget { target: t, .. })) => {
+                    let printer = synthetic::SyntheticPrinter::start(tick);
+                    let source = Arc::new(LiveSource::from_reports(printer.subscribe()));
+                    start_emulator(
+                        t,
+                        em,
+                        printer,
+                        synthetic::SyntheticFiles::new(),
+                        // Nothing to ask, so the identity is composed from the
+                        // one we were told to present under.
+                        Arc::new(detect::SyntheticDetect {
+                            serial: t.serial.clone(),
+                            // An unrecognised model reports whatever it was
+                            // configured as, rather than being rounded to some
+                            // real machine it is not.
+                            model: t
+                                .model
+                                .device_code()
+                                .unwrap_or_else(|| t.model.as_str())
+                                .to_string(),
+                        }),
+                    )
+                    .await?;
+                    source
+                }
+                _ => Arc::new(FakeSource::ramping(tick)),
+            };
+            #[cfg(not(feature = "relay"))]
+            let source: Arc<dyn PrinterSource> = Arc::new(FakeSource::ramping(tick));
             printers.insert(
                 id.clone(),
                 PrinterState {
@@ -214,7 +291,7 @@ pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
                     id,
                     model: None,
                     legacy_captures: true,
-                    source: Arc::new(FakeSource::ramping(tick)),
+                    source,
                     controller: Arc::new(FakeController::verified()),
                     files: Arc::new(FakeFiles),
                     starter: Arc::new(FakeStarter),
@@ -318,7 +395,16 @@ async fn connect_source(
             // no receivers throws it away.
             let link = relay::LivePrinterLink::new();
             let source = Arc::new(LiveSource::from_reports(link.subscribe()));
-            start_emulator(t, em, Arc::clone(&link)).await?;
+            start_emulator(
+                t,
+                em,
+                Arc::clone(&link) as Arc<dyn emulate::Upstream>,
+                Arc::new(ftpd::LivePrinterFiles::new(t.clone())),
+                // Ask the machine itself: model, name and firmware are facts
+                // about it, not ours to compose.
+                detect::ProxyDetect::new(&t.ip, t.detect_port),
+            )
+            .await?;
             // The relay answers clients' `pushall`s from its cache rather than
             // forwarding them, so nothing else would ever refresh it: seeded
             // once at connect and then fed only deltas, which are QoS 0 and
@@ -355,7 +441,9 @@ fn show_addr(host: &str, port: u16) -> String {
 async fn start_emulator(
     target: &ResolvedTarget,
     opts: &EmulateOpts,
-    link: Arc<relay::LivePrinterLink>,
+    upstream: Arc<dyn emulate::Upstream>,
+    files: Arc<dyn ftpd::PrinterFiles>,
+    detect_source: Arc<dyn detect::DetectSource>,
 ) -> anyhow::Result<()> {
     use crate::core::emulate::EmulatedPrinter;
 
@@ -365,7 +453,11 @@ async fn start_emulator(
     } else {
         printer
     };
-    let tls = crate::tls::emulated_printer_server_config(&target.serial)?;
+    // Kept on disk, not made afresh: Bambu Studio verifies a printer against the
+    // CAs it bundles, so a relay can only ever be trusted by being pinned — and a
+    // pin is worthless against an identity that changes every restart.
+    let cert_dir = crate::config::default_emulate_cert_dir();
+    let tls = crate::tls::emulated_printer_server_config(&target.serial, cert_dir.as_deref())?;
     // The tuple form, not "{host}:{port}": formatting an IPv6 host makes `::1`
     // into the unparseable `::1:8883`, and the loopback notice below explicitly
     // recognises `::1` as a host someone may pass.
@@ -377,11 +469,39 @@ async fn start_emulator(
     // Both listeners bound before either is served, so a port clash on FTP
     // fails at startup rather than after MQTT has come up looking healthy.
     let ftp = match opts.ftp_port {
-        Some(port) => Some(bind_ftp_relay(target, opts, port).await?),
+        Some(port) => Some(bind_ftp_relay(target, opts, port, files).await?),
         None => None,
     };
 
-    let emulator = emulate::Emulator::new(printer, link);
+    // Likewise the detect ports — and these especially, because a client that
+    // cannot probe us does not report an error, it simply never arrives.
+    let mut detect_listeners = Vec::new();
+    for (port, tls) in [
+        (opts.detect_port, None),
+        (opts.detect_tls_port, Some(Arc::clone(&tls))),
+    ] {
+        let Some(port) = port else { continue };
+        let addr = show_addr(&opts.host, port);
+        let listener = tokio::net::TcpListener::bind((opts.host.as_str(), port))
+            .await
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::PermissionDenied && port < 1024 {
+                    anyhow::anyhow!(
+                        "binding the detect listener on {addr}: permission denied — \
+                         port {port} is privileged. Grant the capability once with \
+                         `sudo setcap cap_net_bind_service=+ep $(which bambu)`, or move it \
+                         with --emulate-detect-port (a client looking for a printer by IP \
+                         only ever probes 3000/3002, so moving it means Studio won't find \
+                         this relay)."
+                    )
+                } else {
+                    anyhow::anyhow!("binding the detect listener on {addr}: {e}")
+                }
+            })?;
+        detect_listeners.push((listener, tls, addr));
+    }
+
+    let emulator = emulate::Emulator::new(printer, upstream);
     tokio::spawn(Arc::clone(&emulator).pump());
     tokio::spawn({
         let tls = Arc::clone(&tls);
@@ -402,12 +522,37 @@ async fn start_emulator(
         });
         eprintln!("emulate: FTP relay on ftps://{ftp_addr} (implicit TLS)");
     }
+    for (listener, tls, addr) in detect_listeners {
+        let source = Arc::clone(&detect_source);
+        let kind = if tls.is_some() { "TLS" } else { "plain" };
+        tokio::spawn(async move {
+            if let Err(e) = detect::serve(listener, source, tls).await {
+                eprintln!("emulate-detect: listener stopped: {e}");
+            }
+        });
+        eprintln!("emulate: device-detect ({kind}) on {addr}");
+    }
+    if opts.detect_port.is_none() && opts.detect_tls_port.is_none() {
+        eprintln!(
+            "emulate: no detect listener, so Bambu Studio's \"add printer by IP\" will not \
+             find this relay — it probes 3000/3002 before MQTT and gives up quietly"
+        );
+    }
 
     eprintln!(
         "emulating printer {} on mqtts://{addr} — point a client at this host \
          with the printer's own serial and access code",
         target.serial
     );
+    if let Some(dir) = &cert_dir {
+        // Named because a client that checks certificates cannot be talked round
+        // any other way: it has to be handed this file.
+        eprintln!(
+            "emulate: TLS identity {} (stable across restarts; a client that \
+             verifies certificates must be pointed at it)",
+            dir.join(format!("{}.cert.pem", target.serial)).display()
+        );
+    }
     if opts.ftp_port.is_none() {
         eprintln!(
             "emulate: no FTP relay, so a client can watch and control this printer but \
@@ -438,13 +583,26 @@ async fn bind_ftp_relay(
     target: &ResolvedTarget,
     opts: &EmulateOpts,
     port: u16,
+    files: Arc<dyn ftpd::PrinterFiles>,
 ) -> anyhow::Result<(Arc<ftpd::FtpRelay>, tokio::net::TcpListener, String)> {
-    let files: Arc<dyn ftpd::PrinterFiles> = Arc::new(ftpd::LivePrinterFiles::new(target.clone()));
     let relay = if opts.read_only {
         ftpd::FtpRelay::read_only(&target.access_code, files)
     } else {
         ftpd::FtpRelay::new(&target.access_code, files)
     };
+    let pasv = opts
+        .pasv_ports
+        .as_deref()
+        .map(parse_pasv_ports)
+        .transpose()?;
+    if let Some(range) = &pasv {
+        eprintln!(
+            "emulate: FTP passive data ports confined to {}-{}",
+            range.start(),
+            range.end()
+        );
+    }
+    let relay = relay.with_pasv_ports(pasv);
     let addr = show_addr(&opts.host, port);
     let listener = tokio::net::TcpListener::bind((opts.host.as_str(), port))
         .await

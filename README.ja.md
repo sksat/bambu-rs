@@ -244,12 +244,12 @@ use bambu_rs::core::command::{Command, ProjectFile};
 use bambu_rs::core::model::Model;
 use bambu_rs::core::session::CommandOutcome;
 
-let client = LanMqttClient::new(ResolvedTarget {
-    ip: "192.0.2.50".into(),
-    serial: "<SERIAL>".into(),
-    access_code: "<CODE>".into(),
-    model: Model::A1Mini,
-});
+let client = LanMqttClient::new(ResolvedTarget::new(
+    "192.0.2.50",
+    "<SERIAL>",
+    "<CODE>",
+    Model::A1Mini,
+));
 
 // フル calibration。send_and_verify は、publish の成功ではなく、プリンター自身の
 // report を読み直して、実際に始まったことを確認する。

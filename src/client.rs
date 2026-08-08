@@ -32,7 +32,6 @@ use crate::core::version::DeviceVersion;
 // existing `client::{CommandOutcome, VerifyStage}` users keep working.
 pub use crate::core::session::{CommandOutcome, VerifyStage};
 
-const MQTT_PORT: u16 = 8883;
 const MQTT_USER: &str = "bblp";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Backoff between reconnect attempts for a continuous (`reconnect`) watch.
@@ -138,7 +137,7 @@ impl LanMqttClient {
 
     /// Connect, subscribe to the report topic, and request a `pushall`.
     async fn connect(&self) -> Result<(AsyncClient, EventLoop), ClientError> {
-        let mut opts = MqttOptions::new(unique_client_id(), &self.target.ip, MQTT_PORT);
+        let mut opts = MqttOptions::new(unique_client_id(), &self.target.ip, self.target.mqtt_port);
         opts.set_credentials(MQTT_USER, &self.target.access_code);
         opts.set_keep_alive(Duration::from_secs(30));
         opts.set_transport(Transport::Tls(tls_config()?));

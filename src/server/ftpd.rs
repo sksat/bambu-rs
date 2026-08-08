@@ -91,7 +91,7 @@ pub struct LivePrinterFiles {
 
 impl LivePrinterFiles {
     pub fn new(target: crate::config::ResolvedTarget) -> Self {
-        let addr = format!("{}:{}", target.ip, crate::ftp::FTPS_PORT);
+        let addr = format!("{}:{}", target.ip, target.ftps_port);
         Self {
             client: FtpsClient::new(target),
             addr,
@@ -162,6 +162,14 @@ pub struct FtpRelay {
     /// Refuse anything that writes. Mirrors the MQTT relay's read-only mode:
     /// there, control; here, uploads and deletes.
     read_only: bool,
+    /// Ports `PASV` may hand out, or `None` for any ephemeral one.
+    ///
+    /// Every serious FTP server has this knob, and the reason is firewalls: a
+    /// passive transfer opens a *second* connection on a port chosen at the
+    /// time, so a host that denies inbound by default blocks every transfer
+    /// even with 990 allowed. Pinning the range is what makes one firewall rule
+    /// possible. Discovered the hard way, against a real `ufw` deny-by-default.
+    pasv_ports: Option<std::ops::RangeInclusive<u16>>,
 }
 
 impl FtpRelay {
@@ -170,6 +178,7 @@ impl FtpRelay {
             access_code: access_code.into(),
             files,
             read_only: false,
+            pasv_ports: None,
         })
     }
 
@@ -178,7 +187,38 @@ impl FtpRelay {
             access_code: access_code.into(),
             files,
             read_only: true,
+            pasv_ports: None,
         })
+    }
+
+    /// Confine `PASV` to `ports`, so one firewall rule can cover every transfer.
+    pub fn with_pasv_ports(
+        self: Arc<Self>,
+        ports: Option<std::ops::RangeInclusive<u16>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            access_code: self.access_code.clone(),
+            files: Arc::clone(&self.files),
+            read_only: self.read_only,
+            pasv_ports: ports,
+        })
+    }
+
+    /// Bind a data listener, inside the configured range if there is one.
+    async fn bind_data(&self, ip: std::net::IpAddr) -> std::io::Result<TcpListener> {
+        let Some(range) = self.pasv_ports.clone() else {
+            return TcpListener::bind(SocketAddr::new(ip, 0)).await;
+        };
+        let mut last = None;
+        for port in range.clone() {
+            match TcpListener::bind(SocketAddr::new(ip, port)).await {
+                Ok(l) => return Ok(l),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            std::io::Error::other(format!("no free port in {}-{}", range.start(), range.end()))
+        }))
     }
 
     /// Accept control connections forever, each in its own task.
@@ -277,7 +317,18 @@ impl FtpRelay {
                 if line.is_empty() {
                     continue;
                 }
+                let was_authenticated = session.is_authenticated();
                 let action = session.handle(&line);
+                // Say so the moment a client gets in, the way the MQTT side
+                // names every client that connects. A session that logs in and
+                // then stores nothing is a real answer to "did this client send
+                // the file through us?" — and an invisible one until now.
+                if !was_authenticated && session.is_authenticated() {
+                    eprintln!(
+                        "emulate-ftp: {} logged in",
+                        peer.map_or_else(|| "a client".to_string(), |p| p.to_string())
+                    );
+                }
                 if self
                     .run(
                         action,
@@ -326,13 +377,10 @@ impl FtpRelay {
             FtpAction::Passive(kind) => {
                 // Bound to the interface the client already reached us on, so a
                 // relay listening on one address can't hand out another.
-                // A SocketAddr, not a formatted string: `format!("{}:0", ip)`
-                // turns an IPv6 address into `::1:0`, which parses as nothing.
-                let bind = local.map_or_else(
-                    || SocketAddr::from(([0, 0, 0, 0], 0)),
-                    |a| SocketAddr::new(a.ip(), 0),
-                );
-                match TcpListener::bind(bind).await {
+                // The interface the client already reached us on, so a relay
+                // listening on one address cannot hand out another.
+                let ip = local.map_or(std::net::IpAddr::from([0, 0, 0, 0]), |a| a.ip());
+                match self.bind_data(ip).await {
                     Ok(listener) => {
                         let port = listener.local_addr()?.port();
                         let reply = match kind {
@@ -531,7 +579,28 @@ impl FtpRelay {
         let mut total: u64 = 0;
         let mut chunk = vec![0u8; 64 * 1024];
         loop {
-            let n = data.read(&mut chunk).await?;
+            let n = match data.read(&mut chunk).await {
+                Ok(n) => n,
+                // In FTP the close of the data connection *is* the end of the
+                // file — there is no length prefix. Most clients (suppaftp, the
+                // one this crate uses against a printer) close their side
+                // without a TLS close_notify, which rustls reports as
+                // `UnexpectedEof` rather than a clean zero. Refusing those would
+                // refuse nearly every real client.
+                //
+                // The cost is that a genuinely truncated upload looks complete
+                // here. That is caught where it matters instead: a `.gcode.3mf`
+                // carries an md5 sidecar, and `job start` verifies it before the
+                // machine is asked to print anything.
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    eprintln!(
+                        "emulate-ftp: data connection closed without a TLS goodbye after \
+                         {total} bytes; taking that as the end of the file"
+                    );
+                    0
+                }
+                Err(e) => return Err(e.into()),
+            };
             if n == 0 {
                 break;
             }
@@ -546,12 +615,20 @@ impl FtpRelay {
         }
         out.flush().await?;
         drop(out);
-        // Close the TLS session properly rather than just dropping the socket.
-        // A client that finishes an upload by unwrapping its TLS layer — which
-        // Python's ftplib does, and it is the correct thing to do — waits for
-        // our close_notify; dropping the connection instead gives it an
-        // "unexpected EOF in violation of protocol" on an upload that worked.
-        data.shutdown().await?;
+        // Say goodbye properly, but never let the goodbye fail the transfer.
+        //
+        // Python's ftplib unwraps its TLS layer after an upload and waits for
+        // our close_notify; without one it reports "unexpected EOF in violation
+        // of protocol" on a transfer that worked. suppaftp — this crate's own
+        // client, and an ordinary one — instead just closes its side, so
+        // sending the close_notify gets EPIPE. Both are reasonable clients, and
+        // by this point every byte is already in the temp file: the only wrong
+        // answer is to call the upload failed.
+        if let Err(e) = data.shutdown().await {
+            eprintln!(
+                "emulate-ftp: client closed the data connection abruptly ({e}); the upload is complete regardless"
+            );
+        }
         drop(data);
 
         let files = Arc::clone(&self.files);
@@ -560,10 +637,23 @@ impl FtpRelay {
         // Blocking FTPS to the printer, off the runtime's worker threads.
         let sent = tokio::task::spawn_blocking(move || files.upload(&local, &remote)).await?;
         match sent {
-            Ok(n) => Ok(Reply::new(
-                226,
-                format!("stored {n} bytes to {path} on the printer"),
-            )),
+            Ok(n) => {
+                // The one line that says a print was actually sent through here.
+                // Without it a clean upload is the quietest thing the relay
+                // does: only failures were logged, so "did the file go through
+                // us or straight to the printer?" had no answer in the log —
+                // and that is exactly the question anyone debugging a client
+                // asks. The MQTT side names every client that connects; this is
+                // the same courtesy for the side that carries the print.
+                eprintln!(
+                    "emulate-ftp: {} stored {n} bytes to {path} on the printer",
+                    peer.map_or_else(|| "a client".to_string(), |p| p.to_string())
+                );
+                Ok(Reply::new(
+                    226,
+                    format!("stored {n} bytes to {path} on the printer"),
+                ))
+            }
             // The client is told the upload failed and where: it uploaded to us
             // successfully, and the printer is the half that refused.
             Err(e) => Ok(Reply::new(
@@ -598,7 +688,9 @@ impl FtpRelay {
         let mut data = open_data(control, data_listener, acceptor, peer, "sending file").await?;
         let mut file = tokio::fs::File::open(staged.path()).await?;
         let sent = tokio::io::copy(&mut file, &mut data).await?;
-        data.shutdown().await?;
+        // Best-effort, as in `store`: the bytes are out, and a client that has
+        // already hung up must not turn a finished download into a failure.
+        let _ = data.shutdown().await;
         Ok(Reply::new(226, format!("sent {sent} bytes")))
     }
 
@@ -633,7 +725,7 @@ impl FtpRelay {
         let mut data = open_data(control, data_listener, acceptor, peer, "sending listing").await?;
         let body: String = lines.iter().map(|l| format!("{l}\r\n")).collect();
         data.write_all(body.as_bytes()).await?;
-        data.shutdown().await?;
+        let _ = data.shutdown().await;
         Ok(Reply::new(226, format!("listed {} entries", lines.len())))
     }
 
@@ -883,7 +975,7 @@ mod tests {
     async fn start(relay: Arc<FtpRelay>) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let tls = crate::tls::emulated_printer_server_config(SERIAL).unwrap();
+        let tls = crate::tls::emulated_printer_server_config(SERIAL, None).unwrap();
         tokio::spawn(relay.serve(listener, tls));
         addr
     }
@@ -1044,6 +1136,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_client_that_closes_abruptly_still_gets_its_upload_through() {
+        // Found against the real printer. `suppaftp` — the client this relay
+        // uses to reach the printer, and a perfectly ordinary FTP client — just
+        // closes its side of the data connection when it has finished sending.
+        // Trying to answer that with a TLS close_notify gets EPIPE, and because
+        // the shutdown was fallible that turned a complete upload into a 550
+        // *before* anything was forwarded. Every byte had arrived; none reached
+        // the printer.
+        //
+        // Python's ftplib wants the close_notify and this client cannot receive
+        // it, so the shutdown is attempted and its failure ignored.
+        let files = FakeFiles::new();
+        let addr = start(FtpRelay::new(
+            CODE,
+            Arc::clone(&files) as Arc<dyn PrinterFiles>,
+        ))
+        .await;
+        let mut client = TestClient::connect(addr).await;
+        client.login().await;
+        let port = client.pasv().await;
+        client
+            .stream
+            .write_all(b"STOR /cache/abrupt.3mf\r\n")
+            .await
+            .unwrap();
+        client.stream.flush().await.unwrap();
+        let mut data = client.data_connect(port).await;
+        assert_eq!(client.read_reply().await.0, 150);
+        data.write_all(b"every one of these bytes arrived")
+            .await
+            .unwrap();
+        data.flush().await.unwrap();
+        // No `shutdown()`: the socket simply goes away, as suppaftp's does.
+        drop(data);
+
+        let (code, line) = client.read_reply().await;
+        assert_eq!(
+            code, 226,
+            "the upload completed; only the goodbye was rude: {line}"
+        );
+        let uploads = files.uploads();
+        assert_eq!(uploads.len(), 1, "and it must reach the printer");
+        assert_eq!(uploads[0].1, b"every one of these bytes arrived");
+    }
+
+    #[tokio::test]
     async fn a_printer_that_refuses_the_upload_is_reported_not_papered_over() {
         // The client's upload to US succeeded; the printer is the half that
         // said no, and a 226 here would have Studio start a print of a file
@@ -1177,7 +1315,7 @@ mod tests {
         let files = FakeFiles::new();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let tls = crate::tls::emulated_printer_server_config(SERIAL).unwrap();
+        let tls = crate::tls::emulated_printer_server_config(SERIAL, None).unwrap();
         tokio::spawn(
             FtpRelay::new(CODE, Arc::clone(&files) as Arc<dyn PrinterFiles>).serve(listener, tls),
         );
