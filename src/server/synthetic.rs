@@ -100,7 +100,20 @@ impl SyntheticPrinter {
             "home_flag": 0,
             "hms": [],
             "lights_report": [{"node": "chamber_light", "mode": "on"}],
-            "ipcam": {"timelapse": "disable", "ipcam_record": "enable", "resolution": "1080p"},
+            // The shape a real A1 mini sends, `mode_bits` and `tutk_server`
+            // included. They looked like noise until a client was watched
+            // deciding whether to open a liveview: with them absent, Bambu
+            // Studio does not even try, however loudly `ipcam_dev` says a
+            // camera is there. A synthetic printer missing them is not a
+            // stand-in a camera client can be tested against.
+            "ipcam": {
+                "ipcam_dev": "0",
+                "ipcam_record": "enable",
+                "mode_bits": 3,
+                "resolution": "1080p",
+                "timelapse": "disable",
+                "tutk_server": "disable",
+            },
         }})
     }
 

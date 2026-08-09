@@ -222,7 +222,7 @@ impl CameraRelay {
                             // that an error buries the failures worth reading
                             // in a log full of normal departures.
                             Err(e) if emulate::is_ordinary_disconnect(&e) => {
-                                eprintln!("emulate-camera: {peer} left")
+                                eprintln!("emulate-camera: {peer} left ({e})")
                             }
                             Err(e) => eprintln!("emulate-camera: {peer} dropped: {e}"),
                         }
@@ -264,6 +264,7 @@ impl CameraRelay {
             anyhow::bail!("wrong access code");
         }
 
+        eprintln!("emulate-camera: authenticated, sending frames");
         let mut feed = self.frames.clone();
         let mut sent = 0u64;
         // Whatever is current goes out first, so a viewer joining mid-stream
@@ -271,11 +272,21 @@ impl CameraRelay {
         let mut pending = feed.borrow_and_update().clone();
         loop {
             if let Some(frame) = pending.take() {
-                stream
-                    .write_all(&camerad::frame_header(frame.len() as u32))
-                    .await?;
-                stream.write_all(&frame).await?;
-                stream.flush().await?;
+                // The count goes into any failure: the server side of this
+                // protocol has never been observed, so "gave up after the
+                // header", "after one frame" and "after twenty" are three
+                // different diagnoses and the only ones available.
+                let write = async {
+                    stream
+                        .write_all(&camerad::frame_header(frame.len() as u32))
+                        .await?;
+                    stream.write_all(&frame).await?;
+                    stream.flush().await
+                };
+                if let Err(e) = write.await {
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("after {sent} frame(s), {} bytes", frame.len())));
+                }
                 sent += 1;
             }
             // No timeout: a source that has stopped producing leaves the viewer
