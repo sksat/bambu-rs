@@ -332,7 +332,7 @@ pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
             #[cfg(feature = "relay")]
             let source: Arc<dyn PrinterSource> = match (&emulate, targets.first()) {
                 (Some(em), Some(ServeTarget { target: t, .. })) => {
-                    let printer = synthetic::SyntheticPrinter::start(tick);
+                    let printer = synthetic::SyntheticPrinter::start(&t.serial, tick);
                     let source = Arc::new(LiveSource::from_reports(printer.subscribe()));
                     start_emulator(
                         t,

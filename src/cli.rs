@@ -257,6 +257,16 @@ enum Command {
         /// Serve deterministic fake data (no printer needed; for demos/E2E).
         #[arg(long)]
         fake: bool,
+        /// Have `--fake` speak a captured report from a real printer instead of
+        /// the bundled one. Takes a `pushall` capture (either the raw report or
+        /// the envelope `tools/capture_pushall.py` writes).
+        ///
+        /// The bundled fixture is one A1 mini on one day, and a client may care
+        /// about a field that machine lacked or a value it happened to hold —
+        /// Bambu Studio refuses to finish connecting to the bundled one and
+        /// accepts a capture taken from the same printer months later.
+        #[arg(long, value_name = "PUSHALL_JSON", requires = "fake")]
+        fake_report: Option<std::path::PathBuf>,
         /// Poll the printer every N seconds for live updates (default: passive).
         #[arg(long)]
         interval: Option<u64>,
@@ -945,6 +955,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             port,
             password,
             fake,
+            fake_report,
             interval,
             camera_url,
             cameras_config,
@@ -986,6 +997,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             *port,
             password.clone(),
             *fake,
+            fake_report.clone(),
             *interval,
             camera_url.clone(),
             cameras_config.clone(),
@@ -1827,6 +1839,7 @@ fn run_serve(
     port: u16,
     password: Option<String>,
     fake: bool,
+    fake_report: Option<std::path::PathBuf>,
     interval: Option<u64>,
     camera_url: Vec<String>,
     cameras_config: Option<std::path::PathBuf>,
@@ -1851,6 +1864,13 @@ fn run_serve(
     // the emulated printer has to be *some* printer: the serial names its topics
     // and its certificate, and the access code is what clients authenticate
     // with. Nothing is connected to; only the identity is borrowed.
+    #[cfg(feature = "relay")]
+    if let Some(path) = fake_report {
+        // Set before anything builds a synthetic printer, and only once — a
+        // report that changed under a running relay would be a printer that
+        // changed shape mid-conversation.
+        let _ = crate::server::synthetic::CAPTURED_REPORT.set(path);
+    }
     #[cfg(feature = "relay")]
     let targets = if fake {
         emulate
