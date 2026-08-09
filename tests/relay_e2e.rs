@@ -444,3 +444,180 @@ fn the_relay_refuses_a_client_with_the_wrong_access_code() {
         String::from_utf8_lossy(&out.stderr),
     );
 }
+
+/// DOOM through the printer's own LAN interface, across processes.
+///
+/// The relay's own tests prove the two halves separately: that an intercepted
+/// command cannot reach the printer (`server::emulate`) and that the engine's
+/// pipes are read and written correctly (`server::doom`). What only a real
+/// process can show is the wiring in between — that the flags reach the
+/// emulator at all, that the game is served on the port a client's liveview
+/// looks at, and that a button pressed by an ordinary client comes out as a
+/// keypress at the engine's stdin. The clap bug that read the engine's own
+/// `-iwad` as one of our flags got past everything except starting the thing.
+///
+/// The "engine" here is a shell script, not DOOM: this is a test of the
+/// plumbing, and it should not need a WAD or a C compiler.
+#[cfg(all(unix, feature = "doom"))]
+#[test]
+fn a_client_plays_a_game_through_the_printers_own_controls() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("bambu-doom-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let keys = dir.join("keys");
+    let engine = dir.join("engine.sh");
+    // A status record saying the player is on 50 health, then one framed
+    // picture, then everything it is told, written down. The `cat` holds stdin
+    // open, which is what keeps it alive the way a game would.
+    //
+    // The status record's length word is zero and its magic is "DOOM"; a reader
+    // that mistook it for a frame would hand four bytes of binary to a client's
+    // decoder, so this test is also where that would show.
+    std::fs::write(
+        &engine,
+        format!(
+            "#!/bin/sh\n\
+             printf '\\000\\000\\000\\000DOOM\\004\\000\\000\\000\\000\\000\\000\\000'\n\
+             printf '\\062\\000\\000\\000'\n\
+             printf '\\264\\004\\000\\000\\000\\000\\000\\000\\001\\000\\000\\000\\000\\000\\000\\000'\n\
+             printf '\\377\\330'\n\
+             i=0; while [ $i -lt 1200 ]; do printf 'A'; i=$((i+1)); done\n\
+             printf '\\377\\331'\n\
+             cat > {}\n",
+            keys.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mqtt = free_port();
+    let camera = free_port();
+    let http = free_port();
+    let serve = spawn(
+        "doom printer",
+        &[
+            "--serial",
+            SERIAL,
+            "--access-code",
+            CODE,
+            "serve",
+            "--fake",
+            "--port",
+            &http.to_string(),
+            "--emulate",
+            "--emulate-host",
+            "127.0.0.1",
+            "--emulate-port",
+            &mqtt.to_string(),
+            "--emulate-no-detect",
+            "--emulate-doom",
+            "--emulate-doom-engine",
+            engine.to_str().unwrap(),
+            "--emulate-doom-port",
+            &camera.to_string(),
+        ],
+    );
+    wait_for_port(camera, "the game's camera port");
+
+    // 1. What a client's liveview would show is what the engine drew.
+    let target = bambu_rs::config::ResolvedTarget {
+        camera_port: camera,
+        ..bambu_rs::config::ResolvedTarget::new(
+            "127.0.0.1",
+            SERIAL,
+            CODE,
+            bambu_rs::core::model::Model::A1Mini,
+        )
+    };
+    let frame = bambu_rs::camera::CameraClient::new(target)
+        .with_timeout(Duration::from_secs(20))
+        .snapshot()
+        .unwrap_or_else(|e| panic!("the game should be served as the chamber camera: {e}"));
+    assert!(
+        bambu_rs::core::camerad::is_jpeg(&frame),
+        "got {} bytes that are not a picture",
+        frame.len()
+    );
+
+    // 2. The player's health is the nozzle temperature, read by a client that
+    //    knows nothing about any of this. 50 health is 122.5 °C on the scale in
+    //    `core::doom`, and the target is the full-health value, so a client
+    //    drawing current against target is drawing a health bar.
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        let (ok, out) = status_via(mqtt);
+        if ok && out.contains("122.5") {
+            assert!(
+                out.contains("\"nozzle_target\": 220.0"),
+                "the target should be full health:\n{out}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the game's health never reached the nozzle:\n{out}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    // 3. And the home button reaches the game as the trigger. Sent with the
+    //    ordinary client, which waits for the ACK — so this also shows a client
+    //    is not left hanging on a command that went to a game instead.
+    let out = bin()
+        .args([
+            "--ip",
+            "127.0.0.1",
+            "--mqtt-port",
+            &mqtt.to_string(),
+            "--serial",
+            SERIAL,
+            "--access-code",
+            CODE,
+            "--model",
+            "a1mini",
+            "gcode",
+            "G28",
+            "--confirm",
+        ])
+        .env_remove("BAMBU_IP")
+        .env_remove("BAMBU_MQTT_PORT")
+        .current_dir(std::env::temp_dir())
+        .output()
+        .expect("running bambu gcode");
+    assert!(
+        out.status.success(),
+        "the relay should acknowledge a command it took for the game:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    // Long enough for the release to be due — the press goes out at once, the
+    // release when the hold runs out — and only then hang up. Killing serve
+    // first would take the keyboard thread with it and leave the key down.
+    std::thread::sleep(Duration::from_millis(500));
+    drop(serve);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        // `cat` writes what it has, so a 2-byte read is a press whose release
+        // is still on its way rather than a release that never came.
+        if let Ok(seen) = std::fs::read(&keys)
+            && seen.len() >= 4
+        {
+            // KEY_FIRE down, KEY_FIRE up.
+            assert_eq!(
+                seen,
+                vec![1, 0xa3, 0, 0xa3],
+                "the home button should have reached the engine as fire"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "nothing ever reached the engine's keyboard"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}

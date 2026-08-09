@@ -135,10 +135,40 @@ pub trait Upstream: Send + Sync + 'static {
     fn send(&self, payload: Value);
 }
 
+/// Whatever stands behind an intercepting relay in the printer's place.
+///
+/// Paired with [`crate::core::emulate::ControlPolicy::Intercept`], and only ever
+/// through [`Emulator::intercepting`] — the policy and the interceptor are set
+/// together so a relay cannot end up swallowing commands with nothing behind
+/// it. With the `doom` feature, `serve --emulate-doom` puts a `DoomEngine`
+/// here; not linked as a doc reference, because that module is not in a build
+/// without it.
+///
+/// Both directions are one trait because they are one thing: something that
+/// takes the buttons has state of its own, and the report on the way out is
+/// where a client would look for it.
+pub trait Interceptor: Send + Sync + 'static {
+    /// Take one control payload. Called from the client's task, so it must not
+    /// block: one wedged interceptor would stall the connection that fed it.
+    fn consume(&self, payload: &Value);
+
+    /// Say something about itself in a report on its way to clients, before it
+    /// is cached or fanned out. Returns whether anything changed.
+    ///
+    /// Defaulted, because an interceptor that only listens is a reasonable
+    /// thing to be.
+    fn overlay(&self, _message: &mut Value) -> bool {
+        false
+    }
+}
+
 /// The emulated printer: a TLS MQTT listener in front of one upstream link.
 pub struct Emulator {
     printer: EmulatedPrinter,
     upstream: Arc<dyn Upstream>,
+    /// Present exactly when the printer's policy is `Intercept`; see
+    /// [`Emulator::intercepting`].
+    interceptor: Option<Arc<dyn Interceptor>>,
     cache: Arc<RwLock<UpstreamCache>>,
     rewriter: Arc<Mutex<SequenceRewriter>>,
     /// The printer's own pushes, pre-encoded once and shared. Lossy by design:
@@ -203,6 +233,25 @@ impl Emulator {
         Self::with_tuning(printer, upstream, Tuning::default())
     }
 
+    /// A relay that takes control commands for itself and hands them to `sink`
+    /// instead of the printer — see
+    /// [`crate::core::emulate::ControlPolicy::Intercept`].
+    ///
+    /// The policy is set here rather than by the caller, so the only way to get
+    /// an intercepting relay is to say where the commands go.
+    pub fn intercepting(
+        printer: EmulatedPrinter,
+        upstream: Arc<dyn Upstream>,
+        sink: Arc<dyn Interceptor>,
+    ) -> Arc<Self> {
+        Self::build(
+            printer.intercepted(),
+            upstream,
+            Tuning::default(),
+            Some(sink),
+        )
+    }
+
     /// Say a camera is present in everything relayed from here on.
     ///
     /// Only ever called when one is being substituted — see
@@ -228,12 +277,32 @@ impl Emulator {
         upstream: Arc<dyn Upstream>,
         tuning: Tuning,
     ) -> Arc<Self> {
+        Self::build(printer, upstream, tuning, None)
+    }
+
+    fn build(
+        printer: EmulatedPrinter,
+        upstream: Arc<dyn Upstream>,
+        tuning: Tuning,
+        interceptor: Option<Arc<dyn Interceptor>>,
+    ) -> Arc<Self> {
+        // A relay that intercepts with nowhere to put what it takes would ACK
+        // every button press and drop it on the floor — a printer that looks
+        // fine and does nothing, which is the worst failure this can have.
+        // Caught here, at startup, rather than a mystery hours later.
+        assert!(
+            !(printer.control() == crate::core::emulate::ControlPolicy::Intercept
+                && interceptor.is_none()),
+            "an intercepting relay needs somewhere for the commands to go; \
+             build it with Emulator::intercepting"
+        );
         let (fanout, _) = broadcast::channel(FANOUT_DEPTH);
         let reports = Mutex::new(Some(upstream.subscribe()));
         let (healthy, _) = tokio::sync::watch::channel(true);
         Arc::new(Self {
             printer,
             upstream,
+            interceptor,
             cache: Arc::new(RwLock::new(UpstreamCache::new())),
             rewriter: Arc::new(Mutex::new(SequenceRewriter::new())),
             claim_camera: std::sync::atomic::AtomicBool::new(false),
@@ -316,6 +385,13 @@ impl Emulator {
             // live have to agree, or the camera would appear and vanish.
             if self.claim_camera.load(std::sync::atomic::Ordering::Relaxed) {
                 crate::core::camerad::claim_camera(&mut message);
+            }
+            // Whatever is standing in for the printer gets to describe itself,
+            // in the same place and for the same reason: a snapshot answered
+            // from the cache and a delta forwarded live have to agree, or the
+            // reading would flicker between the game's and the printer's.
+            if let Some(interceptor) = &self.interceptor {
+                interceptor.overlay(&mut message);
             }
             // The printer's report says where the printer is, and a client
             // believes it over whatever address it was configured with.
@@ -528,6 +604,23 @@ impl Emulator {
                                 .expect("rewriter lock poisoned")
                                 .rewrite_request(id, &payload);
                             self.upstream.send(rewritten);
+                        }
+                        // Taken by the relay instead of the printer. Not
+                        // rewritten and not remembered: nothing upstream will
+                        // ever answer it, because nothing upstream heard it —
+                        // the ACK has already gone back in `response.send`.
+                        for payload in &response.intercepted {
+                            match &self.interceptor {
+                                Some(sink) => sink.consume(payload),
+                                // Unreachable: the policy and the sink are set
+                                // together. Said out loud rather than ignored,
+                                // because the symptom would be a printer that
+                                // answers every button and does nothing.
+                                None => eprintln!(
+                                    "emulate: intercepted a command with no sink to take it: \
+                                     {payload}"
+                                ),
+                            }
                         }
                         if response.close {
                             writer.flush().await?;
@@ -962,6 +1055,139 @@ mod tests {
         assert!(
             upstream.forwarded().is_empty(),
             "nothing reached the machine"
+        );
+    }
+
+    /// An interceptor that remembers what it was given and has something to say
+    /// for itself, standing in for the game.
+    #[derive(Default)]
+    struct RecordingSink(Mutex<Vec<Value>>);
+
+    impl RecordingSink {
+        fn taken(&self) -> Vec<Value> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl Interceptor for RecordingSink {
+        fn consume(&self, payload: &Value) {
+            self.0.lock().unwrap().push(payload.clone());
+        }
+
+        fn overlay(&self, message: &mut Value) -> bool {
+            let Some(print) = message.get_mut("print").and_then(Value::as_object_mut) else {
+                return false;
+            };
+            print.insert("nozzle_temper".into(), Value::from(148.0));
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn what_stands_in_for_the_printer_can_describe_itself_in_the_report() {
+        // `--emulate-doom` reports the player's health as the nozzle
+        // temperature. The seam that carries it is this: the pump lets the
+        // interceptor rewrite a report before it is cached or fanned out, so a
+        // live delta and a snapshot answered later cannot disagree.
+        let upstream = FakeUpstream::new();
+        let emulator = Emulator::intercepting(
+            EmulatedPrinter::new(SERIAL, CODE),
+            Arc::clone(&upstream) as Arc<dyn Upstream>,
+            Arc::new(RecordingSink::default()) as Arc<dyn Interceptor>,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tls = crate::tls::emulated_printer_server_config(SERIAL, None).unwrap();
+        tokio::spawn(Arc::clone(&emulator).pump());
+        tokio::spawn(Arc::clone(&emulator).serve(listener, tls));
+
+        let mut client = TestClient::connect(addr).await;
+        client.handshake(CODE).await;
+        client.subscribe_reports().await;
+        upstream.push(json!({"print": {
+            "command": "push_status", "msg": 1, "nozzle_temper": 24.0,
+        }}));
+        assert_eq!(client.recv_report().await["print"]["nozzle_temper"], 148.0);
+
+        // …and the cache agrees, so a client that asks for a snapshot instead
+        // of watching the stream sees the same thing.
+        upstream.push(snapshot());
+        until("the cached snapshot to carry it too", || {
+            emulator
+                .cache
+                .read()
+                .unwrap()
+                .snapshot_reply()
+                .is_some_and(|s| s["print"]["nozzle_temper"] == 148.0)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_intercepting_relay_lets_nothing_through_to_the_printer() {
+        // The safety property `serve --emulate-doom` rests on, proved over real
+        // TLS and real bytes rather than against the state machine: a button
+        // press that plays the game must not ALSO reach whatever is upstream.
+        let upstream = FakeUpstream::new();
+        let sink = Arc::new(RecordingSink::default());
+        let emulator = Emulator::intercepting(
+            EmulatedPrinter::new(SERIAL, CODE),
+            Arc::clone(&upstream) as Arc<dyn Upstream>,
+            Arc::clone(&sink) as Arc<dyn Interceptor>,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tls = crate::tls::emulated_printer_server_config(SERIAL, None).unwrap();
+        tokio::spawn(Arc::clone(&emulator).pump());
+        tokio::spawn(Arc::clone(&emulator).serve(listener, tls));
+
+        let mut client = TestClient::connect(addr).await;
+        client.handshake(CODE).await;
+        client.subscribe_reports().await;
+
+        // Everything a client can press, including the ones that would move or
+        // heat a machine.
+        let commands = [
+            json!({"print": {"sequence_id": "1", "command": "gcode_line", "param": "G91\nG1 Y10"}}),
+            json!({"print": {"sequence_id": "2", "command": "gcode_line", "param": "M104 S250"}}),
+            json!({"print": {"sequence_id": "3", "command": "stop"}}),
+            json!({"system": {"sequence_id": "4", "command": "ledctrl", "led_mode": "on"}}),
+            json!({"print": {"sequence_id": "5", "command": "project_file", "url": "ftp:///x"}}),
+        ];
+        for cmd in &commands {
+            client.publish_request(cmd.clone()).await;
+        }
+        until("every command to be taken", || {
+            sink.taken().len() == commands.len()
+        })
+        .await;
+        assert_eq!(sink.taken(), commands.to_vec());
+        assert!(
+            upstream.forwarded().is_empty(),
+            "a command escaped upstream: {:?}",
+            upstream.forwarded()
+        );
+
+        // …and the client is told each one succeeded, or Studio spins forever.
+        for cmd in &commands {
+            let category = cmd.as_object().unwrap().keys().next().unwrap();
+            let ack = client.recv_report().await;
+            assert_eq!(ack[category]["result"], "success", "{ack}");
+            assert_eq!(
+                ack[category]["sequence_id"], cmd[category]["sequence_id"],
+                "{ack}"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "somewhere for the commands to go")]
+    fn an_intercepting_printer_without_a_sink_is_refused_at_startup() {
+        // Otherwise it would ACK every press and drop it — a printer that looks
+        // healthy and does nothing.
+        Emulator::new(
+            EmulatedPrinter::new(SERIAL, CODE).intercepted(),
+            FakeUpstream::new() as Arc<dyn Upstream>,
         );
     }
 

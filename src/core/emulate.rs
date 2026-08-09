@@ -50,6 +50,21 @@ pub enum ControlPolicy {
     Full,
     /// Serve reads, refuse anything that would move or heat the machine.
     ReadOnly,
+    /// Serve reads; take every control command **here** and never forward it.
+    ///
+    /// Unlike [`ReadOnly`](Self::ReadOnly), which tells the client no, this
+    /// accepts the command and hands it to whatever the I/O layer has put
+    /// behind the relay — `serve --emulate-doom` puts a game there, and a jog
+    /// becomes a step forward. The client is ACKed `success`, because from its
+    /// side the command really was carried out; it just was not carried out by
+    /// a printer.
+    ///
+    /// The forwarding is not merely skipped, it is unreachable: this arm writes
+    /// to [`Response::intercepted`] and the upstream arm writes to
+    /// [`Response::upstream`], and no path writes both. That is the whole
+    /// safety argument for pointing a game at a relay — a command that plays
+    /// DOOM cannot also move a machine.
+    Intercept,
 }
 
 /// The identity and policy of the emulated printer.
@@ -90,6 +105,18 @@ impl EmulatedPrinter {
         self
     }
 
+    /// The same relay, with control taken here rather than forwarded — see
+    /// [`ControlPolicy::Intercept`].
+    ///
+    /// Nothing in this module says what does the taking. The I/O layer pairs
+    /// this with a sink, and the two are set together
+    /// ([`crate::server::emulate::Emulator::intercepting`]) so a relay cannot
+    /// end up quietly swallowing commands with nothing behind it.
+    pub fn intercepted(mut self) -> Self {
+        self.control = ControlPolicy::Intercept;
+        self
+    }
+
     pub fn serial(&self) -> &str {
         &self.serial
     }
@@ -124,6 +151,10 @@ pub struct Response {
     pub send: Vec<Packet>,
     /// Request payloads to publish to the real printer.
     pub upstream: Vec<Value>,
+    /// Control payloads taken by the relay itself under
+    /// [`ControlPolicy::Intercept`] — consumed here, and *instead of*
+    /// `upstream`, never as well as it.
+    pub intercepted: Vec<Value>,
     /// Close the connection once `send` is flushed.
     pub close: bool,
 }
@@ -270,8 +301,8 @@ impl ClientSession {
                     session_present: false,
                     code: ConnectCode::BadCredentials,
                 }],
-                upstream: Vec::new(),
                 close: true,
+                ..Response::default()
             };
         }
         self.phase = Phase::Connected;
@@ -389,6 +420,16 @@ impl ClientSession {
                         .send
                         .push(Packet::Publish(report_publish(printer.serial(), &refusal)));
                 }
+                ControlPolicy::Intercept => {
+                    // Accepted, and answered as accepted: whatever is behind
+                    // the relay really did receive it. What it did NOT do is go
+                    // anywhere near `response.upstream`.
+                    let ack = success_ack(&payload);
+                    response
+                        .send
+                        .push(Packet::Publish(report_publish(printer.serial(), &ack)));
+                    response.intercepted.push(payload);
+                }
             },
         }
         response
@@ -446,16 +487,58 @@ fn sequence_id(payload: &Value) -> Option<&str> {
 /// `{sequence_id, param, result, reason}`. Adding one would make our refusals
 /// the only ACKs on the wire shaped differently from the printer's.
 fn refusal_ack(request: &Value) -> Value {
+    ack(
+        request,
+        "fail",
+        "refused by the bambu-rs emulator: relay is read-only",
+    )
+}
+
+/// The ACK for a command the relay took for itself
+/// ([`ControlPolicy::Intercept`]).
+///
+/// `success`, and honestly so from the client's side: the command was accepted
+/// and acted on. Saying `fail` would be a lie in the other direction — and
+/// would turn every button press into an error the operator has to dismiss.
+fn success_ack(request: &Value) -> Value {
+    ack(request, "success", "success")
+}
+
+/// The printer's ACK shape, filled in.
+///
+/// Echoes `sequence_id` and `param`, and carries **no `command` under `print`** —
+/// that is the ACK observed on the A1 mini (docs/protocol.md):
+/// `{sequence_id, param, result, reason}`.
+///
+/// Outside `print` it says which command it answers. Generalising the observed
+/// `print` shape to every category was a guess, and a costly one: Bambu Studio
+/// sends `security.app_cert_install`, gets back a result with nothing naming
+/// the question, and asks again forever — an evening of "Retrieving printer
+/// information" that looked like a dozen other things first. The asymmetry is
+/// the printer's, not ours.
+///
+/// It matters most right here. Under the intercept policy this is the *only*
+/// ACK a client will ever see — the chamber light that opens a door in DOOM is
+/// `system.ledctrl`, not a `print` command — so a shape of our own invention
+/// would be the shape of the whole printer.
+fn ack(request: &Value, result: &str, reason: &str) -> Value {
     let category = category(request).unwrap_or("print");
     let mut ack = Map::new();
     if let Some(seq) = sequence_id(request) {
         ack.insert("sequence_id".to_string(), Value::String(seq.to_string()));
     }
-    ack.insert("result".to_string(), Value::String("fail".to_string()));
-    ack.insert(
-        "reason".to_string(),
-        Value::String("refused by the bambu-rs emulator: relay is read-only".to_string()),
-    );
+    if category != "print"
+        && let Some(command) = request
+            .pointer(&format!("/{category}/command"))
+            .and_then(Value::as_str)
+    {
+        ack.insert("command".to_string(), Value::String(command.to_string()));
+    }
+    if let Some(param) = request.pointer(&format!("/{category}/param")) {
+        ack.insert("param".to_string(), param.clone());
+    }
+    ack.insert("result".to_string(), Value::String(result.to_string()));
+    ack.insert("reason".to_string(), Value::String(reason.to_string()));
     let mut out = Map::new();
     out.insert(category.to_string(), Value::Object(ack));
     Value::Object(out)
@@ -1442,6 +1525,162 @@ mod tests {
             v["print"]["reason"].as_str().unwrap().contains("read-only"),
             "the reason should name the emulator's policy: {v}"
         );
+    }
+
+    // ---- the intercept policy --------------------------------------------
+
+    /// Every shape of control a client can send, and the one thing that must be
+    /// true of all of them under [`ControlPolicy::Intercept`].
+    fn every_control_command() -> Vec<serde_json::Value> {
+        vec![
+            json!({"print": {"sequence_id": "1", "command": "gcode_line", "param": "G91\nG1 Y10"}}),
+            json!({"print": {"sequence_id": "2", "command": "pause"}}),
+            json!({"print": {"sequence_id": "3", "command": "stop"}}),
+            json!({"print": {"sequence_id": "4", "command": "print_speed", "param": "3"}}),
+            json!({"print": {"sequence_id": "5", "command": "project_file", "url": "ftp:///x"}}),
+            json!({"system": {"sequence_id": "6", "command": "ledctrl", "led_mode": "on"}}),
+            json!({"system": {"sequence_id": "7", "command": "reboot"}}),
+            json!({"camera": {"sequence_id": "8", "command": "ipcam_timelapse"}}),
+        ]
+    }
+
+    #[test]
+    fn an_intercepting_relay_never_lets_a_control_command_upstream() {
+        // The whole safety argument for `serve --emulate-doom`: a jog that
+        // plays the game must not ALSO be a jog. Nothing about the payload —
+        // its category, whether the mapping recognises it, whether it has a
+        // sequence id — may get one past this.
+        for payload in every_control_command() {
+            let mut s = connected();
+            let r = s.handle(
+                publish_request(payload.clone(), None),
+                &printer().intercepted(),
+                &cache_with_snapshot(),
+            );
+            assert!(
+                r.upstream.is_empty(),
+                "{payload} reached the machine: {:?}",
+                r.upstream
+            );
+            assert_eq!(r.intercepted, vec![payload.clone()], "{payload}");
+        }
+    }
+
+    #[test]
+    fn an_intercepted_command_is_acknowledged_the_way_the_printer_would() {
+        // Silence leaves Bambu Studio spinning on a button press forever, and a
+        // failure ACK makes every press an error the operator has to dismiss.
+        // The command *was* carried out — as a keypress — so it succeeded.
+        let mut s = connected();
+        let r = s.handle(
+            publish_request(
+                json!({"print": {"sequence_id": "9", "command": "gcode_line", "param": "G28"}}),
+                None,
+            ),
+            &printer().intercepted(),
+            &cache_with_snapshot(),
+        );
+        let [Packet::Publish(p)] = r.send.as_slice() else {
+            panic!("expected one ACK, got {:?}", r.send)
+        };
+        let v: serde_json::Value = serde_json::from_slice(&p.payload).unwrap();
+        assert_eq!(v["print"]["sequence_id"], "9");
+        assert_eq!(v["print"]["result"], "success");
+        // The observed ACK echoes the param and carries no `command` — this one
+        // is the only ACK a client will see, so it has to be the same shape.
+        assert_eq!(v["print"]["param"], "G28");
+        assert!(v["print"].get("command").is_none(), "{v}");
+    }
+
+    #[test]
+    fn an_intercepted_command_is_acked_under_its_own_category() {
+        // `system.ledctrl` is ACKed under /system, not /print (docs/protocol.md).
+        // A client watching the wrong category never sees its answer.
+        let mut s = connected();
+        let r = s.handle(
+            publish_request(
+                json!({"system": {"sequence_id": "4", "command": "ledctrl", "led_mode": "on"}}),
+                None,
+            ),
+            &printer().intercepted(),
+            &cache_with_snapshot(),
+        );
+        let [Packet::Publish(p)] = r.send.as_slice() else {
+            panic!("expected one ACK, got {:?}", r.send)
+        };
+        let v: serde_json::Value = serde_json::from_slice(&p.payload).unwrap();
+        assert_eq!(v["system"]["sequence_id"], "4");
+        assert_eq!(v["system"]["result"], "success");
+        // And it says which command it answers. Outside `print` a client needs
+        // that: Bambu Studio, told only that *something* succeeded, asks its
+        // question again forever. Under interception this ACK is the only reply
+        // the client will ever get, so leaving it out strands the client at the
+        // first non-`print` command — which here is the door-opening key.
+        assert_eq!(
+            v["system"]["command"], "ledctrl",
+            "an ACK outside `print` must name its command: {v}"
+        );
+    }
+
+    /// …and `print` still does not, because that is what the machine does.
+    ///
+    /// Two rules that look like an inconsistency, so both are pinned: copying
+    /// the observed `print` shape to every category is exactly the guess that
+    /// cost an evening, and "fixing" the asymmetry by adding `command`
+    /// everywhere would be the same mistake mirrored.
+    #[test]
+    fn a_print_ack_still_carries_no_command() {
+        let mut s = connected();
+        let r = s.handle(
+            publish_request(
+                json!({"print": {"sequence_id": "5", "command": "gcode_line", "param": "G28"}}),
+                None,
+            ),
+            &printer().intercepted(),
+            &cache_with_snapshot(),
+        );
+        let [Packet::Publish(p)] = r.send.as_slice() else {
+            panic!("expected one ACK, got {:?}", r.send)
+        };
+        let v: serde_json::Value = serde_json::from_slice(&p.payload).unwrap();
+        assert_eq!(v["print"]["sequence_id"], "5");
+        assert!(
+            v["print"]["command"].is_null(),
+            "the A1's `print` ACK carries no command: {v}"
+        );
+    }
+
+    #[test]
+    fn an_intercepting_relay_still_answers_reads_from_the_cache() {
+        // The client has to see a printer, or it shows nothing to press.
+        let mut s = connected();
+        let r = s.handle(
+            publish_request(
+                json!({"pushing": {"sequence_id": "1", "command": "pushall"}}),
+                None,
+            ),
+            &printer().intercepted(),
+            &cache_with_snapshot(),
+        );
+        assert_eq!(r.send.len(), 1, "a pushall is a read; it is always served");
+        assert!(r.upstream.is_empty());
+        assert!(r.intercepted.is_empty(), "a read is not a button press");
+    }
+
+    #[test]
+    fn nothing_is_intercepted_under_the_ordinary_policies() {
+        // The field exists for one mode; every other mode must leave it empty,
+        // or a sink wired up for a game would be fed a live printer's traffic.
+        let cmd = json!({"print": {"sequence_id": "1", "command": "pause"}});
+        for p in [printer(), printer().read_only()] {
+            let mut s = connected();
+            let r = s.handle(
+                publish_request(cmd.clone(), None),
+                &p,
+                &UpstreamCache::new(),
+            );
+            assert!(r.intercepted.is_empty(), "{:?}", p.control());
+        }
     }
 
     #[test]
