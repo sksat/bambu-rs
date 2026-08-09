@@ -49,10 +49,17 @@ bambu serve --fake --emulate \
   --emulate-host 0.0.0.0 --emulate-advertise <this machine's LAN IP> \
   --emulate-doom \
   --emulate-doom-engine "$PWD/build/bambu-doom-engine" \
+  --emulate-doom-arg -workdir --emulate-doom-arg "$PWD/build/saves" \
   --emulate-doom-arg -iwad --emulate-doom-arg "$PWD/build/doom1.wad" \
   --emulate-doom-arg -warp --emulate-doom-arg 1 --emulate-doom-arg 1 \
   --emulate-doom-arg -maxfps --emulate-doom-arg 20
 ```
+
+`-workdir` is worth passing. DOOM keeps `.default.cfg` and `.savegame/` in its
+working directory, and the engine inherits `bambu serve`'s — so without it the
+game drops those into whatever directory you started the relay from. Everything
+after it that is a relative path is relative to *that* directory, which is why
+the WAD above is absolute.
 
 Then add a printer in Bambu Studio by IP, with that serial and access code.
 (Studio verifies certificates: `tools/trust_relay_in_studio.sh` is what gets a
@@ -118,7 +125,8 @@ first one.
 Studio is known to display — and encodes with `stb_image_write` at quality 70,
 which is below the 90 where stb switches away from 4:2:0.
 
-Its own options, before DOOM's: `-raw`, `-quality 1..89`, `-maxfps N`.
+Its own options, before DOOM's: `-raw`, `-quality 1..89`, `-maxfps N`,
+`-workdir <dir>`.
 
 ## Licences
 

@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -291,6 +292,25 @@ int main(int argc, char** argv) {
                 return 2;
             }
             min_frame_interval_ms = (uint32_t)(1000 / fps);
+        } else if (strcmp(argv[i], "-workdir") == 0 && i + 1 < argc) {
+            // DOOM writes `.default.cfg` and `.savegame/` into its working
+            // directory, and this one inherits `bambu serve`'s — so without
+            // this the demo drops those into whatever repository checkout the
+            // relay happened to be started from. Loud on failure: a game that
+            // quietly ran somewhere else would find no WAD and say so in a
+            // much less useful way.
+            const char* dir = argv[++i];
+            if (mkdir(dir, 0777) != 0 && errno != EEXIST) {
+                fprintf(stderr, "doom-engine: cannot make %s: %s\n", dir, strerror(errno));
+                return 2;
+            }
+            if (chdir(dir) != 0) {
+                fprintf(stderr, "doom-engine: cannot enter %s: %s\n", dir, strerror(errno));
+                return 2;
+            }
+            // Said out loud because it moves the ground under every relative
+            // path that follows, `-iwad` included.
+            fprintf(stderr, "doom-engine: saves and config go in %s\n", dir);
         }
         // Everything else is DOOM's: -iwad, -warp, -skill, …
     }
