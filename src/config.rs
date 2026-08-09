@@ -249,6 +249,8 @@ pub const DEFAULT_MQTT_PORT: u16 = 8883;
 pub const DEFAULT_FTPS_PORT: u16 = 990;
 /// Where a printer answers the device-detect probe (plain text).
 pub const DEFAULT_DETECT_PORT: u16 = 3000;
+/// Where a printer serves the chamber-camera stream.
+pub const DEFAULT_CAMERA_PORT: u16 = 6000;
 
 /// Per-invocation overrides (from flags and/or env). Higher precedence than a
 /// stored profile.
@@ -263,6 +265,7 @@ pub struct Overrides {
     pub mqtt_port: Option<u16>,
     pub ftps_port: Option<u16>,
     pub detect_port: Option<u16>,
+    pub camera_port: Option<u16>,
 }
 
 impl Overrides {
@@ -277,6 +280,7 @@ impl Overrides {
             mqtt_port: v("BAMBU_MQTT_PORT").and_then(|s| s.parse().ok()),
             ftps_port: v("BAMBU_FTPS_PORT").and_then(|s| s.parse().ok()),
             detect_port: v("BAMBU_DETECT_PORT").and_then(|s| s.parse().ok()),
+            camera_port: v("BAMBU_CAMERA_PORT").and_then(|s| s.parse().ok()),
         }
     }
 
@@ -290,6 +294,7 @@ impl Overrides {
             mqtt_port: self.mqtt_port.or(lower.mqtt_port),
             ftps_port: self.ftps_port.or(lower.ftps_port),
             detect_port: self.detect_port.or(lower.detect_port),
+            camera_port: self.camera_port.or(lower.camera_port),
         }
     }
 }
@@ -357,6 +362,8 @@ pub struct ResolvedTarget {
     pub ftps_port: u16,
     /// Device-detect port, overridable for the same reason.
     pub detect_port: u16,
+    /// Chamber-camera port, overridable for the same reason.
+    pub camera_port: u16,
 }
 
 impl ResolvedTarget {
@@ -382,6 +389,7 @@ impl ResolvedTarget {
             mqtt_port: DEFAULT_MQTT_PORT,
             ftps_port: DEFAULT_FTPS_PORT,
             detect_port: DEFAULT_DETECT_PORT,
+            camera_port: DEFAULT_CAMERA_PORT,
         }
     }
 }
@@ -396,6 +404,7 @@ impl std::fmt::Debug for ResolvedTarget {
             .field("mqtt_port", &self.mqtt_port)
             .field("ftps_port", &self.ftps_port)
             .field("detect_port", &self.detect_port)
+            .field("camera_port", &self.camera_port)
             .finish()
     }
 }
@@ -425,6 +434,7 @@ pub fn resolve(
         mqtt_port: overrides.mqtt_port.unwrap_or(DEFAULT_MQTT_PORT),
         ftps_port: overrides.ftps_port.unwrap_or(DEFAULT_FTPS_PORT),
         detect_port: overrides.detect_port.unwrap_or(DEFAULT_DETECT_PORT),
+        camera_port: overrides.camera_port.unwrap_or(DEFAULT_CAMERA_PORT),
     })
 }
 
@@ -441,6 +451,7 @@ mod tests {
         assert_eq!(t.mqtt_port, DEFAULT_MQTT_PORT);
         assert_eq!(t.ftps_port, DEFAULT_FTPS_PORT);
         assert_eq!(t.detect_port, DEFAULT_DETECT_PORT);
+        assert_eq!(t.camera_port, DEFAULT_CAMERA_PORT);
         assert_eq!(t.ip, "192.0.2.50");
         assert_eq!(t.model, Model::A1Mini);
     }

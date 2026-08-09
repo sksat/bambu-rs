@@ -82,6 +82,9 @@ struct Cli {
     /// Only `serve --emulate` uses it, to ask the printer who it is.
     #[arg(long, global = true, env = "BAMBU_DETECT_PORT")]
     detect_port: Option<u16>,
+    /// Override the chamber-camera port (default 6000), for the same reason.
+    #[arg(long, global = true, env = "BAMBU_CAMERA_PORT")]
+    camera_port: Option<u16>,
     /// Emit machine-readable JSON (default output is human-readable).
     #[arg(long, global = true)]
     json: bool,
@@ -363,6 +366,37 @@ enum Command {
         #[cfg(feature = "relay")]
         #[arg(long, requires = "emulate")]
         emulate_no_detect: bool,
+        /// Show one of the configured cameras (by label) as the printer's own
+        /// chamber camera, so a client's liveview displays it. Without this the
+        /// camera port is not served at all and a liveview stays empty — which
+        /// is honest, and the right default: presenting one machine's video as
+        /// another's should be asked for, not inferred from a camera happening
+        /// to be configured.
+        #[cfg(feature = "relay")]
+        #[arg(long, value_name = "LABEL", requires = "emulate")]
+        emulate_camera: Option<String>,
+        /// The address to tell clients the printer is at. Required when binding
+        /// to 0.0.0.0, which names no address: the printer's own report carries
+        /// its LAN address, and a client uses that for the camera and for file
+        /// transfer — so relaying it unchanged sends both past this relay.
+        #[cfg(feature = "relay")]
+        #[arg(long, value_name = "IP", requires = "emulate")]
+        emulate_advertise: Option<std::net::Ipv4Addr>,
+        /// Port for the substituted camera. 6000 is where a client looks.
+        #[cfg(feature = "relay")]
+        #[arg(long, default_value_t = 6000, requires = "emulate_camera")]
+        emulate_camera_port: u16,
+        /// How often to fetch, for a camera that offers single snapshots rather
+        /// than a stream. Required in that case: the right rate depends on the
+        /// camera and the network, so there is no default worth guessing.
+        #[cfg(feature = "relay")]
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            requires = "emulate_camera",
+            value_parser = parse_camera_interval
+        )]
+        emulate_camera_interval: Option<f32>,
     },
 }
 
@@ -938,6 +972,14 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             emulate_detect_tls_port,
             #[cfg(feature = "relay")]
             emulate_no_detect,
+            #[cfg(feature = "relay")]
+            emulate_camera,
+            #[cfg(feature = "relay")]
+            emulate_advertise,
+            #[cfg(feature = "relay")]
+            emulate_camera_port,
+            #[cfg(feature = "relay")]
+            emulate_camera_interval,
         } => run_serve(
             cli,
             host,
@@ -959,6 +1001,14 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
                 pasv_ports: emulate_pasv_ports.clone(),
                 detect_port: (!emulate_no_detect).then_some(*emulate_detect_port),
                 detect_tls_port: (!emulate_no_detect).then_some(*emulate_detect_tls_port),
+                advertise: *emulate_advertise,
+                camera: emulate_camera
+                    .as_ref()
+                    .map(|label| crate::server::EmulateCamera {
+                        label: label.clone(),
+                        port: *emulate_camera_port,
+                        poll: emulate_camera_interval.map(camera_interval),
+                    }),
                 read_only: *emulate_read_only,
             }),
         ),
@@ -1727,6 +1777,48 @@ fn run_reboot(cli: &Cli, confirm: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+/// A snapshot interval, once it has been checked to be one.
+///
+/// `Duration::from_secs_f32` panics outright on NaN, infinity, or a negative,
+/// and zero would spin the poll loop as fast as the camera will answer. All
+/// three arrive straight from the command line, so all three are refused before
+/// they reach a `Duration`. Clap has already applied this by the time the value
+/// is used, so the conversion below cannot fail.
+#[cfg(feature = "relay")]
+fn camera_interval(seconds: f32) -> std::time::Duration {
+    std::time::Duration::from_secs_f32(seconds)
+}
+
+/// Reject an interval clap should never have accepted.
+#[cfg(feature = "relay")]
+fn parse_camera_interval(raw: &str) -> Result<f32, String> {
+    let seconds: f32 = raw
+        .parse()
+        .map_err(|_| format!("{raw:?} is not a number of seconds"))?;
+    if !seconds.is_finite() {
+        return Err(format!("{raw:?} is not a finite number of seconds"));
+    }
+    // Zero and negative fail for different reasons, and a message that names
+    // the wrong one sends the reader looking in the wrong place.
+    if seconds == 0.0 {
+        return Err(
+            "an interval of zero would poll the camera without pausing between \
+                    requests; give a positive number of seconds"
+                .to_string(),
+        );
+    }
+    if seconds < 0.0 {
+        return Err(format!(
+            "an interval cannot be negative; {seconds} describes no waiting at all"
+        ));
+    }
+    // Finite and positive is not the same as representable: `1e30` passes both
+    // checks and still panics on the way into a `Duration`.
+    std::time::Duration::try_from_secs_f32(seconds)
+        .map_err(|_| format!("an interval of {seconds} seconds is longer than time itself"))?;
+    Ok(seconds)
+}
+
 #[cfg(feature = "server")]
 #[allow(clippy::too_many_arguments)]
 fn run_serve(
@@ -2030,6 +2122,7 @@ fn synthetic_identity(cli: &Cli) -> crate::server::ServeTarget {
             mqtt_port: crate::config::DEFAULT_MQTT_PORT,
             ftps_port: crate::config::DEFAULT_FTPS_PORT,
             detect_port: crate::config::DEFAULT_DETECT_PORT,
+            camera_port: crate::config::DEFAULT_CAMERA_PORT,
         },
     }
 }
@@ -4283,6 +4376,7 @@ fn flag_overrides(cli: &Cli) -> Overrides {
         mqtt_port: cli.mqtt_port,
         ftps_port: cli.ftps_port,
         detect_port: cli.detect_port,
+        camera_port: cli.camera_port,
     }
 }
 

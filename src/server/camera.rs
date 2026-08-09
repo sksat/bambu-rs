@@ -188,3 +188,40 @@ pub fn open_mjpeg_stream(url: &str) -> Result<OpenedCameraStream, String> {
 pub fn url_stream_opener(url: String) -> StreamOpen {
     Arc::new(move || open_mjpeg_stream(&url))
 }
+
+/// How much of a camera's body to accept before calling it hostile.
+const CAMERA_MAX_BYTES: u64 = 32 * 1024 * 1024;
+/// Bounds a single snapshot fetch.
+const CAMERA_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Blocking single-shot GET of the camera URL. Returns `(content_type, bytes)` or
+/// an error string. The body is read with a hard byte cap so a bad upstream can't
+/// exhaust memory.
+pub fn fetch_camera_frame(url: &str) -> Result<(String, Vec<u8>), String> {
+    // A snapshot CGI never legitimately redirects; disallowing redirects keeps
+    // the server-side fetch from being bounced to an internal address (SSRF).
+    let agent = ureq::AgentBuilder::new()
+        .timeout(CAMERA_TIMEOUT)
+        .redirects(0)
+        .build();
+    let resp = agent.get(url).call().map_err(|e| e.to_string())?;
+    // Default to image/jpeg if the camera omits a content-type.
+    let ctype = resp
+        .header("content-type")
+        .map(str::to_string)
+        .unwrap_or_else(|| "image/jpeg".to_string());
+    let mut bytes = Vec::new();
+    resp.into_reader()
+        .take(CAMERA_MAX_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.is_empty() {
+        return Err("camera returned an empty body".to_string());
+    }
+    Ok((ctype, bytes))
+}
+
+/// One JPEG from a snapshot URL, for a camera with no stream to follow.
+pub fn fetch_snapshot(url: &str) -> Result<Vec<u8>, String> {
+    fetch_camera_frame(url).map(|(_, bytes)| bytes)
+}

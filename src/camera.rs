@@ -17,8 +17,8 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConnection, StreamOwned};
 
 use crate::config::ResolvedTarget;
+use crate::core::camerad::{self, FRAME_HEADER};
 
-const CAMERA_PORT: u16 = 6000;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Errors from a camera snapshot. Messages never include the access code.
@@ -32,25 +32,6 @@ pub enum CameraError {
     Io(#[from] std::io::Error),
     #[error("unexpected frame header (jpeg length {0}); framing differs or camera off")]
     BadFrame(u32),
-}
-
-/// The 80-byte auth packet (header + 32-byte user + 32-byte access code).
-fn auth_packet(access_code: &str) -> Vec<u8> {
-    let mut p = Vec::with_capacity(80);
-    p.extend_from_slice(&0x40u32.to_le_bytes());
-    p.extend_from_slice(&0x3000u32.to_le_bytes());
-    p.extend_from_slice(&0u32.to_le_bytes());
-    p.extend_from_slice(&0u32.to_le_bytes());
-    let mut field = [0u8; 32];
-    let user = b"bblp";
-    field[..user.len()].copy_from_slice(user);
-    p.extend_from_slice(&field);
-    let mut field = [0u8; 32];
-    let code = access_code.as_bytes();
-    let n = code.len().min(32);
-    field[..n].copy_from_slice(&code[..n]);
-    p.extend_from_slice(&field);
-    p
 }
 
 /// A one-shot camera client.
@@ -76,7 +57,7 @@ impl CameraClient {
     pub fn snapshot(&self) -> Result<Vec<u8>, CameraError> {
         let config =
             crate::tls::lan_client_config().map_err(|e| CameraError::Tls(e.to_string()))?;
-        let tcp = TcpStream::connect((self.target.ip.as_str(), CAMERA_PORT))?;
+        let tcp = TcpStream::connect((self.target.ip.as_str(), self.target.camera_port))?;
         tcp.set_read_timeout(Some(self.timeout))?;
         tcp.set_write_timeout(Some(self.timeout))?;
         let server_name = ServerName::try_from(self.target.ip.clone())
@@ -85,15 +66,15 @@ impl CameraClient {
             .map_err(|e| CameraError::Tls(e.to_string()))?;
         let mut tls = StreamOwned::new(conn, tcp);
 
-        tls.write_all(&auth_packet(&self.target.access_code))?;
+        tls.write_all(&camerad::auth_packet(&self.target.access_code))?;
 
-        let mut header = [0u8; 16];
+        let mut header = [0u8; FRAME_HEADER];
         tls.read_exact(&mut header)?;
-        let jpeg_len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-        if !(1000..=8_000_000).contains(&jpeg_len) {
-            return Err(CameraError::BadFrame(jpeg_len));
-        }
-        let mut jpeg = vec![0u8; jpeg_len as usize];
+        let jpeg_len = camerad::frame_len(&header).map_err(|e| match e {
+            camerad::CameraError::FrameSize(n) => CameraError::BadFrame(n),
+            other => CameraError::Tls(other.to_string()),
+        })?;
+        let mut jpeg = vec![0u8; jpeg_len];
         tls.read_exact(&mut jpeg)?;
         Ok(jpeg)
     }
@@ -104,13 +85,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auth_packet_layout() {
-        let p = auth_packet("12345678");
-        assert_eq!(p.len(), 80);
-        assert_eq!(&p[0..4], &0x40u32.to_le_bytes()); // payload size
-        assert_eq!(&p[4..8], &0x3000u32.to_le_bytes()); // type
-        assert_eq!(&p[16..20], b"bblp"); // username, null-padded
-        assert_eq!(p[20], 0);
-        assert_eq!(&p[48..56], b"12345678"); // access code at offset 48
+    fn the_client_and_the_emulated_printer_share_one_wire_format() {
+        // The layout itself is pinned in `core::camerad`. What matters here is
+        // that this client reads it from there rather than keeping a private
+        // copy that could drift away from what the relay serves.
+        let p = camerad::auth_packet("12345678");
+        assert_eq!(p.len(), camerad::AUTH_PACKET);
+        assert_eq!(&p[48..56], b"12345678");
+        let creds = camerad::parse_auth(&p).unwrap().unwrap();
+        assert_eq!(creds.access_code, "12345678");
     }
 }
