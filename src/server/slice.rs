@@ -395,7 +395,14 @@ impl Slicer for LiveSlicer {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) => {}
-                Err(e) => return Err(format!("waiting for the slicer: {e}")),
+                // Same cleanup as the timeout below: returning here would drop
+                // `Child`, which neither kills nor reaps, leaving a slicer (and
+                // its Xvfb) running with nobody holding a handle to it.
+                Err(e) => {
+                    kill_group(&mut child);
+                    let _ = child.wait();
+                    return Err(format!("waiting for the slicer: {e}"));
+                }
             }
             if Instant::now() >= deadline {
                 kill_group(&mut child);

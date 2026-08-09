@@ -3152,14 +3152,17 @@ async fn slice_start(
     // per-object overrides, and the slicer is driven with `--arrange 1 --orient
     // 1`, which re-packs all of it. Refuse instead of quietly ruining it.
     if lower.ends_with(".3mf") {
-        // Off the async workers: the staged model may be 512 MiB, and this both
-        // reads it and walks a zip.
+        // Off the async workers: walking a zip is blocking. The file is handed
+        // over rather than its bytes — a zip answers this from its central
+        // directory, and slurping a 512 MiB upload into RAM (times however many
+        // arrive before one wins the slot) is how the server gets OOM-killed.
         let staged = tmp.path().to_path_buf();
         match tokio::task::spawn_blocking(move || {
-            std::fs::read(&staged)
+            std::fs::File::open(&staged)
                 .map_err(|e| e.to_string())
-                .and_then(|b| {
-                    crate::core::project::is_authored_project(&b).map_err(|e| e.to_string())
+                .and_then(|f| {
+                    crate::core::project::is_authored_project(std::io::BufReader::new(f))
+                        .map_err(|e| e.to_string())
                 })
         })
         .await

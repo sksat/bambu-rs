@@ -12,7 +12,7 @@
 //! `filament_colors`, …). We **compute** the md5 from the gcode bytes (the
 //! authoritative "what will print"); the sidecar is only a cross-check.
 
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek};
 
 use serde::Serialize;
 
@@ -178,9 +178,12 @@ fn injects_timelapse_blocks(gcode: &[u8]) -> bool {
 ///
 /// Detected by the two settings blobs Bambu Studio / OrcaSlicer write into a
 /// project and never into a plain geometry export.
-pub fn is_authored_project(zip_bytes: &[u8]) -> Result<bool, ProjectError> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes))
-        .map_err(|e| ProjectError::InvalidZip(e.to_string()))?;
+/// Takes any seekable reader rather than bytes: a zip is answered from its
+/// central directory, so this never needs the archive in memory — and the
+/// caller's file can be 512 MiB, with several uploads in flight at once.
+pub fn is_authored_project<R: Read + Seek>(zip: R) -> Result<bool, ProjectError> {
+    let mut archive =
+        zip::ZipArchive::new(zip).map_err(|e| ProjectError::InvalidZip(e.to_string()))?;
     Ok([
         "Metadata/project_settings.config",
         "Metadata/model_settings.config",
@@ -342,19 +345,19 @@ mod tests {
                 b"{\"layer_height\":\"0.2\"}",
             ),
         ]);
-        assert!(is_authored_project(&authored).unwrap());
+        assert!(is_authored_project(Cursor::new(&authored)).unwrap());
 
         let per_object = make_3mf(&[
             ("3D/3dmodel.model", b"<model/>"),
             ("Metadata/model_settings.config", b"<config/>"),
         ]);
-        assert!(is_authored_project(&per_object).unwrap());
+        assert!(is_authored_project(Cursor::new(&per_object)).unwrap());
 
         // A plain geometry export — the only kind we may re-arrange and slice.
         let bare = make_3mf(&[("3D/3dmodel.model", b"<model/>")]);
-        assert!(!is_authored_project(&bare).unwrap());
+        assert!(!is_authored_project(Cursor::new(&bare)).unwrap());
 
-        assert!(is_authored_project(b"not a zip").is_err());
+        assert!(is_authored_project(Cursor::new(b"not a zip")).is_err());
     }
 
     #[test]
