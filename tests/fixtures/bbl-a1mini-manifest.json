@@ -1,0 +1,48 @@
+{
+  "_comment": [
+    "Captured from a real BBL bundle so CI can check the core::capability row",
+    "for the A1 mini against something other than a restatement of itself.",
+    "Names only, no vendor profile content. Re-capture with:",
+    "  cargo test -- --ignored capability_row_matches_the_installed_bundle",
+    "which fails with the differences when this file has gone stale."
+  ],
+  "captured_from": {
+    "slicer": "OrcaSlicer",
+    "version_line": "OrcaSlicer-2.4.2:",
+    "bundle": "/opt/orca-slicer/resources/profiles/BBL",
+    "captured_utc": "2026-08-09"
+  },
+  "model": "A1Mini",
+  "nozzle": "0.4",
+  "machine_preset": "Bambu Lab A1 mini 0.4 nozzle",
+  "machine_chain": [
+    "Bambu Lab A1 mini 0.4 nozzle",
+    "fdm_bbl_3dp_001_common",
+    "fdm_machine_common"
+  ],
+  "process_presets": [
+    "0.08mm Extra Fine @BBL A1M",
+    "0.08mm High Quality @BBL A1M",
+    "0.12mm Fine @BBL A1M",
+    "0.12mm High Quality @BBL A1M",
+    "0.16mm High Quality @BBL A1M",
+    "0.16mm Optimal @BBL A1M",
+    "0.20mm Standard @BBL A1M",
+    "0.20mm Strength @BBL A1M",
+    "0.24mm Draft @BBL A1M",
+    "0.28mm Extra Draft @BBL A1M"
+  ],
+  "process_chain_example": [
+    "0.20mm Standard @BBL A1M",
+    "fdm_process_single_0.20",
+    "fdm_process_single_common",
+    "fdm_process_common"
+  ],
+  "filament_preset_example": "Bambu PLA Basic @BBL A1M",
+  "filament_chain_example": [
+    "Bambu PLA Basic @BBL A1M",
+    "Bambu PLA Basic @base",
+    "fdm_filament_pla",
+    "fdm_filament_common"
+  ]
+}
