@@ -458,18 +458,47 @@ fn kill_group(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
+/// How much of the slicer log a failure response carries.
+const LOG_TAIL_CHARS: usize = 1500;
+
+/// How much of the file that can possibly take: UTF-8 is at most 4 bytes per
+/// char, plus slack. The slack is belt-and-braces rather than load-bearing — a
+/// read starting mid-character turns one character into two or three
+/// replacement ones, so the tail is always *longer* than the window and the
+/// damaged start is dropped by the take below regardless.
+const LOG_TAIL_BYTES: u64 = LOG_TAIL_CHARS as u64 * 4 + 64;
+
 /// The last part of the slicer log — what a human needs to see when it failed.
+///
+/// Read from the end rather than whole: this runs while *building a failure
+/// response*, and the failure that matters most is a slicer wedged for the full
+/// timeout, which is also the one that writes the biggest log. Slurping it
+/// there turns "the slice failed" into "the server died".
 fn log_tail(path: &Path) -> String {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let text = read_tail(path, LOG_TAIL_BYTES).unwrap_or_default();
+    // Lossy: the read may start mid-character. The slack above keeps any
+    // replacement char outside the window taken below.
+    let text = String::from_utf8_lossy(&text);
     let tail: String = text
         .chars()
-        .skip(text.chars().count().saturating_sub(1500))
+        .skip(text.chars().count().saturating_sub(LOG_TAIL_CHARS))
         .collect();
     if tail.trim().is_empty() {
         "the slicer logged nothing".to_string()
     } else {
         tail.trim().to_string()
     }
+}
+
+/// The last `n` bytes of a file, or all of it when it is shorter.
+fn read_tail(path: &Path, n: u64) -> Result<Vec<u8>, std::io::Error> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(n)))?;
+    let mut buf = Vec::with_capacity(n.min(len) as usize);
+    f.take(n).read_to_end(&mut buf)?;
+    Ok(buf)
 }
 
 fn write_json(dir: &Path, name: &str, map: &ProfileMap) -> Result<PathBuf, String> {
@@ -782,6 +811,58 @@ fn run_and_verify(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_huge_slicer_log_is_tailed_without_being_read() {
+        // This runs while building a failure response, and the failure most
+        // likely to produce a giant log is a slicer wedged for the whole
+        // timeout — the one case where reading it all turns a failed slice into
+        // a dead server.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slicer.log");
+        let mut big = "noise ".repeat(2_000_000); // ~12 MB
+        big.push_str("\nFATAL: the line that matters\n");
+        std::fs::write(&path, &big).unwrap();
+
+        let tail = log_tail(&path);
+        assert!(tail.ends_with("FATAL: the line that matters"), "{tail}");
+        assert!(
+            tail.chars().count() <= LOG_TAIL_CHARS,
+            "{}",
+            tail.chars().count()
+        );
+        // And no more of the file than the bound was ever touched.
+        assert!(read_tail(&path, LOG_TAIL_BYTES).unwrap().len() as u64 <= LOG_TAIL_BYTES);
+    }
+
+    #[test]
+    fn a_tail_that_starts_mid_character_still_reads_cleanly() {
+        // Reading the last N *bytes* lands inside a character here (4-byte
+        // characters, with a 1-byte suffix so the read cannot come out aligned)
+        // — the tail must still decode to the real end of the log with no
+        // replacement characters showing through.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slicer.log");
+        std::fs::write(&path, "🙂".repeat(20_000) + "!").unwrap();
+        let tail = log_tail(&path);
+        assert!(tail.ends_with("🙂!"), "{tail}");
+        assert!(
+            !tail.contains('\u{fffd}'),
+            "a cut character reached the window: {tail}"
+        );
+    }
+
+    #[test]
+    fn a_short_or_missing_log_still_says_something() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slicer.log");
+        std::fs::write(&path, "  \n\n").unwrap();
+        assert_eq!(log_tail(&path), "the slicer logged nothing");
+        assert_eq!(
+            log_tail(&dir.path().join("nope.log")),
+            "the slicer logged nothing"
+        );
+    }
     use super::*;
 
     /// Wait until `cond` holds, failing only after a deadline no healthy job can
