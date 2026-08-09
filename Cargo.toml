@@ -27,6 +27,10 @@ include = [
     "/LICENSE",
     "/about.toml",
     "/src",
+    # Read at runtime, not only by tests: the synthetic printer answers from
+    # these, so a packaged crate that lacks them does not compile.
+    "/tests/fixtures/pushall-n1-idle.json",
+    "/tests/fixtures/get_version-a1mini.json",
     "/web/src",
     "/web/index.html",
     "/web/package.json",

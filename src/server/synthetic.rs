@@ -96,10 +96,12 @@ fn real_a1_version(serial: &str) -> Value {
         })
         .clone();
     if let Some(obj) = info.as_object_mut() {
-        // The live machine answers a request, so its reply carries these; the
-        // capture was taken from that answer minus them.
-        obj.insert("result".into(), Value::from("success"));
-        obj.insert("reason".into(), Value::from("success"));
+        // Deliberately *without* `result`/`reason`, though the live machine's
+        // reply carries them. `core::report::is_status_report` reads a `result`
+        // as "this is an ACK" and the cache then drops the message — so adding
+        // them here stopped the relay ever learning the inventory, which is the
+        // one thing this function exists to provide. They are added by
+        // `version_reply` below, where the message really is an answer.
         if let Some(modules) = obj.get_mut("module").and_then(Value::as_array_mut) {
             for module in modules {
                 if let Some(m) = module.as_object_mut() {
@@ -143,6 +145,28 @@ fn captured_report() -> Option<serde_json::Map<String, Value>> {
             )
         });
     Some(print.clone())
+}
+
+/// The inventory as an *answer*: the modules, plus the result fields and the
+/// echoed sequence id a request's reply carries.
+fn version_reply(serial: &str, sequence_id: Option<&str>) -> Value {
+    let mut message = real_a1_version(serial);
+    if let Some(info) = message.get_mut("info").and_then(Value::as_object_mut) {
+        if let Some(seq) = sequence_id {
+            info.insert("sequence_id".into(), Value::from(seq));
+        }
+        info.insert("result".into(), Value::from("success"));
+        info.insert("reason".into(), Value::from("success"));
+    }
+    message
+}
+
+/// The `sequence_id` of whichever category a request came in under.
+fn seq_of(payload: &Value) -> Option<&str> {
+    let category = payload.as_object()?.keys().next()?;
+    payload
+        .pointer(&format!("/{category}/sequence_id"))
+        .and_then(Value::as_str)
 }
 
 /// One real A1 mini's idle `pushall`, as captured from the machine.
@@ -373,6 +397,16 @@ impl Upstream for SyntheticPrinter {
             let _ = self.reports.send(self.snapshot());
             return;
         }
+        // So is a get_version: the answer is the inventory. A generic ACK here
+        // would tell a client asking before the relay's cache had warmed that
+        // its question succeeded and nothing else — no modules, no firmware,
+        // and no way to work out what the printer can do.
+        if command == "get_version" {
+            let _ = self
+                .reports
+                .send(version_reply(&self.serial, seq_of(&payload)));
+            return;
+        }
         // Everything else gets the ACK shape observed on the A1: the echoed
         // sequence id, `result`, `reason`, and — for `print` — no `command`.
         //
@@ -478,6 +512,38 @@ mod tests {
             }
         }
         assert!(saw_delta, "a print in progress should emit deltas");
+    }
+
+    /// The inventory has to survive the trip through the relay's cache.
+    ///
+    /// It did not, and nothing said so: adding `result`/`reason` to match the
+    /// live machine's *reply* made `is_status_report` read the broadcast as an
+    /// ACK, the cache dropped it, and a client was left with `firmware: ?` and
+    /// no idea what the printer could do. The relay's own report/ACK rule is
+    /// the arbiter here, so the test asks it directly.
+    #[tokio::test]
+    async fn the_broadcast_inventory_is_a_report_and_the_answer_is_an_answer() {
+        use crate::core::report::is_status_report;
+
+        let broadcast = super::real_a1_version("0309FATEST00001");
+        assert!(
+            is_status_report(&broadcast),
+            "the cache drops anything it reads as an ACK, and then no client \
+             ever learns the firmware: {broadcast}"
+        );
+        assert!(broadcast["info"]["result"].is_null());
+
+        // The reply to a request is the other shape: it says which question it
+        // answers, and carries the modules a generic ACK would have left out.
+        let reply = super::version_reply("0309FATEST00001", Some("77"));
+        assert_eq!(reply["info"]["sequence_id"], "77");
+        assert_eq!(reply["info"]["result"], "success");
+        assert!(
+            reply["info"]["module"]
+                .as_array()
+                .is_some_and(|m| !m.is_empty()),
+            "an answer without the modules tells a client nothing"
+        );
     }
 
     /// Outside `print`, the answer says which question it answers.

@@ -265,6 +265,7 @@ enum Command {
         /// about a field that machine lacked or a value it happened to hold —
         /// Bambu Studio refuses to finish connecting to the bundled one and
         /// accepts a capture taken from the same printer months later.
+        #[cfg(feature = "relay")]
         #[arg(long, value_name = "PUSHALL_JSON", requires = "fake")]
         fake_report: Option<std::path::PathBuf>,
         /// Poll the printer every N seconds for live updates (default: passive).
@@ -955,6 +956,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             port,
             password,
             fake,
+            #[cfg(feature = "relay")]
             fake_report,
             interval,
             camera_url,
@@ -997,6 +999,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             *port,
             password.clone(),
             *fake,
+            #[cfg(feature = "relay")]
             fake_report.clone(),
             *interval,
             camera_url.clone(),
@@ -1839,7 +1842,7 @@ fn run_serve(
     port: u16,
     password: Option<String>,
     fake: bool,
-    fake_report: Option<std::path::PathBuf>,
+    #[cfg(feature = "relay")] fake_report: Option<std::path::PathBuf>,
     interval: Option<u64>,
     camera_url: Vec<String>,
     cameras_config: Option<std::path::PathBuf>,
