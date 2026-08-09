@@ -403,8 +403,16 @@ enum Command {
         /// the starting level are DOOM's business, not the relay's. Typically
         /// `--emulate-doom-arg -iwad --emulate-doom-arg /path/to/doom1.wad
         /// --emulate-doom-arg -warp --emulate-doom-arg 1 --emulate-doom-arg 1`.
+        // `allow_hyphen_values`, because every argument DOOM takes starts with
+        // a hyphen and clap would otherwise read `-iwad` as a flag of ours and
+        // refuse to start.
         #[cfg(feature = "relay")]
-        #[arg(long, value_name = "ARG", requires = "emulate_doom")]
+        #[arg(
+            long,
+            value_name = "ARG",
+            requires = "emulate_doom",
+            allow_hyphen_values = true
+        )]
         emulate_doom_arg: Vec<String>,
         /// Port for the game's picture, which is served as the chamber camera.
         /// 6000 is where a client looks.
