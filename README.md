@@ -177,6 +177,24 @@ Point a relay at *that* and the whole chain runs on one machine — which is wha
 Discovery is deliberately absent: the real printer is announcing the same serial on the same
 network, so add the relay by IP.
 
+### It runs DOOM
+
+The relay shows a client whatever frames it is given on the camera port, and sees every
+command before deciding what to do with it. Point one at the other and Bambu Studio's
+liveview is a screen and its movement panel is a gamepad: jog Y walks, jog X turns, home
+fires, the chamber light opens doors, and the four print-speed levels are the four weapon
+slots.
+
+```bash
+tools/doom/build.sh                     # fetches doomgeneric and the shareware WAD
+bambu serve --fake --emulate --emulate-doom --emulate-doom-engine …   # see tools/doom/README.md
+```
+
+`--emulate-doom` requires `--fake`, so the printer behind it is the synthetic one. A command
+taken for the game is consumed rather than forwarded — that is a property of the relay's
+control policy, not a check that could be forgotten — and it is never available in front of a
+machine that can move.
+
 ## Timelapse
 
 The printer's own built-in timelapse works as you'd expect: toggle recording with
