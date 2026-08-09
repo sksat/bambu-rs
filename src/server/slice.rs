@@ -203,7 +203,7 @@ impl LiveSlicer {
             // one slicer's binary with another's profiles, which is how a
             // version mismatch becomes a silently wrong slice; only reuse it
             // when it belongs to the very binary selected.
-            None => profiles_beside(&bin)
+            None => profiles_for(&bin)
                 .or_else(|| auto.filter(|(b, _)| *b == bin).map(|(_, p)| p))
                 .ok_or_else(|| {
                     format!(
@@ -236,23 +236,40 @@ impl LiveSlicer {
 
 /// The first installed (binary, profiles) pair, in the order they were verified.
 fn auto_detect() -> Option<(PathBuf, PathBuf)> {
-    let orca =
-        which("orca-slicer").map(|b| (b, PathBuf::from("/opt/orca-slicer/resources/profiles/BBL")));
-    let studio = Some((
-        PathBuf::from("/opt/bambustudio-bin/bin/bambu-studio"),
-        PathBuf::from("/opt/bambustudio-bin/resources/profiles/BBL"),
-    ));
-    [orca, studio]
+    // Each candidate's bundle is derived from the binary, never named
+    // separately: pairing "whatever `orca-slicer` is on PATH" with a fixed
+    // `/opt/orca-slicer` bundle silently combines one install's slicer with
+    // another's profiles when both exist — the version mismatch this function
+    // is supposed to avoid. It goes unnoticed on a box where PATH's entry is a
+    // symlink INTO that tree, which is the common layout and was this one.
+    let candidates = [
+        which("orca-slicer"),
+        Some(PathBuf::from("/opt/bambustudio-bin/bin/bambu-studio")),
+    ];
+    candidates
         .into_iter()
         .flatten()
-        .find(|(b, p)| is_executable(b) && p.is_dir())
+        .filter(|b| is_executable(b))
+        .find_map(|b| profiles_for(&b).map(|p| (b, p)))
 }
 
-/// `<prefix>/bin/<slicer>` ships its profiles at `<prefix>/resources/profiles/BBL`.
-fn profiles_beside(bin: &Path) -> Option<PathBuf> {
-    let prefix = bin.parent()?.parent()?;
-    let bundle = prefix.join("resources/profiles/BBL");
-    bundle.is_dir().then_some(bundle)
+/// The BBL bundle belonging to **this** binary.
+///
+/// Two layouts, then the same two again through the binary's canonical target,
+/// because the entry on `PATH` is usually a symlink into the install tree
+/// (here, `/usr/bin/orca-slicer` → `/opt/orca-slicer/AppRun`) and the bundle
+/// sits beside the target rather than the link.
+fn profiles_for(bin: &Path) -> Option<PathBuf> {
+    fn beside(dir: &Path) -> Option<PathBuf> {
+        let bundle = dir.join("resources/profiles/BBL");
+        bundle.is_dir().then_some(bundle)
+    }
+    fn from(bin: &Path) -> Option<PathBuf> {
+        let dir = bin.parent()?;
+        // `<prefix>/bin/<slicer>`, then `<prefix>/<launcher>` (AppImage-style).
+        dir.parent().and_then(beside).or_else(|| beside(dir))
+    }
+    from(bin).or_else(|| from(&std::fs::canonicalize(bin).ok()?))
 }
 
 /// How to name and run this binary. Bambu Studio is the one that needs help.
@@ -879,15 +896,23 @@ fn run_and_verify(
     want_layer_mm: f64,
 ) -> Result<(slice::SliceMeta, u64), String> {
     let out = slicer.slice(p)?;
-    let bytes = std::fs::read(&out.path).map_err(|e| format!("reading the sliced 3mf: {e}"))?;
-    let gcode = crate::core::project::plate_gcode(&bytes, 1)
+    // Opened, not read: the slicer's output archive has no size bound of its
+    // own, and this runs on the same small hosts the upload limit protects.
+    // Only the plate entry is pulled out, and that read is already capped.
+    let file =
+        std::fs::File::open(&out.path).map_err(|e| format!("reading the sliced 3mf: {e}"))?;
+    let size = file
+        .metadata()
+        .map_err(|e| format!("reading the sliced 3mf: {e}"))?
+        .len();
+    let gcode = crate::core::project::plate_gcode_from(std::io::BufReader::new(file), 1)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| {
             "the produced 3mf has no Metadata/plate_1.gcode — it was not sliced".to_string()
         })?;
     let meta = slice::verify_sliced(&gcode, want_layer_mm, out.bed)
         .map_err(|e| format!("verification failed: {e}"))?;
-    Ok((meta, bytes.len() as u64))
+    Ok((meta, size))
 }
 
 #[cfg(test)]
@@ -1175,6 +1200,56 @@ mod tests {
     #[cfg(unix)]
     mod posix {
         use super::*;
+
+        #[test]
+        fn a_bundle_is_only_ever_the_selected_binarys_own() {
+            // The failure this guards: a slicer found on PATH paired with a
+            // *fixed* bundle path that belongs to a different install. It hides
+            // on a box where PATH's entry symlinks into that same tree — which
+            // is the usual layout, and was this one — so it is pinned here.
+            let other = tempfile::tempdir().unwrap();
+            let bin_dir = other.path().join("bin");
+            std::fs::create_dir_all(&bin_dir).unwrap();
+            let lone = bin_dir.join("orca-slicer");
+            std::fs::write(&lone, b"#!/bin/sh\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&lone, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            // No bundle anywhere near it: nothing to pair with, so nothing is
+            // invented — not the machine's /opt bundle, not anyone else's.
+            assert_eq!(profiles_for(&lone), None);
+            let Err(err) = LiveSlicer::discover(Some(lone), None, Duration::from_secs(1)) else {
+                panic!("a binary with no bundle of its own must not be advertised");
+            };
+            assert!(err.contains("no BBL profile bundle found beside"), "{err}");
+
+            // With its own bundle beside it, that is the one used.
+            let mine = other.path().join("resources/profiles/BBL");
+            std::fs::create_dir_all(&mine).unwrap();
+            assert_eq!(profiles_for(&bin_dir.join("orca-slicer")), Some(mine));
+        }
+
+        #[test]
+        fn a_launcher_symlinked_from_path_resolves_to_its_own_tree() {
+            // `/usr/bin/orca-slicer -> /opt/orca-slicer/AppRun`, the layout
+            // installed here: the bundle sits beside the TARGET, not the link.
+            let tree = tempfile::tempdir().unwrap();
+            let run = tree.path().join("AppRun");
+            std::fs::write(&run, b"#!/bin/sh\n").unwrap();
+            let bundle = tree.path().join("resources/profiles/BBL");
+            std::fs::create_dir_all(&bundle).unwrap();
+            assert_eq!(profiles_for(&run), Some(bundle.clone()));
+
+            #[cfg(unix)]
+            {
+                let elsewhere = tempfile::tempdir().unwrap();
+                let link = elsewhere.path().join("orca-slicer");
+                std::os::unix::fs::symlink(&run, &link).unwrap();
+                assert_eq!(profiles_for(&link), Some(bundle));
+            }
+        }
 
         #[test]
         fn discover_refuses_a_directory_that_is_not_a_profile_bundle() {

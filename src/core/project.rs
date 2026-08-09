@@ -251,12 +251,24 @@ fn build_item_count<R: Read + Seek>(archive: &mut zip::ZipArchive<R>, cap: u64) 
 /// zip entry's `read` returns whatever size it likes, so a fixture cannot be
 /// relied on to straddle a boundary.
 fn count_items<R: Read>(mut entry: R, cap: u64) -> BuildItems {
-    const NEEDLE: &[u8] = b"<item";
+    /// Bytes held back between reads: one less than the longest marker, so a
+    /// marker straddling a chunk boundary is seen whole on the next pass. A
+    /// match is only acted on when it *starts* inside the decided region —
+    /// otherwise it is left for next time, which is what stops it being
+    /// half-seen at the edge.
+    const KEEP: usize = b"</build".len() - 1;
+    /// A `<build>` bigger than this is not a file we need to weigh up: it is
+    /// far past "more than one item" already.
+    const BUILD_MAX: usize = 1 << 20;
+
     let mut chunk = vec![0u8; 64 * 1024];
-    // The last NEEDLE-1 bytes of the previous chunk, so a match straddling a
-    // chunk boundary is still seen.
     let mut carry: Vec<u8> = Vec::new();
-    let (mut found, mut total) = (0usize, 0u64);
+    // `Some` once `<build` has been seen: the section's bytes, gathered whole
+    // so items and their transforms are parsed with no chunk boundary running
+    // through them. It is the tail of the document, and small.
+    let mut build: Option<Vec<u8>> = None;
+    let mut total = 0u64;
+
     loop {
         let n = match entry.read(&mut chunk) {
             Ok(0) => break,
@@ -267,19 +279,91 @@ fn count_items<R: Read>(mut entry: R, cap: u64) -> BuildItems {
         if total > cap {
             return BuildItems::Unknown;
         }
-        let mut window = std::mem::take(&mut carry);
-        window.extend_from_slice(&chunk[..n]);
-        found += window
-            .windows(NEEDLE.len())
-            .filter(|w| *w == NEEDLE)
-            .count();
-        if found > 1 {
-            return BuildItems::Count(found); // enough to decide
+        let mut win = std::mem::take(&mut carry);
+        win.extend_from_slice(&chunk[..n]);
+        let usable = win.len().saturating_sub(KEEP);
+        let mut pos = 0;
+        while pos < usable {
+            match build.as_mut() {
+                None => match find(&win[pos..], b"<build") {
+                    Some(i) if pos + i < usable => {
+                        pos += i + b"<build".len();
+                        build = Some(Vec::new());
+                    }
+                    _ => break,
+                },
+                Some(buf) => match find(&win[pos..], b"</build") {
+                    Some(i) if pos + i < usable => {
+                        buf.extend_from_slice(&win[pos..pos + i]);
+                        return decide_build(buf);
+                    }
+                    _ => {
+                        buf.extend_from_slice(&win[pos..usable]);
+                        if buf.len() > BUILD_MAX {
+                            return BuildItems::Count(2); // long past deciding
+                        }
+                        pos = usable;
+                    }
+                },
+            }
         }
-        let keep = window.len().saturating_sub(NEEDLE.len() - 1);
-        carry = window.split_off(keep);
+        carry = win.split_off(usable);
     }
-    BuildItems::Count(found)
+    // EOF: the carry is the tail nothing has decided yet.
+    match build {
+        None => BuildItems::Count(0),
+        Some(mut buf) => match find(&carry, b"</build") {
+            Some(i) => {
+                buf.extend_from_slice(&carry[..i]);
+                decide_build(&buf)
+            }
+            // A `<build>` that never closes is a truncated document; saying
+            // "no items" about it is the answer that re-packs a layout.
+            None => BuildItems::Unknown,
+        },
+    }
+}
+
+/// What a gathered `<build>` section says: how many items, and whether any of
+/// them carries an orientation.
+fn decide_build(build: &[u8]) -> BuildItems {
+    let text = String::from_utf8_lossy(build);
+    let items = text.matches("<item").count();
+    if items > 1 || has_oriented_item(&text) {
+        return BuildItems::Count(items.max(2));
+    }
+    BuildItems::Count(items)
+}
+
+/// Does any `transform=` here have a 3×3 block that is not the identity?
+///
+/// 3MF writes the matrix as twelve numbers, row-major, the last three being the
+/// translation — so the first nine are rotation and scale. Anything else there
+/// is an orientation someone chose, which `--orient 1` would re-decide.
+///
+/// A transform that cannot be parsed counts as oriented: this decides whether
+/// to refuse, and "cannot tell" must not come out as "go ahead and re-orient".
+fn has_oriented_item(text: &str) -> bool {
+    text.match_indices("transform=\"").any(|(i, m)| {
+        let rest = &text[i + m.len()..];
+        let Some(end) = rest.find('"') else {
+            return true;
+        };
+        let nums: Vec<&str> = rest[..end].split_whitespace().collect();
+        if nums.len() < 12 {
+            return true;
+        }
+        const IDENTITY: [f64; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        nums.iter()
+            .take(9)
+            .zip(IDENTITY)
+            .any(|(got, want)| got.parse::<f64>().map_or(true, |v| (v - want).abs() > 1e-6))
+    })
+}
+
+/// First index of `needle` in `hay`.
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// One plate's gcode as text, or `None` when the `.3mf` has no such plate
@@ -288,8 +372,19 @@ fn count_items<R: Read>(mut entry: R, cap: u64) -> BuildItems {
 /// Lossy UTF-8: gcode is ASCII, and a stray byte in a comment must not turn a
 /// verifiable slice into an error.
 pub fn plate_gcode(zip_bytes: &[u8], plate: u32) -> Result<Option<String>, ProjectError> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes))
-        .map_err(|e| ProjectError::InvalidZip(e.to_string()))?;
+    plate_gcode_from(Cursor::new(zip_bytes), plate)
+}
+
+/// [`plate_gcode`] over any seekable reader, so a caller holding a file on disk
+/// does not have to read the whole archive into memory first: a sliced plate's
+/// archive has no size bound of its own, and the entry read below is already
+/// capped.
+pub fn plate_gcode_from<R: Read + Seek>(
+    zip: R,
+    plate: u32,
+) -> Result<Option<String>, ProjectError> {
+    let mut archive =
+        zip::ZipArchive::new(zip).map_err(|e| ProjectError::InvalidZip(e.to_string()))?;
     Ok(
         read_entry(&mut archive, &format!("Metadata/plate_{plate}.gcode"))?
             .map(|b| String::from_utf8_lossy(&b).into_owned()),
@@ -335,8 +430,8 @@ pub fn verify_expectations(
 }
 
 /// Read a ZIP entry fully (capped), `Ok(None)` if the entry isn't present.
-fn read_entry(
-    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
+fn read_entry<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
     name: &str,
 ) -> Result<Option<Vec<u8>>, ProjectError> {
     let file = match archive.by_name(name) {
@@ -424,6 +519,49 @@ mod tests {
             zip.finish().unwrap();
         }
         buf
+    }
+
+    #[test]
+    fn one_object_rotated_on_purpose_is_authored_but_merely_moved_is_not() {
+        // `--orient 1` re-decides orientation, so a part someone laid down at
+        // an angle loses it. A translation is different: putting one object on
+        // the bed is exactly what `--arrange` is for, and refusing every 3mf
+        // carrying an offset would refuse the ordinary STL→3MF conversion.
+        let with = |t: &str| {
+            make_3mf(&[(
+                "3D/3dmodel.model",
+                format!(r#"<model><build><item objectid="1" transform="{t}"/></build></model>"#)
+                    .as_bytes(),
+            )])
+        };
+        let authored = |t: &str| is_authored_project(Cursor::new(&with(t))).unwrap();
+
+        // Identity, and identity with a translation: bare.
+        assert!(!authored("1 0 0 0 1 0 0 0 1 0 0 0"));
+        assert!(!authored("1 0 0 0 1 0 0 0 1 90 90 0"));
+        // Rotated 90° about Z, and scaled: authored.
+        assert!(authored("0 -1 0 1 0 0 0 0 1 0 0 0"), "rotation");
+        assert!(authored("2 0 0 0 2 0 0 0 2 0 0 0"), "scale");
+        // Unparseable or short: cannot tell, so do not re-orient it.
+        assert!(authored("1 0 0 0 1 0 0 0"), "too few numbers");
+        assert!(authored("1 0 0 0 1 0 0 0 x 0 0 0"), "not a number");
+        // And no transform at all is the plainest bare case.
+        let plain = make_3mf(&[(
+            "3D/3dmodel.model",
+            br#"<model><build><item objectid="1"/></build></model>"#,
+        )]);
+        assert!(!is_authored_project(Cursor::new(&plain)).unwrap());
+    }
+
+    #[test]
+    fn an_unterminated_build_section_is_not_read_as_having_no_items() {
+        // A truncated document: saying "zero items" about it is the answer that
+        // hands an authored layout to `--arrange`.
+        let cut = make_3mf(&[(
+            "3D/3dmodel.model",
+            br#"<model><build><item objectid="1"/><item objectid="2"/>"#,
+        )]);
+        assert!(is_authored_project(Cursor::new(&cut)).unwrap());
     }
 
     #[test]
