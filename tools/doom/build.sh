@@ -61,6 +61,7 @@ built $(pwd)/build/bambu-doom-engine
     bambu serve --fake --emulate --serial DOOM00000000001 --access-code 12345678 \\
       --emulate-doom \\
       --emulate-doom-engine $(pwd)/build/bambu-doom-engine \\
+      --emulate-doom-arg -workdir --emulate-doom-arg $(pwd)/build/saves \\
       --emulate-doom-arg -iwad --emulate-doom-arg $(pwd)/build/doom1.wad \\
       --emulate-doom-arg -warp --emulate-doom-arg 1 --emulate-doom-arg 1
 EOF
