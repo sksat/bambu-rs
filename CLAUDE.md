@@ -9,11 +9,11 @@ dashboard.
 
 - **TDD.** Failing test first, minimal code to pass, then refactor — `core/` is kept I/O-free so
   logic can be driven this way.
-- **Design with a second opinion first.** For a non-trivial design, consult `smart-friend`
-  (`codex exec --sandbox read-only -m gpt-5.5 …`) and weigh its take against your own before
-  committing to an approach.
-- **Review substantial changes** with `code-review-gpt` (`codex review -c model=gpt-5.5 --base main`)
-  before finalizing; engage with the feedback rather than rubber-stamping it.
+- **Design with a second opinion first.** For a non-trivial design, get one from a `fable` subagent
+  and weigh its take against your own before committing to an approach.
+- **Review substantial changes** with `code-review-gpt`
+  (`codex review -c model=gpt-5.6-sol --base main`) before finalizing. Engage with the feedback:
+  reproduce each finding before fixing it, and say so on the PR when one doesn't hold.
 
 ## Working in this codebase
 
