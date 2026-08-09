@@ -1208,17 +1208,6 @@ async fn job_start(State(st): State<PrinterState>, Json(b): Json<StartBody>) -> 
                 ));
             }
         }
-        // Length matters as much as range. This path slices ONE filament, and
-        // the mapping is expanded onto the project's filament indices — a
-        // mismatched length is left unexpanded, so the printer falls back to
-        // whatever the gcode baked in. That is how a plate got printed in the
-        // wrong material once already; it is a refusal now, not a surprise.
-        if b.ams_map.len() != 1 {
-            return bad_request(format!(
-                "ams_map has {} entries but this slice uses 1 filament — pass exactly one tray",
-                b.ams_map.len()
-            ));
-        }
     }
     // With an AMS mapping, inspecting is MANDATORY, not a nicety: the wire array
     // is keyed by each filament's index in the project, and only the plate's
@@ -1249,6 +1238,30 @@ async fn job_start(State(st): State<PrinterState>, Json(b): Json<StartBody>) -> 
     } else {
         None
     };
+    // Length matters as much as range, and only the plate says what it should
+    // be: the wire array is keyed by each filament's index in the project, so
+    // `expand_ams_map` leaves a wrong-length map UNEXPANDED and the printer
+    // uses whatever the gcode baked in. That is how a plate got printed in the
+    // wrong material once already — device-verified — so a map that cannot be
+    // expanded is refused here rather than sent and hoped over.
+    if let Some(insp) = inspection.as_ref() {
+        let want = insp.filament_ids.len();
+        if want == 0 {
+            return bad_request(format!(
+                "{} plate {} does not say which filaments it uses, so an AMS mapping cannot be \
+                 resolved — start without use_ams, or re-slice the plate",
+                b.file, b.plate
+            ));
+        }
+        if b.ams_map.len() != want {
+            return bad_request(format!(
+                "ams_map has {} entries but plate {} uses {want} filament(s) — pass one tray per \
+                 filament, in the plate's own order",
+                b.ams_map.len(),
+                b.plate
+            ));
+        }
+    }
     let req = StartRequest {
         file: b.file.clone(),
         plate: b.plate,
@@ -3017,7 +3030,7 @@ async fn slice_start(
     // then fail in the background, which is a worse answer than refusing.
     // (Verified against the installed OrcaSlicer; `.3mf` gets past the format
     // check on its own path.)
-    if ![".stl", ".obj", ".amf", ".3mf"]
+    if !crate::core::slice::MODEL_EXTENSIONS
         .iter()
         .any(|e| lower.ends_with(e))
     {
@@ -3242,18 +3255,6 @@ async fn slice_result(State(st): State<PrinterState>) -> Response {
     let Ok(file) = tokio::fs::File::open(&done.path).await else {
         return server_error("the sliced file has gone".to_string());
     };
-    let stream = futures_util::stream::unfold(Some(file), |st| async move {
-        let mut f = st?;
-        let mut buf = vec![0u8; 64 * 1024];
-        match tokio::io::AsyncReadExt::read(&mut f, &mut buf).await {
-            Ok(0) => None,
-            Ok(n) => {
-                buf.truncate(n);
-                Some((Ok::<Bytes, std::io::Error>(Bytes::from(buf)), Some(f)))
-            }
-            Err(e) => Some((Err(e), None)),
-        }
-    });
     // `out_name` came from `sanitize_output_name`, so it carries no quote or
     // newline to break out of this header.
     let name = done
@@ -3261,6 +3262,27 @@ async fn slice_result(State(st): State<PrinterState>) -> Response {
         .out_name
         .clone()
         .unwrap_or_else(|| "slice.gcode.3mf".to_string());
+    // The lease rides along in the stream state, so the work directory outlives
+    // the download rather than this function. Dropping it here would be
+    // invisible on Linux (an open fd keeps reading through an unlink) and a
+    // leak on Windows, where `TempDir` cannot remove a directory holding an
+    // open file and does not retry — the bounded-disk claim has to hold on
+    // both.
+    let stream = futures_util::stream::unfold(Some((file, done)), |st| async move {
+        let (mut f, lease) = st?;
+        let mut buf = vec![0u8; 64 * 1024];
+        match tokio::io::AsyncReadExt::read(&mut f, &mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((
+                    Ok::<Bytes, std::io::Error>(Bytes::from(buf)),
+                    Some((f, lease)),
+                ))
+            }
+            Err(e) => Some((Err(e), None)),
+        }
+    });
     (
         [
             (CONTENT_TYPE, "application/octet-stream".to_string()),
@@ -4784,6 +4806,67 @@ mod tests {
             zip.finish().unwrap();
         }
         buf
+    }
+
+    /// A `.3mf` whose plate 1 declares these filament ids — the positions
+    /// `expand_ams_map` keys the wire array by.
+    fn three_mf_with_filaments(ids: &[usize]) -> Vec<u8> {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let colors = vec!["\"#FFFFFF\""; ids.len()].join(",");
+        let list = ids
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"{{"filament_colors":[{colors}],"filament_ids":[{list}],"bed_type":"textured_plate"}}"#
+        );
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.start_file("Metadata/plate_1.gcode", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"G1 X1\n").unwrap();
+            zip.start_file("Metadata/plate_1.json", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(json.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    /// A server whose only file is `bytes`.
+    fn app_serving(bytes: Vec<u8>) -> TestServer {
+        let mut state = printer("test");
+        state.files = Arc::new(OneFile(bytes));
+        TestServer::new(one(state))
+    }
+
+    #[tokio::test]
+    async fn an_ams_map_must_have_one_entry_per_filament_the_plate_uses() {
+        // The wire array is keyed by each filament's index in the project, and
+        // `expand_ams_map` leaves a wrong-length map UNEXPANDED — the printer
+        // then uses whatever the gcode baked in. That is how a plate got
+        // printed in the wrong material once already, so a length that cannot
+        // be expanded is refused rather than sent.
+        let app = app_serving(three_mf_with_filaments(&[0, 1]));
+        let start = |map: serde_json::Value| {
+            app.post("/api/job/start")
+                .json(&json!({ "file": "/two.3mf", "plate": 1, "confirm": true,
+                               "use_ams": true, "ams_map": map }))
+        };
+        for bad in [json!([0]), json!([0, 1, 2])] {
+            let n = bad.as_array().unwrap().len();
+            let res = start(bad).await;
+            res.assert_status(StatusCode::BAD_REQUEST);
+            let t = res.text();
+            assert!(t.contains("ams_map"), "{n}: {t}");
+            assert!(t.contains('2'), "names how many the plate uses: {t}");
+        }
+        // The matching length is exactly what a two-colour print needs, and
+        // must NOT be refused.
+        start(json!([0, 1])).await.assert_status_ok();
     }
 
     #[tokio::test]

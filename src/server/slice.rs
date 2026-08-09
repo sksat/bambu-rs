@@ -569,6 +569,12 @@ pub struct SliceJobStatus {
     pub layer_mm: Option<f64>,
     pub filament: Option<String>,
     pub bed_type: Option<String>,
+    /// The process profile the height resolved to, and whether `layer_height`
+    /// had to be forced on top of it. A non-stock request rides a neighbour's
+    /// speeds, flow and cooling; that is worth saying out loud rather than
+    /// leaving the caller to infer it from a height it never sees again.
+    pub process: Option<String>,
+    pub layer_forced: Option<bool>,
     /// From the verified gcode, not from the request.
     pub layers: Option<u32>,
     pub bed_temp_c: Option<u32>,
@@ -585,6 +591,8 @@ impl Default for SliceJobStatus {
             layer_mm: None,
             filament: None,
             bed_type: None,
+            process: None,
+            layer_forced: None,
             layers: None,
             bed_temp_c: None,
             size_bytes: None,
@@ -605,6 +613,8 @@ impl SliceJobStatus {
             "layer_mm": self.layer_mm,
             "filament": self.filament,
             "bed_type": self.bed_type,
+            "process": self.process,
+            "layer_forced": self.layer_forced,
             "layers": self.layers,
             "bed_temp_c": self.bed_temp_c,
             "size_bytes": self.size_bytes,
@@ -651,6 +661,10 @@ impl SliceManager {
             return Err("a slice is already running".to_string());
         }
         let out_path = workdir.path().join(&params.out_name);
+        // Best-effort: the slice itself resolves this again and fails properly
+        // if it cannot, so a `None` here only means the status is quieter.
+        let choice =
+            crate::core::slice::process_for_layer(params.layer_mm, &params.preset_suffix).ok();
         let status = Arc::new(Mutex::new(SliceJobStatus {
             state: "running",
             input_name: Some(params.input_name.clone()),
@@ -658,6 +672,8 @@ impl SliceManager {
             layer_mm: Some(params.layer_mm),
             filament: Some(params.filament.clone()),
             bed_type: Some(params.bed_type.clone()),
+            process: choice.as_ref().map(|c| c.name.clone()),
+            layer_forced: choice.as_ref().map(|c| c.force_layer),
             ..Default::default()
         }));
 

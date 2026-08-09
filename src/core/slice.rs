@@ -253,11 +253,23 @@ pub fn fmt_mm(v: f64) -> String {
 /// How far a requested height may sit from a stock profile before the pick
 /// stops being a rounding and starts being a guess.
 ///
-/// The stock heights are 0.04 apart, so half of that is the point where a
-/// neighbour is no closer. Beyond it the profile's speeds, flow and cooling
-/// were tuned for a height the print will not use — a guess, and this module
-/// refuses those elsewhere.
-const PROCESS_MAX_GAP_MM: f64 = 0.02;
+/// Half the table's own spacing — the point where a neighbour is no closer —
+/// and **derived** from it rather than written down, so re-spacing the table
+/// cannot leave a stale literal behind. Beyond it the profile's speeds, flow
+/// and cooling were tuned for a height the print will not use: a guess, which
+/// this module refuses elsewhere too.
+///
+/// This is not one of the setup-dependent knobs CLAUDE.md requires to be
+/// configured (park-frame selection and friends). Nothing physical decides it —
+/// it falls out of where BBL put its presets, so there is no value an operator
+/// could know better.
+fn process_max_gap_mm() -> f64 {
+    PROCESS_TABLE
+        .windows(2)
+        .map(|w| w[1].0 - w[0].0)
+        .fold(f64::INFINITY, f64::min)
+        / 2.0
+}
 
 /// Pick the process profile for `layer_mm`, named for the given preset suffix
 /// (e.g. `@BBL A1M`). A non-stock height picks the nearest profile and asks the
@@ -269,7 +281,10 @@ pub fn process_for_layer(layer_mm: f64, preset_suffix: &str) -> Result<ProcessCh
         .min_by(|a, b| (a.0 - layer_mm).abs().total_cmp(&(b.0 - layer_mm).abs()))
         .expect("the process table is not empty");
     let gap = (best_h - layer_mm).abs();
-    if gap > PROCESS_MAX_GAP_MM {
+    // Slack for the same reason `layer_fits_nozzle` needs it: these are decimal
+    // fractions that are not exact in binary, and 0.02 lands just above the
+    // subtraction's result.
+    if gap > process_max_gap_mm() + 1e-9 {
         let stock = PROCESS_TABLE
             .iter()
             .map(|(h, _)| format!("{h}"))
@@ -564,6 +579,16 @@ pub fn layer_fits_nozzle(layer_mm: f64, nozzle: &str) -> Result<(), String> {
 /// Path separators are stripped and anything outside `[A-Za-z0-9._-]` is folded
 /// to `_`: the result names a file on disk and rides in a `Content-Disposition`
 /// header, so it must not carry a separator, a quote, or a newline.
+/// The model formats this slicer reads, lowercase and dotted.
+///
+/// One list, because two drift: libslic3r picks its reader from the extension
+/// and rejects anything else before opening the file ("Unknown file format.
+/// Input file must have .stl, .obj, .amf(.xml) extension"), so the set the API
+/// accepts and the set [`sanitize_output_name`] strips have to be the same set.
+/// They were not — `.step` was stripped though the slicer cannot read it, and
+/// `.obj` was accepted but left on, producing `cube.obj.gcode.3mf`.
+pub const MODEL_EXTENSIONS: [&str; 4] = [".stl", ".obj", ".amf", ".3mf"];
+
 pub fn sanitize_output_name(input_name: &str) -> String {
     let base = input_name
         .rsplit(['/', '\\'])
@@ -572,7 +597,9 @@ pub fn sanitize_output_name(input_name: &str) -> String {
         .trim();
     let lower = base.to_ascii_lowercase();
     let mut stem = base;
-    for suffix in [".gcode.3mf", ".3mf", ".stl", ".step", ".stp"] {
+    // `.gcode.3mf` first: it is a suffix of `.3mf`, and stripping the shorter
+    // one would leave a stray `.gcode`.
+    for suffix in std::iter::once(".gcode.3mf").chain(MODEL_EXTENSIONS) {
         if lower.len() > suffix.len() && lower.ends_with(suffix) {
             stem = &base[..base.len() - suffix.len()];
             break;
@@ -1037,14 +1064,40 @@ mod tests {
 
     #[test]
     fn sanitize_output_name_strips_paths_and_extensions() {
-        assert_eq!(sanitize_output_name("cube.stl"), "cube.gcode.3mf");
-        assert_eq!(sanitize_output_name("Part A.STEP"), "Part_A.gcode.3mf");
-        assert_eq!(sanitize_output_name("bracket.3mf"), "bracket.gcode.3mf");
+        // Every format the slicer reads loses its extension, none keeps it —
+        // `cube.obj.gcode.3mf` was the bug this pins.
+        for ext in ["stl", "obj", "amf", "3mf", "STL", "Obj"] {
+            assert_eq!(
+                sanitize_output_name(&format!("cube.{ext}")),
+                "cube.gcode.3mf",
+                "{ext}"
+            );
+        }
+        assert_eq!(sanitize_output_name("Part A.stl"), "Part_A.gcode.3mf");
         assert_eq!(sanitize_output_name("x.gcode.3mf"), "x.gcode.3mf");
         assert_eq!(sanitize_output_name("../../etc/passwd"), "passwd.gcode.3mf");
         assert_eq!(sanitize_output_name("a\\b\\c.stl"), "c.gcode.3mf");
         assert_eq!(sanitize_output_name(".."), "model.gcode.3mf");
         assert_eq!(sanitize_output_name("\"evil\n.stl"), "_evil_.gcode.3mf");
+    }
+
+    #[test]
+    fn the_accepted_gap_follows_the_table_rather_than_a_literal() {
+        // Half the spacing: at exactly that distance neither neighbour is
+        // closer, so it is the last point where "nearest" still means anything.
+        assert!((process_max_gap_mm() - 0.02).abs() < 1e-9);
+        // And it is the boundary the caller actually meets — a midpoint is in,
+        // one step past it is out.
+        assert!(process_for_layer(0.22, "@BBL A1M").is_ok(), "midpoint");
+        assert!(
+            process_for_layer(0.30, "@BBL A1M").is_ok(),
+            "half a step past the top"
+        );
+        assert!(process_for_layer(0.31, "@BBL A1M").is_err());
+        // A non-stock height is a forced layer height on the nearest profile,
+        // and says so — that flag is what the caller is told.
+        assert!(process_for_layer(0.22, "@BBL A1M").unwrap().force_layer);
+        assert!(!process_for_layer(0.20, "@BBL A1M").unwrap().force_layer);
     }
 
     #[test]
