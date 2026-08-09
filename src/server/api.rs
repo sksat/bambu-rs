@@ -1568,12 +1568,6 @@ async fn file_mesh(State(st): State<PrinterState>, Query(q): Query<MeshQuery>) -
 // repeatable) and edited at runtime via the gated config endpoint. IDs are
 // positional: "internal" for the built-in, "ext-{i}" for the i-th external.
 
-/// Cap a proxied camera frame to bound server memory (a single JPEG is well under
-/// this; a misbehaving upstream can't OOM us).
-const CAMERA_MAX_BYTES: u64 = 32 * 1024 * 1024;
-/// Upstream fetch timeout — a stalled camera shouldn't hang the request.
-const CAMERA_TIMEOUT: Duration = Duration::from_secs(8);
-
 /// List the available cameras (open read) as `{id, kind, label}`. URLs are never
 /// exposed here — only the proxied snapshot is reachable, by id.
 async fn cameras_list(State(st): State<PrinterState>) -> Json<serde_json::Value> {
@@ -1638,7 +1632,8 @@ async fn camera_snapshot(State(st): State<PrinterState>, Path(id): Path<String>)
     let Some(url) = url else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match tokio::task::spawn_blocking(move || fetch_camera_frame(&url)).await {
+    match tokio::task::spawn_blocking(move || crate::server::camera::fetch_camera_frame(&url)).await
+    {
         Ok(Ok((ctype, bytes))) => (
             [
                 (CONTENT_TYPE, ctype),
@@ -1963,33 +1958,6 @@ async fn cameras_config_set(
     Json(json!({ "external": external_json(&st) })).into_response()
 }
 
-/// Blocking single-shot GET of the camera URL. Returns `(content_type, bytes)` or
-/// an error string. The body is read with a hard byte cap so a bad upstream can't
-/// exhaust memory.
-fn fetch_camera_frame(url: &str) -> Result<(String, Vec<u8>), String> {
-    // A snapshot CGI never legitimately redirects; disallowing redirects keeps
-    // the server-side fetch from being bounced to an internal address (SSRF).
-    let agent = ureq::AgentBuilder::new()
-        .timeout(CAMERA_TIMEOUT)
-        .redirects(0)
-        .build();
-    let resp = agent.get(url).call().map_err(|e| e.to_string())?;
-    // Default to image/jpeg if the camera omits a content-type.
-    let ctype = resp
-        .header("content-type")
-        .map(str::to_string)
-        .unwrap_or_else(|| "image/jpeg".to_string());
-    let mut bytes = Vec::new();
-    resp.into_reader()
-        .take(CAMERA_MAX_BYTES)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    if bytes.is_empty() {
-        return Err("camera returned an empty body".to_string());
-    }
-    Ok((ctype, bytes))
-}
-
 #[derive(Deserialize)]
 struct TimelapseStartBody {
     /// Single camera id to capture from: `internal` or `ext-{i}`. Convenience
@@ -2071,7 +2039,7 @@ fn resolve_grab(st: &PrinterState, camera: &str) -> Option<(String, FrameGrab)> 
     let url = st.external_cameras.read().unwrap().get(idx)?.url.clone();
     Some((
         camera.to_string(),
-        Arc::new(move || fetch_camera_frame(&url).map(|(_, bytes)| bytes)),
+        Arc::new(move || crate::server::camera::fetch_camera_frame(&url).map(|(_, bytes)| bytes)),
     ))
 }
 
