@@ -33,6 +33,17 @@ jobs:
       # default and so would be linted by nothing at all if it were left out here.
       - name: Clippy
         run: cargo clippy --all-targets --features dashboard,ts-rs,doom -- -D warnings
+      # Publishing is redistribution, and the game is not something this crate
+      # wants to hand to everyone who depends on it. `include` drops it with a
+      # negated pattern (`exclude` does not work alongside `include`), which is
+      # a quiet thing to get wrong — a renamed module would put DOOM back in the
+      # tarball and nothing else here would notice.
+      - name: No DOOM in the published crate
+        run: |
+          if cargo package --list --no-verify | grep -i doom; then
+            echo "::error::the files above would be published; see the include list in Cargo.toml"
+            exit 1
+          fi
 
   # Test the meaningful feature combinations, not just --all-features — a
   # library-only consumer builds with default-features off, and the server /

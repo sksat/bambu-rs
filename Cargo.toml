@@ -27,6 +27,21 @@ include = [
     "/LICENSE",
     "/about.toml",
     "/src",
+    # …but not the game. Publishing a crate is redistribution, and this one
+    # would rather not carry DOOM into somebody else's dependency tree — the
+    # code here is MIT and the engine is never linked, but "explain why your
+    # printer library ships a shooter" is not a conversation worth having. The
+    # engine's own sources (`tools/`) are already outside this list.
+    #
+    # `exclude` cannot do this: Cargo ignores it whenever `include` is given.
+    # Negation inside `include` does work — checked with `cargo package --list`,
+    # which CI now also does so this cannot rot back.
+    #
+    # The `doom` feature therefore only builds from a git checkout. Enabling it
+    # on a crates.io copy fails on the missing module, which is the honest
+    # outcome: the code genuinely is not there.
+    "!/src/core/doom/**",
+    "!/src/server/doom.rs",
     # Read at runtime, not only by tests: the synthetic printer answers from
     # these, so a packaged crate that lacks them does not compile.
     "/tests/fixtures/pushall-n1-idle.json",
@@ -105,6 +120,10 @@ relay = ["server", "dep:rcgen", "dep:tokio-rustls"]
 # command line out of a build that did not want them. The engine itself is a
 # separate program built from `tools/doom/` and spawned, never linked, which is
 # also why enabling this does not make the crate GPL.
+#
+# **Only from a git checkout.** The sources are deliberately left out of the
+# published crate (see `include`), so this feature has nothing to compile on a
+# copy from crates.io.
 doom = ["relay"]
 # The embedded web dashboard SPA, served by `bambu serve` when enabled. Builds on
 # the API server and embeds `web/dist/` via rust-embed.
