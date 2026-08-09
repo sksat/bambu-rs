@@ -87,6 +87,12 @@ scripts/slice.py /tmp/cube.stl /tmp/cube.gcode.3mf            # 0.20mm PLA defau
 - `--brim`: force an outer brim of N mm (e.g. `--brim 5`) for thin/tall-and-narrow
   parts prone to lifting. PLA benefits; PETG adheres hard enough that a brim is
   usually unneeded and harder to peel.
+- `--support` / `--support-type`: generate support. Anything resting on a point
+  or with a real overhang needs it — a sphere printed without it has nothing to
+  build its first layers on. The A1M presets already choose `tree(auto)` and a
+  30° threshold, so `--support` alone is usually the whole decision;
+  `--support-type` overrides the style. **Support material counts toward the
+  weight the slicer reports**, so re-check the weight after enabling it.
 - `--infill`: sparse infill density in percent. The knob for **how much filament
   the part uses** — a solid part is the size's upper bound and nothing else moves
   weight nearly as much. Read the result back rather than predicting it:
