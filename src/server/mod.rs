@@ -355,6 +355,7 @@ pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
                                 .device_code()
                                 .unwrap_or_else(|| t.model.as_str())
                                 .to_string(),
+                            name: synthetic_name(em),
                         }),
                         &cams,
                         // The only call site that may pass a game. The live one
@@ -791,6 +792,20 @@ fn advertised_address(opts: &EmulateOpts) -> anyhow::Result<std::net::Ipv4Addr> 
          take the camera and file transfers straight to the printer, past this relay",
         opts.host
     )
+}
+
+/// What a synthetic printer calls itself to a client.
+///
+/// The name lands in Bambu Studio's device list and in its error dialogs, so it
+/// is the one place a person sees what they are actually talking to. A printer
+/// that is a game says so.
+#[cfg(feature = "relay")]
+fn synthetic_name(opts: &EmulateOpts) -> String {
+    if opts.doom.is_some() {
+        "DOOM".to_string()
+    } else {
+        "synthetic".to_string()
+    }
 }
 
 /// Bind the camera relay, resolving which camera is standing in.
