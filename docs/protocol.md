@@ -418,24 +418,71 @@ works. On the A1 mini, 2026-08-09:
   and it moved. That exercises the sequence rewriting against a client nobody
   here wrote — Studio numbers its own commands from `"1"`, exactly the collision
   the rewriter exists to prevent.
-- **Sending a print works, and does not go through the relay.** Studio uploaded
-  two sliced files and printed them while pointed at the relay — but the relay
-  was serving no FTP at the time, and 990 is refused on both of its addresses.
-  The only FTP open on the network is the printer's own, so Studio transferred
-  straight to the printer's own address on 990 (`192.168.0.3` here, which is
-  just what this machine happened to be) and used the relay for MQTT alone.
-  **[observed]**
+- **Sending a print works, and the relay carries it once it stops saying
+  otherwise.** Studio uploaded sliced files straight to the printer's own
+  address on 990 while its MQTT session ran through the relay, and did the same
+  for the camera. That was recorded here as "Studio bypasses the relay by
+  design". **It was not.** See below: the relay was handing out the printer's
+  address in every report. **[observed]**
+- **The camera substitution reaches Studio.** With the address corrected, the
+  frame header written the way other readers write it, and 720p baseline JPEG,
+  Studio opens the relay's camera port, authenticates, and holds the stream —
+  displaying a camera that is not the printer's. **[observed 2026-08-09]**
 
-  How Studio knows an address the user never gave it is **not established**.
-  SSDP was the obvious candidate and does not look like the answer: listening on
-  UDP 2021 and 1990 for about two minutes caught **no announcement at all**, so
-  if the printer announces, it is rarer than that or tied to boot. The plainer
-  explanation is that Studio had been connected to this printer directly once
-  before and kept the address — its plugin keeps that state in an encrypted
-  file, so this is not something the config can be read to settle. Either way, a
-  relay cannot assume it carries the file: as long as the real printer is
-  directly reachable, Studio may go round it, and the FTP relay matters for
-  clients that cannot. **[observed: no SSDP in ~2 min; the rest unconfirmed]**
+### The address in the report is an instruction to leave **[observed]**
+
+`print.net.info[].ip` is a `u32` holding the printer's own LAN address
+little-endian: `50374848` is `192.168.0.3`. Bambu Studio reads it and uses it
+for **everything except MQTT** — the chamber camera on 6000 and the FTP upload
+on 990 both go there, whatever address the user typed to add the printer.
+
+So a relay that forwards reports unchanged is telling every client to go round
+it. `bambu serve --emulate` rewrites the field to its own address
+(`--emulate-advertise <IP>`, required when binding to `0.0.0.0`, which names no
+address).
+
+Two things worth keeping about how this was found, because both cost hours:
+
+- **It hides from a text search.** Grepping a captured report for `"192.168"`
+  finds nothing, because the address is a number. The conclusion drawn from that
+  — "the relay leaks no address" — then survived several rounds of debugging and
+  produced a confident, wrong note in this file about Studio's design.
+- **One address, one relay.** The report has room for the addresses the printer
+  has, and the relay must claim one of them. A relay reachable at both
+  `127.0.0.1` and a LAN address cannot advertise both, so it cannot serve a
+  local client and a remote one at once. There is no fix inside this protocol.
+
+### What makes a client open a liveview **[observed]**
+
+Serving the camera port is not enough on its own:
+
+- `ipcam.ipcam_dev` must be `"1"`. The A1 mini here reports `"0"` honestly — its
+  built-in camera is physically dead — and a client reading that never attempts
+  a connection. The relay rewrites it, but only when a camera is substituted.
+- `ipcam.mode_bits` and `ipcam.tutk_server` have to be present. A synthetic
+  printer whose `ipcam` had only `ipcam_dev`, `ipcam_record`, `resolution` and
+  `timelapse` was never asked for a liveview at all; adding the other two
+  changed that.
+
+### The camera frame header **[spec, not observed here]**
+
+Four little-endian `u32`s: payload length, `0`, `1`, `0`, then the JPEG. Only
+the length is confirmed against hardware — this crate's client has always read
+16 bytes and used the first four. The rest is what published readers of this
+stream write, adopted after twelve zeros produced a stream Studio dropped after
+about a second.
+
+Frames themselves: complete SOI…EOI, **baseline** JPEG — the plugin's dimension
+scanner looks for SOF0, so a progressive SOF2 is invisible to it — and 1280x720
+is what OpenBambuAPI records for A1/P1-class streams. Both the header and the
+frame format changed together in the run that first worked, so which of them
+mattered is **not established**.
+
+Studio's "LAN Connection Failed" is generic: it appears whenever liveview fails
+to reach a playing state, and says nothing about TLS, authentication or MQTT.
+When a client gives up on a stream, the useful evidence is how far it got, which
+is why the relay logs the frame count on the way out.
+
 
 ### Do not date a file by what the printer says **[observed]**
 
