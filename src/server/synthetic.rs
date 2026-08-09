@@ -54,12 +54,75 @@ struct Progress {
     bed: f64,
 }
 
-/// `home_flag` as a real A1 mini reports it with every axis homed.
+/// How often to repeat the inventory and a full snapshot, in ticks.
 ///
-/// **[observed]**, not decoded — see `docs/protocol.md`, where the bit layout
-/// is still an open question. Copied whole because a value assembled from
-/// guesses about the bits would be a different kind of wrong.
-const HOMED: u32 = 847_201_680;
+/// Small enough that a client connecting late is not left guessing for long,
+/// large enough not to be chatter.
+const INVENTORY_EVERY: u32 = 5;
+
+/// One real A1 mini's `info.get_version`, as captured from the machine.
+///
+/// A client asks this before deciding what a printer can do — the `ota`
+/// module's `sw_ver` is the firmware the capability registry keys on. A printer
+/// that never answers is one of unknown make and firmware, and a client that
+/// cannot justify enabling a feature does not enable it.
+const REAL_A1_VERSION: &str = include_str!("../../tests/fixtures/get_version-a1mini.json");
+
+/// The captured inventory, parsed once, as the `{"info": …}` a printer sends.
+fn real_a1_version() -> Value {
+    static BASE: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    BASE.get_or_init(|| {
+        let info = serde_json::from_str::<Value>(REAL_A1_VERSION)
+            .ok()
+            .and_then(|v| v.get("message")?.get("info").cloned())
+            .expect("the captured fixture has message.info");
+        json!({ "info": info })
+    })
+    .clone()
+}
+
+/// One real A1 mini's idle `pushall`, as captured from the machine.
+///
+/// The synthetic printer is built on this rather than on a hand-written object
+/// that looks about right. Sixty-four fields against the twenty that were here
+/// before, and the difference is not cosmetic: Bambu Studio decides whether to
+/// show filament, and whether the camera button can even be pressed, from
+/// fields that were simply missing. A stand-in for a printer has to be the
+/// shape of one.
+///
+/// Already scrubbed — it carries no serial, no access code, and its network
+/// section is redacted, which is why the overlay puts a placeholder back.
+const REAL_A1_IDLE: &str = include_str!("../../tests/fixtures/pushall-n1-idle.json");
+
+/// The captured report's `print` object, parsed once.
+fn real_a1_idle() -> serde_json::Map<String, Value> {
+    static BASE: std::sync::OnceLock<serde_json::Map<String, Value>> = std::sync::OnceLock::new();
+    BASE.get_or_init(|| {
+        serde_json::from_str::<Value>(REAL_A1_IDLE)
+            .ok()
+            .and_then(|v| v.get("message")?.get("print")?.as_object().cloned())
+            .expect("the captured fixture has message.print")
+    })
+    .clone()
+}
+
+/// `home_flag` with X, Y and Z reported as homed.
+///
+/// The low three bits are the axes. Deduced from two captures of the same
+/// machine rather than from documentation, which lists the layout as unknown:
+///
+/// ```text
+/// idle since power-on   847201680   …1001 0000
+/// paused mid-print      847201687   …1001 0111
+///                                          ^^^ X, Y, Z
+/// ```
+///
+/// A printer that has been idle since boot has *not* homed, which is the trap:
+/// the idle capture looks like a fine value to copy and is exactly the one that
+/// makes Bambu Studio answer every jog with "Please home all axes". The rest of
+/// the word is left as the machine sent it — those bits are still unknown, and
+/// inventing them would be the same mistake one level down.
+const HOMED: u32 = 847_201_687;
 
 impl SyntheticPrinter {
     /// Start reporting a print in progress. A snapshot goes out immediately —
@@ -96,11 +159,29 @@ impl SyntheticPrinter {
         tokio::spawn(async move {
             // The seed. Sent before the first tick so a client that connects
             // straight away is not left waiting a whole interval for state.
+            //
+            // The inventory goes with it: the relay answers a client's
+            // `get_version` from its cache, and the cache only has one if the
+            // printer has said so. Without it a client sees a printer of no
+            // known firmware and switches features off.
+            let _ = ticker.reports.send(real_a1_version());
             let _ = ticker.reports.send(ticker.snapshot());
             let mut tick = tokio::time::interval(interval);
             tick.tick().await; // the immediate one; we just sent the snapshot
+            let mut ticks: u32 = 0;
             loop {
                 tick.tick().await;
+                ticks += 1;
+                // The seed reaches whoever is subscribed when it is sent, and
+                // the emulator subscribes a moment after this task starts — so
+                // the inventory, sent once, can miss the one reader that needs
+                // it, and a client is then told nothing about the firmware for
+                // as long as the process lives. Cheap to repeat, and the cache
+                // ignores a repeat it already has.
+                if ticks.is_multiple_of(INVENTORY_EVERY) {
+                    let _ = ticker.reports.send(real_a1_version());
+                    let _ = ticker.reports.send(ticker.snapshot());
+                }
                 let delta = ticker.advance();
                 // Err only means nobody is listening yet.
                 let _ = ticker.reports.send(delta);
@@ -115,7 +196,8 @@ impl SyntheticPrinter {
         // An idle machine is not a printing one with the numbers zeroed: it has
         // no job at all, and nothing is being held at temperature.
         let idle = self.job == Job::Idle;
-        json!({"print": {
+        let mut print = real_a1_idle();
+        for (k, v) in json!({
             "command": "push_status",
             "msg": 0,
             "sequence_id": "1000",
@@ -131,36 +213,22 @@ impl SyntheticPrinter {
             "nozzle_target_temper": if idle { 0.0 } else { 220.0 },
             "bed_temper": p.bed,
             "bed_target_temper": if idle { 0.0 } else { 60.0 },
-            "chamber_temper": 5,
             "cooling_fan_speed": if idle { "0" } else { "100" },
-            "spd_lvl": 2,
-            "stg_cur": 0,
-            // What a real A1 mini reports once its axes are homed, copied from
-            // `tests/fixtures/pushall-n1-idle.json` rather than derived: the
-            // bit layout is one of the open unknowns in docs/protocol.md.
-            //
-            // Zero here meant "not homed", and Bambu Studio answers a jog with
-            // "Please home all axes" and refuses to move — which in DOOM mode
-            // means the movement panel cannot play the game at all. A synthetic
-            // printer that has never homed is not a useful stand-in for one.
+            // The captured machine had not homed; a stand-in that cannot move
+            // is no use to a client whose movement panel is the controller.
             "home_flag": HOMED,
-            "hms": [],
-            "lights_report": [{"node": "chamber_light", "mode": "on"}],
-            // The shape a real A1 mini sends, `mode_bits` and `tutk_server`
-            // included. They looked like noise until a client was watched
-            // deciding whether to open a liveview: with them absent, Bambu
-            // Studio does not even try, however loudly `ipcam_dev` says a
-            // camera is there. A synthetic printer missing them is not a
-            // stand-in a camera client can be tested against.
-            "ipcam": {
-                "ipcam_dev": "0",
-                "ipcam_record": "enable",
-                "mode_bits": 3,
-                "resolution": "1080p",
-                "timelapse": "disable",
-                "tutk_server": "disable",
-            },
-        }})
+            // The capture's network section is redacted, and a client reads the
+            // address from it to decide where the camera and file transfer
+            // live. A placeholder here is enough: the relay rewrites it to
+            // whatever address it was told to advertise.
+            "net": {"conf": 0, "info": [{"ip": 16_777_343, "mask": 65_535}]},
+        })
+        .as_object()
+        .expect("the overlay is an object")
+        {
+            print.insert(k.clone(), v.clone());
+        }
+        json!({ "print": print })
     }
 
     /// Advance one layer and describe only what changed — a delta, the way the

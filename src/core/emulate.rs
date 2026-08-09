@@ -520,6 +520,19 @@ fn ack(request: &Value, result: &str, reason: &str) -> Value {
     if let Some(param) = request.pointer(&format!("/{category}/param")) {
         ack.insert("param".to_string(), param.clone());
     }
+    // A `print` ACK carries no `command` — that is observed, and echoing one
+    // there would be inventing a shape the machine does not send. Every other
+    // category does need it: Bambu Studio sends `security.app_cert_install`,
+    // gets back result/reason/sequence_id with no command, cannot match the
+    // answer to its question, and retries forever while showing "Retrieving
+    // printer information". The asymmetry is the printer's, not ours.
+    if category != "print"
+        && let Some(command) = request
+            .pointer(&format!("/{category}/command"))
+            .and_then(Value::as_str)
+    {
+        ack.insert("command".to_string(), Value::String(command.to_string()));
+    }
     ack.insert("result".to_string(), Value::String(result.to_string()));
     ack.insert("reason".to_string(), Value::String(reason.to_string()));
     let mut out = Map::new();
