@@ -130,6 +130,11 @@ unzip -l out.gcode.3mf | grep Metadata/plate_1.gcode   # proves it's sliced, not
 unzip -p out.gcode.3mf Metadata/plate_1.gcode | grep -c 'Draw the first line'   # must be 0
 ```
 
+Both slicers write a numbered log (`00000.log`) into their **working directory**,
+so a hand-run slice drops one wherever you happened to be — `cd` to a scratch
+directory first, or expect to clean up. (The helper above already runs the slicer
+in a temp directory and reads the log back only if the slice fails.)
+
 ### Headless caveat (thumbnails)
 With no display the slice succeeds but logs `init opengl failed! skip thumbnail
 generating` — the gcode is fine, but the 3mf has **no `Metadata/plate_*.png`** (so
