@@ -311,10 +311,26 @@ impl Multipart {
 
 impl Multipart {
     /// The earliest delimiter in `buf`, and which one it was.
+    ///
+    /// A delimiter starts a line. Searching for the bytes anywhere would find
+    /// them inside a photograph too — JPEG payloads are arbitrary binary, so
+    /// `--frame` occurs in one sooner or later — and the frame would be cut in
+    /// half. That failure needs a particular image to show up, so it would sit
+    /// there until some unlucky picture triggered it.
     fn find_marker<'a>(&'a self, buf: &[u8]) -> Option<(usize, &'a [u8])> {
         self.markers
             .iter()
-            .filter_map(|m| find(buf, m).map(|at| (at, m.as_slice())))
+            .filter_map(|m| {
+                let mut from = 0;
+                while let Some(rel) = find(&buf[from..], m) {
+                    let at = from + rel;
+                    if at == 0 || buf[..at].ends_with(b"\n") {
+                        return Some((at, m.as_slice()));
+                    }
+                    from = at + 1;
+                }
+                None
+            })
             .min_by_key(|(at, m)| (*at, std::cmp::Reverse(m.len())))
     }
 }
@@ -564,6 +580,25 @@ mod tests {
         let got = drain(&mp, &body);
         assert_eq!(got, want[..1].to_vec());
         assert!(is_jpeg(&got[0]));
+    }
+
+    #[test]
+    fn a_boundary_inside_a_picture_does_not_cut_it_in_half() {
+        // JPEG payloads are arbitrary bytes, so the delimiter's characters turn
+        // up inside one eventually. Treated as a delimiter, the frame is
+        // truncated — and only for the pictures unlucky enough to contain it.
+        let mut payload = vec![0xFF, 0xD8];
+        payload.extend(std::iter::repeat_n(0x20, 400));
+        payload.extend_from_slice(b"--frame");
+        payload.extend(std::iter::repeat_n(0x20, 600));
+        payload.extend_from_slice(&[0xFF, 0xD9]);
+
+        let mp = Multipart::from_content_type("multipart/x-mixed-replace; boundary=frame").unwrap();
+        // Without a declared length the parser has to find the next delimiter
+        // itself, which is where the mistake would bite.
+        let body = multipart_body("frame", &[payload.clone(), jpeg(0xAB)], false);
+        let got = drain(&mp, &body);
+        assert_eq!(got.first(), Some(&payload), "the picture came out whole");
     }
 
     #[test]
