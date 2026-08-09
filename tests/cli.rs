@@ -773,6 +773,10 @@ fn waiting_for_the_motion_is_not_offered_for_a_single_line() {
     let _ = std::fs::remove_dir_all(&cfg);
 }
 
+/// Only meaningful where the flag exists: without `relay` there is no
+/// `--emulate-camera-interval`, and clap's "unexpected argument" is a different
+/// refusal from the one under test.
+#[cfg(feature = "relay")]
 #[test]
 fn a_camera_interval_that_would_panic_or_spin_is_refused_up_front() {
     // These reach `Duration::from_secs_f32` straight from the command line.
