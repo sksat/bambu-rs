@@ -91,6 +91,13 @@ impl DetectSource for ProxyDetect {
 pub struct SyntheticDetect {
     pub serial: String,
     pub model: String,
+    /// What a client puts in its device list and its error messages.
+    ///
+    /// A real printer answers with its own name — `3DP-030-488` on the machine
+    /// here — so "synthetic" in that slot is honest but useless: it describes
+    /// the implementation rather than the thing being presented. When the
+    /// printer is a game, "DOOM" is the more truthful of the two.
+    pub name: String,
 }
 
 impl DetectSource for SyntheticDetect {
@@ -100,7 +107,7 @@ impl DetectSource for SyntheticDetect {
             seq,
             &self.serial,
             &self.model,
-            "synthetic",
+            &self.name,
             "00.00.00.00",
         ))
     }
