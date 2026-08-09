@@ -90,14 +90,29 @@ curl -s "$B/api/slice" | jq .job
 curl -s -o cube.gcode.3mf -H "authorization: Bearer $PW" "$B/api/slice/result"
 # …or print it straight off the server, without a round trip through a browser:
 curl -s -X POST "$B/api/slice/print" -H 'content-type: application/json' -d '{"dry_run":true}'
+# The plan reports `expect`: the id of the slice it describes. Confirming has to
+# echo it back, so a slice that replaced this one between the two calls is a 409
+# rather than a print of a file you never saw a plan for.
+ID=$(curl -s -X POST "$B/api/slice/print" -H 'content-type: application/json' \
+       -d '{"dry_run":true}' | jq .plan.expect)
 curl -s -X POST "$B/api/slice/print" -H 'content-type: application/json' \
-  -d '{"confirm":true,"use_ams":true,"ams_map":[0]}'
+  -d "{\"confirm\":true,\"expect\":$ID,\"use_ams\":true,\"ams_map\":[0]}"
 ```
 
 `layer` is judged against the nozzle the printer reports, not a fixed window: a
 0.2 nozzle cannot lay 0.4 mm and a 0.8 can, so the accepted range is derived
 from the diameter. A height with no process profile near it is refused rather
 than sliced on a neighbour's speeds and flow.
+
+The **nozzle itself** must be one we have profiles for, which today means 0.4.
+The BBL bundle ships a separate process set per nozzle — the unsuffixed presets
+declare `"compatible_printers": ["Bambu Lab A1 mini 0.4 nozzle"]` — so a 0.6 or
+0.8 is refused rather than sliced with 0.4 speeds and flow. Models the slicer
+cannot read are refused up front too (`.stl`, `.obj`, `.amf` and bare-geometry
+`.3mf` are in; STEP is not, and needs converting first). An **authored** 3mf —
+one with slicer settings blobs, or more than one object placed in `<build>` — is
+refused as well: this path slices with `--arrange 1 --orient 1`, which would
+re-pack the layout its author chose.
 
 Limits, deliberately: one slice at a time per printer (a second is `409`), one
 filament, no timelapse mode, and no queue or persistence across a restart.
