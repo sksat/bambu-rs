@@ -357,6 +357,13 @@ enum Command {
         #[cfg(feature = "relay")]
         #[arg(long, value_name = "LABEL", requires = "emulate")]
         emulate_camera: Option<String>,
+        /// The address to tell clients the printer is at. Required when binding
+        /// to 0.0.0.0, which names no address: the printer's own report carries
+        /// its LAN address, and a client uses that for the camera and for file
+        /// transfer — so relaying it unchanged sends both past this relay.
+        #[cfg(feature = "relay")]
+        #[arg(long, value_name = "IP", requires = "emulate")]
+        emulate_advertise: Option<std::net::Ipv4Addr>,
         /// Port for the substituted camera. 6000 is where a client looks.
         #[cfg(feature = "relay")]
         #[arg(long, default_value_t = 6000, requires = "emulate_camera")]
@@ -947,6 +954,8 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             #[cfg(feature = "relay")]
             emulate_camera,
             #[cfg(feature = "relay")]
+            emulate_advertise,
+            #[cfg(feature = "relay")]
             emulate_camera_port,
             #[cfg(feature = "relay")]
             emulate_camera_interval,
@@ -968,6 +977,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
                 pasv_ports: emulate_pasv_ports.clone(),
                 detect_port: (!emulate_no_detect).then_some(*emulate_detect_port),
                 detect_tls_port: (!emulate_no_detect).then_some(*emulate_detect_tls_port),
+                advertise: *emulate_advertise,
                 camera: emulate_camera
                     .as_ref()
                     .map(|label| crate::server::EmulateCamera {

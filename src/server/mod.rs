@@ -112,6 +112,17 @@ pub struct EmulateOpts {
     /// that it has to be asked for by name; it never follows from an external
     /// camera merely being configured.
     pub camera: Option<EmulateCamera>,
+    /// The address to tell clients the printer is at.
+    ///
+    /// The printer's report carries its own LAN address, and a client believes
+    /// it: Bambu Studio takes the camera and the file upload there, whatever
+    /// address it was given for MQTT. Relaying that unchanged makes the relay
+    /// carry the session and nothing else.
+    ///
+    /// `None` when the bind host already names a reachable address — it is then
+    /// derived from it. Binding to `0.0.0.0` is a binding instruction rather
+    /// than a place, so that case has to say which address clients should use.
+    pub advertise: Option<std::net::Ipv4Addr>,
     /// Serve reads but refuse anything that would move or heat the machine —
     /// and, on the FTP side, anything that writes.
     pub read_only: bool,
@@ -547,6 +558,7 @@ async fn start_emulator(
     if opts.camera.is_some() {
         emulator.claim_camera();
     }
+    emulator.advertise_at(advertised_address(opts)?);
     tokio::spawn(Arc::clone(&emulator).pump());
     tokio::spawn({
         let tls = Arc::clone(&tls);
@@ -637,6 +649,31 @@ async fn start_emulator(
         );
     }
     Ok(())
+}
+
+/// Which address to tell clients the printer is at.
+///
+/// Derived from the bind host when that names one, because a relay bound to a
+/// specific address is reachable at it. `0.0.0.0` names no address at all, and
+/// picking one of this machine's interfaces would be a guess that fails
+/// silently — the client simply talks to the printer instead, and the relay
+/// looks like it is working right up until the camera is empty.
+#[cfg(feature = "relay")]
+fn advertised_address(opts: &EmulateOpts) -> anyhow::Result<std::net::Ipv4Addr> {
+    if let Some(ip) = opts.advertise {
+        return Ok(ip);
+    }
+    if let Ok(ip) = opts.host.parse::<std::net::Ipv4Addr>()
+        && !ip.is_unspecified()
+    {
+        return Ok(ip);
+    }
+    anyhow::bail!(
+        "--emulate-host {} does not name an address clients can use, and the printer's \
+         report tells them where to find it — without --emulate-advertise <IP> they would \
+         take the camera and file transfers straight to the printer, past this relay",
+        opts.host
+    )
 }
 
 /// Bind the camera relay, resolving which camera is standing in.

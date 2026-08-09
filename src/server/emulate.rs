@@ -160,6 +160,11 @@ pub struct Emulator {
     /// substituted: a client reads `ipcam_dev` and will not open a liveview at
     /// all while the printer says there is nothing there.
     claim_camera: std::sync::atomic::AtomicBool,
+    /// The address to tell clients the printer is at. `None` leaves the
+    /// printer's own in place, which sends every client's camera and file
+    /// transfer straight past the relay — see
+    /// [`crate::core::emulate::rewrite_lan_address`].
+    advertise: Mutex<Option<std::net::Ipv4Addr>>,
     /// `false` once the printer is presumed gone. Client tasks watch this and
     /// hang up, which is how the silence reaches them.
     healthy: tokio::sync::watch::Sender<bool>,
@@ -208,6 +213,15 @@ impl Emulator {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Tell clients the printer is at `ip` rather than where it really is.
+    ///
+    /// Not cosmetic: the printer's report carries its own address, and a client
+    /// reading it uses that for the camera and for file transfer. Repeating it
+    /// is how a relay ends up carrying only the MQTT session.
+    pub fn advertise_at(&self, ip: std::net::Ipv4Addr) {
+        *self.advertise.lock().expect("advertise lock poisoned") = Some(ip);
+    }
+
     /// As [`new`](Self::new), with the timeouts set explicitly.
     pub fn with_tuning(
         printer: EmulatedPrinter,
@@ -223,6 +237,7 @@ impl Emulator {
             cache: Arc::new(RwLock::new(UpstreamCache::new())),
             rewriter: Arc::new(Mutex::new(SequenceRewriter::new())),
             claim_camera: std::sync::atomic::AtomicBool::new(false),
+            advertise: Mutex::new(None),
             fanout,
             clients: Mutex::new(HashMap::new()),
             handshake_timeout: tuning.handshake_timeout,
@@ -301,6 +316,11 @@ impl Emulator {
             // live have to agree, or the camera would appear and vanish.
             if self.claim_camera.load(std::sync::atomic::Ordering::Relaxed) {
                 crate::core::camerad::claim_camera(&mut message);
+            }
+            // The printer's report says where the printer is, and a client
+            // believes it over whatever address it was configured with.
+            if let Some(ip) = *self.advertise.lock().expect("advertise lock poisoned") {
+                crate::core::emulate::rewrite_lan_address(&mut message, ip);
             }
             // The printer spoke, so it is alive: reset the watchdog and, if we
             // had given up on it, tell the clients it is back.

@@ -461,6 +461,53 @@ fn refusal_ack(request: &Value) -> Value {
     Value::Object(out)
 }
 
+/// Point a client at the relay by correcting the address in `print.net`.
+///
+/// **The printer tells clients where it lives, and a relay that repeats it is
+/// telling them to go round it.** `print.net.info[].ip` is a `u32` holding the
+/// machine's own LAN address little-endian — `50374848` is `192.168.0.3`. Bambu
+/// Studio reads it and uses it for everything except MQTT: the chamber camera
+/// and the FTP upload both go to that address, however the user reached the
+/// relay. Observed on real hardware, twice, on two independent paths.
+///
+/// It hides well. Grepping a captured report for `"192.168"` finds nothing,
+/// because it is a number, and the conclusion "the relay leaks no address" is
+/// then wrong for an hour of debugging.
+///
+/// `advertised` must be an address the *client* can reach — the relay's, not
+/// `0.0.0.0`, which is a binding instruction rather than a place.
+///
+/// Returns whether anything changed.
+pub fn rewrite_lan_address(message: &mut Value, advertised: std::net::Ipv4Addr) -> bool {
+    let Some(info) = message
+        .get_mut("print")
+        .and_then(|p| p.get_mut("net"))
+        .and_then(|n| n.get_mut("info"))
+        .and_then(Value::as_array_mut)
+    else {
+        return false;
+    };
+    let want = u32::from_le_bytes(advertised.octets());
+    let mut changed = false;
+    for entry in info.iter_mut() {
+        let Some(slot) = entry.get_mut("ip") else {
+            continue;
+        };
+        // Zero means "no address on this interface"; inventing one there would
+        // describe a network that does not exist. Every *other* entry is
+        // rewritten, because a client reading the list may take any of them.
+        match slot.as_u64() {
+            Some(0) | None => continue,
+            Some(current) if current == want as u64 => continue,
+            Some(_) => {
+                *slot = Value::from(want);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 /// Wrap a report message as the QoS-0 publish the printer would send.
 pub fn report_publish(serial: &str, message: &Value) -> Publish {
     Publish::at_most_once(report_topic(serial), message.to_string().into_bytes())
@@ -1505,6 +1552,63 @@ mod tests {
                 "{id} would overflow a signed 32-bit id"
             );
         }
+    }
+
+    #[test]
+    fn the_address_a_client_is_sent_to_becomes_the_relays() {
+        use std::net::Ipv4Addr;
+        // The shape a real A1 mini sends. 50374848 is 192.168.0.3 read
+        // little-endian — which is why grepping the JSON for "192.168" finds
+        // nothing and concludes, wrongly, that no address is being relayed.
+        let mut report = serde_json::json!({"print": {
+            "command": "push_status",
+            "net": {"conf": 0, "info": [{"ip": 50374848u32, "mask": 65535}]},
+        }});
+        assert!(rewrite_lan_address(
+            &mut report,
+            Ipv4Addr::new(192, 168, 0, 25)
+        ));
+        let got = report["print"]["net"]["info"][0]["ip"].as_u64().unwrap() as u32;
+        assert_eq!(
+            Ipv4Addr::from(got.to_le_bytes()),
+            Ipv4Addr::new(192, 168, 0, 25)
+        );
+        // Everything else about the network is the printer's to describe.
+        assert_eq!(report["print"]["net"]["info"][0]["mask"], 65535);
+        assert_eq!(report["print"]["net"]["conf"], 0);
+        // Idempotent.
+        assert!(!rewrite_lan_address(
+            &mut report,
+            Ipv4Addr::new(192, 168, 0, 25)
+        ));
+    }
+
+    #[test]
+    fn every_interface_is_corrected_and_an_empty_one_is_left_empty() {
+        use std::net::Ipv4Addr;
+        // A client may take any entry in the list, so correcting only the first
+        // would leave a working route to the printer in the second. A zero is
+        // "no address here" — filling it in would describe a network that does
+        // not exist.
+        let mut report = serde_json::json!({"print": {"net": {"info": [
+            {"ip": 50374848u32}, {"ip": 0}, {"ip": 16843009u32},
+        ]}}});
+        assert!(rewrite_lan_address(&mut report, Ipv4Addr::new(10, 0, 0, 7)));
+        let want = u32::from_le_bytes(Ipv4Addr::new(10, 0, 0, 7).octets()) as u64;
+        let info = report["print"]["net"]["info"].as_array().unwrap();
+        assert_eq!(info[0]["ip"].as_u64(), Some(want));
+        assert_eq!(info[1]["ip"].as_u64(), Some(0), "an empty slot stays empty");
+        assert_eq!(info[2]["ip"].as_u64(), Some(want));
+    }
+
+    #[test]
+    fn a_message_with_no_network_section_is_untouched() {
+        use std::net::Ipv4Addr;
+        // Deltas mostly carry temperatures; an ACK carries none of this.
+        let mut delta = serde_json::json!({"print": {"mc_percent": 41}});
+        let before = delta.clone();
+        assert!(!rewrite_lan_address(&mut delta, Ipv4Addr::new(10, 0, 0, 7)));
+        assert_eq!(delta, before);
     }
 
     #[test]
