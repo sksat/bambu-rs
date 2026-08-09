@@ -365,7 +365,12 @@ enum Command {
         /// than a stream. Required in that case: the right rate depends on the
         /// camera and the network, so there is no default worth guessing.
         #[cfg(feature = "relay")]
-        #[arg(long, value_name = "SECONDS", requires = "emulate_camera")]
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            requires = "emulate_camera",
+            value_parser = parse_camera_interval
+        )]
         emulate_camera_interval: Option<f32>,
     },
 }
@@ -968,7 +973,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
                     .map(|label| crate::server::EmulateCamera {
                         label: label.clone(),
                         port: *emulate_camera_port,
-                        poll: emulate_camera_interval.map(std::time::Duration::from_secs_f32),
+                        poll: emulate_camera_interval.map(camera_interval),
                     }),
                 read_only: *emulate_read_only,
             }),
@@ -1736,6 +1741,36 @@ fn run_reboot(cli: &Cli, confirm: bool) -> Result<(), CliError> {
          No ACK is expected; it may rejoin DHCP on a different IP."
     );
     Ok(())
+}
+
+/// A snapshot interval, once it has been checked to be one.
+///
+/// `Duration::from_secs_f32` panics outright on NaN, infinity, or a negative,
+/// and zero would spin the poll loop as fast as the camera will answer. All
+/// three arrive straight from the command line, so all three are refused before
+/// they reach a `Duration`. Clap has already applied this by the time the value
+/// is used, so the conversion below cannot fail.
+#[cfg(feature = "relay")]
+fn camera_interval(seconds: f32) -> std::time::Duration {
+    std::time::Duration::from_secs_f32(seconds)
+}
+
+/// Reject an interval clap should never have accepted.
+#[cfg(feature = "relay")]
+fn parse_camera_interval(raw: &str) -> Result<f32, String> {
+    let seconds: f32 = raw
+        .parse()
+        .map_err(|_| format!("{raw:?} is not a number of seconds"))?;
+    if !seconds.is_finite() {
+        return Err(format!("{raw:?} is not a finite number of seconds"));
+    }
+    if seconds <= 0.0 {
+        return Err(format!(
+            "an interval of {seconds} would poll the camera without pausing; give a positive \
+             number of seconds"
+        ));
+    }
+    Ok(seconds)
 }
 
 #[cfg(feature = "server")]
