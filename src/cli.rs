@@ -1798,10 +1798,18 @@ fn parse_camera_interval(raw: &str) -> Result<f32, String> {
     if !seconds.is_finite() {
         return Err(format!("{raw:?} is not a finite number of seconds"));
     }
-    if seconds <= 0.0 {
+    // Zero and negative fail for different reasons, and a message that names
+    // the wrong one sends the reader looking in the wrong place.
+    if seconds == 0.0 {
+        return Err(
+            "an interval of zero would poll the camera without pausing between \
+                    requests; give a positive number of seconds"
+                .to_string(),
+        );
+    }
+    if seconds < 0.0 {
         return Err(format!(
-            "an interval of {seconds} would poll the camera without pausing; give a positive \
-             number of seconds"
+            "an interval cannot be negative; {seconds} describes no waiting at all"
         ));
     }
     // Finite and positive is not the same as representable: `1e30` passes both
