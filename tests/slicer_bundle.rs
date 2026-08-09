@@ -119,14 +119,34 @@ fn the_row_matches_the_captured_bundle() {
 #[ignore = "needs a BBL profile bundle installed"]
 fn capability_row_matches_the_installed_bundle() {
     let m = manifest();
-    let root = std::path::PathBuf::from(m["captured_from"]["bundle"].as_str().unwrap());
-    if !root.is_dir() {
-        panic!(
-            "no bundle at {} — install OrcaSlicer/Bambu Studio, or re-capture the manifest \
-             from wherever yours lives",
-            root.display()
+    // The manifest's path is provenance — where this capture came from — not a
+    // requirement. A bundle lives somewhere else on Bambu Studio, on macOS and
+    // Windows, and wherever `--slicer-profiles` points, and refusing to check
+    // those would make this test useful on exactly one machine.
+    let recorded = std::path::PathBuf::from(m["captured_from"]["bundle"].as_str().unwrap());
+    // An explicit choice that does not exist is an error, not a reason to go
+    // and check some other bundle: passing then would tell you your install is
+    // fine when it was never looked at.
+    if let Some(chosen) = std::env::var_os("BAMBU_BBL_PROFILES") {
+        let chosen = std::path::PathBuf::from(chosen);
+        assert!(
+            chosen.is_dir(),
+            "BAMBU_BBL_PROFILES={} is not a directory",
+            chosen.display()
         );
     }
+    let candidates = [
+        std::env::var_os("BAMBU_BBL_PROFILES").map(std::path::PathBuf::from),
+        Some(recorded.clone()),
+        Some("/opt/bambustudio-bin/resources/profiles/BBL".into()),
+    ];
+    let Some(root) = candidates.into_iter().flatten().find(|p| p.is_dir()) else {
+        panic!(
+            "no BBL bundle found (looked at $BAMBU_BBL_PROFILES, {}, and the Bambu Studio \
+             install) — point BAMBU_BBL_PROFILES at yours",
+            recorded.display()
+        );
+    };
     let fetch = BundleFiles(root.clone());
 
     // The recorded chains are the load-bearing part: `flatten` walks them, and
@@ -181,27 +201,39 @@ fn capability_row_matches_the_installed_bundle() {
     )
     .expect("the machine profile flattens");
     for key in ["printable_area", "machine_start_gcode", "nozzle_diameter"] {
-        assert!(machine.contains_key(key), "flattened machine has no {key:?}");
+        assert!(
+            machine.contains_key(key),
+            "flattened machine has no {key:?}"
+        );
     }
 
-    let process = flatten(
-        ProfileKind::Process,
-        strings(&m, "process_chain_example")[0].as_str(),
-        &fetch,
-        &[],
-    )
-    .expect("the process profile flattens");
-    // The first trap this module's docs describe: the leaf carries no
-    // `layer_height` at all, so an unresolved chain silently slices at Orca's
-    // 0.2mm default. A flattened one must have it, and it must be the height
-    // the preset's own name promises.
-    let got = process
-        .get("layer_height")
-        .and_then(Value::as_str)
-        .expect("flattened process has no layer_height — the inherits chain did not resolve");
-    assert_eq!(
-        got.parse::<f64>().expect("a number"),
-        0.20,
-        "0.20mm Standard flattened to a different layer height"
-    );
+    // EVERY height the row can ask for, not just the one the manifest recorded
+    // a chain for. A bundle that renamed or broke `0.08mm Extra Fine` would
+    // otherwise leave this test green while that height fails to slice.
+    let names = default_registry()
+        .slicer_names(&Model::A1Mini)
+        .copied()
+        .expect("the A1 mini has a slicer row");
+    let suffix = names
+        .process_suffix(m["nozzle"].as_str().unwrap())
+        .expect("0.4 is the mapped nozzle");
+    for layer in [0.08, 0.12, 0.16, 0.20, 0.24, 0.28] {
+        let choice = process_for_layer(layer, suffix).expect("a stock height has a process");
+        let flat = flatten(ProfileKind::Process, &choice.name, &fetch, &[])
+            .unwrap_or_else(|e| panic!("{:?} does not flatten: {e}", choice.name));
+        // The first trap this module's docs describe: the leaf carries no
+        // `layer_height` at all, so an unresolved chain silently slices at
+        // Orca's 0.2mm default — which looks right for 0.20 by coincidence and
+        // is wrong for every other height. Checking all six is what makes that
+        // coincidence visible.
+        let got = flat
+            .get("layer_height")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("{:?} flattened without a layer_height", choice.name));
+        assert!(
+            (got.parse::<f64>().expect("a number") - layer).abs() < 1e-9,
+            "{:?} flattened to layer_height {got}, not {layer}",
+            choice.name
+        );
+    }
 }
