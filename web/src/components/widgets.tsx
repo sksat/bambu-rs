@@ -3,6 +3,7 @@ import type { CSSProperties } from "react";
 import type { TempPoint } from "../useStatus";
 import type { AmsTray } from "../types";
 import { remainText, swatch, trayLabel, wifiTier } from "../format";
+import { API } from "../api";
 
 /// The plate preview embedded in a sliced .3mf; renders nothing if absent or for
 /// non-.3mf files.
@@ -15,7 +16,7 @@ export function Thumb({ file, className }: { file: string; className?: string })
       className={className ?? "thumb"}
       loading="lazy"
       alt=""
-      src={`/api/file/thumbnail?name=${encodeURIComponent(name)}`}
+      src={`${API}/file/thumbnail?name=${encodeURIComponent(name)}`}
       onError={() => setOk(false)}
       data-testid="thumb"
     />

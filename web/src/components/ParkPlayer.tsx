@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { listParks, type ParkIndex } from "../cameras";
+import { API } from "../api";
 
 // How often to re-poll the filmstrip index (picks up new frames while a run is live),
 // and the playback rate when "play" is pressed.
@@ -124,7 +125,7 @@ export function ParkPlayer({ id }: { id: string }) {
   // can be sparse (the index parser skips malformed lines), so don't assume n === position.
   const frameN = meta?.n ?? cur;
   // Frames are the indexed `/park/{n}` JPEGs (the index lives at `/park`).
-  const src = `/api/camera/${id}/park/${frameN}${liveTip ? `?t=${tick}` : ""}`;
+  const src = `${API}/camera/${id}/park/${frameN}${liveTip ? `?t=${tick}` : ""}`;
 
   return (
     <div className="pp" data-testid="park-player">

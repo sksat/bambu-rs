@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { PrinterStatus } from "./types";
+import { API } from "./api";
 
 export type Conn = "connecting" | "live" | "offline";
 
@@ -29,7 +30,7 @@ export function useStatus(): { status: PrinterStatus | null; conn: Conn; history
 
     const connect = () => {
       const proto = location.protocol === "https:" ? "wss" : "ws";
-      ws = new WebSocket(`${proto}://${location.host}/api/ws`);
+      ws = new WebSocket(`${proto}://${location.host}${API}/ws`);
       ws.onopen = () => setConn("live");
       ws.onmessage = (ev) => {
         let s: PrinterStatus;

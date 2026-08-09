@@ -3,6 +3,7 @@ import { Thumb } from "./widgets";
 import { ModelView } from "./Viewer3D";
 import { listCameras, type Camera } from "../cameras";
 import { startTimelapse, type TimelapseMode } from "../timelapse";
+import { API } from "../api";
 
 // The default recording camera: segment-capable (the robust dense-stream capture) preferred,
 // then park-capable (park detection), then any external (printer-synced smooth), else the
@@ -72,7 +73,7 @@ export function FilesSection({ sdcard }: { sdcard?: boolean | null }) {
     if (opts?.auto && inFlight.current) return;
     inFlight.current = true;
     try {
-      const r = await fetch(`/api/file?dir=${encodeURIComponent(d)}`);
+      const r = await fetch(`${API}/file?dir=${encodeURIComponent(d)}`);
       const data = (await r.json()) as { files?: FileEntry[]; error?: string };
       if (d !== dirRef.current) return; // a stale response for a directory we've left
       if (r.ok) {
@@ -116,7 +117,7 @@ export function FilesSection({ sdcard }: { sdcard?: boolean | null }) {
     if (pw) headers["Authorization"] = `Bearer ${pw}`;
     try {
       const q = `dir=${encodeURIComponent(dir)}&name=${encodeURIComponent(file.name)}`;
-      const r = await fetch(`/api/file/upload?${q}`, { method: "POST", headers, body: file });
+      const r = await fetch(`${API}/file/upload?${q}`, { method: "POST", headers, body: file });
       const d = (await r.json().catch(() => ({}))) as { error?: string };
       if (r.ok) {
         setMsg(`uploaded ${file.name}`);
@@ -354,7 +355,7 @@ function StartDialog({ path, onClose }: { path: string; onClose: () => void }) {
     void (async () => {
       try {
         const r = await fetch(
-          `/api/file/inspect?name=${encodeURIComponent(path)}&plate=${plate}`,
+          `${API}/file/inspect?name=${encodeURIComponent(path)}&plate=${plate}`,
         );
         const d = (await r.json().catch(() => ({}))) as {
           inspected?: boolean;
@@ -397,7 +398,7 @@ function StartDialog({ path, onClose }: { path: string; onClose: () => void }) {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (pw) headers["Authorization"] = `Bearer ${pw}`;
     try {
-      const r = await fetch("/api/job/start", {
+      const r = await fetch(`${API}/job/start`, {
         method: "POST",
         headers,
         body: JSON.stringify({

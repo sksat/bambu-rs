@@ -1,3 +1,4 @@
+import { API } from "./api";
 // Serve-internal timelapse capture: the server grabs a frame from a configured
 // camera on each new print layer (no second printer connection). Status is an
 // open read; start/stop are gated writes (carry the control password).
@@ -31,7 +32,7 @@ export type TimelapseMode = "smooth" | "plain" | "park" | "segment";
 
 export async function getTimelapse(): Promise<TimelapseState | null> {
   try {
-    const r = await fetch("/api/timelapse");
+    const r = await fetch(`${API}/timelapse`);
     if (!r.ok) return null;
     return (await r.json()) as TimelapseState;
   } catch {
@@ -68,12 +69,12 @@ export function startTimelapse(
   // its full-layer window default); smooth/plain do.
   if (mode === "plain") body.interval_ms = opts.intervalMs ?? 3000;
   else if (mode === "smooth") body.every = opts.every ?? 1;
-  return post("/api/timelapse/start", body, password);
+  return post(`${API}/timelapse/start`, body, password);
 }
 
 export function stopTimelapse(
   mode: TimelapseMode | "all",
   password: string | null,
 ): Promise<Write> {
-  return post("/api/timelapse/stop", { mode }, password);
+  return post(`${API}/timelapse/stop`, { mode }, password);
 }
