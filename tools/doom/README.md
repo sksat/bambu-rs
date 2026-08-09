@@ -91,6 +91,13 @@ emulate-doom: print.gcode_line "G91\nG1 Y10 F3000\nG90" — forward for 250ms
 emulate-doom: print.project_file — nothing bound
 ```
 
+One visible consequence of consuming commands: a client that checks a command
+*took effect* will call it unverified, because the printer's report never
+changes. `bambu speed sport` through this exits 6 for exactly that reason — the
+level was pressed as weapon 3 and `spd_lvl` stayed where it was. That is the
+honest answer; making the report agree would mean sending the command upstream,
+which is the one thing this mode may not do.
+
 ## The engine protocol
 
 `--emulate-doom-engine` can be any program that speaks this; DOOM is just the

@@ -332,9 +332,10 @@ pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
                     // movement panel enabled for a printer that is not printing
                     // — and a printer that is "printing" while someone plays
                     // DOOM through it is a confusing thing to show.
-                    let printer = match em.doom {
-                        Some(_) => synthetic::SyntheticPrinter::idle(tick),
-                        None => synthetic::SyntheticPrinter::start(tick),
+                    let printer = if em.doom.is_some() {
+                        synthetic::SyntheticPrinter::idle(tick)
+                    } else {
+                        synthetic::SyntheticPrinter::start(tick)
                     };
                     let source = Arc::new(LiveSource::from_reports(printer.subscribe()));
                     start_emulator(
