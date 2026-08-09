@@ -135,10 +135,25 @@ pub trait Upstream: Send + Sync + 'static {
     fn send(&self, payload: Value);
 }
 
+/// Where a control command goes when the relay takes it instead of the printer.
+///
+/// Paired with [`crate::core::emulate::ControlPolicy::Intercept`], and only ever
+/// through [`Emulator::intercepting`] — the policy and the sink are set together
+/// so a relay cannot end up swallowing commands with nothing behind it.
+/// `serve --emulate-doom` puts [`crate::server::doom::DoomEngine`] here.
+pub trait ControlSink: Send + Sync + 'static {
+    /// Take one control payload. Called from the client's task, so it must not
+    /// block: one wedged sink would stall the connection that fed it.
+    fn consume(&self, payload: &Value);
+}
+
 /// The emulated printer: a TLS MQTT listener in front of one upstream link.
 pub struct Emulator {
     printer: EmulatedPrinter,
     upstream: Arc<dyn Upstream>,
+    /// Present exactly when the printer's policy is `Intercept`; see
+    /// [`Emulator::intercepting`].
+    control_sink: Option<Arc<dyn ControlSink>>,
     cache: Arc<RwLock<UpstreamCache>>,
     rewriter: Arc<Mutex<SequenceRewriter>>,
     /// The printer's own pushes, pre-encoded once and shared. Lossy by design:
@@ -203,6 +218,25 @@ impl Emulator {
         Self::with_tuning(printer, upstream, Tuning::default())
     }
 
+    /// A relay that takes control commands for itself and hands them to `sink`
+    /// instead of the printer — see
+    /// [`crate::core::emulate::ControlPolicy::Intercept`].
+    ///
+    /// The policy is set here rather than by the caller, so the only way to get
+    /// an intercepting relay is to say where the commands go.
+    pub fn intercepting(
+        printer: EmulatedPrinter,
+        upstream: Arc<dyn Upstream>,
+        sink: Arc<dyn ControlSink>,
+    ) -> Arc<Self> {
+        Self::build(
+            printer.intercepted(),
+            upstream,
+            Tuning::default(),
+            Some(sink),
+        )
+    }
+
     /// Say a camera is present in everything relayed from here on.
     ///
     /// Only ever called when one is being substituted — see
@@ -228,12 +262,32 @@ impl Emulator {
         upstream: Arc<dyn Upstream>,
         tuning: Tuning,
     ) -> Arc<Self> {
+        Self::build(printer, upstream, tuning, None)
+    }
+
+    fn build(
+        printer: EmulatedPrinter,
+        upstream: Arc<dyn Upstream>,
+        tuning: Tuning,
+        control_sink: Option<Arc<dyn ControlSink>>,
+    ) -> Arc<Self> {
+        // A relay that intercepts with nowhere to put what it takes would ACK
+        // every button press and drop it on the floor — a printer that looks
+        // fine and does nothing, which is the worst failure this can have.
+        // Caught here, at startup, rather than a mystery hours later.
+        assert!(
+            !(printer.control() == crate::core::emulate::ControlPolicy::Intercept
+                && control_sink.is_none()),
+            "an intercepting relay needs somewhere for the commands to go; \
+             build it with Emulator::intercepting"
+        );
         let (fanout, _) = broadcast::channel(FANOUT_DEPTH);
         let reports = Mutex::new(Some(upstream.subscribe()));
         let (healthy, _) = tokio::sync::watch::channel(true);
         Arc::new(Self {
             printer,
             upstream,
+            control_sink,
             cache: Arc::new(RwLock::new(UpstreamCache::new())),
             rewriter: Arc::new(Mutex::new(SequenceRewriter::new())),
             claim_camera: std::sync::atomic::AtomicBool::new(false),
@@ -528,6 +582,23 @@ impl Emulator {
                                 .expect("rewriter lock poisoned")
                                 .rewrite_request(id, &payload);
                             self.upstream.send(rewritten);
+                        }
+                        // Taken by the relay instead of the printer. Not
+                        // rewritten and not remembered: nothing upstream will
+                        // ever answer it, because nothing upstream heard it —
+                        // the ACK has already gone back in `response.send`.
+                        for payload in &response.intercepted {
+                            match &self.control_sink {
+                                Some(sink) => sink.consume(payload),
+                                // Unreachable: the policy and the sink are set
+                                // together. Said out loud rather than ignored,
+                                // because the symptom would be a printer that
+                                // answers every button and does nothing.
+                                None => eprintln!(
+                                    "emulate: intercepted a command with no sink to take it: \
+                                     {payload}"
+                                ),
+                            }
                         }
                         if response.close {
                             writer.flush().await?;
@@ -962,6 +1033,90 @@ mod tests {
         assert!(
             upstream.forwarded().is_empty(),
             "nothing reached the machine"
+        );
+    }
+
+    /// A sink that remembers what it was given, standing in for the game.
+    #[derive(Default)]
+    struct RecordingSink(Mutex<Vec<Value>>);
+
+    impl RecordingSink {
+        fn taken(&self) -> Vec<Value> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl ControlSink for RecordingSink {
+        fn consume(&self, payload: &Value) {
+            self.0.lock().unwrap().push(payload.clone());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_intercepting_relay_lets_nothing_through_to_the_printer() {
+        // The safety property `serve --emulate-doom` rests on, proved over real
+        // TLS and real bytes rather than against the state machine: a button
+        // press that plays the game must not ALSO reach whatever is upstream.
+        let upstream = FakeUpstream::new();
+        let sink = Arc::new(RecordingSink::default());
+        let emulator = Emulator::intercepting(
+            EmulatedPrinter::new(SERIAL, CODE),
+            Arc::clone(&upstream) as Arc<dyn Upstream>,
+            Arc::clone(&sink) as Arc<dyn ControlSink>,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tls = crate::tls::emulated_printer_server_config(SERIAL, None).unwrap();
+        tokio::spawn(Arc::clone(&emulator).pump());
+        tokio::spawn(Arc::clone(&emulator).serve(listener, tls));
+
+        let mut client = TestClient::connect(addr).await;
+        client.handshake(CODE).await;
+        client.subscribe_reports().await;
+
+        // Everything a client can press, including the ones that would move or
+        // heat a machine.
+        let commands = [
+            json!({"print": {"sequence_id": "1", "command": "gcode_line", "param": "G91\nG1 Y10"}}),
+            json!({"print": {"sequence_id": "2", "command": "gcode_line", "param": "M104 S250"}}),
+            json!({"print": {"sequence_id": "3", "command": "stop"}}),
+            json!({"system": {"sequence_id": "4", "command": "ledctrl", "led_mode": "on"}}),
+            json!({"print": {"sequence_id": "5", "command": "project_file", "url": "ftp:///x"}}),
+        ];
+        for cmd in &commands {
+            client.publish_request(cmd.clone()).await;
+        }
+        until("every command to be taken", || {
+            sink.taken().len() == commands.len()
+        })
+        .await;
+        assert_eq!(sink.taken(), commands.to_vec());
+        assert!(
+            upstream.forwarded().is_empty(),
+            "a command escaped upstream: {:?}",
+            upstream.forwarded()
+        );
+
+        // …and the client is told each one succeeded, or Studio spins forever.
+        for cmd in &commands {
+            let category = cmd.as_object().unwrap().keys().next().unwrap();
+            let ack = client.recv_report().await;
+            assert_eq!(ack[category]["result"], "success", "{ack}");
+            assert_eq!(
+                ack[category]["sequence_id"], cmd[category]["sequence_id"],
+                "{ack}"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "somewhere for the commands to go")]
+    fn an_intercepting_printer_without_a_sink_is_refused_at_startup() {
+        // Otherwise it would ACK every press and drop it — a printer that looks
+        // healthy and does nothing.
+        Emulator::new(
+            EmulatedPrinter::new(SERIAL, CODE).intercepted(),
+            FakeUpstream::new() as Arc<dyn Upstream>,
         );
     }
 
