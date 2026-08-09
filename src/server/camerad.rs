@@ -28,6 +28,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::core::camerad::{self, AUTH_PACKET};
+use crate::server::emulate;
 
 /// How long a client has to send its authentication packet.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -214,6 +215,14 @@ impl CameraRelay {
                         match relay.serve_one(stream).await {
                             Ok(sent) => {
                                 eprintln!("emulate-camera: {peer} left after {sent} frame(s)")
+                            }
+                            // A viewer that takes what it wanted and hangs up
+                            // is not a fault — it is what this crate's own
+                            // client does, one frame per connection. Calling
+                            // that an error buries the failures worth reading
+                            // in a log full of normal departures.
+                            Err(e) if emulate::is_ordinary_disconnect(&e) => {
+                                eprintln!("emulate-camera: {peer} left")
                             }
                             Err(e) => eprintln!("emulate-camera: {peer} dropped: {e}"),
                         }
