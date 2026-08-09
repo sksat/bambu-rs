@@ -87,6 +87,18 @@ scripts/slice.py /tmp/cube.stl /tmp/cube.gcode.3mf            # 0.20mm PLA defau
 - `--brim`: force an outer brim of N mm (e.g. `--brim 5`) for thin/tall-and-narrow
   parts prone to lifting. PLA benefits; PETG adheres hard enough that a brim is
   usually unneeded and harder to peel.
+- `--infill`: sparse infill density in percent. The knob for **how much filament
+  the part uses** — a solid part is the size's upper bound and nothing else moves
+  weight nearly as much. Read the result back rather than predicting it:
+
+  ```bash
+  unzip -p out.gcode.3mf Metadata/slice_info.config \
+    | grep -oE 'key="(weight|prediction)" value="[^"]+"'
+  ```
+
+  Weight is close to linear in density, so two slices bracket any target. A 46mm
+  ball came out 28.15 g at 40% and 61.11 g at 100%; the interpolated 82% gave
+  49.38 g, one slice later.
 
 For a headless thumbnail run the helper under `xvfb-run -a …` (see the caveat below;
 on some boxes GL still fails and the 3mf ships without a preview — the gcode is fine).
