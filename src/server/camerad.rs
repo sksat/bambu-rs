@@ -33,6 +33,10 @@ use crate::server::emulate;
 /// How long a client has to send its authentication packet.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a peer may take over the TLS handshake, before it has said who it
+/// is and while it is holding one of the viewer slots.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// How many viewers at once. Frames are shared, so this bounds sockets, not work.
 const MAX_VIEWERS: usize = 16;
 
@@ -205,8 +209,18 @@ impl CameraRelay {
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                match acceptor.accept(socket).await {
-                    Ok(stream) => {
+                // Bounded like the MQTT side: the permit is taken before the
+                // handshake, so peers that connect and then dribble would hold
+                // every viewer slot until the process restarted — and it costs
+                // them nothing to do it again.
+                let accepted = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(socket));
+                match accepted.await {
+                    Err(_) => {
+                        eprintln!(
+                            "emulate-camera: {peer} never finished TLS within {HANDSHAKE_TIMEOUT:?}"
+                        )
+                    }
+                    Ok(Ok(stream)) => {
                         // Logged at both ends, and this is not housekeeping:
                         // the server side of this protocol has never been
                         // observed, so *where* a real client gives up is the
@@ -227,7 +241,9 @@ impl CameraRelay {
                             Err(e) => eprintln!("emulate-camera: {peer} dropped: {e}"),
                         }
                     }
-                    Err(e) => eprintln!("emulate-camera: TLS handshake with {peer} failed: {e}"),
+                    Ok(Err(e)) => {
+                        eprintln!("emulate-camera: TLS handshake with {peer} failed: {e}")
+                    }
                 }
             });
         }

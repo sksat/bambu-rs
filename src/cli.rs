@@ -1804,6 +1804,10 @@ fn parse_camera_interval(raw: &str) -> Result<f32, String> {
              number of seconds"
         ));
     }
+    // Finite and positive is not the same as representable: `1e30` passes both
+    // checks and still panics on the way into a `Duration`.
+    std::time::Duration::try_from_secs_f32(seconds)
+        .map_err(|_| format!("an interval of {seconds} seconds is longer than time itself"))?;
     Ok(seconds)
 }
 
