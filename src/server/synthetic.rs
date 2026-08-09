@@ -54,6 +54,13 @@ struct Progress {
     bed: f64,
 }
 
+/// `home_flag` as a real A1 mini reports it with every axis homed.
+///
+/// **[observed]**, not decoded — see `docs/protocol.md`, where the bit layout
+/// is still an open question. Copied whole because a value assembled from
+/// guesses about the bits would be a different kind of wrong.
+const HOMED: u32 = 847_201_680;
+
 impl SyntheticPrinter {
     /// Start reporting a print in progress. A snapshot goes out immediately —
     /// the relay's cache is seeded from it, exactly as a real connection's
@@ -128,7 +135,15 @@ impl SyntheticPrinter {
             "cooling_fan_speed": if idle { "0" } else { "100" },
             "spd_lvl": 2,
             "stg_cur": 0,
-            "home_flag": 0,
+            // What a real A1 mini reports once its axes are homed, copied from
+            // `tests/fixtures/pushall-n1-idle.json` rather than derived: the
+            // bit layout is one of the open unknowns in docs/protocol.md.
+            //
+            // Zero here meant "not homed", and Bambu Studio answers a jog with
+            // "Please home all axes" and refuses to move — which in DOOM mode
+            // means the movement panel cannot play the game at all. A synthetic
+            // printer that has never homed is not a useful stand-in for one.
+            "home_flag": HOMED,
             "hms": [],
             "lights_report": [{"node": "chamber_light", "mode": "on"}],
             // The shape a real A1 mini sends, `mode_bits` and `tutk_server`
