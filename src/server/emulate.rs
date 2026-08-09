@@ -156,6 +156,10 @@ pub struct Emulator {
     /// When the printer last said anything. The watchdog reads it; the pump
     /// writes it.
     last_report: Mutex<tokio::time::Instant>,
+    /// Whether to tell clients a camera exists. Set when one is being
+    /// substituted: a client reads `ipcam_dev` and will not open a liveview at
+    /// all while the printer says there is nothing there.
+    claim_camera: std::sync::atomic::AtomicBool,
     /// `false` once the printer is presumed gone. Client tasks watch this and
     /// hang up, which is how the silence reaches them.
     healthy: tokio::sync::watch::Sender<bool>,
@@ -194,6 +198,16 @@ impl Emulator {
         Self::with_tuning(printer, upstream, Tuning::default())
     }
 
+    /// Say a camera is present in everything relayed from here on.
+    ///
+    /// Only ever called when one is being substituted — see
+    /// [`crate::core::camerad::claim_camera`] for why this is the single place
+    /// the relay contradicts the printer, and what keeps that honest.
+    pub fn claim_camera(&self) {
+        self.claim_camera
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// As [`new`](Self::new), with the timeouts set explicitly.
     pub fn with_tuning(
         printer: EmulatedPrinter,
@@ -208,6 +222,7 @@ impl Emulator {
             upstream,
             cache: Arc::new(RwLock::new(UpstreamCache::new())),
             rewriter: Arc::new(Mutex::new(SequenceRewriter::new())),
+            claim_camera: std::sync::atomic::AtomicBool::new(false),
             fanout,
             clients: Mutex::new(HashMap::new()),
             handshake_timeout: tuning.handshake_timeout,
@@ -265,7 +280,7 @@ impl Emulator {
             .unwrap_or_else(|| self.upstream.subscribe());
         tokio::spawn(Arc::clone(&self).watchdog());
         loop {
-            let message = match reports.recv().await {
+            let mut message = match reports.recv().await {
                 Ok(m) => m,
                 // We fell behind the printer and those deltas are gone. Merging
                 // the rest onto a cache with a hole in it would serve a subtly
@@ -281,6 +296,12 @@ impl Emulator {
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
             };
+            // Before the cache and before the fan-out, so the claim reaches
+            // both: a snapshot answered from the cache and a delta forwarded
+            // live have to agree, or the camera would appear and vanish.
+            if self.claim_camera.load(std::sync::atomic::Ordering::Relaxed) {
+                crate::core::camerad::claim_camera(&mut message);
+            }
             // The printer spoke, so it is alive: reset the watchdog and, if we
             // had given up on it, tell the clients it is back.
             *self.last_report.lock().expect("last_report lock poisoned") =
