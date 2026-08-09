@@ -19,7 +19,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{
     StatusCode,
-    header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE},
+    header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE},
 };
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -47,6 +47,9 @@ use super::files::FileStore;
 #[cfg(test)]
 use super::hook::NoHook;
 use super::hook::{HookError, PrePrintHook};
+#[cfg(test)]
+use super::slice::FakeSlicer;
+use super::slice::{SliceManager, SliceParams, Slicer, SlicerInfo};
 #[cfg(test)]
 use super::start::FakeStarter;
 use super::start::{StartRequest, Starter};
@@ -416,6 +419,16 @@ pub struct PrinterState {
     /// starts — a plate changer's swap, typically. [`super::hook::NoHook`] when the profile
     /// configures none, which is the common case.
     pub hook: Arc<dyn PrePrintHook>,
+    /// The slicer, **shared by every printer this server serves** — it is one
+    /// heavyweight binary on this host, and `LiveSlicer` serialises the actual
+    /// processes across them.
+    pub slicer: Arc<dyn Slicer>,
+    /// This printer's slice slot: one job at a time, no queue.
+    pub slice_jobs: Arc<SliceManager>,
+    /// Which BBL profiles slice for this printer's model, resolved once at
+    /// startup from the capability registry. `None` = no verified mapping, so
+    /// slicing is refused rather than aimed at some other machine's bed.
+    pub slicer_names: Option<crate::core::slice::SlicerNames>,
 }
 
 /// A safe absolute path on the printer: starts with `/`, no traversal or scheme.
@@ -447,6 +460,11 @@ impl PrinterState {
             timelapse: Default::default(),
             hook_running: Default::default(),
             hook: Arc::new(NoHook),
+            slicer: Arc::new(FakeSlicer),
+            slice_jobs: Default::default(),
+            slicer_names: crate::core::capability::default_registry()
+                .slicer_names(&crate::core::model::Model::A1Mini)
+                .copied(),
         }
     }
 }
@@ -477,6 +495,7 @@ fn printer_routes(prefix: &str, state: PrinterState) -> Router {
         .route(&p("/camera/{id}/park"), get(park_index))
         .route(&p("/camera/{id}/park/{n}"), get(camera_park_frame))
         .route(&p("/timelapse"), get(timelapse_status))
+        .route(&p("/slice"), get(slice_info))
         .route(&p("/capture"), get(captures_list))
         .route(&p("/capture/{run}/{cam}/video.mp4"), get(capture_video))
         .route(&p("/capture/{run}/{cam}/thumb.jpg"), get(capture_thumb));
@@ -513,6 +532,18 @@ fn printer_routes(prefix: &str, state: PrinterState) -> Router {
             &p("/job/upload-start"),
             post(job_upload_start).layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
         )
+        // The model to slice streams to the job's temp dir, same cap as an upload.
+        .route(
+            &p("/slice"),
+            post(slice_start).layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
+        )
+        .route(&p("/slice/print"), post(slice_print))
+        // Gated with the writes, deliberately. Open reads are about the
+        // PRINTER's state; this hands back a file derived from geometry the
+        // caller uploaded moments ago, and letting that fall out of router
+        // placement rather than a decision is how it would stay open by
+        // accident.
+        .route(&p("/slice/result"), get(slice_result))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_password,
@@ -1207,6 +1238,30 @@ async fn job_start(State(st): State<PrinterState>, Json(b): Json<StartBody>) -> 
     } else {
         None
     };
+    // Length matters as much as range, and only the plate says what it should
+    // be: the wire array is keyed by each filament's index in the project, so
+    // `expand_ams_map` leaves a wrong-length map UNEXPANDED and the printer
+    // uses whatever the gcode baked in. That is how a plate got printed in the
+    // wrong material once already — device-verified — so a map that cannot be
+    // expanded is refused here rather than sent and hoped over.
+    if let Some(insp) = inspection.as_ref() {
+        let want = insp.filament_ids.len();
+        if want == 0 {
+            return bad_request(format!(
+                "{} plate {} does not say which filaments it uses, so an AMS mapping cannot be \
+                 resolved — start without use_ams, or re-slice the plate",
+                b.file, b.plate
+            ));
+        }
+        if b.ams_map.len() != want {
+            return bad_request(format!(
+                "ams_map has {} entries but plate {} uses {want} filament(s) — pass one tray per \
+                 filament, in the plate's own order",
+                b.ams_map.len(),
+                b.plate
+            ));
+        }
+    }
     let req = StartRequest {
         file: b.file.clone(),
         plate: b.plate,
@@ -2738,33 +2793,8 @@ async fn job_upload_start(
         Ok(t) => t,
         Err(e) => return server_error(e.to_string()),
     };
-    {
-        let mut file = match tokio::fs::File::create(tmp.path()).await {
-            Ok(f) => f,
-            Err(e) => return server_error(e.to_string()),
-        };
-        let mut stream = body.into_data_stream();
-        let mut written: u64 = 0;
-        while let Some(chunk) = stream.next().await {
-            let chunk = match chunk {
-                Ok(c) => c,
-                Err(_) => return bad_request("upload stream error".to_string()),
-            };
-            written += chunk.len() as u64;
-            if written > MAX_UPLOAD_BYTES {
-                return (
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    Json(json!({ "error": "upload exceeds the 512 MiB limit" })),
-                )
-                    .into_response();
-            }
-            if file.write_all(&chunk).await.is_err() {
-                return server_error("writing upload".to_string());
-            }
-        }
-        if file.flush().await.is_err() {
-            return server_error("flushing upload".to_string());
-        }
+    if let Err(resp) = stream_body_to(&tmp, body).await {
+        return resp;
     }
 
     // For a .3mf, read the plate-gcode md5 from the bytes we just staged.
@@ -2800,6 +2830,59 @@ async fn job_upload_start(
     // (confirm is guaranteed here — the early gate rejected !confirm && !dry_run,
     // and dry_run returned above.)
 
+    let res = upload_and_start(
+        &st,
+        tmp.path(),
+        UploadStart {
+            dir: &dir,
+            name: &q.name,
+            remote: &remote,
+            overwrite: q.overwrite,
+            overwrite_hint: "add &overwrite=true",
+            plate: q.plate,
+            use_ams: false,
+            ams_map: Vec::new(),
+            bed_type,
+            timelapse: q.timelapse,
+            inspection,
+        },
+    )
+    .await;
+    drop(tmp); // remove the staged file once uploaded (or on error)
+    res
+}
+
+/// Where a staged local file is going, and how to print it once it lands.
+struct UploadStart<'a> {
+    dir: &'a str,
+    /// Bare filename on the printer, for the overwrite check.
+    name: &'a str,
+    /// `dir` + `name`: the absolute on-printer path.
+    remote: &'a str,
+    overwrite: bool,
+    /// How *this* endpoint spells the overwrite flag, so the refusal tells the
+    /// caller something it can actually act on.
+    overwrite_hint: &'static str,
+    plate: u32,
+    use_ams: bool,
+    ams_map: Vec<i32>,
+    bed_type: String,
+    timelapse: bool,
+    inspection: Option<crate::core::project::PlateInspection>,
+}
+
+/// The device-verified tail of "put this local file on the printer and print
+/// it": hold the start lock across both halves, refuse while busy, refuse to
+/// clobber, FTPS-upload, then start.
+///
+/// Shared by `job/upload-start` and `slice/print` rather than reimplemented — so
+/// a freshly sliced file never has to round-trip through the browser to reach
+/// the printer, and every one of these guards applies to it verbatim.
+async fn upload_and_start(
+    st: &PrinterState,
+    local: &std::path::Path,
+    p: UploadStart<'_>,
+) -> Response {
     // Hold the start lock across upload+start so two requests can't both pass idle.
     let Ok(_guard) = st.start_lock.try_lock() else {
         return (
@@ -2808,22 +2891,23 @@ async fn job_upload_start(
         )
             .into_response();
     };
-    if let Some(busy) = require_idle(&st) {
+    if let Some(busy) = require_idle(st) {
         return busy;
     }
 
     // Conservative overwrite guard (list the dir; a listing error doesn't block).
-    if !q.overwrite {
+    if !p.overwrite {
         let files = st.files.clone();
-        let dir_for_check = dir.clone();
-        let name = q.name.clone();
+        let dir_for_check = p.dir.to_string();
+        let name = p.name.to_string();
         if let Ok(Ok(entries)) =
             tokio::task::spawn_blocking(move || files.list(&dir_for_check)).await
             && entries.iter().any(|e| e.name == name)
         {
+            let (remote, hint) = (p.remote, p.overwrite_hint);
             return (
                 StatusCode::CONFLICT,
-                Json(json!({ "error": format!("{remote} already exists (add &overwrite=true to replace it)") })),
+                Json(json!({ "error": format!("{remote} already exists ({hint} to replace it)") })),
             )
                 .into_response();
         }
@@ -2831,10 +2915,9 @@ async fn job_upload_start(
 
     // Upload the staged file, then start from its on-printer path.
     let files = st.files.clone();
-    let path = tmp.path().to_path_buf();
-    let remote_for_upload = remote.clone();
+    let path = local.to_path_buf();
+    let remote_for_upload = p.remote.to_string();
     let up = tokio::task::spawn_blocking(move || files.upload(&remote_for_upload, &path)).await;
-    drop(tmp); // remove the staged file once uploaded (or on error)
     match up {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -2846,25 +2929,584 @@ async fn job_upload_start(
     // The upload above can take minutes. A job started from the printer's screen
     // in that window must not be driven into by a plate swap, so idle is checked
     // again before the hook rather than only before the upload.
-    if let Some(busy) = require_idle(&st) {
+    if let Some(busy) = require_idle(st) {
         return busy;
     }
-    if let Some(failed) = run_pre_print_hook(&st).await {
+    if let Some(failed) = run_pre_print_hook(st).await {
         return failed;
     }
 
     let req = StartRequest {
-        file: remote,
-        plate: q.plate,
-        use_ams: false,
-        ams_map: Vec::new(),
-        bed_type,
-        timelapse: q.timelapse,
-        inspection,
+        file: p.remote.to_string(),
+        plate: p.plate,
+        use_ams: p.use_ams,
+        ams_map: p.ams_map,
+        bed_type: p.bed_type,
+        timelapse: p.timelapse,
+        inspection: p.inspection,
     };
     let starter = st.starter.clone();
     let res = tokio::task::spawn_blocking(move || starter.start(&req)).await;
     verify_response(res)
+}
+
+// ── Slicing ────────────────────────────────────────────────────────────────
+
+/// Can this printer be sliced for right now? `Err(reason)` is handed to the
+/// caller verbatim — it names the thing to install or the model we have no
+/// mapping for.
+fn slice_available(st: &PrinterState) -> Result<SlicerInfo, String> {
+    // The machine profile decides the bed, the start gcode and the flow
+    // calibration. Slicing an unmapped model against some other machine's
+    // profile is exactly the failure this feature exists to prevent, so an
+    // unmapped model is unavailable, never an A1-mini fallback.
+    if st.slicer_names.is_none() {
+        return Err(format!(
+            "no verified slicer profile mapping for model {}",
+            st.model.as_deref().unwrap_or("unknown")
+        ));
+    }
+    st.slicer.info()
+}
+
+/// Whether slicing is available here, and what the slice slot is doing.
+async fn slice_info(State(st): State<PrinterState>) -> Response {
+    let (slicer, reason) = match slice_available(&st) {
+        Ok(info) => (
+            Some(json!({ "kind": info.kind, "thumbnails": info.thumbnails })),
+            None,
+        ),
+        Err(reason) => (None, Some(reason)),
+    };
+    Json(json!({
+        "available": slicer.is_some(),
+        "slicer": slicer,
+        "reason": reason,
+        "machine": st.slicer_names.map(|n| n.machine_base),
+        "job": st.slice_jobs.status().to_json(),
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct SliceQuery {
+    name: Option<String>,
+    layer: Option<f64>,
+    filament: Option<String>,
+    bed_type: Option<String>,
+    brim: Option<f64>,
+    nozzle: Option<String>,
+}
+
+/// Slice a model (write). The body is the raw model bytes, streamed to a temp
+/// file exactly like an upload; the answer is 202 + the job, which is then
+/// polled at `GET /slice`.
+///
+/// `layer`, `filament` and `bed_type` are **required with no server default**:
+/// the first two depend on the user's intent and the spool actually loaded, and
+/// defaulting the third is precisely the Cool-Plate-at-35°C silent wrong guess.
+/// The slicer binary and profile paths, by contrast, are discoverable facts, so
+/// those are auto-detected.
+async fn slice_start(
+    State(st): State<PrinterState>,
+    Query(q): Query<SliceQuery>,
+    body: Body,
+) -> Response {
+    let name = q.name.unwrap_or_default();
+    // Same filename guard as an upload — `name` is a single filename.
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+        return bad_request(format!("invalid filename {name:?}"));
+    }
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".gcode.3mf") {
+        return bad_request(
+            "that is already a sliced .gcode.3mf — send it to the printer with /job/upload-start"
+                .to_string(),
+        );
+    }
+    // Exactly what the slicer reads. It rejects anything else before opening
+    // the file — "Unknown file format. Input file must have .stl, .obj,
+    // .amf(.xml) extension" — so accepting `.step` here would return 202 and
+    // then fail in the background, which is a worse answer than refusing.
+    // (Verified against the installed OrcaSlicer; `.3mf` gets past the format
+    // check on its own path.)
+    if !crate::core::slice::MODEL_EXTENSIONS
+        .iter()
+        .any(|e| lower.ends_with(e))
+    {
+        return bad_request(format!(
+            "{name:?} is not a model file this slicer reads: expected .stl, .obj, .amf or .3mf \
+             (STEP is not supported — convert it first)"
+        ));
+    }
+
+    let Some(layer) = q.layer else {
+        return bad_request(
+            "layer required: the layer height in mm, e.g. &layer=0.2 (there is no default — it \
+             is your call, not the server's)"
+                .to_string(),
+        );
+    };
+    let Some(filament) = q.filament.filter(|f| !f.trim().is_empty()) else {
+        return bad_request(
+            "filament required: a full profile name, e.g. &filament=Bambu PLA Basic @BBL A1M"
+                .to_string(),
+        );
+    };
+    if !crate::core::slice::is_safe_profile_name(&filament) {
+        return bad_request(format!("invalid filament profile name {filament:?}"));
+    }
+    let Some(bed_type) = q.bed_type.filter(|b| !b.trim().is_empty()) else {
+        return bad_request(
+            "bed_type required: the plate actually on the printer, e.g. &bed_type=Textured PEI \
+             Plate — it sets the bed temperature, and guessing it means a cold plate and a print \
+             that lifts"
+                .to_string(),
+        );
+    };
+    if !crate::core::slice::is_safe_profile_name(&bed_type) {
+        return bad_request(format!("invalid bed_type {bed_type:?}"));
+    }
+    if let Some(brim) = q.brim
+        && !(0.0..=20.0).contains(&brim)
+    {
+        return bad_request(format!("brim={brim} is outside 0–20 mm"));
+    }
+
+    if let Err(reason) = slice_available(&st) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": reason })),
+        )
+            .into_response();
+    }
+    let names = st
+        .slicer_names
+        .expect("availability already proved there is a mapping");
+
+    // The nozzle picks the machine preset. Prefer what the printer reports over
+    // what the caller assumed; refuse rather than assume 0.4.
+    let Some(nozzle) = st
+        .source
+        .current()
+        .nozzle_diameter
+        .or_else(|| q.nozzle.filter(|n| !n.trim().is_empty()))
+    else {
+        return bad_request("nozzle unknown — pass &nozzle=0.4".to_string());
+    };
+    let machine_profile = names.machine_profile(&nozzle);
+    if !crate::core::slice::is_safe_profile_name(&machine_profile) {
+        return bad_request(format!("invalid nozzle {nozzle:?}"));
+    }
+    // The process presets are per-nozzle, and only the 0.4 set is mapped. A
+    // 0.6 machine would otherwise slice with 0.4 speeds and flow: a success
+    // that is wrong, which is worse than this refusal.
+    let preset_suffix = match names.process_suffix(&nozzle) {
+        Ok(s) => s,
+        Err(why) => return bad_request(why),
+    };
+    // Judged against the nozzle actually fitted, and only once that is known: a
+    // fixed 0.04–0.4 window accepts 0.4 mm on a 0.2 nozzle and refuses legal
+    // heights on a 0.6, while naming a nozzle the machine doesn't have.
+    if let Err(why) = crate::core::slice::layer_fits_nozzle(layer, &nozzle) {
+        return bad_request(why);
+    }
+
+    // Claimed BEFORE the body is streamed, not merely checked. A check would
+    // let every concurrent caller through to write its own copy of a body worth
+    // up to 512 MiB and race for the slot afterwards, so one-slice-at-a-time
+    // would bound the slicer and not the disk. The guard releases on drop,
+    // including when the client disconnects mid-upload and axum drops this
+    // future.
+    let Some(slot) = st.slice_jobs.reserve() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "a slice is already running" })),
+        )
+            .into_response();
+    };
+
+    // The suffix is not cosmetic: libslic3r picks its model reader from the
+    // extension, so an extensionless staged file is rejected before it is even
+    // read — "Unknown file format. Input file must have .stl, .obj, .amf(.xml)
+    // extension" — and every real slice fails. Verified against the installed
+    // slicer with byte-identical files that differed only in name.
+    let suffix = std::path::Path::new(&name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{}", e.to_ascii_lowercase()))
+        .unwrap_or_default();
+    let tmp = match tempfile::Builder::new()
+        .prefix("bambu-model-")
+        .suffix(&suffix)
+        .tempfile()
+    {
+        Ok(t) => t,
+        Err(e) => return server_error(e.to_string()),
+    };
+    let written = match stream_body_to(&tmp, body).await {
+        Ok(n) => n,
+        Err(resp) => return resp,
+    };
+    if written == 0 {
+        return bad_request("empty body: POST the model file's bytes".to_string());
+    }
+
+    // An authored project 3mf carries its own plates, orientations and
+    // per-object overrides, and the slicer is driven with `--arrange 1 --orient
+    // 1`, which re-packs all of it. Refuse instead of quietly ruining it.
+    if lower.ends_with(".3mf") {
+        // Off the async workers: walking a zip is blocking. The file is handed
+        // over rather than its bytes — a zip answers this from its central
+        // directory, and slurping a 512 MiB upload into RAM (times however many
+        // arrive before one wins the slot) is how the server gets OOM-killed.
+        let staged = tmp.path().to_path_buf();
+        match tokio::task::spawn_blocking(move || {
+            std::fs::File::open(&staged)
+                .map_err(|e| e.to_string())
+                .and_then(|f| {
+                    crate::core::project::is_authored_project(std::io::BufReader::new(f))
+                        .map_err(|e| e.to_string())
+                })
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("3mf inspection task failed: {e}")))
+        {
+            Ok(true) => {
+                return bad_request(
+                    "this is an authored project 3mf; slicing it here would re-arrange and \
+                     re-orient its plates — slice it with its own settings instead"
+                        .to_string(),
+                );
+            }
+            Ok(false) => {}
+            Err(e) => return bad_request(format!("3mf inspection: {e}")),
+        }
+    }
+
+    let workdir = match tempfile::Builder::new().prefix("bambu-slice-").tempdir() {
+        Ok(d) => d,
+        Err(e) => return server_error(e.to_string()),
+    };
+    let params = SliceParams {
+        input: tmp.path().to_path_buf(),
+        input_name: name.clone(),
+        out_dir: workdir.path().to_path_buf(),
+        out_name: crate::core::slice::sanitize_output_name(&name),
+        machine_profile,
+        preset_suffix: preset_suffix.to_string(),
+        layer_mm: layer,
+        filament,
+        bed_type,
+        brim_mm: q.brim,
+    };
+    match st.slice_jobs.start(st.slicer.clone(), params, tmp, workdir) {
+        Ok(()) => {
+            // The running status keeps the next caller out from here on, so the
+            // claim is spent rather than released.
+            slot.commit();
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({ "job": st.slice_jobs.status().to_json() })),
+            )
+                .into_response()
+        }
+        Err(e) => (StatusCode::CONFLICT, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+/// Stream a request body into an already-created temp file, returning the byte
+/// count. `DefaultBodyLimit` does not bound a raw `Body` consumed by hand, so
+/// the cap is counted here.
+async fn stream_body_to(tmp: &tempfile::NamedTempFile, body: Body) -> Result<u64, Response> {
+    let mut file = tokio::fs::File::create(tmp.path())
+        .await
+        .map_err(|e| server_error(e.to_string()))?;
+    let mut stream = body.into_data_stream();
+    let mut written: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| bad_request("upload stream error".to_string()))?;
+        written += chunk.len() as u64;
+        if written > MAX_UPLOAD_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({ "error": "upload exceeds the 512 MiB limit" })),
+            )
+                .into_response());
+        }
+        file.write_all(&chunk)
+            .await
+            .map_err(|_| server_error("writing upload".to_string()))?;
+    }
+    file.flush()
+        .await
+        .map_err(|_| server_error("flushing upload".to_string()))?;
+    Ok(written)
+}
+
+/// Download the finished `.gcode.3mf`.
+async fn slice_result(State(st): State<PrinterState>) -> Response {
+    let status = st.slice_jobs.status();
+    if status.state == "running" {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "slice still running" })),
+        )
+            .into_response();
+    }
+    let Some(done) = st.slice_jobs.result() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no finished slice", "job": status.to_json() })),
+        )
+            .into_response();
+    };
+    // Streamed, not buffered: a plate's gcode for a big print is tens of MB,
+    // and the POST that made it accepts up to 512 MiB. Same shape as
+    // `capture_video`, and for the same reason.
+    let Ok(file) = tokio::fs::File::open(&done.path).await else {
+        return server_error("the sliced file has gone".to_string());
+    };
+    // `out_name` came from `sanitize_output_name`, so it carries no quote or
+    // newline to break out of this header.
+    let name = done
+        .status
+        .out_name
+        .clone()
+        .unwrap_or_else(|| "slice.gcode.3mf".to_string());
+    // The lease rides along in the stream state, so the work directory outlives
+    // the download rather than this function. Dropping it here would be
+    // invisible on Linux (an open fd keeps reading through an unlink) and a
+    // leak on Windows, where `TempDir` cannot remove a directory holding an
+    // open file and does not retry — the bounded-disk claim has to hold on
+    // both.
+    let stream = futures_util::stream::unfold(Some((file, done)), |st| async move {
+        let (mut f, lease) = st?;
+        let mut buf = vec![0u8; 64 * 1024];
+        match tokio::io::AsyncReadExt::read(&mut f, &mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((
+                    Ok::<Bytes, std::io::Error>(Bytes::from(buf)),
+                    Some((f, lease)),
+                ))
+            }
+            Err(e) => Some((Err(e), None)),
+        }
+    });
+    (
+        [
+            (CONTENT_TYPE, "application/octet-stream".to_string()),
+            // Same URL, different file after the next slice — and the file is
+            // the caller's own geometry. A cached copy would hand back the
+            // previous job's output, or keep this one on disk after it is gone.
+            (CACHE_CONTROL, "no-store".to_string()),
+            (
+                CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{name}\""),
+            ),
+        ],
+        Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct SlicePrintBody {
+    #[serde(default = "default_plate")]
+    plate: u32,
+    #[serde(default)]
+    timelapse: bool,
+    bed_type: Option<String>,
+    #[serde(default)]
+    use_ams: bool,
+    #[serde(default)]
+    ams_map: Vec<i32>,
+    dir: Option<String>,
+    #[serde(default)]
+    overwrite: bool,
+    #[serde(default)]
+    confirm: bool,
+    #[serde(default)]
+    dry_run: bool,
+    /// Which slice this print is for — the `id` the dry run reported.
+    ///
+    /// Required to confirm, because the slot holds exactly one result: another
+    /// caller can slice between the plan and the confirmation, and without this
+    /// the confirmation would silently print the replacement. Same shape as the
+    /// CLI's `--expect-md5`, and the reason is the same one.
+    expect: Option<u64>,
+}
+
+impl Default for SlicePrintBody {
+    fn default() -> Self {
+        Self {
+            plate: default_plate(),
+            timelapse: false,
+            bed_type: None,
+            use_ams: false,
+            ams_map: Vec::new(),
+            dir: None,
+            overwrite: false,
+            confirm: false,
+            dry_run: false,
+            expect: None,
+        }
+    }
+}
+
+/// Print the slice that is sitting in the slot: upload it over FTPS and start,
+/// through the same [`upload_and_start`] the dashboard's upload path uses.
+async fn slice_print(
+    State(st): State<PrinterState>,
+    body: Option<Json<SlicePrintBody>>,
+) -> Response {
+    let b = body.map_or_else(SlicePrintBody::default, |Json(b)| b);
+    if st.slice_jobs.status().state == "running" {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "slice still running" })),
+        )
+            .into_response();
+    }
+    // `path` lives in the slot's working directory, which a NEW slice would drop
+    // out from under this upload. That costs at most a 502 on this request: the
+    // replacement job gets a fresh directory, so this path can only ever name
+    // this slice's own output — never someone else's file.
+    let Some(done) = st.slice_jobs.result() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no finished slice to print — POST /api/slice first" })),
+        )
+            .into_response();
+    };
+    if b.use_ams {
+        for (i, v) in b.ams_map.iter().enumerate() {
+            if !(-1..=3).contains(v) {
+                return bad_request(format!(
+                    "ams_map[{i}]={v} out of range (trays 0..3, or -1 external)"
+                ));
+            }
+        }
+        // Length matters as much as range. This path slices ONE filament, and
+        // the mapping is expanded onto the project's filament indices — a
+        // mismatched length is left unexpanded, so the printer falls back to
+        // whatever the gcode baked in. That is how a plate got printed in the
+        // wrong material once already; it is a refusal now, not a surprise.
+        if b.ams_map.len() != 1 {
+            return bad_request(format!(
+                "ams_map has {} entries but this slice uses 1 filament — pass exactly one tray",
+                b.ams_map.len()
+            ));
+        }
+    }
+    // The A1 mini prints from `/`; a start that reads an uploaded file out of
+    // `/cache` fails with 0x0500C010 (verified).
+    let dir = b.dir.clone().unwrap_or_else(|| "/".to_string());
+    if dir != "/" && !is_safe_remote_path(&dir) {
+        return bad_request(format!("invalid dir {dir:?}"));
+    }
+    let name = done
+        .status
+        .out_name
+        .clone()
+        .unwrap_or_else(|| "slice.gcode.3mf".to_string());
+    let remote = format!("{}/{}", dir.trim_end_matches('/'), name);
+
+    // Inspect the local result so the plate-gcode md5 is stamped into the start
+    // command and the printer verifies the file it is about to run. Off the
+    // async workers: a sliced plate is tens of MB and this both reads it and
+    // walks a zip, which would block a runtime thread for the whole of it.
+    let path_for_inspect = done.path.clone();
+    let plate = b.plate;
+    let inspection = match tokio::task::spawn_blocking(move || {
+        // Opened, not read: the slicer's output has no archive-size bound, and
+        // several print requests reach here before any of them takes the start
+        // lock. The entries this pulls out are individually capped.
+        std::fs::File::open(&path_for_inspect)
+            .map_err(|e| e.to_string())
+            .and_then(|f| {
+                crate::core::project::inspect_plate_from(std::io::BufReader::new(f), plate)
+                    .map_err(|e| e.to_string())
+            })
+    })
+    .await
+    {
+        Ok(Ok(insp)) => insp,
+        Ok(Err(e)) => return bad_request(format!("3mf inspection: {e}")),
+        Err(_) => return server_error("3mf inspection task failed".to_string()),
+    };
+    let bed_type = b.bed_type.clone().unwrap_or_else(|| "auto".to_string());
+
+    if b.dry_run {
+        return Json(json!({ "plan": {
+            "file": remote,
+            "plate": b.plate,
+            "use_ams": b.use_ams,
+            "ams_map": b.ams_map,
+            "bed_type": bed_type,
+            "timelapse": b.timelapse,
+            "md5": inspection.gcode_md5,
+            "has_timelapse_blocks": inspection.has_timelapse_blocks,
+            "overwrite": b.overwrite,
+            // What to echo back to print exactly this slice.
+            "expect": done.status.id,
+        }}))
+        .into_response();
+    }
+    if let Some(unconfirmed) = need_confirm(b.confirm) {
+        return unconfirmed;
+    }
+    // The plan above described one particular slice, and the slot holds one at a
+    // time. Between that plan and this confirmation another caller can slice —
+    // legally, the slot was free — and everything named here (`remote`, `name`,
+    // the md5 just computed) would then describe the replacement. Confirming a
+    // print of a file nobody looked at is the same class of mistake as the AMS
+    // mapping ones, so it is proven rather than assumed.
+    match b.expect {
+        Some(want) if Some(want) == done.status.id => {}
+        Some(want) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": format!(
+                        "slice {want} is no longer the one loaded (the slot now holds {}) — \
+                         dry-run again and confirm against that",
+                        done.status.id.map_or_else(|| "none".to_string(), |v| v.to_string())
+                    ),
+                })),
+            )
+                .into_response();
+        }
+        None => {
+            return bad_request(format!(
+                "confirming a print needs \"expect\": <the dry run's slice id> — this slice is {}",
+                done.status
+                    .id
+                    .map_or_else(|| "unknown".to_string(), |v| v.to_string())
+            ));
+        }
+    }
+
+    upload_and_start(
+        &st,
+        &done.path,
+        UploadStart {
+            dir: &dir,
+            name: &name,
+            remote: &remote,
+            overwrite: b.overwrite,
+            overwrite_hint: "pass \"overwrite\": true",
+            plate: b.plate,
+            use_ams: b.use_ams,
+            ams_map: b.ams_map.clone(),
+            bed_type,
+            timelapse: b.timelapse,
+            inspection: Some(inspection),
+        },
+    )
+    .await
 }
 
 /// Upgrade to a WebSocket that pushes a `PrinterStatus` JSON frame on connect and
@@ -2966,6 +3608,11 @@ mod tests {
             timelapse: Default::default(),
             hook_running: Default::default(),
             hook: Arc::new(NoHook),
+            slicer: Arc::new(FakeSlicer),
+            slice_jobs: Default::default(),
+            slicer_names: crate::core::capability::default_registry()
+                .slicer_names(&crate::core::model::Model::A1Mini)
+                .copied(),
         };
         TestServer::new(one(state))
     }
@@ -2988,6 +3635,11 @@ mod tests {
             timelapse: Default::default(),
             hook_running: Default::default(),
             hook: Arc::new(NoHook),
+            slicer: Arc::new(FakeSlicer),
+            slice_jobs: Default::default(),
+            slicer_names: crate::core::capability::default_registry()
+                .slicer_names(&crate::core::model::Model::A1Mini)
+                .copied(),
         }
     }
 
@@ -4062,6 +4714,11 @@ mod tests {
             timelapse: tl.clone(),
             hook_running: Default::default(),
             hook: Arc::new(NoHook),
+            slicer: Arc::new(FakeSlicer),
+            slice_jobs: Default::default(),
+            slicer_names: crate::core::capability::default_registry()
+                .slicer_names(&crate::core::model::Model::A1Mini)
+                .copied(),
         };
         (TestServer::new(one(state)), tl)
     }
@@ -4207,6 +4864,67 @@ mod tests {
         buf
     }
 
+    /// A `.3mf` whose plate 1 declares these filament ids — the positions
+    /// `expand_ams_map` keys the wire array by.
+    fn three_mf_with_filaments(ids: &[usize]) -> Vec<u8> {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let colors = vec!["\"#FFFFFF\""; ids.len()].join(",");
+        let list = ids
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"{{"filament_colors":[{colors}],"filament_ids":[{list}],"bed_type":"textured_plate"}}"#
+        );
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.start_file("Metadata/plate_1.gcode", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"G1 X1\n").unwrap();
+            zip.start_file("Metadata/plate_1.json", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(json.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    /// A server whose only file is `bytes`.
+    fn app_serving(bytes: Vec<u8>) -> TestServer {
+        let mut state = printer("test");
+        state.files = Arc::new(OneFile(bytes));
+        TestServer::new(one(state))
+    }
+
+    #[tokio::test]
+    async fn an_ams_map_must_have_one_entry_per_filament_the_plate_uses() {
+        // The wire array is keyed by each filament's index in the project, and
+        // `expand_ams_map` leaves a wrong-length map UNEXPANDED — the printer
+        // then uses whatever the gcode baked in. That is how a plate got
+        // printed in the wrong material once already, so a length that cannot
+        // be expanded is refused rather than sent.
+        let app = app_serving(three_mf_with_filaments(&[0, 1]));
+        let start = |map: serde_json::Value| {
+            app.post("/api/job/start")
+                .json(&json!({ "file": "/two.3mf", "plate": 1, "confirm": true,
+                               "use_ams": true, "ams_map": map }))
+        };
+        for bad in [json!([0]), json!([0, 1, 2])] {
+            let n = bad.as_array().unwrap().len();
+            let res = start(bad).await;
+            res.assert_status(StatusCode::BAD_REQUEST);
+            let t = res.text();
+            assert!(t.contains("ams_map"), "{n}: {t}");
+            assert!(t.contains('2'), "names how many the plate uses: {t}");
+        }
+        // The matching length is exactly what a two-colour print needs, and
+        // must NOT be refused.
+        start(json!([0, 1])).await.assert_status_ok();
+    }
+
     #[tokio::test]
     async fn file_inspect_reports_timelapse_capability_open() {
         let state = PrinterState {
@@ -4226,6 +4944,11 @@ mod tests {
             timelapse: Default::default(),
             hook_running: Default::default(),
             hook: Arc::new(NoHook),
+            slicer: Arc::new(FakeSlicer),
+            slice_jobs: Default::default(),
+            slicer_names: crate::core::capability::default_registry()
+                .slicer_names(&crate::core::model::Model::A1Mini)
+                .copied(),
         };
         let server = TestServer::new(one(state));
         let res = server
@@ -4271,6 +4994,11 @@ mod tests {
             timelapse: Default::default(),
             hook_running: Default::default(),
             hook: Arc::new(NoHook),
+            slicer: Arc::new(FakeSlicer),
+            slice_jobs: Default::default(),
+            slicer_names: crate::core::capability::default_registry()
+                .slicer_names(&crate::core::model::Model::A1Mini)
+                .copied(),
         };
         let server = TestServer::new(one(state));
         let res = server
@@ -4711,6 +5439,11 @@ mod tests {
             timelapse: Default::default(),
             hook_running: Default::default(),
             hook: Arc::new(NoHook),
+            slicer: Arc::new(FakeSlicer),
+            slice_jobs: Default::default(),
+            slicer_names: crate::core::capability::default_registry()
+                .slicer_names(&crate::core::model::Model::A1Mini)
+                .copied(),
         };
         TestServer::new(one(state))
             .post("/api/job/start")
@@ -4739,6 +5472,11 @@ mod tests {
             timelapse: Default::default(),
             hook_running: Default::default(),
             hook: Arc::new(NoHook),
+            slicer: Arc::new(FakeSlicer),
+            slice_jobs: Default::default(),
+            slicer_names: crate::core::capability::default_registry()
+                .slicer_names(&crate::core::model::Model::A1Mini)
+                .copied(),
         };
         TestServer::new(one(state))
     }
@@ -4783,6 +5521,11 @@ mod tests {
             timelapse: Default::default(),
             hook_running: Default::default(),
             hook: Arc::new(NoHook),
+            slicer: Arc::new(FakeSlicer),
+            slice_jobs: Default::default(),
+            slicer_names: crate::core::capability::default_registry()
+                .slicer_names(&crate::core::model::Model::A1Mini)
+                .copied(),
         };
         TestServer::new(one(state))
     }
@@ -5252,6 +5995,11 @@ mod tests {
             timelapse: Default::default(),
             hook_running: Default::default(),
             hook: Arc::new(NoHook),
+            slicer: Arc::new(FakeSlicer),
+            slice_jobs: Default::default(),
+            slicer_names: crate::core::capability::default_registry()
+                .slicer_names(&crate::core::model::Model::A1Mini)
+                .copied(),
         };
         let mut ws = ws_server(state)
             .get_websocket("/api/ws")
@@ -5271,5 +6019,672 @@ mod tests {
             }
         }
         assert!(hotter, "ramping source should push rising nozzle temps");
+    }
+
+    // ── slicing ──────────────────────────────────────────────────────────
+
+    /// A slicing-capable test server, with the slicer and the model mapping
+    /// chosen by the test.
+    fn slice_app(
+        slicer: Arc<dyn Slicer>,
+        model: Option<crate::core::model::Model>,
+    ) -> (TestServer, PrinterState) {
+        let state = PrinterState {
+            name: "test".to_string(),
+            id: "test".to_string(),
+            model: model.as_ref().map(|m| m.as_str().to_string()),
+            legacy_captures: true,
+            source: Arc::new(FakeSource::idle()),
+            controller: Arc::new(FakeController::verified()),
+            files: Arc::new(FakeFiles),
+            starter: Arc::new(FakeStarter),
+            password: None,
+            start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            external_cameras: Arc::new(RwLock::new(Vec::new())),
+            internal_camera: Arc::new(NoCamera),
+            timelapse: Default::default(),
+            hook_running: Default::default(),
+            hook: Arc::new(NoHook),
+            slicer,
+            slice_jobs: Default::default(),
+            slicer_names: model.and_then(|m| {
+                crate::core::capability::default_registry()
+                    .slicer_names(&m)
+                    .copied()
+            }),
+        };
+        (TestServer::new(one(state.clone())), state)
+    }
+
+    /// The usual case: a fake slicer standing in for an A1 mini.
+    fn fake_slice_app() -> TestServer {
+        slice_app(
+            Arc::new(FakeSlicer),
+            Some(crate::core::model::Model::A1Mini),
+        )
+        .0
+    }
+
+    /// The valid half of a slice request (percent-encoded, as a client sends
+    /// it), so each test can vary one thing.
+    const SLICE_Q: &str = "name=cube.stl&layer=0.12&filament=Bambu%20PLA%20Basic%20@BBL%20A1M\
+         &bed_type=Textured%20PEI%20Plate&nozzle=0.4";
+    const FILAMENT_Q: &str = "filament=Bambu%20PLA%20Basic%20@BBL%20A1M";
+
+    /// The id of the slice currently in the slot — what a caller echoes back to
+    /// confirm a print of exactly this one.
+    async fn slice_id(app: &TestServer) -> u64 {
+        app.get("/api/slice").await.json::<serde_json::Value>()["job"]["id"]
+            .as_u64()
+            .expect("a finished slice has an id")
+    }
+
+    /// Poll the slot the way the dashboard does, until the job settles.
+    async fn await_slice(app: &TestServer) -> serde_json::Value {
+        for _ in 0..2000 {
+            let job = app.get("/api/slice").await.json::<serde_json::Value>()["job"].clone();
+            if job["state"] != "running" {
+                return job;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the slice never finished");
+    }
+
+    #[tokio::test]
+    async fn slice_availability_is_advertised_with_the_machine_it_would_slice_for() {
+        let body = fake_slice_app()
+            .get("/api/slice")
+            .await
+            .json::<serde_json::Value>();
+        assert_eq!(body["available"], true);
+        assert_eq!(body["slicer"]["kind"], "fake");
+        assert_eq!(body["machine"], "Bambu Lab A1 mini");
+        assert_eq!(body["job"]["state"], "idle");
+        assert!(body["reason"].is_null());
+    }
+
+    #[tokio::test]
+    async fn with_no_slicer_installed_the_api_says_so_instead_of_failing() {
+        let (app, _) = slice_app(
+            Arc::new(super::super::slice::NoSlicer(
+                "no slicer found: install X".to_string(),
+            )),
+            Some(crate::core::model::Model::A1Mini),
+        );
+        let body = app.get("/api/slice").await.json::<serde_json::Value>();
+        assert_eq!(body["available"], false);
+        assert_eq!(body["reason"], "no slicer found: install X");
+
+        let res = app
+            .post(&format!("/api/slice?{SLICE_Q}"))
+            .bytes(b"solid cube".to_vec().into())
+            .await;
+        res.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            res.json::<serde_json::Value>()["error"],
+            "no slicer found: install X"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_with_no_verified_profile_mapping_is_not_sliced_for() {
+        // A P1S is a printer we happily control — and one we have never verified
+        // a slicing profile for. Slicing it against the A1 mini's machine
+        // profile would emit gcode for a different bed.
+        let (app, _) = slice_app(Arc::new(FakeSlicer), Some(crate::core::model::Model::P1S));
+        let body = app.get("/api/slice").await.json::<serde_json::Value>();
+        assert_eq!(body["available"], false);
+        assert!(
+            body["reason"].as_str().unwrap().contains("p1s"),
+            "{}",
+            body["reason"]
+        );
+        assert!(body["machine"].is_null());
+        app.post(&format!("/api/slice?{SLICE_Q}"))
+            .bytes(b"solid cube".to_vec().into())
+            .await
+            .assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn slice_refuses_to_guess_the_things_only_the_user_knows() {
+        let app = fake_slice_app();
+        let body = b"solid cube".to_vec();
+        for (q, want) in [
+            (
+                "name=cube.stl&filament=Bambu%20PLA%20Basic%20@BBL%20A1M&bed_type=Textured%20PEI%20Plate",
+                "layer",
+            ),
+            (
+                "name=cube.stl&layer=0.12&bed_type=Textured%20PEI%20Plate",
+                "filament",
+            ),
+            (
+                "name=cube.stl&layer=0.12&filament=Bambu%20PLA%20Basic%20@BBL%20A1M",
+                "bed_type",
+            ),
+        ] {
+            let res = app
+                .post(&format!("/api/slice?{q}"))
+                .bytes(body.clone().into())
+                .await;
+            res.assert_status(StatusCode::BAD_REQUEST);
+            let err = res.json::<serde_json::Value>()["error"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(err.contains(want), "expected {want:?} in {err:?}");
+        }
+        // The nozzle picks the machine preset; an idle fake reports none.
+        let res = app
+            .post(
+                "/api/slice?name=cube.stl&layer=0.12&filament=Bambu%20PLA%20Basic%20@BBL%20A1M\
+                 &bed_type=Textured%20PEI%20Plate",
+            )
+            .bytes(body.clone().into())
+            .await;
+        res.assert_status(StatusCode::BAD_REQUEST);
+        assert!(
+            res.json::<serde_json::Value>()["error"]
+                .as_str()
+                .unwrap()
+                .contains("nozzle")
+        );
+    }
+
+    #[tokio::test]
+    async fn slice_rejects_bad_names_extensions_and_layer_heights() {
+        let app = fake_slice_app();
+        let body = b"solid cube".to_vec();
+        let post = async |q: String| {
+            app.post(&format!("/api/slice?{q}"))
+                .bytes(body.clone().into())
+                .await
+        };
+
+        for name in [
+            "..%2F..%2Fetc%2Fpasswd",
+            "sub%2Fcube.stl",
+            "cube%5Cx.stl",
+            "",
+        ] {
+            let q = SLICE_Q.replace("name=cube.stl", &format!("name={name}"));
+            post(q).await.assert_status(StatusCode::BAD_REQUEST);
+        }
+        // Not a model.
+        post(SLICE_Q.replace("cube.stl", "notes.txt"))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+        // Already sliced — that goes to /job/upload-start, not here.
+        let res = post(SLICE_Q.replace("cube.stl", "cube.gcode.3mf")).await;
+        res.assert_status(StatusCode::BAD_REQUEST);
+        assert!(
+            res.json::<serde_json::Value>()["error"]
+                .as_str()
+                .unwrap()
+                .contains("already a sliced")
+        );
+        // Outside what a nozzle can lay down.
+        post(SLICE_Q.replace("layer=0.12", "layer=1.5"))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+        // A filament name that would walk out of the profiles directory.
+        post(SLICE_Q.replace(FILAMENT_Q, "filament=..%2F..%2F..%2F..%2Fetc%2Fpasswd"))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+        // Nothing to slice.
+        app.post(&format!("/api/slice?{SLICE_Q}"))
+            .bytes(Vec::new().into())
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn an_authored_project_3mf_is_refused_rather_than_re_arranged() {
+        let app = fake_slice_app();
+        let mut buf = Vec::new();
+        {
+            use std::io::Write as _;
+            use zip::write::SimpleFileOptions;
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            for name in ["3D/3dmodel.model", "Metadata/project_settings.config"] {
+                zip.start_file(name, SimpleFileOptions::default()).unwrap();
+                zip.write_all(b"{}").unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let res = app
+            .post(&format!(
+                "/api/slice?{}",
+                SLICE_Q.replace("cube.stl", "part.3mf")
+            ))
+            .bytes(buf.clone().into())
+            .await;
+        res.assert_status(StatusCode::BAD_REQUEST);
+        let err = res.json::<serde_json::Value>()["error"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("project"), "{err}");
+
+        // Bare geometry in a 3mf is fine — that is the case the helper is for.
+        let mut bare = Vec::new();
+        {
+            use std::io::Write as _;
+            use zip::write::SimpleFileOptions;
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut bare));
+            zip.start_file("3D/3dmodel.model", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"<model/>").unwrap();
+            zip.finish().unwrap();
+        }
+        app.post(&format!(
+            "/api/slice?{}",
+            SLICE_Q.replace("cube.stl", "part.3mf")
+        ))
+        .bytes(bare.into())
+        .await
+        .assert_status(StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn the_finished_slice_is_password_gated_while_its_status_stays_open() {
+        // An unusual pairing — an authenticated GET — so it needs a test of its
+        // own. Everything else here builds a state with no password, which
+        // means moving this route back into `reads` would go unnoticed.
+        let (app, st) = slice_app(
+            Arc::new(FakeSlicer),
+            Some(crate::core::model::Model::A1Mini),
+        );
+        let guarded = TestServer::new(one(PrinterState {
+            password: Some("hunter2".to_string()),
+            ..st
+        }));
+        drop(app);
+        // Status is printer-shaped and stays open…
+        guarded.get("/api/slice").await.assert_status_ok();
+        // …the file made from the caller's own geometry is not.
+        guarded
+            .get("/api/slice/result")
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
+        guarded
+            .get("/api/slice/result")
+            .add_header("authorization", "Bearer hunter2")
+            // No slice has run, so this is the honest 404 rather than a 401.
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_slot_is_claimed_before_the_upload_not_after_it() {
+        // Otherwise "one slice at a time" bounds the slicer and not the disk:
+        // every concurrent caller sees an idle slot, writes its own copy of a
+        // body worth up to 512 MiB, and only then races to start.
+        let (app, st) = slice_app(
+            Arc::new(FakeSlicer),
+            Some(crate::core::model::Model::A1Mini),
+        );
+
+        let held = st.slice_jobs.reserve().expect("the slot starts free");
+        // While someone is staging, the slot reads as busy and a second upload
+        // is refused before it can write anything.
+        assert_eq!(st.slice_jobs.status().state, "running");
+        let res = app
+            .post(&format!("/api/slice?{SLICE_Q}"))
+            .bytes(b"solid cube".to_vec().into())
+            .await;
+        res.assert_status(StatusCode::CONFLICT);
+        assert!(res.text().contains("already running"), "{}", res.text());
+
+        // Releasing it — which is what a failed or abandoned upload does, since
+        // the guard drops — leaves the slot usable rather than wedged.
+        drop(held);
+        assert_eq!(st.slice_jobs.status().state, "idle");
+        app.post(&format!("/api/slice?{SLICE_Q}"))
+            .bytes(b"solid cube".to_vec().into())
+            .await
+            .assert_status(StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_upload_does_not_wedge_the_slot() {
+        // Every early return between the claim and the start drops the guard.
+        // If one did not, a single bad request would take the printer's slicing
+        // out of service until a restart.
+        let app = fake_slice_app();
+        app.post(&format!(
+            "/api/slice?{}",
+            SLICE_Q.replace("cube.stl", "notes.txt")
+        ))
+        .bytes(b"nope".to_vec().into())
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
+        // Still usable.
+        app.post(&format!("/api/slice?{SLICE_Q}"))
+            .bytes(b"solid cube".to_vec().into())
+            .await
+            .assert_status(StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn a_nozzle_without_verified_profiles_is_refused_rather_than_sliced_at_0_4() {
+        // The bundle ships a process set per nozzle; only the 0.4 set is
+        // mapped. Slicing a 0.6 with 0.4 speeds and flow would succeed and be
+        // wrong — the failure mode this whole module is arranged against.
+        let app = fake_slice_app();
+        for n in ["0.2", "0.6", "0.8"] {
+            let res = app
+                .post(&format!(
+                    "/api/slice?{}",
+                    SLICE_Q.replace("nozzle=0.4", &format!("nozzle={n}"))
+                ))
+                .bytes(b"solid cube".to_vec().into())
+                .await;
+            res.assert_status(StatusCode::BAD_REQUEST);
+            assert!(
+                res.text().contains("no verified slicing profiles"),
+                "{n}: {}",
+                res.text()
+            );
+            assert!(res.text().contains(n), "names the nozzle: {}", res.text());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_format_the_slicer_cannot_read_is_refused_up_front() {
+        // The slicer rejects anything but .stl/.obj/.amf (and .3mf on its own
+        // path) before it opens the file. Accepting `.step` here would answer
+        // 202 and fail in the background — a worse answer than refusing.
+        let (app, _) = slice_app(
+            Arc::new(FakeSlicer),
+            Some(crate::core::model::Model::A1Mini),
+        );
+        for bad in ["part.step", "part.stp"] {
+            let res = app
+                .post(&format!("/api/slice?{}", SLICE_Q.replace("cube.stl", bad)))
+                .bytes(b"whatever".to_vec().into())
+                .await;
+            res.assert_status(StatusCode::BAD_REQUEST);
+            assert!(
+                res.text().contains("STEP is not supported"),
+                "{}",
+                res.text()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn printing_a_slice_needs_exactly_one_tray() {
+        // The slice uses one filament, and a mismatched map is left unexpanded
+        // — the printer then falls back to whatever the gcode baked in, which
+        // is how a plate got printed in the wrong material once already.
+        let app = fake_slice_app();
+        app.post(&format!("/api/slice?{SLICE_Q}"))
+            .bytes(b"solid cube".to_vec().into())
+            .await
+            .assert_status(StatusCode::ACCEPTED);
+        await_slice(&app).await;
+        for map in [json!([]), json!([0, 3])] {
+            let res = app
+                .post("/api/slice/print")
+                .json(&json!({ "use_ams": true, "ams_map": map, "dry_run": true }))
+                .await;
+            res.assert_status(StatusCode::BAD_REQUEST);
+            assert!(res.text().contains("exactly one tray"), "{}", res.text());
+        }
+        // One is fine.
+        app.post("/api/slice/print")
+            .json(&json!({ "use_ams": true, "ams_map": [0], "dry_run": true }))
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn the_staged_model_keeps_the_extension_the_slicer_dispatches_on() {
+        // libslic3r picks its model reader from the extension and refuses an
+        // extensionless path outright — verified against the installed slicer,
+        // where byte-identical files differing only in name gave "Unknown file
+        // format" and a load. Staging without a suffix therefore made EVERY
+        // real slice fail, and no test noticed because every double ignored
+        // `p.input`. This one looks at it.
+        struct Inspects(Arc<std::sync::Mutex<Option<String>>>);
+        impl Slicer for Inspects {
+            fn info(&self) -> Result<SlicerInfo, String> {
+                Ok(SlicerInfo {
+                    kind: "inspects".to_string(),
+                    thumbnails: false,
+                })
+            }
+            fn slice(&self, p: &SliceParams) -> Result<super::super::slice::SliceOutput, String> {
+                *self.0.lock().unwrap() = Some(p.input.to_string_lossy().into_owned());
+                Err("stop here; the path is what this test is about".to_string())
+            }
+        }
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let (app, _) = slice_app(
+            Arc::new(Inspects(Arc::clone(&seen))),
+            Some(crate::core::model::Model::A1Mini),
+        );
+        app.post(&format!("/api/slice?{SLICE_Q}"))
+            .bytes(b"solid cube".to_vec().into())
+            .await
+            .assert_status(StatusCode::ACCEPTED);
+        await_slice(&app).await;
+        let path = seen.lock().unwrap().clone().expect("the slicer saw a path");
+        assert!(
+            path.ends_with(".stl"),
+            "the staged model must carry the uploaded file's extension, got {path:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_slice_while_one_runs_is_refused() {
+        // A slicer that only finishes when the test lets it, so the slot is
+        // provably still occupied at the second request.
+        struct Gated(Arc<std::sync::atomic::AtomicBool>);
+        impl Slicer for Gated {
+            fn info(&self) -> Result<SlicerInfo, String> {
+                Ok(SlicerInfo {
+                    kind: "gated".to_string(),
+                    thumbnails: false,
+                })
+            }
+            fn slice(&self, _p: &SliceParams) -> Result<super::super::slice::SliceOutput, String> {
+                while !self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err("released".to_string())
+            }
+        }
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (app, _) = slice_app(
+            Arc::new(Gated(Arc::clone(&gate))),
+            Some(crate::core::model::Model::A1Mini),
+        );
+        app.post(&format!("/api/slice?{SLICE_Q}"))
+            .bytes(b"solid cube".to_vec().into())
+            .await
+            .assert_status(StatusCode::ACCEPTED);
+        app.post(&format!("/api/slice?{SLICE_Q}"))
+            .bytes(b"solid cube".to_vec().into())
+            .await
+            .assert_status(StatusCode::CONFLICT);
+        // And the finished file cannot be fetched mid-run.
+        app.get("/api/slice/result")
+            .await
+            .assert_status(StatusCode::CONFLICT);
+
+        gate.store(true, std::sync::atomic::Ordering::SeqCst);
+        let job = await_slice(&app).await;
+        assert_eq!(job["state"], "failed");
+        assert_eq!(job["error"], "released");
+    }
+
+    #[tokio::test]
+    async fn slice_then_download_then_print_it() {
+        let app = fake_slice_app();
+        // Nothing sliced yet.
+        app.get("/api/slice/result")
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+        app.post("/api/slice/print")
+            .json(&json!({ "confirm": true }))
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+
+        app.post(&format!("/api/slice?{SLICE_Q}"))
+            .bytes(b"solid cube".to_vec().into())
+            .await
+            .assert_status(StatusCode::ACCEPTED);
+        let job = await_slice(&app).await;
+        assert_eq!(job["state"], "done", "{job}");
+        assert_eq!(job["out_name"], "cube.gcode.3mf");
+        // Read back out of the verified gcode, not echoed from the request.
+        assert_eq!(job["layers"], 42);
+        assert_eq!(job["bed_temp_c"], 65);
+
+        let res = app.get("/api/slice/result").await;
+        res.assert_status_ok();
+        assert!(
+            res.headers()[CONTENT_DISPOSITION]
+                .to_str()
+                .unwrap()
+                .contains("cube.gcode.3mf")
+        );
+        assert!(crate::core::project::inspect_plate(res.as_bytes(), 1).is_ok());
+
+        // Printing it is gated exactly like any other start.
+        app.post("/api/slice/print")
+            .json(&json!({}))
+            .await
+            .assert_status(StatusCode::PRECONDITION_REQUIRED);
+        let plan = app
+            .post("/api/slice/print")
+            .json(&json!({ "dry_run": true }))
+            .await
+            .json::<serde_json::Value>();
+        assert_eq!(plan["plan"]["file"], "/cube.gcode.3mf");
+        assert_eq!(plan["plan"]["plate"], 1);
+        // The md5 the printer will verify the file against is stamped from the
+        // local bytes, not taken on trust.
+        assert_eq!(plan["plan"]["md5"].as_str().unwrap().len(), 32);
+
+        // The plan names the slice it is for, and confirming echoes it back.
+        let expect = plan["plan"]["expect"].as_u64().unwrap();
+        assert_eq!(expect, slice_id(&app).await);
+        app.post("/api/slice/print")
+            .json(&json!({ "confirm": true, "expect": expect }))
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn slice_print_validates_the_ams_map_like_every_other_start() {
+        let app = fake_slice_app();
+        app.post(&format!("/api/slice?{SLICE_Q}"))
+            .bytes(b"solid cube".to_vec().into())
+            .await
+            .assert_status(StatusCode::ACCEPTED);
+        await_slice(&app).await;
+        app.post("/api/slice/print")
+            .json(&json!({ "confirm": true, "use_ams": true, "ams_map": [9] }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn confirming_a_print_must_name_the_slice_the_plan_described() {
+        // One slot, several callers: a second slice between the plan and the
+        // confirmation replaces the result, and the confirmation would then
+        // print a file whose plan nobody saw. Proven, not assumed.
+        let app = fake_slice_app();
+        let slice = |name: &str| {
+            app.post(&format!("/api/slice?{}", SLICE_Q.replace("cube.stl", name)))
+                .bytes(b"solid cube".to_vec().into())
+        };
+        slice("first.stl").await.assert_status(StatusCode::ACCEPTED);
+        await_slice(&app).await;
+
+        let plan = app
+            .post("/api/slice/print")
+            .json(&json!({ "dry_run": true }))
+            .await;
+        plan.assert_status_ok();
+        let first: u64 = plan.json::<serde_json::Value>()["plan"]["expect"]
+            .as_u64()
+            .expect("the plan says which slice it is for");
+
+        // Someone else slices. The slot was free, so this is allowed.
+        slice("second.stl")
+            .await
+            .assert_status(StatusCode::ACCEPTED);
+        await_slice(&app).await;
+
+        // Confirming against the plan we were shown must not print the other one.
+        let stale = app
+            .post("/api/slice/print")
+            .json(&json!({ "confirm": true, "expect": first }))
+            .await;
+        stale.assert_status(StatusCode::CONFLICT);
+        assert!(
+            stale.text().contains("no longer the one loaded"),
+            "{}",
+            stale.text()
+        );
+
+        // Confirming with no id at all is refused too — that is the same race
+        // with the check simply omitted.
+        app.post("/api/slice/print")
+            .json(&json!({ "confirm": true }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+
+        // Re-planning shows the current slice, and confirming that one works.
+        let plan2 = app
+            .post("/api/slice/print")
+            .json(&json!({ "dry_run": true }))
+            .await;
+        let second = plan2.json::<serde_json::Value>()["plan"]["expect"]
+            .as_u64()
+            .unwrap();
+        assert_ne!(first, second, "a new slice gets a new id");
+        app.post("/api/slice/print")
+            .json(&json!({ "confirm": true, "expect": second }))
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn slice_print_refuses_while_the_printer_is_busy() {
+        let (app, st) = slice_app(
+            Arc::new(FakeSlicer),
+            Some(crate::core::model::Model::A1Mini),
+        );
+        app.post(&format!("/api/slice?{SLICE_Q}"))
+            .bytes(b"solid cube".to_vec().into())
+            .await
+            .assert_status(StatusCode::ACCEPTED);
+        await_slice(&app).await;
+        // Re-serve the SAME finished slot behind a busy printer: the refusal has
+        // to come from the idle guard in the shared upload-and-start helper, not
+        // from there being nothing to print.
+        let busy = PrinterStatus {
+            gcode_state: Some("RUNNING".to_string()),
+            ..Default::default()
+        };
+        let (tx, rx) = watch::channel(busy);
+        let busy_state = PrinterState {
+            source: Arc::new(FakeSource { tx, _keepalive: rx }),
+            slice_jobs: st.slice_jobs.clone(),
+            ..st.clone()
+        };
+        let id = slice_id(&app).await;
+        TestServer::new(one(busy_state))
+            .post("/api/slice/print")
+            .json(&json!({ "confirm": true, "expect": id }))
+            .await
+            .assert_status(StatusCode::CONFLICT);
     }
 }

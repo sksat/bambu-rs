@@ -22,6 +22,7 @@ pub mod hook;
 pub mod live;
 #[cfg(feature = "relay")]
 pub mod relay;
+pub mod slice;
 pub mod start;
 pub mod stream_record;
 #[cfg(feature = "relay")]
@@ -64,6 +65,15 @@ pub struct ServeOpts {
     /// browser that can't reach the LAN cam (e.g. over Tailscale) still gets a live
     /// view; the dashboard can add/remove more at runtime.
     pub external_cameras: Vec<ExternalCamera>,
+    /// Explicit slicer binary, instead of auto-detecting one. Given, it must
+    /// exist — an explicit choice never silently falls back to another install.
+    pub slicer_bin: Option<std::path::PathBuf>,
+    /// Explicit `.../profiles/BBL` bundle to slice from.
+    pub slicer_profiles: Option<std::path::PathBuf>,
+    /// Wall-clock cap on one slice. Unlike a physical tuning constant this HAS a
+    /// default, because a wrong value cannot cause an unsafe action: too small
+    /// only fails the slice.
+    pub slice_timeout: Duration,
     /// Emulate a Local-Mode printer so Bambu Studio (and any other LAN client)
     /// can connect *through* this server instead of fighting it for the
     /// printer's attention. `None` = off.
@@ -167,6 +177,9 @@ pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
         fake,
         interval,
         external_cameras,
+        slicer_bin,
+        slicer_profiles,
+        slice_timeout,
         ..
     } = opts;
     // There has to be *a* printer, real or synthetic, and an identity to present
@@ -243,6 +256,22 @@ pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
         let mut seed_cameras = Some(external_cameras);
         let mut printers = BTreeMap::new();
         let mut default = String::new();
+        // One slicer for the whole server: it is a single heavyweight binary on
+        // this host, not a per-printer resource. A host without one is NOT a
+        // reason to refuse to serve — the API says so and degrades, like the
+        // missing-ffmpeg path.
+        let slicer: Arc<dyn slice::Slicer> = if fake {
+            Arc::new(slice::FakeSlicer)
+        } else {
+            match slice::LiveSlicer::discover(slicer_bin, slicer_profiles, slice_timeout) {
+                Ok(s) => Arc::new(s),
+                Err(reason) => {
+                    eprintln!("note: slicing unavailable — {reason}");
+                    Arc::new(slice::NoSlicer(reason))
+                }
+            }
+        };
+        let registry = crate::core::capability::default_registry();
         if targets.is_empty() || fake {
             if !fake {
                 eprintln!(
@@ -310,6 +339,14 @@ pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
                     timelapse: Default::default(),
                     hook_running: Default::default(),
                     hook: Arc::new(NoHook),
+                    slicer: Arc::clone(&slicer),
+                    slice_jobs: Default::default(),
+                    // The fake printer impersonates an A1 mini everywhere else
+                    // (FakeSource, fake AMS), so it slices as one too — which is
+                    // what `--fake` serves.
+                    slicer_names: registry
+                        .slicer_names(&crate::core::model::Model::A1Mini)
+                        .copied(),
                 },
             );
         } else {
@@ -358,9 +395,15 @@ pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
                         timelapse: Default::default(),
                         hook_running: Default::default(),
                         hook: match hook {
-                            Some(spec) => Arc::new(LiveHook::new(t, spec)),
+                            Some(spec) => Arc::new(LiveHook::new(t.clone(), spec)),
                             None => Arc::new(NoHook),
                         },
+                        // The machine profile follows THIS printer's model, so
+                        // the unprefixed and per-printer routes cannot slice
+                        // geometry for the wrong machine's bed.
+                        slicer_names: registry.slicer_names(&t.model).copied(),
+                        slicer: Arc::clone(&slicer),
+                        slice_jobs: Default::default(),
                     },
                 );
             }

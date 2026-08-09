@@ -79,6 +79,7 @@ server = [
     "tokio/fs",
     "tokio/io-util",
     "dep:ureq",
+    "dep:libc",
 ]
 # Printer emulation — `bambu serve --emulate` presents the printer's own LAN
 # interfaces (MQTT/TLS and implicit FTPS) and relays every client over the one
@@ -152,6 +153,13 @@ zip = { version = "7.2.0", default-features = false, features = ["deflate"] }
 # uniformly without a per-target `strip` tool).
 [profile.release]
 strip = true
+
+# Only for the slicer timeout: killing the slicer's whole PROCESS GROUP so
+# `xvfb-run`'s Xvfb dies with it, instead of leaking one Xvfb per timeout —
+# `Child::kill` reaches the child alone. Already in the tree via tokio, so this
+# adds no crate to the build.
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2.186", optional = true }
 
 [build-dependencies]
 # Generates the embedded license notice (in-process via the cargo-about library). Optional —

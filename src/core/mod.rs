@@ -25,6 +25,7 @@ pub mod safety;
 pub mod sequence;
 pub mod session;
 pub mod settle;
+pub mod slice;
 pub mod stage;
 pub mod start;
 pub mod status;

@@ -22,6 +22,7 @@
 
 use crate::core::firmware::FirmwareVersion;
 use crate::core::model::Model;
+use crate::core::slice::SlicerNames;
 
 /// Whether the printer pushes its full state each time (X1 class) or only deltas
 /// that the client must cache and merge (P1/A1 class).
@@ -242,6 +243,11 @@ struct ModelProfile {
     // Safety:
     /// `None` => no confirmed control boundary => control is refused.
     control_boundary: Option<ControlBoundary>,
+    /// Which BBL slicer profiles produce printable gcode for this model.
+    /// `None` => we have never verified a mapping, so slicing is refused rather
+    /// than guessed — the wrong machine profile emits a start gcode for a
+    /// different bed.
+    slicer: Option<SlicerNames>,
 }
 
 /// A set of known model profiles. Construct via [`default_registry`] or build a
@@ -253,6 +259,20 @@ pub struct CapabilityRegistry {
 impl CapabilityRegistry {
     fn profile(&self, model: &Model) -> Option<&ModelProfile> {
         self.profiles.iter().find(|p| &p.model == model)
+    }
+
+    /// Which BBL profile names slice for this model, if any.
+    ///
+    /// Firmware-independent on purpose: slicing happens on this host against the
+    /// slicer's own profile bundle, so no firmware is involved — and `serve`
+    /// does not reliably know the firmware at startup, so routing this through
+    /// [`resolve`] would mean inventing one just to look up a string.
+    ///
+    /// `None` => no verified mapping => slicing is advertised unavailable.
+    /// Extending support is a captured fixture plus a row here, never an inline
+    /// model branch.
+    pub fn slicer_names(&self, model: &Model) -> Option<&SlicerNames> {
+        self.profile(model).and_then(|p| p.slicer.as_ref())
     }
 }
 
@@ -364,6 +384,12 @@ pub fn default_registry() -> CapabilityRegistry {
                 evidence: EvidenceGrade::Observed,
                 max_known_firmware: fw("01.07.02"),
                 control_boundary: a1_boundary(),
+                // The device-verified pairing: sliced on this machine profile,
+                // printed on the real unit.
+                slicer: Some(SlicerNames {
+                    machine_base: "Bambu Lab A1 mini",
+                    preset_suffix: "@BBL A1M",
+                }),
             },
             // VendorSpec: A1 (full) — same family as the observed A1 mini.
             ModelProfile {
@@ -374,6 +400,7 @@ pub fn default_registry() -> CapabilityRegistry {
                 evidence: EvidenceGrade::VendorSpec,
                 max_known_firmware: fw("01.07.02"),
                 control_boundary: a1_boundary(),
+                slicer: None,
             },
             ModelProfile {
                 model: Model::P1P,
@@ -383,6 +410,7 @@ pub fn default_registry() -> CapabilityRegistry {
                 evidence: EvidenceGrade::VendorSpec,
                 max_known_firmware: fw("01.08.04"),
                 control_boundary: p1_boundary(),
+                slicer: None,
             },
             ModelProfile {
                 model: Model::P1S,
@@ -392,6 +420,7 @@ pub fn default_registry() -> CapabilityRegistry {
                 evidence: EvidenceGrade::VendorSpec,
                 max_known_firmware: fw("01.08.04"),
                 control_boundary: p1_boundary(),
+                slicer: None,
             },
             ModelProfile {
                 model: Model::X1Carbon,
@@ -401,6 +430,7 @@ pub fn default_registry() -> CapabilityRegistry {
                 evidence: EvidenceGrade::VendorSpec,
                 max_known_firmware: fw("01.08.05"),
                 control_boundary: x1_boundary(),
+                slicer: None,
             },
             ModelProfile {
                 model: Model::X1E,
@@ -410,6 +440,7 @@ pub fn default_registry() -> CapabilityRegistry {
                 evidence: EvidenceGrade::VendorSpec,
                 max_known_firmware: fw("01.08.05"),
                 control_boundary: x1_boundary(),
+                slicer: None,
             },
             // INFERRED: H2D SSDP code never observed, push mode inferred — keep
             // descriptive info but grant NO control boundary (control refused).
@@ -426,6 +457,7 @@ pub fn default_registry() -> CapabilityRegistry {
                 evidence: EvidenceGrade::Inferred,
                 max_known_firmware: fw("01.02.00"),
                 control_boundary: None,
+                slicer: None,
             },
         ],
     }
@@ -437,6 +469,24 @@ mod tests {
 
     fn fw(s: &str) -> FirmwareVersion {
         FirmwareVersion::parse(s).unwrap()
+    }
+
+    #[test]
+    fn only_the_device_verified_model_has_slicer_profiles() {
+        let reg = default_registry();
+        assert_eq!(
+            reg.slicer_names(&Model::A1Mini),
+            Some(&SlicerNames {
+                machine_base: "Bambu Lab A1 mini",
+                preset_suffix: "@BBL A1M",
+            })
+        );
+        // Every other model — including ones we happily control — has no
+        // verified mapping, so slicing must be refused rather than guessed.
+        for model in [Model::A1, Model::P1S, Model::X1Carbon, Model::H2D] {
+            assert_eq!(reg.slicer_names(&model), None, "{model:?}");
+        }
+        assert_eq!(reg.slicer_names(&Model::Unknown("zzz".into())), None);
     }
 
     #[test]
