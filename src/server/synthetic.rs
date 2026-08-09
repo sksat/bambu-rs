@@ -33,6 +33,9 @@ pub struct SyntheticPrinter {
     reports: broadcast::Sender<Value>,
     progress: Mutex<Progress>,
     job: Job,
+    /// The serial this printer answers under. A client reads it from the
+    /// inventory to recognise the machine.
+    serial: String,
 }
 
 /// What the synthetic printer is pretending to be doing.
@@ -68,17 +71,78 @@ const INVENTORY_EVERY: u32 = 5;
 /// cannot justify enabling a feature does not enable it.
 const REAL_A1_VERSION: &str = include_str!("../../tests/fixtures/get_version-a1mini.json");
 
-/// The captured inventory, parsed once, as the `{"info": …}` a printer sends.
-fn real_a1_version() -> Value {
+/// The captured inventory as the `{"info": …}` a printer sends, wearing
+/// `serial` rather than the fixture's scrubbed placeholder.
+///
+/// Scrubbing the capture was right — it should not carry a machine's serials
+/// into the repository — but the placeholder must not reach a client. A client
+/// reads the device's serial from the `ota` and `esp32` modules; given the
+/// literal string `<redacted>` it cannot match the printer it already knows,
+/// treats it as a stranger, and (in Bambu Studio's case) tries to install its
+/// application certificate, asking again forever.
+///
+/// The component serials — mainboard, toolhead, AMS — get the same value. They
+/// are not the device's, and inventing plausible-looking ones would be worse:
+/// this way anything reading them sees one identity, which is the truth about a
+/// printer that is one process.
+fn real_a1_version(serial: &str) -> Value {
     static BASE: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
-    BASE.get_or_init(|| {
-        let info = serde_json::from_str::<Value>(REAL_A1_VERSION)
-            .ok()
-            .and_then(|v| v.get("message")?.get("info").cloned())
-            .expect("the captured fixture has message.info");
-        json!({ "info": info })
-    })
-    .clone()
+    let mut info = BASE
+        .get_or_init(|| {
+            serde_json::from_str::<Value>(REAL_A1_VERSION)
+                .ok()
+                .and_then(|v| v.get("message")?.get("info").cloned())
+                .expect("the captured fixture has message.info")
+        })
+        .clone();
+    if let Some(obj) = info.as_object_mut() {
+        // The live machine answers a request, so its reply carries these; the
+        // capture was taken from that answer minus them.
+        obj.insert("result".into(), Value::from("success"));
+        obj.insert("reason".into(), Value::from("success"));
+        if let Some(modules) = obj.get_mut("module").and_then(Value::as_array_mut) {
+            for module in modules {
+                if let Some(m) = module.as_object_mut() {
+                    m.insert("sn".into(), Value::from(serial));
+                }
+            }
+        }
+    }
+    json!({ "info": info })
+}
+
+/// Where to read a capture of a real printer's report, if one was configured.
+///
+/// Set by `--fake-report`; read here rather than threaded through because the
+/// synthetic printer is built in one place and this is the only thing it needs
+/// from the outside.
+pub static CAPTURED_REPORT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// The configured capture's `print` object, or `None` if there is no usable one.
+///
+/// A capture that cannot be read or parsed is a hard error rather than a quiet
+/// fall back to the fixture: somebody who passed the flag wants that machine's
+/// report, and silently serving a different one would be the sort of thing that
+/// takes an evening to notice.
+fn captured_report() -> Option<serde_json::Map<String, Value>> {
+    let path = CAPTURED_REPORT.get()?;
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("reading the capture at {}: {e}", path.display()));
+    let value: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("the capture at {} is not JSON: {e}", path.display()));
+    // Accept both the raw report and the `{_meta, message}` envelope the
+    // capture tools write, because both are what people have on disk.
+    let print = value
+        .get("print")
+        .or_else(|| value.pointer("/message/print"))
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| {
+            panic!(
+                "the capture at {} has no `print` object; is it a pushall?",
+                path.display()
+            )
+        });
+    Some(print.clone())
 }
 
 /// One real A1 mini's idle `pushall`, as captured from the machine.
@@ -97,6 +161,19 @@ const REAL_A1_IDLE: &str = include_str!("../../tests/fixtures/pushall-n1-idle.js
 /// The captured report's `print` object, parsed once.
 fn real_a1_idle() -> serde_json::Map<String, Value> {
     static BASE: std::sync::OnceLock<serde_json::Map<String, Value>> = std::sync::OnceLock::new();
+    // A capture of a real machine, if one was given. The bundled fixture is one
+    // A1 mini on one day; a client deciding what a printer can do may care
+    // about a field that machine did not have, or a value it happened to hold.
+    // Pointing the stand-in at your own capture is the difference between
+    // testing against a printer and testing against this printer.
+    //
+    // Bambu Studio is the reason this exists: with the bundled fixture it kept
+    // demanding `security.app_cert_install` and would not proceed, and with a
+    // capture taken from the machine that same evening it was satisfied. Which
+    // field it reads has not been established — see docs/protocol.md.
+    if let Some(obj) = captured_report() {
+        return obj;
+    }
     BASE.get_or_init(|| {
         serde_json::from_str::<Value>(REAL_A1_IDLE)
             .ok()
@@ -128,8 +205,8 @@ impl SyntheticPrinter {
     /// Start reporting a print in progress. A snapshot goes out immediately —
     /// the relay's cache is seeded from it, exactly as a real connection's
     /// opening `pushall` would — and a delta follows every `interval`.
-    pub fn start(interval: Duration) -> Arc<Self> {
-        Self::spawn(interval, Job::Printing)
+    pub fn start(serial: &str, interval: Duration) -> Arc<Self> {
+        Self::spawn(serial, interval, Job::Printing)
     }
 
     /// The same printer, idle: nothing running, and the deltas are the small
@@ -139,15 +216,16 @@ impl SyntheticPrinter {
     /// nothing for half a minute and disconnects its clients — correctly, since
     /// on a real link that means the machine is gone — so an idle printer that
     /// went quiet would take the whole demo down with it.
-    pub fn idle(interval: Duration) -> Arc<Self> {
-        Self::spawn(interval, Job::Idle)
+    pub fn idle(serial: &str, interval: Duration) -> Arc<Self> {
+        Self::spawn(serial, interval, Job::Idle)
     }
 
-    fn spawn(interval: Duration, job: Job) -> Arc<Self> {
+    fn spawn(serial: &str, interval: Duration, job: Job) -> Arc<Self> {
         let (reports, _) = broadcast::channel(DEPTH);
         let me = Arc::new(Self {
             reports,
             job,
+            serial: serial.to_string(),
             progress: Mutex::new(Progress {
                 layer: 0,
                 percent: 0,
@@ -164,7 +242,7 @@ impl SyntheticPrinter {
             // `get_version` from its cache, and the cache only has one if the
             // printer has said so. Without it a client sees a printer of no
             // known firmware and switches features off.
-            let _ = ticker.reports.send(real_a1_version());
+            let _ = ticker.reports.send(real_a1_version(&ticker.serial));
             let _ = ticker.reports.send(ticker.snapshot());
             let mut tick = tokio::time::interval(interval);
             tick.tick().await; // the immediate one; we just sent the snapshot
@@ -179,7 +257,7 @@ impl SyntheticPrinter {
                 // as long as the process lives. Cheap to repeat, and the cache
                 // ignores a repeat it already has.
                 if ticks.is_multiple_of(INVENTORY_EVERY) {
-                    let _ = ticker.reports.send(real_a1_version());
+                    let _ = ticker.reports.send(real_a1_version(&ticker.serial));
                     let _ = ticker.reports.send(ticker.snapshot());
                 }
                 let delta = ticker.advance();
@@ -222,6 +300,10 @@ impl SyntheticPrinter {
             // live. A placeholder here is enough: the relay rewrites it to
             // whatever address it was told to advertise.
             "net": {"conf": 0, "info": [{"ip": 16_777_343, "mask": 65_535}]},
+            // Scrubbed out of the capture, and a placeholder is not a signal
+            // strength. Somebody's radio is not being described here; this is a
+            // printer sitting next to its access point.
+            "wifi_signal": "-50dBm",
         })
         .as_object()
         .expect("the overlay is an object")
@@ -307,11 +389,58 @@ impl Upstream for SyntheticPrinter {
 
 #[cfg(test)]
 mod tests {
+    /// Nothing a client is shown may still be wearing the scrubbing.
+    ///
+    /// The fixtures are stripped of the machine's identifiers before they enter
+    /// the repository, which is right — and twice now a placeholder has gone
+    /// out on the wire instead. Bambu Studio read `<redacted>` where the
+    /// device's serial belongs, decided it had never met this printer, and
+    /// spent the evening trying to pair with it. The next scrubbed field would
+    /// do the same thing quietly, so this fails instead.
+    #[tokio::test]
+    async fn no_scrubbing_placeholder_ever_reaches_a_client() {
+        fn placeholders(value: &serde_json::Value, path: &str, found: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (k, v) in map {
+                        if k.contains("redact") {
+                            found.push(format!("{path}.{k}"));
+                        }
+                        placeholders(v, &format!("{path}.{k}"), found);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for (i, v) in items.iter().enumerate() {
+                        placeholders(v, &format!("{path}[{i}]"), found);
+                    }
+                }
+                serde_json::Value::String(text) if text.to_lowercase().contains("redact") => {
+                    found.push(path.to_string())
+                }
+                _ => {}
+            }
+        }
+
+        let printer =
+            super::SyntheticPrinter::idle("0309FATEST00001", super::Duration::from_secs(3600));
+        let mut found = Vec::new();
+        placeholders(&printer.snapshot(), "snapshot", &mut found);
+        placeholders(
+            &super::real_a1_version("0309FATEST00001"),
+            "get_version",
+            &mut found,
+        );
+        assert!(
+            found.is_empty(),
+            "these would be sent to a client as if they were real: {found:?}"
+        );
+    }
+
     use super::*;
 
     #[tokio::test]
     async fn it_seeds_with_a_full_snapshot_then_sends_deltas() {
-        let printer = SyntheticPrinter::start(Duration::from_millis(20));
+        let printer = SyntheticPrinter::start("0309FATEST00001", Duration::from_millis(20));
         let mut rx = printer.subscribe();
         // The seed may already have gone out before we subscribed, so ask for
         // one the way a relay does.
@@ -341,7 +470,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_command_is_acked_the_way_the_printer_acks() {
-        let printer = SyntheticPrinter::start(Duration::from_secs(3600));
+        let printer = SyntheticPrinter::start("0309FATEST00001", Duration::from_secs(3600));
         let mut rx = printer.subscribe();
         printer.send(json!({"print": {"sequence_id": "42", "command": "pause"}}));
 

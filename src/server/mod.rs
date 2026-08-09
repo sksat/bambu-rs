@@ -333,9 +333,9 @@ pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
                     // — and a printer that is "printing" while someone plays
                     // DOOM through it is a confusing thing to show.
                     let printer = if em.doom.is_some() {
-                        synthetic::SyntheticPrinter::idle(tick)
+                        synthetic::SyntheticPrinter::idle(&t.serial, tick)
                     } else {
-                        synthetic::SyntheticPrinter::start(tick)
+                        synthetic::SyntheticPrinter::start(&t.serial, tick)
                     };
                     let source = Arc::new(LiveSource::from_reports(printer.subscribe()));
                     start_emulator(

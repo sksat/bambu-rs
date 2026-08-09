@@ -259,16 +259,21 @@ fn hold_for_move(axis: Axis, delta: f64) -> Option<Hold> {
         return None;
     }
     let key = match (axis, delta > 0.0) {
-        // Y is the bed moving towards and away from you on an A1, which is as
-        // close to "forward" as a printer gets.
-        (Axis::Y, true) => Key::Forward,
-        (Axis::Y, false) => Key::Back,
+        // Y and Z are inverted; X is not. The printer's frame of reference is
+        // the machine's, not the player's — a growing Y carries the bed
+        // *towards* the operator, so the scene comes at you and the player
+        // walks backwards; Z raises the toolhead, and up-on-the-panel reads as
+        // sidestepping the other way once you are inside the game. Turning is
+        // the exception, because the panel's left really is the player's left.
+        // Established at the machine, one axis at a time.
+        (Axis::Y, true) => Key::Back,
+        (Axis::Y, false) => Key::Forward,
         // X turns rather than strafes: with only four movement buttons,
         // turning is what makes a corridor navigable at all.
         (Axis::X, true) => Key::TurnRight,
         (Axis::X, false) => Key::TurnLeft,
-        (Axis::Z, true) => Key::StrafeRight,
-        (Axis::Z, false) => Key::StrafeLeft,
+        (Axis::Z, true) => Key::StrafeLeft,
+        (Axis::Z, false) => Key::StrafeRight,
         // Pushing filament out is firing; pulling it back is the use key, so
         // the filament panel is a second trigger and a door opener.
         (Axis::E, true) => Key::Fire,
@@ -636,12 +641,12 @@ mod tests {
     fn the_bed_axis_walks_and_the_other_one_turns() {
         // The whole game is reachable from the four arrows on Studio's movement
         // panel, so these four are what the demo lives or dies by.
-        assert_eq!(keys(&jog("Y", 10.0)), vec![Key::Forward]);
-        assert_eq!(keys(&jog("Y", -10.0)), vec![Key::Back]);
+        assert_eq!(keys(&jog("Y", 10.0)), vec![Key::Back]);
+        assert_eq!(keys(&jog("Y", -10.0)), vec![Key::Forward]);
         assert_eq!(keys(&jog("X", 10.0)), vec![Key::TurnRight]);
         assert_eq!(keys(&jog("X", -10.0)), vec![Key::TurnLeft]);
-        assert_eq!(keys(&jog("Z", 10.0)), vec![Key::StrafeRight]);
-        assert_eq!(keys(&jog("Z", -10.0)), vec![Key::StrafeLeft]);
+        assert_eq!(keys(&jog("Z", 10.0)), vec![Key::StrafeLeft]);
+        assert_eq!(keys(&jog("Z", -10.0)), vec![Key::StrafeRight]);
     }
 
     #[test]
@@ -717,7 +722,7 @@ mod tests {
         let payload = json!({"print": {
             "command": "gcode_line", "param": "G91\nG1 X10 Y-10 F3000\nG90",
         }});
-        assert_eq!(keys(&payload), vec![Key::TurnRight, Key::Back]);
+        assert_eq!(keys(&payload), vec![Key::TurnRight, Key::Forward]);
     }
 
     #[test]
@@ -733,7 +738,7 @@ mod tests {
             "G91\r\nG1 Y10\r\nG90",
         ] {
             let payload = json!({"print": {"command": "gcode_line", "param": param}});
-            assert_eq!(keys(&payload), vec![Key::Forward], "{param:?}");
+            assert_eq!(keys(&payload), vec![Key::Back], "{param:?}");
         }
     }
 
@@ -746,7 +751,7 @@ mod tests {
         assert!(keys(&payload).is_empty());
         // …and the mode is per-payload: the trailing G90 of a jog restores
         // absolute mode *after* the move, which must still count.
-        assert_eq!(keys(&jog("Y", 5.0)), vec![Key::Forward]);
+        assert_eq!(keys(&jog("Y", 5.0)), vec![Key::Back]);
     }
 
     #[test]

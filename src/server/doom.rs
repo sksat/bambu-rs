@@ -477,7 +477,7 @@ mod tests {
         let writer = out.clone();
         let thread = std::thread::spawn(move || keyboard(writer, &rx));
         tx.send(Hold {
-            key: Key::Forward,
+            key: Key::Back,
             ms: 30,
         })
         .unwrap();
@@ -485,10 +485,7 @@ mod tests {
         thread.join().unwrap();
         // Down, then up: a key that is never released walks the player into a
         // wall until the process ends.
-        assert_eq!(
-            out.bytes(),
-            vec![1, Key::Forward.code(), 0, Key::Forward.code()]
-        );
+        assert_eq!(out.bytes(), vec![1, Key::Back.code(), 0, Key::Back.code()]);
     }
 
     #[test]
@@ -529,7 +526,7 @@ mod tests {
         engine.consume(&json!({"print": {"command": "project_file", "url": "ftp:///x"}}));
         let held: Vec<Hold> = rx.try_iter().collect();
         assert_eq!(held.len(), 1, "only the jog is a button: {held:?}");
-        assert_eq!(held[0].key, Key::Forward);
+        assert_eq!(held[0].key, Key::Back);
     }
 
     #[test]
