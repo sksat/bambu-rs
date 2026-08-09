@@ -23,11 +23,13 @@ paths resolve against the **config file's directory**, never the cwd:
 ```bash
 mkdir -p ~/.config/bambu-rs/sequences
 cp sequences/a1mini-swapmod-swap.gcode ~/.config/bambu-rs/sequences/swap.gcode
+cp sequences/a1mini-swapmod-load.gcode ~/.config/bambu-rs/sequences/load.gcode
 ```
 
 ```toml
 [printers.<name>.sequences]
 swap = "sequences/swap.gcode"
+load = "sequences/load.gcode"
 ```
 
 Then, always with `--wait` — see `docs/plate-changer.md` for why that word is
@@ -39,9 +41,13 @@ bambu gcode --sequence swap --wait --confirm
 
 ## What is here
 
-| file | machine | accessory |
-|---|---|---|
-| `a1mini-swapmod-swap.gcode` | Bambu Lab A1 mini | Swapmod plate changer — eject the current plate, load the next |
+| file | machine | accessory | what |
+|---|---|---|---|
+| `a1mini-swapmod-load.gcode` | Bambu Lab A1 mini | Swapmod plate changer | load a plate, eject nothing — for the **first** plate of a run |
+| `a1mini-swapmod-swap.gcode` | Bambu Lab A1 mini | Swapmod plate changer | eject the current plate and load the next |
+
+Load first, swap thereafter: the swap assumes there is already a plate on the
+bed and ejects it. `docs/plate-changer.md` has the rest.
 
 The Swapmod's **models are not** in this repository and should not be: they are
 the vendor's, and you need to have bought them. This is the motion macro only —

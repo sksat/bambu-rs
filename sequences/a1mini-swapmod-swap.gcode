@@ -6,10 +6,16 @@
 ; from that file. `G90` and `G28` are added here as preconditions — absolute
 ; positioning and a known origin, without which the coordinates mean nothing.
 ;
-; The changer has no electronics: the toolhead drives it. The trigger is the Z
-; axis dropping 186->180 at X=188 and again at X=170; everything else is
-; positioning. The `G4 S3` dwells let the plate settle and are not padding —
-; shortening them makes the swap unreliable.
+; The changer has no electronics: the toolhead drives it. The trigger is a
+; ROPE, pulled by the Z axis dropping 186->180 at X=188 and again at X=170;
+; everything else is positioning. `G0 Y150 F200` is deliberately slow — that is
+; where the load is taken.
+;
+; About the dwells: the self-test's own later cycles use `G4 S1` and fewer of
+; them, and it completes ten swaps that way, so `S3` is the cautious setting
+; rather than a requirement. This block is the one that has actually been run
+; on the machine (2026-08-07, a full print -> eject -> load -> print cycle), so
+; it is the one shipped, unshortened.
 ;
 ; These coordinates are for THIS machine and this accessory. Read them before
 ; you run them.

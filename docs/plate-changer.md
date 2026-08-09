@@ -4,16 +4,39 @@ Notes from running a **Swapmod** changer on a **Bambu Lab A1 mini**. The
 mechanism is generic — a macro that moves the toolhead, run before a print —
 so most of this applies to any accessory driven the same way.
 
-Everything measured is marked as such. `sequences/a1mini-swapmod-swap.gcode` is
-the macro these notes describe.
+Everything measured is marked as such, with the date it was measured. The two
+macros are in `sequences/`.
+
+## Two sequences, not one
+
+| | what | trigger | verified |
+|---|---|---|---|
+| `a1mini-swapmod-load.gcode` | load a plate, eject nothing | **not used** | 2026-08-06 |
+| `a1mini-swapmod-swap.gcode` | eject the current plate, load the next | used | 2026-08-07 |
+
+The **load** one is for the first plate of a run: the swap assumes a plate is
+already on the bed and ejects it. It is also the gentler of the two — the head
+parks out of the way at X=-10 / Z=30 and stays there, and the bed's Y travel
+alone carries the plate in. About 40 s.
+
+Both come from the vendor's self-test project, which contains eleven blocks: one
+"plate load only", then ten swap cycles. The shipped swap is the **first** of
+those ten; the later nine are the same motion with `G4 S1` and fewer dwells, and
+the self-test completes all ten, so the longer dwells are the cautious setting
+rather than a requirement.
 
 ## The changer has no electronics
 
-The toolhead drives it. The trigger is the **Z axis dropping 186 → 180 at X=188
-and again at X=170**; the rest of the macro is positioning, and the `G4 S3`
-dwells let the plate settle rather than padding the runtime.
+The toolhead drives it, and the trigger is a **rope**, not a rod. It is pulled
+by the **Z axis dropping 186 → 180 at X=188 and again at X=170**; the rest of
+the macro is positioning. `G0 Y150 F200` is deliberately slow — that is where
+the load is taken.
 
-Which is why the coordinates are per-machine and the tool has no built-in
+Per the kit's own guidance, a **slack rope is the failure to look for**: the
+ejector lifter then does not rise far enough to catch the plate's hook. The
+slack shows as a gap under the trigger glider; take it up until the gap closes.
+
+This is also why the coordinates are per-machine and the tool has no built-in
 knowledge of any accessory: naming a `.gcode` file in the profile is the whole
 integration (`Profile::sequences`).
 
@@ -113,6 +136,35 @@ a `FAILED` state, so a bad plate stops the batch. (`--watch-timeout` defaults to
 6 h. There is no `bambu watch` subcommand; `status --watch` deliberately does
 *not* stop at completion.)
 
+## What a full cycle looked like
+
+Run by hand on 2026-08-07, two hooked plates in the magazine:
+
+```
+21:55 → 22:36   hook bar #1   (66 layers, PETG, 9.58 g, 41 min)
+22:37           swap: all 32 commands sent, every one verified   (~1 min)
+22:38 → 23:19   hook bar #2   completed normally
+```
+
+The eject is confirmed by the second print rather than by watching: both bars
+print at the same coordinates, so if #1 were still on the bed the nozzle would
+have hit it. #2 running to completion means the bed was empty — the plate had
+been swapped.
+
+### Calibration is not needed per plate change
+
+It is already in the start command — `bambu job start --dry-run` shows it:
+
+```
+bed_leveling   = True     # re-meshes the bed, absorbing plate-to-plate thickness
+flow_cali      = True
+vibration_cali = True
+```
+
+The separate `bambu calibrate` (motor noise, resonance) measures the **machine**,
+not the plate. Re-run it when the machine changes — a part swapped, the Swapmod
+installed, a new noise, an axis HMS — not between plates.
+
 ## Operational notes
 
 - **The PTFE tube works loose.** It came out twice during swap runs — the
@@ -127,3 +179,28 @@ a `FAILED` state, so a bad plate stops the batch. (`--watch-timeout` defaults to
 - **The printer must be idle** and the bed clear of anything you want to keep.
 - **`--dry-run` first**, especially with a hook configured: it is the only
   preview that says the swap is about to run.
+- **`FTP error: [550]` or an empty `md5=` on a dry run**, typically just after a
+  calibration: pass `--upload` and the local bytes are verified directly instead
+  of reading the file back off the printer.
+
+### Error codes seen while running this
+
+| code | means | what it actually was |
+|---|---|---|
+| `0x03008019` | no plate detected | the plate was **seated crooked** |
+| `0x12008006/07/16` | filament feed failure | the **PTFE tube had come out** |
+| `0x03008015` | no filament source | a wrong `--ams-map` |
+| `0x0300400C` | task cancelled | a manual stop (normal) |
+| `0x0300800B` | cutter jam | unexplained — see below |
+
+`bambu status` prints a lookup URL for anything not in that list.
+
+### Open, and worth knowing before an unattended run
+
+- **`HMS_0300_1900_0002_0002`** (severity 2) is outstanding: *"the eddy current
+  sensor of the Y axis is not sensitive enough; remove foreign objects from the
+  Y-axis linear rail."* The Y axis is the one the changer drives the plate along,
+  so debris or interference there is worth checking first.
+- **`0x0300800B` (cutter jam)** happened twice right after a self-test and has
+  never reproduced during ordinary printing. The head only reaches X=188 during
+  a swap, which is the obvious suspect and is not confirmed.
