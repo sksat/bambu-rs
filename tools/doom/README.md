@@ -179,3 +179,11 @@ doomgeneric and the DOOM source it carries are GPL-2.0; `stb_image_write.h` is
 public domain / MIT. Neither is redistributed here — `build.sh` fetches them at
 build time. `doomgeneric_bambu.c` and the Makefile are part of bambu-rs and MIT,
 and are only ever compiled *with* GPL sources by you, on your machine.
+
+**The binary that comes out is GPL-2.0**, whatever the licence on the file you
+started from: linking MIT code into a GPL work makes the combined work GPL, and
+`bambu-doom-engine` is a combined work. It is yours to run and yours to keep;
+handing it to somebody else means handing over the corresponding source under
+the GPL too. Nothing here builds it for you or ships it, which is why the crate
+stays MIT — `serve --emulate-doom` spawns a program it does not link against,
+and finds nothing at all unless you have built one.

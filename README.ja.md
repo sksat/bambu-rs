@@ -174,26 +174,6 @@ access code を知っている人は、中継越しにプリンターを操作�
 探索（discovery）には意図的に応答しません。
 同じネットワークで実機が同じ serial を広告しているため、IP で追加してください。
 
-### DOOM が動きます
-
-中継はカメラポートに渡されたフレームをそのままクライアントに見せ、制御コマンドは転送する前に必ず一度手元を通ります。
-この 2 つをつなぐと、Bambu Studio の liveview が画面に、軸移動パネルがゲームパッドになります。
-Y 軸の jog で前後に歩き、X 軸で旋回し、home ボタンが射撃、chamber light が扉を開ける use キー、印刷速度の 4 段階が武器スロットの 1〜4 です。
-
-返事は温度計に出ます。
-**プレイヤーの体力がノズル温度**で、満タンで 220 ℃、死ぬと室温まで下がります。
-armour はベッド温度です。
-この仕掛けを何も知らないクライアントでも、画面で一番大きい数字にゲームの状態が出ることになります。
-
-```bash
-tools/doom/build.sh                     # doomgeneric と shareware WAD を取得してビルド
-bambu serve --fake --emulate --emulate-doom --emulate-doom-engine …   # 詳細は tools/doom/README.md
-```
-
-`--emulate-doom` は `--fake` を要求するので、中継の向こう側にいるのは合成プリンターだけです。
-ゲームに取られたコマンドは転送されずに消費されます。
-これは「忘れうるチェック」ではなく制御ポリシーの性質であり、動く機械の前でこのモードを選ぶことはできません。
-
 ## Timelapse
 
 内蔵カメラによる公式の timelapse はそのまま扱えます（`bambu timelapse enable/disable` で録画の切り替え、`job start --timelapse` で印刷ごとの指定、`bambu timelapse get` で録画済み動画の取得）。
