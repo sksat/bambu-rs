@@ -10,8 +10,9 @@
 //! **What is known, and what is not.** The auth packet and the length-prefixed
 //! header are how our client talks to a printer. Everything else is thinner:
 //!
-//! - 12 of the 16 header bytes have never been seen. Our client reads 16 and
-//!   uses the first 4; see [`UNKNOWN_HEADER_TAIL`].
+//! - 12 of the 16 header bytes have never been seen *here*. Our client reads 16
+//!   and uses the first 4; see [`HEADER_TAIL`] for what other implementations
+//!   put there.
 //! - The client takes **one frame per connection** and hangs up, so continuous
 //!   streaming — whether the printer paces frames, expects keepalives, or ever
 //!   re-authenticates — is not something this crate has observed.
@@ -36,14 +37,24 @@ pub const AUTH_PACKET: usize = 80;
 /// The username every LAN service on the printer uses.
 pub const USER: &str = "bblp";
 
-/// The 12 header bytes after the length, which nobody here has ever seen.
+/// The three words after the length.
 ///
-/// **A guess, and deliberately the emptiest one.** Our client reads the header
-/// and uses only the length; the community clients whose source can be read do
-/// the same. Any invented value would be exactly as likely to be wrong as zeros
-/// while looking like knowledge. A test pins this so that changing it has to be
-/// a decision, and `docs/protocol.md` carries it as an open unknown.
-pub const UNKNOWN_HEADER_TAIL: [u8; 12] = [0; 12];
+/// The header is four little-endian `u32`s: the payload length, then `0`, `1`,
+/// `0`. The middle `1` is what published readers of this stream write and
+/// expect; this crate has never seen a real printer's bytes, because the one A1
+/// mini here has a dead camera, so this is **derived from other implementations
+/// rather than observed** — recorded in `docs/protocol.md` as such.
+///
+/// It began as twelve zeros on the reasoning that an invented value is as
+/// likely wrong as an empty one. That reasoning was fine and the result was
+/// still wrong: "nobody has looked" is not the same as "nothing is known", and
+/// asking turned up a documented layout. A test pins it so a change is a
+/// decision.
+pub const HEADER_TAIL: [u8; 12] = [
+    0, 0, 0, 0, // reserved
+    1, 0, 0, 0, // the word every published reader writes here
+    0, 0, 0, 0, // reserved
+];
 
 /// Frames outside this range are refused rather than forwarded.
 ///
@@ -140,7 +151,7 @@ pub fn parse_auth(buf: &[u8]) -> Result<Option<Credentials>, CameraError> {
 pub fn frame_header(len: u32) -> [u8; FRAME_HEADER] {
     let mut header = [0u8; FRAME_HEADER];
     header[0..4].copy_from_slice(&len.to_le_bytes());
-    header[4..].copy_from_slice(&UNKNOWN_HEADER_TAIL);
+    header[4..].copy_from_slice(&HEADER_TAIL);
     header
 }
 
@@ -403,9 +414,15 @@ mod tests {
             &4096u32.to_le_bytes(),
             "little-endian length"
         );
-        // Pinned so that inventing a value for the twelve bytes we have never
-        // seen has to be a deliberate change, not a drive-by.
-        assert_eq!(&header[4..], &[0u8; 12], "the unknown tail stays empty");
+        // Four little-endian words: length, 0, 1, 0. Pinned so that changing
+        // what we claim about bytes nobody here has observed is deliberate.
+        assert_eq!(&header[4..8], &0u32.to_le_bytes());
+        assert_eq!(
+            &header[8..12],
+            &1u32.to_le_bytes(),
+            "the word readers expect"
+        );
+        assert_eq!(&header[12..16], &0u32.to_le_bytes());
         assert_eq!(frame_len(&header).unwrap(), 4096);
     }
 
