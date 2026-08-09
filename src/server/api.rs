@@ -3421,10 +3421,14 @@ async fn slice_print(
     let path_for_inspect = done.path.clone();
     let plate = b.plate;
     let inspection = match tokio::task::spawn_blocking(move || {
-        std::fs::read(&path_for_inspect)
+        // Opened, not read: the slicer's output has no archive-size bound, and
+        // several print requests reach here before any of them takes the start
+        // lock. The entries this pulls out are individually capped.
+        std::fs::File::open(&path_for_inspect)
             .map_err(|e| e.to_string())
-            .and_then(|b2| {
-                crate::core::project::inspect_plate(&b2, plate).map_err(|e| e.to_string())
+            .and_then(|f| {
+                crate::core::project::inspect_plate_from(std::io::BufReader::new(f), plate)
+                    .map_err(|e| e.to_string())
             })
     })
     .await

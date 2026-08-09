@@ -100,8 +100,18 @@ pub fn gcode_md5_hex(bytes: &[u8]) -> String {
 
 /// Inspect one plate of a `.gcode.3mf` given its raw ZIP bytes.
 pub fn inspect_plate(zip_bytes: &[u8], plate: u32) -> Result<PlateInspection, ProjectError> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes))
-        .map_err(|e| ProjectError::InvalidZip(e.to_string()))?;
+    inspect_plate_from(Cursor::new(zip_bytes), plate)
+}
+
+/// [`inspect_plate`] over any seekable reader, so a caller holding the file on
+/// disk never needs the archive in memory: a sliced plate's archive has no size
+/// bound of its own, and the entries read below are individually capped.
+pub fn inspect_plate_from<R: Read + Seek>(
+    zip: R,
+    plate: u32,
+) -> Result<PlateInspection, ProjectError> {
+    let mut archive =
+        zip::ZipArchive::new(zip).map_err(|e| ProjectError::InvalidZip(e.to_string()))?;
 
     let gcode = read_entry(&mut archive, &format!("Metadata/plate_{plate}.gcode"))?
         .ok_or(ProjectError::PlateMissing(plate))?;
@@ -356,9 +366,22 @@ fn decide_build(build: &[u8]) -> BuildItems {
 /// A transform that cannot be parsed counts as oriented: this decides whether
 /// to refuse, and "cannot tell" must not come out as "go ahead and re-orient".
 fn has_oriented_item(text: &str) -> bool {
-    text.match_indices("transform=").any(|(i, m)| {
-        let rest = &text[i + m.len()..];
-        // XML allows either quote character for an attribute value.
+    text.match_indices("transform").any(|(i, m)| {
+        // An attribute name, not the tail of another one (`mytransform=`).
+        if !text[..i]
+            .chars()
+            .next_back()
+            .is_none_or(char::is_whitespace)
+        {
+            return false;
+        }
+        // XML permits whitespace either side of `=`, and either quote
+        // character around the value.
+        let rest = text[i + m.len()..].trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            return false;
+        };
+        let rest = rest.trim_start();
         let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
             return true;
         };
@@ -371,10 +394,14 @@ fn has_oriented_item(text: &str) -> bool {
             return true;
         }
         const IDENTITY: [f64; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
-        nums.iter()
-            .take(9)
-            .zip(IDENTITY)
-            .any(|(got, want)| got.parse::<f64>().map_or(true, |v| (v - want).abs() > 1e-6))
+        nums.iter().take(9).zip(IDENTITY).any(|(got, want)| {
+            // `"NaN"` and `"inf"` parse, and every comparison against NaN is
+            // false — so without the finite check a NaN reads as *matching* the
+            // identity, which is the opposite of what this function promises
+            // for a transform it cannot make sense of.
+            got.parse::<f64>()
+                .map_or(true, |v| !v.is_finite() || (v - want).abs() > 1e-6)
+        })
     })
 }
 
@@ -599,6 +626,26 @@ mod tests {
                     .as_bytes(),
             )])
         };
+        // XML permits whitespace around `=`; a transform written that way was
+        // skipped entirely, so a rotated part came out as bare geometry.
+        let spaced = make_3mf(&[(
+            "3D/3dmodel.model",
+            br#"<model><build><item objectid="1"
+                  transform = "0 -1 0 1 0 0 0 0 1 0 0 0" /></build></model>"#,
+        )]);
+        assert!(
+            is_authored_project(Cursor::new(&spaced)).unwrap(),
+            "spaced ="
+        );
+        // And an attribute that merely ends in the same letters is not it.
+        let other = make_3mf(&[(
+            "3D/3dmodel.model",
+            br#"<model><build><item objectid="1" mytransform="9 9 9"/></build></model>"#,
+        )]);
+        assert!(
+            !is_authored_project(Cursor::new(&other)).unwrap(),
+            "mytransform"
+        );
         let authored = |t: &str| is_authored_project(Cursor::new(&with(t))).unwrap();
 
         // Identity, and identity with a translation: bare.
@@ -610,6 +657,11 @@ mod tests {
         // Unparseable or short: cannot tell, so do not re-orient it.
         assert!(authored("1 0 0 0 1 0 0 0"), "too few numbers");
         assert!(authored("1 0 0 0 1 0 0 0 x 0 0 0"), "not a number");
+        // `NaN` and `inf` PARSE, and every comparison against NaN is false —
+        // so without a finite check they read as *matching* the identity, the
+        // opposite of what an indeterminate transform is promised to do.
+        assert!(authored("NaN 0 0 0 1 0 0 0 1 0 0 0"), "NaN");
+        assert!(authored("1 0 0 0 inf 0 0 0 1 0 0 0"), "inf");
         // And no transform at all is the plainest bare case.
         let plain = make_3mf(&[(
             "3D/3dmodel.model",

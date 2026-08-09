@@ -79,23 +79,24 @@ curl -s "$B/api/slice"
 # Slice a model. layer / filament / bed_type are REQUIRED: they depend on your
 # intent and on the spool and plate actually fitted, so the server never guesses
 # (a defaulted bed_type means a 35 °C Cool Plate and a print that lifts).
-curl -s -X POST --data-binary @cube.stl \
+curl -s -X POST --data-binary @cube.stl -H "authorization: Bearer $PW" \
   "$B/api/slice?name=cube.stl&layer=0.12&filament=Bambu%20PLA%20Basic%20@BBL%20A1M&bed_type=Textured%20PEI%20Plate"
 
-# Poll until state is "done" (or "failed", with the reason in .job.error)
+# Poll until state is "done" (or "failed", with the reason in .job.error).
+# This one is an open read, like every other status — no token needed.
 curl -s "$B/api/slice" | jq .job
 
 # Then either download it… (password-gated like the slice itself: it hands back
 # a file made from geometry you uploaded, not printer state)
 curl -s -o cube.gcode.3mf -H "authorization: Bearer $PW" "$B/api/slice/result"
 # …or print it straight off the server, without a round trip through a browser:
-curl -s -X POST "$B/api/slice/print" -H 'content-type: application/json' -d '{"dry_run":true}'
 # The plan reports `expect`: the id of the slice it describes. Confirming has to
 # echo it back, so a slice that replaced this one between the two calls is a 409
 # rather than a print of a file you never saw a plan for.
-ID=$(curl -s -X POST "$B/api/slice/print" -H 'content-type: application/json' \
-       -d '{"dry_run":true}' | jq .plan.expect)
-curl -s -X POST "$B/api/slice/print" -H 'content-type: application/json' \
+ID=$(curl -s -X POST "$B/api/slice/print" -H "authorization: Bearer $PW" \
+       -H 'content-type: application/json' -d '{"dry_run":true}' | jq .plan.expect)
+curl -s -X POST "$B/api/slice/print" -H "authorization: Bearer $PW" \
+  -H 'content-type: application/json' \
   -d "{\"confirm\":true,\"expect\":$ID,\"use_ams\":true,\"ams_map\":[0]}"
 ```
 
