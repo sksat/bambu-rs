@@ -256,7 +256,9 @@ fn count_items<R: Read>(mut entry: R, cap: u64) -> BuildItems {
     /// match is only acted on when it *starts* inside the decided region —
     /// otherwise it is left for next time, which is what stops it being
     /// half-seen at the edge.
-    const KEEP: usize = b"</build".len() - 1;
+    // Long enough to hold `</` + a namespace prefix + `build`; a marker that
+    // straddles a boundary is seen whole next pass.
+    const KEEP: usize = 64;
     /// A `<build>` bigger than this is not a file we need to weigh up: it is
     /// far past "more than one item" already.
     const BUILD_MAX: usize = 1 << 20;
@@ -285,15 +287,15 @@ fn count_items<R: Read>(mut entry: R, cap: u64) -> BuildItems {
         let mut pos = 0;
         while pos < usable {
             match build.as_mut() {
-                None => match find(&win[pos..], b"<build") {
-                    Some(i) if pos + i < usable => {
-                        pos += i + b"<build".len();
+                None => match find_element(&win[pos..], b"build", false) {
+                    Some((i, end)) if pos + i < usable => {
+                        pos += end;
                         build = Some(Vec::new());
                     }
                     _ => break,
                 },
-                Some(buf) => match find(&win[pos..], b"</build") {
-                    Some(i) if pos + i < usable => {
+                Some(buf) => match find_element(&win[pos..], b"build", true) {
+                    Some((i, _)) if pos + i < usable => {
                         buf.extend_from_slice(&win[pos..pos + i]);
                         return decide_build(buf);
                     }
@@ -309,27 +311,37 @@ fn count_items<R: Read>(mut entry: R, cap: u64) -> BuildItems {
         }
         carry = win.split_off(usable);
     }
-    // EOF: the carry is the tail nothing has decided yet.
-    match build {
-        None => BuildItems::Count(0),
-        Some(mut buf) => match find(&carry, b"</build") {
-            Some(i) => {
-                buf.extend_from_slice(&carry[..i]);
-                decide_build(&buf)
-            }
-            // A `<build>` that never closes is a truncated document; saying
-            // "no items" about it is the answer that re-packs a layout.
-            None => BuildItems::Unknown,
+    // EOF: the carry is the tail nothing has decided yet — and for a short
+    // document that can still be the whole `<build>` section, since nothing is
+    // acted on until it is `KEEP` bytes from the end.
+    let (mut buf, rest) = match build {
+        Some(buf) => (buf, &carry[..]),
+        None => match find_element(&carry, b"build", false) {
+            Some((_, end)) => (Vec::new(), &carry[end..]),
+            None => return BuildItems::Count(0),
         },
+    };
+    match find_element(rest, b"build", true) {
+        Some((i, _)) => {
+            buf.extend_from_slice(&rest[..i]);
+            decide_build(&buf)
+        }
+        // A `<build>` that never closes is a truncated document; saying "no
+        // items" about it is the answer that re-packs a layout.
+        None => BuildItems::Unknown,
     }
 }
 
 /// What a gathered `<build>` section says: how many items, and whether any of
 /// them carries an orientation.
 fn decide_build(build: &[u8]) -> BuildItems {
-    let text = String::from_utf8_lossy(build);
-    let items = text.matches("<item").count();
-    if items > 1 || has_oriented_item(&text) {
+    let mut items = 0usize;
+    let mut at = 0usize;
+    while let Some((_, end)) = find_element(&build[at..], b"item", false) {
+        items += 1;
+        at += end;
+    }
+    if items > 1 || has_oriented_item(&String::from_utf8_lossy(build)) {
         return BuildItems::Count(items.max(2));
     }
     BuildItems::Count(items)
@@ -344,9 +356,14 @@ fn decide_build(build: &[u8]) -> BuildItems {
 /// A transform that cannot be parsed counts as oriented: this decides whether
 /// to refuse, and "cannot tell" must not come out as "go ahead and re-orient".
 fn has_oriented_item(text: &str) -> bool {
-    text.match_indices("transform=\"").any(|(i, m)| {
+    text.match_indices("transform=").any(|(i, m)| {
         let rest = &text[i + m.len()..];
-        let Some(end) = rest.find('"') else {
+        // XML allows either quote character for an attribute value.
+        let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+            return true;
+        };
+        let rest = &rest[quote.len_utf8()..];
+        let Some(end) = rest.find(quote) else {
             return true;
         };
         let nums: Vec<&str> = rest[..end].split_whitespace().collect();
@@ -361,9 +378,57 @@ fn has_oriented_item(text: &str) -> bool {
     })
 }
 
-/// First index of `needle` in `hay`.
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
+/// Where an element tag named `name` starts and ends in `hay`, allowing any
+/// namespace prefix: `<build`, `<c:build`, `</build`, `</c:build`.
+///
+/// XML lets a document bind the 3MF core namespace to a prefix and write
+/// `<c:build><c:item/></c:build>`, which means exactly what the unprefixed form
+/// means. Matching the literal bytes `<build` misses it — and missing it here
+/// reads an authored assembly as bare geometry, which is the answer that lets
+/// `--arrange 1` re-pack it.
+///
+/// Returns `(start, end)`: the index of the `<`, and the index just past the
+/// element name.
+fn find_element(hay: &[u8], name: &[u8], closing: bool) -> Option<(usize, usize)> {
+    fn is_name_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')
+    }
+    let mut at = 0;
+    while let Some(rel) = hay[at..]
+        .windows(name.len())
+        .position(|w| w.eq_ignore_ascii_case(name))
+    {
+        let i = at + rel;
+        at = i + 1;
+        // An element name ends at whitespace, `/` or `>` — otherwise this is a
+        // longer name that merely starts the same way (`<buildplate`).
+        match hay.get(i + name.len()) {
+            Some(b) if b.is_ascii_whitespace() || matches!(b, b'/' | b'>') => {}
+            _ => continue,
+        }
+        // Walk back over an optional `prefix:`, then the `/` of a closing tag,
+        // then require the `<`.
+        let mut j = i;
+        if j > 0 && hay[j - 1] == b':' {
+            j -= 1;
+            while j > 0 && is_name_byte(hay[j - 1]) {
+                j -= 1;
+            }
+            if j == 0 {
+                continue;
+            }
+        }
+        if closing {
+            if j == 0 || hay[j - 1] != b'/' {
+                continue;
+            }
+            j -= 1;
+        }
+        if j > 0 && hay[j - 1] == b'<' {
+            return Some((j - 1, i + name.len()));
+        }
+    }
+    None
 }
 
 /// One plate's gcode as text, or `None` when the `.3mf` has no such plate
@@ -554,6 +619,51 @@ mod tests {
     }
 
     #[test]
+    fn a_namespace_prefixed_document_is_read_the_same_as_a_plain_one() {
+        // `<c:build><c:item/></c:build>` with `c` bound to the 3MF core
+        // namespace means exactly what the unprefixed form means. Matching the
+        // literal bytes `<build` misses it — and missing it reads an authored
+        // assembly as bare geometry, the answer that lets `--arrange` re-pack.
+        let prefixed = make_3mf(&[(
+            "3D/3dmodel.model",
+            br#"<c:model xmlns:c="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+                  <c:build><c:item objectid="1"/><c:item objectid="2"/></c:build></c:model>"#,
+        )]);
+        assert!(is_authored_project(Cursor::new(&prefixed)).unwrap());
+
+        // One prefixed item, rotated: still authored, via the transform.
+        let one = make_3mf(&[(
+            "3D/3dmodel.model",
+            br#"<c:model><c:build><c:item objectid="1"
+                  transform='0 -1 0 1 0 0 0 0 1 0 0 0'/></c:build></c:model>"#,
+        )]);
+        assert!(is_authored_project(Cursor::new(&one)).unwrap());
+
+        // And one prefixed item merely moved is still bare — single-quoted, to
+        // pin that both attribute quote styles are read.
+        let moved = make_3mf(&[(
+            "3D/3dmodel.model",
+            br#"<c:model><c:build><c:item objectid="1"
+                  transform='1 0 0 0 1 0 0 0 1 40 40 0'/></c:build></c:model>"#,
+        )]);
+        assert!(!is_authored_project(Cursor::new(&moved)).unwrap());
+    }
+
+    #[test]
+    fn an_element_whose_name_merely_starts_the_same_is_not_a_match() {
+        // `<buildplate>` is not `<build>`, and `<items>` is not `<item>`.
+        assert_eq!(find_element(b"<buildplate>", b"build", false), None);
+        assert_eq!(find_element(b"<items/>", b"item", false), None);
+        // A closing tag is not an opening one, and vice versa.
+        assert_eq!(find_element(b"</build>", b"build", false), None);
+        assert_eq!(find_element(b"<build>", b"build", true), None);
+        // The plain forms still match, prefix or not.
+        assert_eq!(find_element(b"<build>", b"build", false), Some((0, 6)));
+        assert_eq!(find_element(b"<c:build>", b"build", false), Some((0, 8)));
+        assert_eq!(find_element(b"</c:build>", b"build", true), Some((0, 9)));
+    }
+
+    #[test]
     fn an_unterminated_build_section_is_not_read_as_having_no_items() {
         // A truncated document: saying "zero items" about it is the answer that
         // hands an authored layout to `--arrange`.
@@ -614,6 +724,10 @@ mod tests {
         // One item is still one, however it is chopped up.
         let one = br#"<model><build><item objectid="1"/></build></model>"#;
         assert_eq!(count_items(Dribble(one), 1 << 20), BuildItems::Count(1));
+        // A namespace prefix lengthens every marker, so it is the case most
+        // likely to straddle a boundary.
+        let pfx = br#"<c:model><c:build><c:item objectid="1"/><c:item objectid="2"/></c:build></c:model>"#;
+        assert_eq!(count_items(Dribble(pfx), 1 << 20), BuildItems::Count(2));
     }
 
     #[test]
