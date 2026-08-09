@@ -34,6 +34,7 @@
 
 #include "doomgeneric.h"
 #include "doomkeys.h"
+#include "doomstat.h"  // gamestate, players[], consoleplayer — for the status record
 #include "m_argv.h"
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -53,6 +54,25 @@
 // The smallest frame the relay's own client will accept. A picture below this
 // is treated as an error page, so sending one is worse than sending nothing.
 #define MIN_FRAME 1000
+
+// A status record shares the pipe with the pictures, and says how the player is
+// doing so the relay can report health as the nozzle temperature.
+//
+// Its length word is ZERO, which is the whole trick: no frame may be shorter
+// than MIN_FRAME, so a reader that knows only about frames refuses this outright
+// instead of handing four bytes of binary to a JPEG decoder. The magic sits in
+// the word a frame leaves at zero, and is readable in a hexdump, which is the
+// only debugger this pipe has.
+//
+//   0..4   0
+//   4..8   "DOOM"
+//   8..12  payload length
+//   12..16 0
+//   payload: health int16le, armour int16le  (negative = no player)
+//
+// The Rust side of this is `status_header`/`parse_vitals` in src/core/doom.rs.
+#define STATUS_MAGIC "DOOM"
+#define STATUS_PAYLOAD 4
 
 // Below 90, stb writes 4:2:0 chroma subsampling, which is the baseline JPEG
 // profile a printer's camera produces and the one clients are known to decode.
@@ -139,7 +159,49 @@ static void scale_into_rgb(void) {
     }
 }
 
+// Tell the relay how the player is doing, if it has changed.
+//
+// Sent before the frame-rate gate, so throttling the picture does not also
+// freeze the health: the record is 20 bytes and the reading is what a client
+// sees on its temperature readout.
+static void write_status(void) {
+    static int16_t last_health = -2, last_armour = -2;  // -1 is a real answer
+    int16_t health = -1, armour = -1;
+    // Only inside a level is there a player to ask about. At the title screen
+    // and between maps the fields hold whatever they last held, and reporting
+    // that would be a health bar that lies while the game is not running.
+    if (gamestate == GS_LEVEL && playeringame[consoleplayer]) {
+        health = (int16_t)players[consoleplayer].health;
+        armour = (int16_t)players[consoleplayer].armorpoints;
+    }
+    if (health == last_health && armour == last_armour) {
+        return;
+    }
+    last_health = health;
+    last_armour = armour;
+
+    unsigned char record[FRAME_HEADER + STATUS_PAYLOAD];
+    memset(record, 0, sizeof(record));
+    memcpy(record + 4, STATUS_MAGIC, 4);
+    record[8] = STATUS_PAYLOAD;
+    record[16] = (unsigned char)(health & 0xFF);
+    record[17] = (unsigned char)((health >> 8) & 0xFF);
+    record[18] = (unsigned char)(armour & 0xFF);
+    record[19] = (unsigned char)((armour >> 8) & 0xFF);
+    if (write_all(record, sizeof(record)) != 0) {
+        fprintf(stderr, "doom-engine: the host stopped reading; stopping\n");
+        exit(0);
+    }
+}
+
 void DG_DrawFrame(void) {
+    // Before the gate below: `-raw` is for ffplay, which would choke on a
+    // record it has no idea about, and everything else wants the health as soon
+    // as it moves.
+    if (!raw_output) {
+        write_status();
+    }
+
     const uint32_t now = DG_GetTicksMs();
     if (min_frame_interval_ms && frames_sent &&
         (uint32_t)(now - last_frame_ms) < min_frame_interval_ms) {

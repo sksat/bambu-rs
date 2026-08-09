@@ -468,12 +468,19 @@ fn a_client_plays_a_game_through_the_printers_own_controls() {
     std::fs::create_dir_all(&dir).unwrap();
     let keys = dir.join("keys");
     let engine = dir.join("engine.sh");
-    // One framed picture, then everything it is told, written down. The `cat`
-    // holds stdin open, which is what keeps it alive the way a game would.
+    // A status record saying the player is on 50 health, then one framed
+    // picture, then everything it is told, written down. The `cat` holds stdin
+    // open, which is what keeps it alive the way a game would.
+    //
+    // The status record's length word is zero and its magic is "DOOM"; a reader
+    // that mistook it for a frame would hand four bytes of binary to a client's
+    // decoder, so this test is also where that would show.
     std::fs::write(
         &engine,
         format!(
             "#!/bin/sh\n\
+             printf '\\000\\000\\000\\000DOOM\\004\\000\\000\\000\\000\\000\\000\\000'\n\
+             printf '\\062\\000\\000\\000'\n\
              printf '\\264\\004\\000\\000\\000\\000\\000\\000\\001\\000\\000\\000\\000\\000\\000\\000'\n\
              printf '\\377\\330'\n\
              i=0; while [ $i -lt 1200 ]; do printf 'A'; i=$((i+1)); done\n\
@@ -534,7 +541,28 @@ fn a_client_plays_a_game_through_the_printers_own_controls() {
         frame.len()
     );
 
-    // 2. And the home button reaches the game as the trigger. Sent with the
+    // 2. The player's health is the nozzle temperature, read by a client that
+    //    knows nothing about any of this. 50 health is 122.5 °C on the scale in
+    //    `core::doom`, and the target is the full-health value, so a client
+    //    drawing current against target is drawing a health bar.
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        let (ok, out) = status_via(mqtt);
+        if ok && out.contains("122.5") {
+            assert!(
+                out.contains("\"nozzle_target\": 220.0"),
+                "the target should be full health:\n{out}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the game's health never reached the nozzle:\n{out}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    // 3. And the home button reaches the game as the trigger. Sent with the
     //    ordinary client, which waits for the ACK — so this also shows a client
     //    is not left hanging on a command that went to a game instead.
     let out = bin()
