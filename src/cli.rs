@@ -257,6 +257,26 @@ enum Command {
         /// Serve deterministic fake data (no printer needed; for demos/E2E).
         #[arg(long)]
         fake: bool,
+        /// Have `--fake` speak a captured report from a real printer instead of
+        /// the bundled one. Takes a `pushall` capture (either the raw report or
+        /// the envelope `tools/capture_pushall.py` writes).
+        ///
+        /// The bundled fixture is one A1 mini on one day, and a client may care
+        /// about a field that machine lacked or a value it happened to hold —
+        /// Bambu Studio refuses to finish connecting to the bundled one and
+        /// accepts a capture taken from the same printer months later.
+        ///
+        /// Needs `--emulate` as well as `--fake`: the capture is what the
+        /// emulated printer says on the wire, and plain `--fake` serves the
+        /// dashboard a ramping fake that never reads it.
+        #[cfg(feature = "relay")]
+        #[arg(
+            long,
+            value_name = "PUSHALL_JSON",
+            requires = "fake",
+            requires = "emulate"
+        )]
+        fake_report: Option<std::path::PathBuf>,
         /// Poll the printer every N seconds for live updates (default: passive).
         #[arg(long)]
         interval: Option<u64>,
@@ -945,6 +965,8 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             port,
             password,
             fake,
+            #[cfg(feature = "relay")]
+            fake_report,
             interval,
             camera_url,
             cameras_config,
@@ -986,6 +1008,8 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             *port,
             password.clone(),
             *fake,
+            #[cfg(feature = "relay")]
+            fake_report.clone(),
             *interval,
             camera_url.clone(),
             cameras_config.clone(),
@@ -1827,6 +1851,7 @@ fn run_serve(
     port: u16,
     password: Option<String>,
     fake: bool,
+    #[cfg(feature = "relay")] fake_report: Option<std::path::PathBuf>,
     interval: Option<u64>,
     camera_url: Vec<String>,
     cameras_config: Option<std::path::PathBuf>,
@@ -1851,6 +1876,36 @@ fn run_serve(
     // the emulated printer has to be *some* printer: the serial names its topics
     // and its certificate, and the access code is what clients authenticate
     // with. Nothing is connected to; only the identity is borrowed.
+    #[cfg(feature = "relay")]
+    if let Some(path) = fake_report {
+        // Read here, before anything is bound, so a capture that cannot be used
+        // is refused while there is still somebody to tell. Deeper in it would
+        // be a panic in a detached task: the listeners would come up and serve
+        // a printer whose producer had already died.
+        crate::server::synthetic::load_capture(&path)
+            .map_err(|e| CliError::new(exit::VALIDATION, e))?;
+    }
+    // The synthetic printer's inventory is one captured A1 mini: its modules,
+    // its firmware, its product name. Detect advertises whatever `--model` says,
+    // so any other model would have a client told one thing on port 3000 and
+    // another by `get_version` — and reading A1 capabilities for a machine it
+    // was told is a P1S. Refused rather than quietly overridden, because the
+    // way to add a model here is a capture of that model, not a string.
+    #[cfg(feature = "relay")]
+    if fake
+        && emulate.is_some()
+        && let Some(model) = cli.model.as_deref()
+        && model != "a1mini"
+    {
+        return Err(CliError::new(
+            exit::VALIDATION,
+            format!(
+                "--fake --emulate can only be an a1mini (asked for {model}): the \
+                 synthetic printer answers `get_version` from a captured A1 mini, \
+                 and advertising a different model would contradict it"
+            ),
+        ));
+    }
     #[cfg(feature = "relay")]
     let targets = if fake {
         emulate
