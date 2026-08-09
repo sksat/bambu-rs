@@ -3,6 +3,7 @@
 //!
 //! Submodules are added one TDD slice at a time.
 
+pub mod camerad;
 pub mod capability;
 pub mod command;
 #[cfg(feature = "relay")]

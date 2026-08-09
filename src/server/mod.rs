@@ -10,6 +10,8 @@ pub mod api;
 #[cfg(feature = "dashboard")]
 pub mod assets;
 pub mod camera;
+#[cfg(feature = "relay")]
+pub mod camerad;
 pub mod control;
 #[cfg(feature = "relay")]
 pub mod detect;
@@ -103,9 +105,31 @@ pub struct EmulateOpts {
     pub detect_port: Option<u16>,
     /// The TLS device-detect port (`3002`), or `None`. Same protocol inside.
     pub detect_tls_port: Option<u16>,
+    /// Present a **substituted** chamber camera on the printer's camera port.
+    ///
+    /// `None` leaves 6000 unserved, and a client then sees no camera — which is
+    /// the truth. Showing one machine's video as another's is deliberate enough
+    /// that it has to be asked for by name; it never follows from an external
+    /// camera merely being configured.
+    pub camera: Option<EmulateCamera>,
     /// Serve reads but refuse anything that would move or heat the machine —
     /// and, on the FTP side, anything that writes.
     pub read_only: bool,
+}
+
+/// Which camera stands in for the printer's own, and where it is served.
+#[cfg(feature = "relay")]
+pub struct EmulateCamera {
+    /// The label of a `--camera-url` / `--cameras-config` entry.
+    pub label: String,
+    /// Bind port. `6000` is where a client looks unless told otherwise.
+    pub port: u16,
+    /// How often to fetch, for a camera that only offers single snapshots.
+    ///
+    /// Required in that case and with no default: the right rate belongs to the
+    /// camera and the network between here and it. A camera with a `stream_url`
+    /// ignores this — its frames arrive when they arrive.
+    pub poll: Option<Duration>,
 }
 
 /// A printer to serve, under the profile name it is configured as.
@@ -254,6 +278,12 @@ pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
             // processes with no hardware — so the dashboard reads the synthetic
             // printer's own reports rather than a second, unrelated fake.
             #[cfg(feature = "relay")]
+            let cams = seed_cameras.take().unwrap_or_default();
+            #[cfg(feature = "relay")]
+            let fake_cams = cams.clone();
+            #[cfg(not(feature = "relay"))]
+            let fake_cams = seed_cameras.take().unwrap_or_default();
+            #[cfg(feature = "relay")]
             let source: Arc<dyn PrinterSource> = match (&emulate, targets.first()) {
                 (Some(em), Some(ServeTarget { target: t, .. })) => {
                     let printer = synthetic::SyntheticPrinter::start(tick);
@@ -276,6 +306,7 @@ pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
                                 .unwrap_or_else(|| t.model.as_str())
                                 .to_string(),
                         }),
+                        &cams,
                     )
                     .await?;
                     source
@@ -297,9 +328,7 @@ pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
                     starter: Arc::new(FakeStarter),
                     password: password.clone(),
                     start_lock: Arc::new(tokio::sync::Mutex::new(())),
-                    external_cameras: Arc::new(std::sync::RwLock::new(
-                        seed_cameras.take().unwrap_or_default(),
-                    )),
+                    external_cameras: Arc::new(std::sync::RwLock::new(fake_cams)),
                     internal_camera: Arc::new(NoCamera),
                     timelapse: Default::default(),
                 },
@@ -320,6 +349,8 @@ pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
                     interval,
                     #[cfg(feature = "relay")]
                     &emulate,
+                    #[cfg(feature = "relay")]
+                    &cams,
                 )
                 .await?;
                 printers.insert(
@@ -381,6 +412,7 @@ async fn connect_source(
     t: &ResolvedTarget,
     interval: Option<Duration>,
     #[cfg(feature = "relay")] emulate: &Option<EmulateOpts>,
+    #[cfg(feature = "relay")] cameras: &[ExternalCamera],
 ) -> anyhow::Result<Arc<dyn PrinterSource>> {
     #[cfg(not(feature = "relay"))]
     {
@@ -403,6 +435,7 @@ async fn connect_source(
                 // Ask the machine itself: model, name and firmware are facts
                 // about it, not ours to compose.
                 detect::ProxyDetect::new(&t.ip, t.detect_port),
+                cameras,
             )
             .await?;
             // The relay answers clients' `pushall`s from its cache rather than
@@ -444,6 +477,7 @@ async fn start_emulator(
     upstream: Arc<dyn emulate::Upstream>,
     files: Arc<dyn ftpd::PrinterFiles>,
     detect_source: Arc<dyn detect::DetectSource>,
+    cameras: &[ExternalCamera],
 ) -> anyhow::Result<()> {
     use crate::core::emulate::EmulatedPrinter;
 
@@ -501,6 +535,14 @@ async fn start_emulator(
         detect_listeners.push((listener, tls, addr));
     }
 
+    // Bound with the others, before anything is served: a camera port already
+    // taken should stop startup, not surface later as a client that finds a
+    // printer with no picture.
+    let camera = match &opts.camera {
+        Some(want) => Some(bind_camera_relay(target, opts, want, cameras).await?),
+        None => None,
+    };
+
     let emulator = emulate::Emulator::new(printer, upstream);
     tokio::spawn(Arc::clone(&emulator).pump());
     tokio::spawn({
@@ -522,6 +564,17 @@ async fn start_emulator(
         });
         eprintln!("emulate: FTP relay on ftps://{ftp_addr} (implicit TLS)");
     }
+    if let Some((relay, listener, addr, from)) = camera {
+        tokio::spawn({
+            let tls = Arc::clone(&tls);
+            async move {
+                if let Err(e) = relay.serve(listener, tls).await {
+                    eprintln!("emulate-camera: listener stopped: {e}");
+                }
+            }
+        });
+        eprintln!("emulate: chamber camera on {addr}, showing {from}");
+    }
     for (listener, tls, addr) in detect_listeners {
         let source = Arc::clone(&detect_source);
         let kind = if tls.is_some() { "TLS" } else { "plain" };
@@ -531,6 +584,12 @@ async fn start_emulator(
             }
         });
         eprintln!("emulate: device-detect ({kind}) on {addr}");
+    }
+    if opts.camera.is_none() {
+        eprintln!(
+            "emulate: no camera relay, so a client's liveview will stay empty (pass \
+             --emulate-camera <label> to show one of the configured cameras instead)"
+        );
     }
     if opts.detect_port.is_none() && opts.detect_tls_port.is_none() {
         eprintln!(
@@ -575,6 +634,78 @@ async fn start_emulator(
         );
     }
     Ok(())
+}
+
+/// Bind the camera relay, resolving which camera is standing in.
+///
+/// Every way this can be wrong is a hard error rather than a fallback: a client
+/// shown the wrong camera has no way to tell, and a silently-empty liveview is
+/// indistinguishable from the printer's own camera being off.
+#[cfg(feature = "relay")]
+async fn bind_camera_relay(
+    target: &ResolvedTarget,
+    opts: &EmulateOpts,
+    want: &EmulateCamera,
+    cameras: &[ExternalCamera],
+) -> anyhow::Result<(
+    Arc<camerad::CameraRelay>,
+    tokio::net::TcpListener,
+    String,
+    String,
+)> {
+    let camera = cameras
+        .iter()
+        .find(|c| c.label == want.label)
+        .ok_or_else(|| {
+            let known: Vec<&str> = cameras.iter().map(|c| c.label.as_str()).collect();
+            if known.is_empty() {
+                anyhow::anyhow!(
+                    "--emulate-camera {:?} needs a camera to show; none are configured \
+                     (add one with --camera-url or --cameras-config)",
+                    want.label
+                )
+            } else {
+                anyhow::anyhow!(
+                    "--emulate-camera {:?} names no configured camera; there is {}",
+                    want.label,
+                    known.join(", ")
+                )
+            }
+        })?;
+
+    // A stream is a moving picture; polling a snapshot URL is a slideshow of
+    // the same view. Prefer the stream, and refuse to invent a rate for the
+    // camera that only has snapshots.
+    let frames = match (&camera.stream_url, want.poll) {
+        (Some(url), _) => camerad::FrameSource::from_mjpeg(camera::url_stream_opener(url.clone())),
+        (None, Some(every)) => {
+            let url = camera.url.clone();
+            camerad::FrameSource::from_snapshots(
+                Arc::new(move || camera::fetch_snapshot(&url)),
+                every,
+            )
+        }
+        (None, None) => anyhow::bail!(
+            "camera {:?} offers single snapshots, not a stream, so --emulate-camera-interval \
+             must say how often to take one",
+            camera.label
+        ),
+    };
+
+    let addr = show_addr(&opts.host, want.port);
+    let listener = tokio::net::TcpListener::bind((opts.host.as_str(), want.port))
+        .await
+        .map_err(|e| anyhow::anyhow!("binding the camera relay on {addr}: {e}"))?;
+    let from = match &camera.stream_url {
+        Some(url) => format!("{} ({url})", camera.label),
+        None => format!("{} ({}, polled)", camera.label, camera.url),
+    };
+    Ok((
+        camerad::CameraRelay::new(&target.access_code, frames),
+        listener,
+        addr,
+        from,
+    ))
 }
 
 /// Bind the FTP relay's listener, explaining the one failure people actually hit.

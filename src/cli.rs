@@ -82,6 +82,9 @@ struct Cli {
     /// Only `serve --emulate` uses it, to ask the printer who it is.
     #[arg(long, global = true, env = "BAMBU_DETECT_PORT")]
     detect_port: Option<u16>,
+    /// Override the chamber-camera port (default 6000), for the same reason.
+    #[arg(long, global = true, env = "BAMBU_CAMERA_PORT")]
+    camera_port: Option<u16>,
     /// Emit machine-readable JSON (default output is human-readable).
     #[arg(long, global = true)]
     json: bool,
@@ -345,6 +348,25 @@ enum Command {
         #[cfg(feature = "relay")]
         #[arg(long, requires = "emulate")]
         emulate_no_detect: bool,
+        /// Show one of the configured cameras (by label) as the printer's own
+        /// chamber camera, so a client's liveview displays it. Without this the
+        /// camera port is not served at all and a liveview stays empty — which
+        /// is honest, and the right default: presenting one machine's video as
+        /// another's should be asked for, not inferred from a camera happening
+        /// to be configured.
+        #[cfg(feature = "relay")]
+        #[arg(long, value_name = "LABEL", requires = "emulate")]
+        emulate_camera: Option<String>,
+        /// Port for the substituted camera. 6000 is where a client looks.
+        #[cfg(feature = "relay")]
+        #[arg(long, default_value_t = 6000, requires = "emulate_camera")]
+        emulate_camera_port: u16,
+        /// How often to fetch, for a camera that offers single snapshots rather
+        /// than a stream. Required in that case: the right rate depends on the
+        /// camera and the network, so there is no default worth guessing.
+        #[cfg(feature = "relay")]
+        #[arg(long, value_name = "SECONDS", requires = "emulate_camera")]
+        emulate_camera_interval: Option<f32>,
     },
 }
 
@@ -917,6 +939,12 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             emulate_detect_tls_port,
             #[cfg(feature = "relay")]
             emulate_no_detect,
+            #[cfg(feature = "relay")]
+            emulate_camera,
+            #[cfg(feature = "relay")]
+            emulate_camera_port,
+            #[cfg(feature = "relay")]
+            emulate_camera_interval,
         } => run_serve(
             cli,
             host,
@@ -935,6 +963,13 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
                 pasv_ports: emulate_pasv_ports.clone(),
                 detect_port: (!emulate_no_detect).then_some(*emulate_detect_port),
                 detect_tls_port: (!emulate_no_detect).then_some(*emulate_detect_tls_port),
+                camera: emulate_camera
+                    .as_ref()
+                    .map(|label| crate::server::EmulateCamera {
+                        label: label.clone(),
+                        port: *emulate_camera_port,
+                        poll: emulate_camera_interval.map(std::time::Duration::from_secs_f32),
+                    }),
                 read_only: *emulate_read_only,
             }),
         ),
@@ -1915,6 +1950,7 @@ fn synthetic_identity(cli: &Cli) -> crate::server::ServeTarget {
             mqtt_port: crate::config::DEFAULT_MQTT_PORT,
             ftps_port: crate::config::DEFAULT_FTPS_PORT,
             detect_port: crate::config::DEFAULT_DETECT_PORT,
+            camera_port: crate::config::DEFAULT_CAMERA_PORT,
         },
     }
 }
@@ -4183,6 +4219,7 @@ fn flag_overrides(cli: &Cli) -> Overrides {
         mqtt_port: cli.mqtt_port,
         ftps_port: cli.ftps_port,
         detect_port: cli.detect_port,
+        camera_port: cli.camera_port,
     }
 }
 
