@@ -45,7 +45,7 @@ enum Job {
     Printing,
     /// Sitting there. A client leaves the movement controls enabled for an idle
     /// printer and greys them out for a busy one, so this is the state to be in
-    /// when a client's movement controls are the point.
+    /// when the movement controls are the point — see `serve --emulate-doom`.
     Idle,
 }
 
