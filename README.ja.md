@@ -106,6 +106,20 @@ bambu job start /cache/out.gcode.3mf --plate 1 --ams-map 0 \
 詳細（フラグ、AMS マッピング、外部スプール、`--dry-run`）は
 [docs/slicing.md](docs/slicing.md) にあります。
 
+## アクセサリ: シーケンスと pre-print フック
+
+プロファイルに名前を付けた `.gcode` マクロは、任意のタイミングで実行できるほか、
+**印刷開始の直前**に自動実行させられます。プレートチェンジャーはこれで駆動します。
+
+```bash
+bambu gcode --sequence swap --wait --confirm    # --wait: 動作が「完了」してから返る
+```
+
+肝は `--wait` です。最後の ACK は約1秒で返るのに機械は1分近く動き続け、しかも印刷開始は
+その後ろに並びません。待たなければ、動いているチェンジャーに印刷を突っ込むことになります。
+完了をどう観測しているかは [docs/plate-changer.md](docs/plate-changer.md)、
+参考マクロは `sequences/` にあります。
+
 ## Dashboard
 
 `bambu serve` は小さなローカルサーバーを立ち上げます。
