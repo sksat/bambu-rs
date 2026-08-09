@@ -3321,6 +3321,13 @@ struct SlicePrintBody {
     confirm: bool,
     #[serde(default)]
     dry_run: bool,
+    /// Which slice this print is for — the `id` the dry run reported.
+    ///
+    /// Required to confirm, because the slot holds exactly one result: another
+    /// caller can slice between the plan and the confirmation, and without this
+    /// the confirmation would silently print the replacement. Same shape as the
+    /// CLI's `--expect-md5`, and the reason is the same one.
+    expect: Option<u64>,
 }
 
 impl Default for SlicePrintBody {
@@ -3335,6 +3342,7 @@ impl Default for SlicePrintBody {
             overwrite: false,
             confirm: false,
             dry_run: false,
+            expect: None,
         }
     }
 }
@@ -3429,11 +3437,43 @@ async fn slice_print(
             "md5": inspection.gcode_md5,
             "has_timelapse_blocks": inspection.has_timelapse_blocks,
             "overwrite": b.overwrite,
+            // What to echo back to print exactly this slice.
+            "expect": done.status.id,
         }}))
         .into_response();
     }
     if let Some(unconfirmed) = need_confirm(b.confirm) {
         return unconfirmed;
+    }
+    // The plan above described one particular slice, and the slot holds one at a
+    // time. Between that plan and this confirmation another caller can slice —
+    // legally, the slot was free — and everything named here (`remote`, `name`,
+    // the md5 just computed) would then describe the replacement. Confirming a
+    // print of a file nobody looked at is the same class of mistake as the AMS
+    // mapping ones, so it is proven rather than assumed.
+    match b.expect {
+        Some(want) if Some(want) == done.status.id => {}
+        Some(want) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": format!(
+                        "slice {want} is no longer the one loaded (the slot now holds {}) — \
+                         dry-run again and confirm against that",
+                        done.status.id.map_or_else(|| "none".to_string(), |v| v.to_string())
+                    ),
+                })),
+            )
+                .into_response();
+        }
+        None => {
+            return bad_request(format!(
+                "confirming a print needs \"expect\": <the dry run's slice id> — this slice is {}",
+                done.status
+                    .id
+                    .map_or_else(|| "unknown".to_string(), |v| v.to_string())
+            ));
+        }
     }
 
     upload_and_start(
@@ -6018,6 +6058,14 @@ mod tests {
          &bed_type=Textured%20PEI%20Plate&nozzle=0.4";
     const FILAMENT_Q: &str = "filament=Bambu%20PLA%20Basic%20@BBL%20A1M";
 
+    /// The id of the slice currently in the slot — what a caller echoes back to
+    /// confirm a print of exactly this one.
+    async fn slice_id(app: &TestServer) -> u64 {
+        app.get("/api/slice").await.json::<serde_json::Value>()["job"]["id"]
+            .as_u64()
+            .expect("a finished slice has an id")
+    }
+
     /// Poll the slot the way the dashboard does, until the job settles.
     async fn await_slice(app: &TestServer) -> serde_json::Value {
         for _ in 0..2000 {
@@ -6459,8 +6507,11 @@ mod tests {
         // local bytes, not taken on trust.
         assert_eq!(plan["plan"]["md5"].as_str().unwrap().len(), 32);
 
+        // The plan names the slice it is for, and confirming echoes it back.
+        let expect = plan["plan"]["expect"].as_u64().unwrap();
+        assert_eq!(expect, slice_id(&app).await);
         app.post("/api/slice/print")
-            .json(&json!({ "confirm": true }))
+            .json(&json!({ "confirm": true, "expect": expect }))
             .await
             .assert_status_ok();
     }
@@ -6477,6 +6528,68 @@ mod tests {
             .json(&json!({ "confirm": true, "use_ams": true, "ams_map": [9] }))
             .await
             .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn confirming_a_print_must_name_the_slice_the_plan_described() {
+        // One slot, several callers: a second slice between the plan and the
+        // confirmation replaces the result, and the confirmation would then
+        // print a file whose plan nobody saw. Proven, not assumed.
+        let app = fake_slice_app();
+        let slice = |name: &str| {
+            app.post(&format!("/api/slice?{}", SLICE_Q.replace("cube.stl", name)))
+                .bytes(b"solid cube".to_vec().into())
+        };
+        slice("first.stl").await.assert_status(StatusCode::ACCEPTED);
+        await_slice(&app).await;
+
+        let plan = app
+            .post("/api/slice/print")
+            .json(&json!({ "dry_run": true }))
+            .await;
+        plan.assert_status_ok();
+        let first: u64 = plan.json::<serde_json::Value>()["plan"]["expect"]
+            .as_u64()
+            .expect("the plan says which slice it is for");
+
+        // Someone else slices. The slot was free, so this is allowed.
+        slice("second.stl")
+            .await
+            .assert_status(StatusCode::ACCEPTED);
+        await_slice(&app).await;
+
+        // Confirming against the plan we were shown must not print the other one.
+        let stale = app
+            .post("/api/slice/print")
+            .json(&json!({ "confirm": true, "expect": first }))
+            .await;
+        stale.assert_status(StatusCode::CONFLICT);
+        assert!(
+            stale.text().contains("no longer the one loaded"),
+            "{}",
+            stale.text()
+        );
+
+        // Confirming with no id at all is refused too — that is the same race
+        // with the check simply omitted.
+        app.post("/api/slice/print")
+            .json(&json!({ "confirm": true }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+
+        // Re-planning shows the current slice, and confirming that one works.
+        let plan2 = app
+            .post("/api/slice/print")
+            .json(&json!({ "dry_run": true }))
+            .await;
+        let second = plan2.json::<serde_json::Value>()["plan"]["expect"]
+            .as_u64()
+            .unwrap();
+        assert_ne!(first, second, "a new slice gets a new id");
+        app.post("/api/slice/print")
+            .json(&json!({ "confirm": true, "expect": second }))
+            .await
+            .assert_status_ok();
     }
 
     #[tokio::test]
@@ -6503,9 +6616,10 @@ mod tests {
             slice_jobs: st.slice_jobs.clone(),
             ..st.clone()
         };
+        let id = slice_id(&app).await;
         TestServer::new(one(busy_state))
             .post("/api/slice/print")
-            .json(&json!({ "confirm": true }))
+            .json(&json!({ "confirm": true, "expect": id }))
             .await
             .assert_status(StatusCode::CONFLICT);
     }

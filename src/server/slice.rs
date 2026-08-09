@@ -600,6 +600,12 @@ impl Slicer for FakeSlicer {
 pub struct SliceJobStatus {
     /// `idle` | `running` | `done` | `failed`.
     pub state: &'static str,
+    /// Which slice this is — bumped on every start, so a caller that inspected
+    /// a result can prove the slot still holds *that* one. The slot is a single
+    /// slot: a second slice replaces the first, and a print confirmed against
+    /// the plan of a slice that has since been replaced would send a file its
+    /// operator never looked at.
+    pub id: Option<u64>,
     pub input_name: Option<String>,
     pub out_name: Option<String>,
     pub layer_mm: Option<f64>,
@@ -622,6 +628,7 @@ impl Default for SliceJobStatus {
     fn default() -> Self {
         Self {
             state: "idle",
+            id: None,
             input_name: None,
             out_name: None,
             layer_mm: None,
@@ -644,6 +651,7 @@ impl SliceJobStatus {
     pub fn to_json(&self) -> Value {
         json!({
             "state": self.state,
+            "id": self.id,
             "input_name": self.input_name,
             "out_name": self.out_name,
             "layer_mm": self.layer_mm,
@@ -661,6 +669,8 @@ impl SliceJobStatus {
 
 #[derive(Default)]
 struct Inner {
+    /// Bumped on every start; see [`SliceJobStatus::id`].
+    next_id: u64,
     /// Shared with the running task, which updates it; replaced on each start.
     status: Arc<Mutex<SliceJobStatus>>,
     handle: Option<tokio::task::JoinHandle<()>>,
@@ -701,8 +711,10 @@ impl SliceManager {
         // if it cannot, so a `None` here only means the status is quieter.
         let choice =
             crate::core::slice::process_for_layer(params.layer_mm, &params.preset_suffix).ok();
+        g.next_id += 1;
         let status = Arc::new(Mutex::new(SliceJobStatus {
             state: "running",
+            id: Some(g.next_id),
             input_name: Some(params.input_name.clone()),
             out_name: Some(params.out_name.clone()),
             layer_mm: Some(params.layer_mm),

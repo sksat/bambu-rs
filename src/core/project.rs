@@ -176,20 +176,56 @@ fn injects_timelapse_blocks(gcode: &[u8]) -> bool {
 /// extrusion, visibly not the designed part. So the server refuses these rather
 /// than quietly ruining them.
 ///
-/// Detected by the two settings blobs Bambu Studio / OrcaSlicer write into a
-/// project and never into a plain geometry export.
+/// Two signals, because authored layout arrives two ways:
+///
+/// 1. The settings blobs Bambu Studio / OrcaSlicer write into a project and
+///    never into a plain geometry export.
+/// 2. **More than one build item** in `3D/3dmodel.model`. Placement between
+///    objects is authored work whatever tool wrote the file — a CAD assembly
+///    exported straight to 3MF carries it in `<build>` and in no settings blob
+///    at all — and `--arrange 1` re-packs it. One item is the ordinary export,
+///    and arranging that is the point, so it stays bare.
+///
 /// Takes any seekable reader rather than bytes: a zip is answered from its
 /// central directory, so this never needs the archive in memory — and the
 /// caller's file can be 512 MiB, with several uploads in flight at once.
 pub fn is_authored_project<R: Read + Seek>(zip: R) -> Result<bool, ProjectError> {
     let mut archive =
         zip::ZipArchive::new(zip).map_err(|e| ProjectError::InvalidZip(e.to_string()))?;
-    Ok([
+    if [
         "Metadata/project_settings.config",
         "Metadata/model_settings.config",
     ]
     .iter()
-    .any(|name| archive.by_name(name).is_ok()))
+    .any(|name| archive.by_name(name).is_ok())
+    {
+        return Ok(true);
+    }
+    Ok(build_item_count(&mut archive) > 1)
+}
+
+/// How many `<item>`s the root model's `<build>` lists.
+///
+/// Counted textually rather than parsed: `<item>` appears nowhere else in a
+/// `.model` file (meshes use `<triangle>`/`<vertex>`, assemblies use
+/// `<component>`), there is no XML dependency here, and the answer only has to
+/// separate "one" from "more than one". A file that cannot be read at all
+/// counts as zero — the settings-blob signal above is unaffected, and the
+/// slicer will reject an unreadable model itself.
+fn build_item_count<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> usize {
+    let Ok(mut entry) = archive.by_name("3D/3dmodel.model") else {
+        return 0;
+    };
+    let mut buf = String::new();
+    if entry
+        .by_ref()
+        .take(MAX_ENTRY_BYTES)
+        .read_to_string(&mut buf)
+        .is_err()
+    {
+        return 0;
+    }
+    buf.matches("<item").count()
 }
 
 /// One plate's gcode as text, or `None` when the `.3mf` has no such plate
@@ -334,6 +370,30 @@ mod tests {
             zip.finish().unwrap();
         }
         buf
+    }
+
+    #[test]
+    fn a_multi_object_3mf_is_authored_even_without_a_slicer_settings_blob() {
+        // Placement between objects is authored work whatever wrote the file:
+        // the slicer runs with `--arrange 1`, which re-packs them. A 3mf from
+        // a CAD tool carries that layout in <build>, not in a Bambu/Orca
+        // settings blob, so keying only on those blobs re-arranges an assembly
+        // and calls it bare geometry.
+        let assembly = make_3mf(&[(
+            "3D/3dmodel.model",
+            br#"<model><build>
+                  <item objectid="1" transform="1 0 0 0 1 0 0 0 1 0 0 0"/>
+                  <item objectid="2" transform="1 0 0 0 1 0 0 0 1 40 0 0"/>
+                </build></model>"#,
+        )]);
+        assert!(is_authored_project(Cursor::new(&assembly)).unwrap());
+
+        // One object is the ordinary export, and arranging it is the point.
+        let single = make_3mf(&[(
+            "3D/3dmodel.model",
+            br#"<model><build><item objectid="1"/></build></model>"#,
+        )]);
+        assert!(!is_authored_project(Cursor::new(&single)).unwrap());
     }
 
     #[test]
