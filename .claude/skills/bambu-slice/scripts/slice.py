@@ -40,7 +40,11 @@ def detect_slicer():
     """Prefer OrcaSlicer (the originally-verified path); fall back to Bambu Studio
     (`/opt/bambustudio-bin`), which ships the same BBL profiles + CLI flags but
     needs its bundled libs on LD_LIBRARY_PATH and LC_ALL=C (segfault workaround)."""
+    # Absolute: PATH may hold a relative entry (`.`, `./build/bin`), and the
+    # slicer runs from a scratch directory — a relative program name would be
+    # looked up there and vanish.
     orca = shutil.which("orca-slicer")
+    orca = os.path.abspath(orca) if orca else None
     orca_prof = "/opt/orca-slicer/resources/profiles/BBL"
     if orca and os.path.isdir(orca_prof):
         return [orca], orca_prof, dict(os.environ)
@@ -179,9 +183,12 @@ def main():
     mach, pf, fil = tmp(mach_prof), tmp(proc), tmp(flatten("filament", a.filament))
     outdir = os.path.dirname(os.path.abspath(a.out)) or "."
     os.makedirs(outdir, exist_ok=True)
+    # Absolute, because the slicer is run from a scratch directory (below) and a
+    # relative model path would no longer resolve.
+    model = os.path.abspath(a.stl)
     cmd = BIN + ["--load-settings", f"{mach};{pf}", "--load-filaments", fil,
                  "--arrange", "1", "--orient", "1", "--slice", "0",
-                 "--outputdir", outdir, "--export-3mf", os.path.basename(a.out), a.stl]
+                 "--outputdir", outdir, "--export-3mf", os.path.basename(a.out), model]
     out = os.path.join(outdir, os.path.basename(a.out))
     # Refuse to write over the input. Slicing a .3mf in place is an easy typo,
     # and the cleanup below would delete the source before the slicer ever
@@ -196,17 +203,27 @@ def main():
     # ship settings that have nothing to do with this invocation.
     if os.path.exists(out):
         os.unlink(out)
-    r = subprocess.run(cmd, capture_output=True, text=True, env=ENV)
+    # Run from a scratch directory, not the caller's. Both slicers write a
+    # numbered log (`00000.log`: headless-GL failures, thumbnail skips) into the
+    # working directory, so slicing from inside a project drops that file in the
+    # project — which is how one reached this repo's main branch. The log is
+    # still read back on failure, below.
+    with tempfile.TemporaryDirectory() as scratch:
+        r = subprocess.run(cmd, capture_output=True, text=True, env=ENV, cwd=scratch)
+        logs = "".join(
+            open(os.path.join(scratch, f), errors="replace").read()
+            for f in sorted(os.listdir(scratch)) if f.endswith(".log")
+        )
     for t in (mach, pf, fil):
         os.unlink(t)
     # The slicer reports failure by exit status; it also prints config errors and
     # keeps going far enough to look busy. Observed: a project 3mf whose settings
     # it rejects exits non-zero having written nothing.
     if r.returncode != 0:
-        sys.stderr.write((r.stdout or "")[-1500:] + (r.stderr or "")[-1500:])
+        sys.stderr.write((r.stdout or "")[-1500:] + (r.stderr or "")[-1500:] + logs[-1500:])
         sys.exit(f"slice failed: {BIN[0]} exited {r.returncode}")
     if not os.path.exists(out):
-        sys.stderr.write((r.stdout or "")[-1500:] + (r.stderr or "")[-1500:])
+        sys.stderr.write((r.stdout or "")[-1500:] + (r.stderr or "")[-1500:] + logs[-1500:])
         sys.exit("slice failed: no output 3mf produced")
     g = subprocess.run(["unzip", "-p", out, "Metadata/plate_1.gcode"], capture_output=True, text=True).stdout
     m = re.search(r"^; layer_height = ([0-9.]+)", g, re.M)
