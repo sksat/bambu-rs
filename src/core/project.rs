@@ -190,6 +190,12 @@ fn injects_timelapse_blocks(gcode: &[u8]) -> bool {
 /// central directory, so this never needs the archive in memory — and the
 /// caller's file can be 512 MiB, with several uploads in flight at once.
 pub fn is_authored_project<R: Read + Seek>(zip: R) -> Result<bool, ProjectError> {
+    is_authored_project_capped(zip, MAX_ENTRY_BYTES)
+}
+
+/// The above with the scan cap injectable, so a test can reach the
+/// too-big-to-scan branch without a 256 MiB fixture.
+fn is_authored_project_capped<R: Read + Seek>(zip: R, cap: u64) -> Result<bool, ProjectError> {
     let mut archive =
         zip::ZipArchive::new(zip).map_err(|e| ProjectError::InvalidZip(e.to_string()))?;
     if [
@@ -201,7 +207,26 @@ pub fn is_authored_project<R: Read + Seek>(zip: R) -> Result<bool, ProjectError>
     {
         return Ok(true);
     }
-    Ok(build_item_count(&mut archive) > 1)
+    // `Unknown` means the build section could not be reached, and answering
+    // "bare geometry" there is the answer that re-packs an authored layout. Say
+    // authored instead: the cost is refusing an unusually large model, against
+    // destroying one.
+    Ok(match build_item_count(&mut archive, cap) {
+        BuildItems::Count(n) => n > 1,
+        BuildItems::Unknown => true,
+    })
+}
+
+/// What the root model's `<build>` section says, when it can be reached.
+#[derive(Debug, PartialEq, Eq)]
+enum BuildItems {
+    Count(usize),
+    /// The entry could not be read to the end within the size cap, so the
+    /// build section may never have been reached. In 3MF the `<build>` follows
+    /// the mesh resources, so a model with more geometry than the cap puts its
+    /// items *past* it — and a truncated prefix reads as zero items, i.e. as
+    /// bare geometry, which is the layout-destroying answer.
+    Unknown,
 }
 
 /// How many `<item>`s the root model's `<build>` lists.
@@ -209,23 +234,52 @@ pub fn is_authored_project<R: Read + Seek>(zip: R) -> Result<bool, ProjectError>
 /// Counted textually rather than parsed: `<item>` appears nowhere else in a
 /// `.model` file (meshes use `<triangle>`/`<vertex>`, assemblies use
 /// `<component>`), there is no XML dependency here, and the answer only has to
-/// separate "one" from "more than one". A file that cannot be read at all
-/// counts as zero — the settings-blob signal above is unaffected, and the
-/// slicer will reject an unreadable model itself.
-fn build_item_count<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> usize {
-    let Ok(mut entry) = archive.by_name("3D/3dmodel.model") else {
-        return 0;
-    };
-    let mut buf = String::new();
-    if entry
-        .by_ref()
-        .take(MAX_ENTRY_BYTES)
-        .read_to_string(&mut buf)
-        .is_err()
-    {
-        return 0;
+/// separate "one" from "more than one" — so it stops at two.
+///
+/// Streamed in chunks with a rolling overlap, never buffered: this reads an
+/// attacker-supplied archive entry, and holding it costs as much memory as the
+/// decompressed model is big.
+fn build_item_count<R: Read + Seek>(archive: &mut zip::ZipArchive<R>, cap: u64) -> BuildItems {
+    match archive.by_name("3D/3dmodel.model") {
+        Ok(entry) => count_items(entry, cap),
+        Err(_) => BuildItems::Count(0),
     }
-    buf.matches("<item").count()
+}
+
+/// The scan itself, over any reader — separate so a test can feed it a reader
+/// that returns one byte at a time and actually exercise the chunk overlap. A
+/// zip entry's `read` returns whatever size it likes, so a fixture cannot be
+/// relied on to straddle a boundary.
+fn count_items<R: Read>(mut entry: R, cap: u64) -> BuildItems {
+    const NEEDLE: &[u8] = b"<item";
+    let mut chunk = vec![0u8; 64 * 1024];
+    // The last NEEDLE-1 bytes of the previous chunk, so a match straddling a
+    // chunk boundary is still seen.
+    let mut carry: Vec<u8> = Vec::new();
+    let (mut found, mut total) = (0usize, 0u64);
+    loop {
+        let n = match entry.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => return BuildItems::Unknown,
+        };
+        total += n as u64;
+        if total > cap {
+            return BuildItems::Unknown;
+        }
+        let mut window = std::mem::take(&mut carry);
+        window.extend_from_slice(&chunk[..n]);
+        found += window
+            .windows(NEEDLE.len())
+            .filter(|w| *w == NEEDLE)
+            .count();
+        if found > 1 {
+            return BuildItems::Count(found); // enough to decide
+        }
+        let keep = window.len().saturating_sub(NEEDLE.len() - 1);
+        carry = window.split_off(keep);
+    }
+    BuildItems::Count(found)
 }
 
 /// One plate's gcode as text, or `None` when the `.3mf` has no such plate
@@ -370,6 +424,58 @@ mod tests {
             zip.finish().unwrap();
         }
         buf
+    }
+
+    #[test]
+    fn a_model_too_big_to_scan_is_authored_rather_than_assumed_bare() {
+        // 3MF puts <build> AFTER the mesh resources, so a model with more
+        // geometry than the scan cap has its items past the cutoff. Reading the
+        // prefix and calling that "zero items" is the answer that hands an
+        // authored layout to `--arrange 1`.
+        let big = make_3mf(&[(
+            "3D/3dmodel.model",
+            format!(
+                "<model><resources>{}</resources><build>\
+                 <item objectid=\"1\"/><item objectid=\"2\"/></build></model>",
+                "<vertex x=\"0\" y=\"0\" z=\"0\"/>".repeat(400)
+            )
+            .as_bytes(),
+        )]);
+        let mut archive = zip::ZipArchive::new(Cursor::new(&big)).unwrap();
+        // Reachable: both items counted.
+        assert_eq!(
+            build_item_count(&mut archive, 1 << 20),
+            BuildItems::Count(2)
+        );
+        // Cut short before <build>: unknown, never "zero".
+        assert_eq!(build_item_count(&mut archive, 64), BuildItems::Unknown);
+        // And unknown resolves to authored, so the layout is not re-packed.
+        assert!(is_authored_project_capped(Cursor::new(&big), 64).unwrap());
+    }
+
+    #[test]
+    fn a_build_item_split_across_read_chunks_is_still_counted() {
+        // The scan reads in chunks and carries an overlap between them; without
+        // it a `<item` straddling a boundary vanishes and an assembly reads as
+        // bare geometry. Driven through a reader that hands over ONE byte per
+        // call, so every needle is split — a zip entry's `read` returns
+        // whatever size it likes, and a fixture cannot force the case.
+        struct Dribble<'a>(&'a [u8]);
+        impl std::io::Read for Dribble<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                if self.0.is_empty() || out.is_empty() {
+                    return Ok(0);
+                }
+                out[0] = self.0[0];
+                self.0 = &self.0[1..];
+                Ok(1)
+            }
+        }
+        let xml = br#"<model><build><item objectid="1"/><item objectid="2"/></build></model>"#;
+        assert_eq!(count_items(Dribble(xml), 1 << 20), BuildItems::Count(2));
+        // One item is still one, however it is chopped up.
+        let one = br#"<model><build><item objectid="1"/></build></model>"#;
+        assert_eq!(count_items(Dribble(one), 1 << 20), BuildItems::Count(1));
     }
 
     #[test]

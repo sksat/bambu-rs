@@ -669,6 +669,13 @@ impl SliceJobStatus {
 
 #[derive(Default)]
 struct Inner {
+    /// A caller is staging an upload for this slot but has not started yet.
+    /// Held from before the body is streamed, because the body is the expensive
+    /// part: without it every concurrent request sees an idle slot, writes its
+    /// own copy to disk, and only then races for the slot — so "one job at a
+    /// time" bounds CPU but not disk, and a handful of 512 MiB uploads fill the
+    /// host between them.
+    reserved: bool,
     /// Bumped on every start; see [`SliceJobStatus::id`].
     next_id: u64,
     /// Shared with the running task, which updates it; replaced on each start.
@@ -706,6 +713,9 @@ impl SliceManager {
         if g.status.lock().unwrap_or_else(|e| e.into_inner()).state == "running" {
             return Err("a slice is already running".to_string());
         }
+        // The reservation has done its job; the running status takes over as the
+        // thing that keeps the next caller out.
+        g.reserved = false;
         let out_path = workdir.path().join(&params.out_name);
         // Best-effort: the slice itself resolves this again and fails properly
         // if it cannot, so a `None` here only means the status is quieter.
@@ -765,7 +775,39 @@ impl SliceManager {
     pub fn status(&self) -> SliceJobStatus {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let s = g.status.lock().unwrap_or_else(|e| e.into_inner());
-        s.clone()
+        let mut out = s.clone();
+        // A reservation is the slot being busy as far as anyone outside is
+        // concerned; reporting `idle` would invite exactly the pile-up the
+        // reservation exists to stop.
+        if g.reserved && out.state != "running" {
+            out.state = "running";
+        }
+        out
+    }
+
+    /// Claim the slot before doing the expensive work, or `None` if it is
+    /// taken. Dropping the returned guard releases it — which is what makes
+    /// this safe against a client that disconnects mid-upload, since axum then
+    /// drops the handler's future and no explicit cleanup would run.
+    pub fn reserve(self: &Arc<Self>) -> Option<SliceReservation> {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let running = g.status.lock().unwrap_or_else(|e| e.into_inner()).state == "running";
+        if running || g.reserved {
+            return None;
+        }
+        g.reserved = true;
+        drop(g);
+        Some(SliceReservation {
+            slot: Arc::clone(self),
+            armed: true,
+        })
+    }
+
+    fn release(&self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reserved = false;
     }
 
     /// The finished `.gcode.3mf` and the status that describes it, or `None`
@@ -797,6 +839,33 @@ pub struct SliceResult {
     /// Kept only to keep the directory alive; a concurrent slice would
     /// otherwise delete it while this one is being read.
     _workdir: Arc<tempfile::TempDir>,
+}
+
+/// A held claim on a printer's slice slot. Releases on drop unless committed.
+pub struct SliceReservation {
+    slot: Arc<SliceManager>,
+    armed: bool,
+}
+
+impl SliceReservation {
+    /// The slice has started, so the running status keeps the next caller out
+    /// and this claim is spent.
+    ///
+    /// Explicit rather than relying on the drop being harmless: once the job
+    /// finishes, another caller can reserve, and a still-armed guard from the
+    /// request that *started* that job would then release someone else's claim.
+    /// Vanishingly unlikely by timing, impossible by construction.
+    pub fn commit(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SliceReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.slot.release();
+        }
+    }
 }
 
 /// Slice, then prove the result — for **every** `Slicer`, live or fake.

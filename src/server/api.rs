@@ -3112,15 +3112,19 @@ async fn slice_start(
         return bad_request(why);
     }
 
-    // Cheap rejection before streaming a possibly huge body to disk. The slot
-    // itself is the authority — see the `start` below.
-    if st.slice_jobs.status().state == "running" {
+    // Claimed BEFORE the body is streamed, not merely checked. A check would
+    // let every concurrent caller through to write its own copy of a body worth
+    // up to 512 MiB and race for the slot afterwards, so one-slice-at-a-time
+    // would bound the slicer and not the disk. The guard releases on drop,
+    // including when the client disconnects mid-upload and axum drops this
+    // future.
+    let Some(slot) = st.slice_jobs.reserve() else {
         return (
             StatusCode::CONFLICT,
             Json(json!({ "error": "a slice is already running" })),
         )
             .into_response();
-    }
+    };
 
     // The suffix is not cosmetic: libslic3r picks its model reader from the
     // extension, so an extensionless staged file is rejected before it is even
@@ -3197,11 +3201,16 @@ async fn slice_start(
         brim_mm: q.brim,
     };
     match st.slice_jobs.start(st.slicer.clone(), params, tmp, workdir) {
-        Ok(()) => (
-            StatusCode::ACCEPTED,
-            Json(json!({ "job": st.slice_jobs.status().to_json() })),
-        )
-            .into_response(),
+        Ok(()) => {
+            // The running status keeps the next caller out from here on, so the
+            // claim is spent rather than released.
+            slot.commit();
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({ "job": st.slice_jobs.status().to_json() })),
+            )
+                .into_response()
+        }
         Err(e) => (StatusCode::CONFLICT, Json(json!({ "error": e }))).into_response(),
     }
 }
@@ -6302,6 +6311,57 @@ mod tests {
             // No slice has run, so this is the honest 404 rather than a 401.
             .await
             .assert_status(StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_slot_is_claimed_before_the_upload_not_after_it() {
+        // Otherwise "one slice at a time" bounds the slicer and not the disk:
+        // every concurrent caller sees an idle slot, writes its own copy of a
+        // body worth up to 512 MiB, and only then races to start.
+        let (app, st) = slice_app(
+            Arc::new(FakeSlicer),
+            Some(crate::core::model::Model::A1Mini),
+        );
+
+        let held = st.slice_jobs.reserve().expect("the slot starts free");
+        // While someone is staging, the slot reads as busy and a second upload
+        // is refused before it can write anything.
+        assert_eq!(st.slice_jobs.status().state, "running");
+        let res = app
+            .post(&format!("/api/slice?{SLICE_Q}"))
+            .bytes(b"solid cube".to_vec().into())
+            .await;
+        res.assert_status(StatusCode::CONFLICT);
+        assert!(res.text().contains("already running"), "{}", res.text());
+
+        // Releasing it — which is what a failed or abandoned upload does, since
+        // the guard drops — leaves the slot usable rather than wedged.
+        drop(held);
+        assert_eq!(st.slice_jobs.status().state, "idle");
+        app.post(&format!("/api/slice?{SLICE_Q}"))
+            .bytes(b"solid cube".to_vec().into())
+            .await
+            .assert_status(StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_upload_does_not_wedge_the_slot() {
+        // Every early return between the claim and the start drops the guard.
+        // If one did not, a single bad request would take the printer's slicing
+        // out of service until a restart.
+        let app = fake_slice_app();
+        app.post(&format!(
+            "/api/slice?{}",
+            SLICE_Q.replace("cube.stl", "notes.txt")
+        ))
+        .bytes(b"nope".to_vec().into())
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
+        // Still usable.
+        app.post(&format!("/api/slice?{SLICE_Q}"))
+            .bytes(b"solid cube".to_vec().into())
+            .await
+            .assert_status(StatusCode::ACCEPTED);
     }
 
     #[tokio::test]
