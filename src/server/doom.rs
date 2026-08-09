@@ -35,17 +35,24 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::core::camerad::{self, FRAME_HEADER};
-use crate::core::doom::{Hold, KeyPad, holds_for};
+use crate::core::doom::{
+    Hold, KeyPad, Record, Vitals, classify_record, holds_for, parse_vitals, report_vitals,
+};
 use crate::server::camerad::FrameFeed;
-use crate::server::emulate::ControlSink;
+use crate::server::emulate::Interceptor;
 
-/// A running DOOM: the frames it draws and the keys it is holding.
+/// A running DOOM: the frames it draws, the keys it is holding, and how the
+/// player is doing.
 pub struct DoomEngine {
     frames: FrameFeed,
     /// Presses on their way to the keyboard thread, which owns the deadlines.
-    /// Unbounded and non-blocking, because [`ControlSink::consume`] is called
+    /// Unbounded and non-blocking, because [`Interceptor::consume`] is called
     /// from a client's connection task.
     keys: Sender<Hold>,
+    /// The last thing the engine said about the player, for the report on its
+    /// way out. A lock rather than a channel: only the newest matters, and it
+    /// is read once per report and written a few times a second.
+    vitals: Arc<std::sync::Mutex<Vitals>>,
 }
 
 impl DoomEngine {
@@ -76,9 +83,11 @@ impl DoomEngine {
             .take()
             .ok_or_else(|| anyhow::anyhow!("the DOOM engine has no stdout to draw on"))?;
 
+        let vitals = Arc::new(std::sync::Mutex::new(Vitals::default()));
         let (tx, frames) = tokio::sync::watch::channel(None);
+        let seen = Arc::clone(&vitals);
         std::thread::spawn(move || {
-            if let Err(e) = pump_frames(stdout, &tx) {
+            if let Err(e) = pump_engine(stdout, &tx, &seen) {
                 eprintln!("emulate-doom: the frame stream ended: {e}");
             }
         });
@@ -97,7 +106,11 @@ impl DoomEngine {
             Err(e) => eprintln!("emulate-doom: cannot wait on the engine: {e}"),
         });
 
-        Ok(Arc::new(Self { frames, keys }))
+        Ok(Arc::new(Self {
+            frames,
+            keys,
+            vitals,
+        }))
     }
 
     /// The frames it is drawing, for the camera relay to serve.
@@ -106,7 +119,7 @@ impl DoomEngine {
     }
 }
 
-impl ControlSink for DoomEngine {
+impl Interceptor for DoomEngine {
     fn consume(&self, payload: &Value) {
         let holds = holds_for(payload);
         // Logged either way. The mapping is the part of this demo most likely
@@ -133,6 +146,13 @@ impl ControlSink for DoomEngine {
             let _ = self.keys.send(hold);
         }
     }
+
+    /// Report the player's health as the nozzle temperature, and their armour
+    /// as the bed's — see [`crate::core::doom::report_vitals`].
+    fn overlay(&self, message: &mut Value) -> bool {
+        let vitals = *self.vitals.lock().expect("vitals lock poisoned");
+        report_vitals(message, vitals)
+    }
 }
 
 /// A one-line account of a request, for the log: `print.gcode_line "G28"`.
@@ -155,17 +175,21 @@ fn describe(payload: &Value) -> String {
     }
 }
 
-/// Read frames off the engine's stdout until it stops.
+/// Read the engine's stdout until it stops: pictures, and what it says about
+/// the player.
 ///
-/// The framing is the printer's own, so this is the same header
-/// [`crate::server::camerad`] writes on the way out — which means a frame is
-/// validated once here and then passed through untouched.
-fn pump_frames<R: Read>(
+/// The frame framing is the printer's own, so a picture is validated once here
+/// and then passed through untouched. A status record shares the pipe but
+/// cannot be confused with one — its length word is zero, which is not a length
+/// any frame may have (see [`crate::core::doom::status_header`]).
+fn pump_engine<R: Read>(
     mut reader: R,
     tx: &tokio::sync::watch::Sender<Option<Arc<Vec<u8>>>>,
+    vitals: &std::sync::Mutex<Vitals>,
 ) -> anyhow::Result<()> {
     let mut header = [0u8; FRAME_HEADER];
     let mut frames = 0u64;
+    let mut said_vitals = false;
     loop {
         if tx.is_closed() {
             return Ok(());
@@ -175,23 +199,44 @@ fn pump_frames<R: Read>(
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e.into()),
         }
-        let len = camerad::frame_len(&header)?;
-        let mut frame = vec![0u8; len];
-        reader.read_exact(&mut frame)?;
-        // The relay's own client refuses anything that is not a whole JPEG, so
-        // a frame that would be refused at the far end is dropped here, where
-        // the reason can be said out loud.
-        if !camerad::is_jpeg(&frame) {
-            eprintln!("emulate-doom: the engine sent {len} bytes that are not a JPEG; skipped");
-            continue;
+        match classify_record(&header)? {
+            Record::Frame { len } => {
+                let mut frame = vec![0u8; len];
+                reader.read_exact(&mut frame)?;
+                // The relay's own client refuses anything that is not a whole
+                // JPEG, so a frame that would be refused at the far end is
+                // dropped here, where the reason can be said out loud.
+                if !camerad::is_jpeg(&frame) {
+                    eprintln!(
+                        "emulate-doom: the engine sent {len} bytes that are not a JPEG; skipped"
+                    );
+                    continue;
+                }
+                if frames == 0 {
+                    // The line that separates "the engine never drew anything"
+                    // from "the client never asked for it".
+                    eprintln!("emulate-doom: first frame from the engine, {len} bytes");
+                }
+                frames += 1;
+                let _ = tx.send(Some(Arc::new(frame)));
+            }
+            Record::Status { len } => {
+                let mut payload = vec![0u8; len];
+                reader.read_exact(&mut payload)?;
+                let read = parse_vitals(&payload);
+                if !said_vitals && read != Vitals::default() {
+                    // Said once: an engine that draws but never reports leaves
+                    // the temperature the printer's own, and that is otherwise
+                    // indistinguishable from a game where nobody is hurt.
+                    eprintln!(
+                        "emulate-doom: the engine reports the player — health is the nozzle \
+                         temperature from here on"
+                    );
+                    said_vitals = true;
+                }
+                *vitals.lock().expect("vitals lock poisoned") = read;
+            }
         }
-        if frames == 0 {
-            // The line that separates "the engine never drew anything" from
-            // "the client never asked for it".
-            eprintln!("emulate-doom: first frame from the engine, {len} bytes");
-        }
-        frames += 1;
-        let _ = tx.send(Some(Arc::new(frame)));
     }
 }
 
@@ -278,7 +323,8 @@ mod tests {
     async fn the_engines_frames_come_out_whole() {
         let want = vec![jpeg(0x11, 2000), jpeg(0x22, 3000)];
         let (tx, feed) = tokio::sync::watch::channel(None);
-        pump_frames(std::io::Cursor::new(framed(&want)), &tx).unwrap();
+        let vitals = std::sync::Mutex::new(Vitals::default());
+        pump_engine(std::io::Cursor::new(framed(&want)), &tx, &vitals).unwrap();
         // The feed keeps only the newest, which is what a viewer joining late
         // should see.
         assert_eq!(feed.borrow().clone().unwrap().as_ref(), &want[1]);
@@ -301,7 +347,13 @@ mod tests {
         }
         let want = jpeg(0x33, 1500);
         let (tx, feed) = tokio::sync::watch::channel(None);
-        pump_frames(Dribble(framed(std::slice::from_ref(&want)), 0), &tx).unwrap();
+        let vitals = std::sync::Mutex::new(Vitals::default());
+        pump_engine(
+            Dribble(framed(std::slice::from_ref(&want)), 0),
+            &tx,
+            &vitals,
+        )
+        .unwrap();
         assert_eq!(feed.borrow().clone().unwrap().as_ref(), &want);
     }
 
@@ -312,8 +364,110 @@ mod tests {
         let junk = b"<html>not a doom</html>".repeat(60);
         let good = jpeg(0x44, 1200);
         let (tx, feed) = tokio::sync::watch::channel(None);
-        pump_frames(std::io::Cursor::new(framed(&[junk, good.clone()])), &tx).unwrap();
+        let vitals = std::sync::Mutex::new(Vitals::default());
+        pump_engine(
+            std::io::Cursor::new(framed(&[junk, good.clone()])),
+            &tx,
+            &vitals,
+        )
+        .unwrap();
         assert_eq!(feed.borrow().clone().unwrap().as_ref(), &good);
+    }
+
+    /// One status record, as the engine writes it.
+    fn status(vitals: Vitals) -> Vec<u8> {
+        let payload = crate::core::doom::vitals_payload(vitals);
+        let mut out = crate::core::doom::status_header(payload.len() as u32).to_vec();
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    #[tokio::test]
+    async fn the_player_arrives_on_the_same_pipe_as_the_pictures() {
+        // Health and pictures interleave on one stream; neither may swallow the
+        // other, and a status record must not end up in the liveview.
+        let hurt = Vitals {
+            health: Some(37),
+            armour: Some(0),
+        };
+        let want = jpeg(0x55, 1400);
+        let mut stream = status(Vitals {
+            health: Some(100),
+            armour: Some(100),
+        });
+        stream.extend_from_slice(&framed(std::slice::from_ref(&want)));
+        stream.extend_from_slice(&status(hurt));
+
+        let (tx, feed) = tokio::sync::watch::channel(None);
+        let vitals = std::sync::Mutex::new(Vitals::default());
+        pump_engine(std::io::Cursor::new(stream), &tx, &vitals).unwrap();
+        assert_eq!(*vitals.lock().unwrap(), hurt, "the newest reading wins");
+        assert_eq!(
+            feed.borrow().clone().unwrap().as_ref(),
+            &want,
+            "and the picture came through whole"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_status_record_is_never_shown_as_a_picture() {
+        // The failure this prevents: four bytes of binary handed to a client's
+        // JPEG decoder as a photograph of a print.
+        let (tx, feed) = tokio::sync::watch::channel(None);
+        let vitals = std::sync::Mutex::new(Vitals::default());
+        pump_engine(
+            std::io::Cursor::new(status(Vitals {
+                health: Some(1),
+                armour: None,
+            })),
+            &tx,
+            &vitals,
+        )
+        .unwrap();
+        assert!(feed.borrow().is_none(), "nothing was drawn");
+        assert_eq!(vitals.lock().unwrap().health, Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_record_that_is_neither_stops_the_stream_rather_than_guessing() {
+        // A header claiming a two-byte frame is a desynchronised pipe, and
+        // reading on from there would hand a client whatever came next.
+        let mut junk = camerad::frame_header(2).to_vec();
+        junk.extend_from_slice(&[0, 0]);
+        let (tx, _feed) = tokio::sync::watch::channel(None);
+        let vitals = std::sync::Mutex::new(Vitals::default());
+        assert!(pump_engine(std::io::Cursor::new(junk), &tx, &vitals).is_err());
+    }
+
+    #[test]
+    fn the_report_a_client_sees_carries_the_players_health() {
+        // The wiring, at the seam: what the engine said becomes what the
+        // emulator writes into a report.
+        let (keys, _rx) = channel();
+        let engine = DoomEngine {
+            frames: tokio::sync::watch::channel(None).1,
+            keys,
+            vitals: Arc::new(std::sync::Mutex::new(Vitals {
+                health: Some(100),
+                armour: None,
+            })),
+        };
+        let mut report = json!({"print": {"command": "push_status", "msg": 1}});
+        assert!(engine.overlay(&mut report));
+        assert_eq!(report["print"]["nozzle_temper"], 220.0);
+    }
+
+    #[test]
+    fn an_engine_that_has_said_nothing_leaves_the_printers_own_reading_alone() {
+        let (keys, _rx) = channel();
+        let engine = DoomEngine {
+            frames: tokio::sync::watch::channel(None).1,
+            keys,
+            vitals: Arc::new(std::sync::Mutex::new(Vitals::default())),
+        };
+        let mut report = json!({"print": {"command": "push_status", "nozzle_temper": 24.0}});
+        assert!(!engine.overlay(&mut report));
+        assert_eq!(report["print"]["nozzle_temper"], 24.0);
     }
 
     #[test]
@@ -367,6 +521,7 @@ mod tests {
         let engine = DoomEngine {
             frames: tokio::sync::watch::channel(None).1,
             keys,
+            vitals: Arc::new(std::sync::Mutex::new(Vitals::default())),
         };
         engine.consume(&json!({"print": {
             "command": "gcode_line", "param": "G91\nG1 Y10 F3000\nG90",

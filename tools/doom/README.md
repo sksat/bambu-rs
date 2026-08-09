@@ -88,6 +88,31 @@ Studio's 1 mm button is a nudge and its 10 mm button is a stride. The mapping
 itself is `src/core/doom.rs`, which is pure and unit-tested: G-code in, key
 presses out.
 
+## The readout
+
+The game comes back the other way too, and not only as pictures:
+
+| DOOM | the printer says |
+| --- | --- |
+| health 100 | nozzle **220 °C** — a plausible PLA temperature |
+| health 50 | nozzle 122.5 °C |
+| health 0 | nozzle 25 °C — a machine that has gone cold |
+| armour | the bed, on the same scale: 0 → 25 °C, 100 → 60 °C |
+
+The *targets* are set to the full-health values (220 and 60) rather than to
+anything the game is doing, so a client drawing current against target is
+drawing a health bar without having been told it is one. Above 100 health a
+soulsphere runs the nozzle hot, capped at the 300 °C ceiling `core::safety`
+puts on a nozzle — a client is never shown a temperature this crate would
+refuse to command.
+
+Ammo deliberately goes nowhere. There is no field on a printer's face where a
+count of bullets reads as anything but a wrong number, and the game already
+draws it.
+
+The reading moves at the printer's own report rate, so a hit shows up on the
+next status report rather than instantly.
+
 Anything with no button behind it (`project_file`, a temperature command) is
 consumed and does nothing. The relay says so on stderr, one line per press —
 which is the only way to tell a mapping that missed from a button that never
@@ -116,6 +141,26 @@ first one.
   port 6000, so a frame is never re-encoded on its way to a client.
   With `-raw` the headers are dropped and the output is plain concatenated
   JPEGs, which `ffplay -f mjpeg -` will play.
+- **stdout, also**: status records, saying how the player is doing. Same
+  16-byte header, but the length word is **zero** — which no frame may be, so a
+  reader that knows only about frames refuses one outright instead of handing
+  four bytes of binary to a JPEG decoder. The magic goes in the word a frame
+  leaves at zero, where it is readable in a hexdump:
+
+  ```text
+  0..4    0                     not a frame length, and cannot become one
+  4..8    "DOOM"                the magic
+  8..12   payload length        4 today
+  12..16  0
+  payload health int16le, armour int16le    negative = no player
+  ```
+
+  Sent only when a number changes, and only inside a level — at the title
+  screen there is no player, and a health bar that lied while the game was not
+  running would be worse than none. A payload longer or shorter than this one
+  is read as far as it goes, so the record can grow a field later without a
+  flag day. The Rust side is `status_header` / `parse_vitals` in
+  `src/core/doom.rs`.
 - **stdin**: key events, two bytes each — `[pressed (0|1), DOOM key code]`.
   That is `DG_GetKey`'s own shape. EOF means the relay has gone; exit.
 - **stderr**: everything else. A single stray byte on stdout is a corrupt frame.

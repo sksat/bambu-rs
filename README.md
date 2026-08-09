@@ -185,6 +185,11 @@ liveview is a screen and its movement panel is a gamepad: jog Y walks, jog X tur
 fires, the chamber light opens doors, and the four print-speed levels are the four weapon
 slots.
 
+The reply goes on the temperature readout. **The player's health is the nozzle
+temperature** — 220 °C at full health, room temperature when you die — and their armour is
+the bed's, so a client that knows nothing about any of this still shows the game in the
+largest type on its screen.
+
 ```bash
 tools/doom/build.sh                     # fetches doomgeneric and the shareware WAD
 bambu serve --fake --emulate --emulate-doom --emulate-doom-engine …   # see tools/doom/README.md
