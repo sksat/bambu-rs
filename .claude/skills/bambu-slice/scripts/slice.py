@@ -132,6 +132,11 @@ def main():
     # merge defaults to "Cool Plate" (35C) -> poor adhesion / warping.
     ap.add_argument("--bed-type", default="Textured PEI Plate")
     ap.add_argument("--brim", help="force an outer brim of this width in mm (e.g. 5)")
+    ap.add_argument("--support", action="store_true",
+                    help="generate support. Needed for anything with a real overhang — a sphere "
+                         "resting on a point has nothing to build the first layers on")
+    ap.add_argument("--support-type", help="override the profile's support type "
+                                           "(e.g. 'tree(auto)', 'normal(auto)')")
     ap.add_argument("--infill", help="sparse infill density in percent (e.g. 60) — drives how much "
                                      "filament the part uses; check the result with slice_info.config's weight=")
     a = ap.parse_args()
@@ -142,6 +147,14 @@ def main():
     bed_ov = {"curr_bed_type": a.bed_type}
     if a.brim is not None:
         bed_ov.update({"brim_type": "outer_only", "brim_width": str(a.brim)})
+    if a.support or a.support_type:
+        # The profile already chooses the style (tree(auto) on the A1M presets)
+        # and the threshold angle; enabling is the whole decision unless the
+        # caller says otherwise. Support material counts toward the weight the
+        # slicer reports, so check it after enabling rather than before.
+        bed_ov["enable_support"] = "1"
+        if a.support_type:
+            bed_ov["support_type"] = a.support_type
     if a.infill is not None:
         # Percent, as a string like every other value here. The profile's own
         # pattern and wall count are left alone: density is the knob that moves
