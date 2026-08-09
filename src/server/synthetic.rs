@@ -113,38 +113,48 @@ fn real_a1_version(serial: &str) -> Value {
     json!({ "info": info })
 }
 
-/// Where to read a capture of a real printer's report, if one was configured.
+/// The capture a `--fake-report` was read from, parsed once.
 ///
-/// Set by `--fake-report`; read here rather than threaded through because the
-/// synthetic printer is built in one place and this is the only thing it needs
-/// from the outside.
-pub static CAPTURED_REPORT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+/// The parsed report rather than the path it came from, and set before the
+/// server starts rather than on first use. Both matter: holding the path meant
+/// re-reading the file on every snapshot, so a capture tool rewriting it under
+/// a running relay changed the printer's shape mid-conversation, and the
+/// failure — a bad file — surfaced as a panic inside a detached ticker task,
+/// which unwinds that one task and leaves the listeners up serving nothing.
+pub static CAPTURED_REPORT: std::sync::OnceLock<serde_json::Map<String, Value>> =
+    std::sync::OnceLock::new();
 
-/// The configured capture's `print` object, or `None` if there is no usable one.
+/// Read and parse a capture, so a bad one is refused while there is still a
+/// caller to tell.
 ///
 /// A capture that cannot be read or parsed is a hard error rather than a quiet
 /// fall back to the fixture: somebody who passed the flag wants that machine's
 /// report, and silently serving a different one would be the sort of thing that
 /// takes an evening to notice.
-fn captured_report() -> Option<serde_json::Map<String, Value>> {
-    let path = CAPTURED_REPORT.get()?;
+pub fn load_capture(path: &std::path::Path) -> Result<(), String> {
     let text = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("reading the capture at {}: {e}", path.display()));
+        .map_err(|e| format!("reading the capture at {}: {e}", path.display()))?;
     let value: Value = serde_json::from_str(&text)
-        .unwrap_or_else(|e| panic!("the capture at {} is not JSON: {e}", path.display()));
+        .map_err(|e| format!("the capture at {} is not JSON: {e}", path.display()))?;
     // Accept both the raw report and the `{_meta, message}` envelope the
     // capture tools write, because both are what people have on disk.
     let print = value
         .get("print")
         .or_else(|| value.pointer("/message/print"))
         .and_then(Value::as_object)
-        .unwrap_or_else(|| {
-            panic!(
+        .ok_or_else(|| {
+            format!(
                 "the capture at {} has no `print` object; is it a pushall?",
                 path.display()
             )
-        });
-    Some(print.clone())
+        })?;
+    let _ = CAPTURED_REPORT.set(print.clone());
+    Ok(())
+}
+
+/// The configured capture's `print` object, or `None` if there is no usable one.
+fn captured_report() -> Option<serde_json::Map<String, Value>> {
+    CAPTURED_REPORT.get().cloned()
 }
 
 /// The inventory as an *answer*: the modules, plus the result fields and the
@@ -307,6 +317,22 @@ impl SyntheticPrinter {
             "print_error": 0,
             "subtask_name": if idle { "" } else { "synthetic.gcode.3mf" },
             "gcode_file": if idle { "" } else { "synthetic.gcode.3mf" },
+            // The base is an *idle* capture, so every field describing a job
+            // says there isn't one. Overlaying `gcode_state: RUNNING` on top and
+            // stopping there left a printer reporting a print in progress and
+            // `print_type: "idle"` with no task in the same breath — two answers
+            // to the same question, which is worse than either.
+            //
+            // A print started over the LAN is `"local"` — the value this crate
+            // already models in `core::status` and serves from its own fake.
+            // The ids are placeholders: what matters is that a printer running
+            // a job has *some* task, not which. There is no capture of this
+            // machine mid-print to take real ones from, so nothing else here is
+            // guessed at — `mc_print_stage` in particular keeps the captured
+            // value rather than a made-up "printing" one.
+            "print_type": if idle { "idle" } else { "local" },
+            "task_id": if idle { "0" } else { "1" },
+            "subtask_id": if idle { "0" } else { "1" },
             "mc_percent": if idle { 0 } else { p.percent },
             "layer_num": if idle { 0 } else { p.layer },
             "total_layer_num": if idle { 0 } else { 100 },
@@ -435,6 +461,35 @@ impl Upstream for SyntheticPrinter {
 
 #[cfg(test)]
 mod tests {
+    /// A printer running a job must not also say it has no job.
+    ///
+    /// The snapshot is an *idle* capture with the moving values laid over it,
+    /// so every field describing a job starts out saying there isn't one.
+    /// Overlaying `gcode_state` and stopping there produced a report that read
+    /// `RUNNING` and `print_type: "idle"` with task id `0` at the same time —
+    /// each field true of the capture, the combination true of no printer.
+    #[tokio::test]
+    async fn a_printing_snapshot_does_not_also_describe_an_idle_one() {
+        let printing =
+            super::SyntheticPrinter::start("0309FATEST00001", super::Duration::from_secs(3600))
+                .snapshot();
+        let p = &printing["print"];
+        assert_eq!(p["gcode_state"], "RUNNING");
+        assert_eq!(p["print_type"], "local", "a job is running: {p}");
+        assert_ne!(p["task_id"], "0", "a job is running but has no task: {p}");
+        assert_ne!(p["subtask_id"], "0");
+
+        // And the idle one still describes an idle printer, which is what the
+        // capture already said — the overlay must not invent a job either way.
+        let idle =
+            super::SyntheticPrinter::idle("0309FATEST00001", super::Duration::from_secs(3600))
+                .snapshot();
+        let i = &idle["print"];
+        assert_eq!(i["gcode_state"], "IDLE");
+        assert_eq!(i["print_type"], "idle");
+        assert_eq!(i["task_id"], "0");
+    }
+
     /// Nothing a client is shown may still be wearing the scrubbing.
     ///
     /// The fixtures are stripped of the machine's identifiers before they enter

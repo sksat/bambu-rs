@@ -773,6 +773,99 @@ fn waiting_for_the_motion_is_not_offered_for_a_single_line() {
     let _ = std::fs::remove_dir_all(&cfg);
 }
 
+/// A capture that would go unread, and one that cannot be read, both refused
+/// before anything binds a port.
+///
+/// `--fake-report` only reaches the wire through the emulated printer: plain
+/// `--fake` serves the dashboard a ramping fake that never looks at it, so the
+/// flag was accepted, ignored, and not even opened. And a bad capture used to
+/// surface as a panic inside the ticker task — the listeners came up, the
+/// producer was already dead, and the failure looked like a printer that had
+/// nothing to say.
+#[cfg(feature = "relay")]
+#[test]
+fn a_capture_is_refused_when_it_would_go_unread_or_cannot_be_read() {
+    let cfg = tmp_cfg("fake-report");
+    let missing = cfg.join("nope.json");
+
+    // No --emulate: nothing would ever read it.
+    let out = bambu(&cfg)
+        .args([
+            "serve",
+            "--fake",
+            "--fake-report",
+            missing.to_str().expect("path is utf-8"),
+        ])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("emulate"),
+        "it should say what is missing, got:\n{stderr}"
+    );
+
+    // With --emulate, the file is opened — and this one is not there.
+    let out = bambu(&cfg)
+        .args([
+            "serve",
+            "--fake",
+            "--emulate",
+            "--fake-report",
+            missing.to_str().expect("path is utf-8"),
+        ])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("nope.json"),
+        "it should name the capture it could not read, got:\n{stderr}"
+    );
+
+    // A JSON file that is not a report is refused for what it is, not with a
+    // parse error further in.
+    let wrong = cfg.join("wrong.json");
+    std::fs::write(&wrong, r#"{"hello": "world"}"#).expect("the temp config dir is writable");
+    let out = bambu(&cfg)
+        .args([
+            "serve",
+            "--fake",
+            "--emulate",
+            "--fake-report",
+            wrong.to_str().expect("path is utf-8"),
+        ])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("pushall") || stderr.contains("`print`"),
+        "it should say what the file is missing, got:\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+/// The synthetic printer is one captured A1 mini, so it may only claim to be
+/// one.
+///
+/// Detect advertises whatever `--model` says while `get_version` answers from
+/// the capture, so any other model has a client told two different things
+/// depending on which port it asked — and deriving A1 capabilities for what it
+/// believes is a P1S.
+#[cfg(feature = "relay")]
+#[test]
+fn the_synthetic_printer_refuses_to_be_a_model_it_has_no_capture_of() {
+    let cfg = tmp_cfg("synthetic-model");
+    let out = bambu(&cfg)
+        .args(["--model", "p1s", "serve", "--fake", "--emulate"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("a1mini") && stderr.contains("p1s"),
+        "it should name both what was asked for and what it can be, got:\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
 /// Only meaningful where the flag exists: without `relay` there is no
 /// `--emulate-camera-interval`, and clap's "unexpected argument" is a different
 /// refusal from the one under test.
