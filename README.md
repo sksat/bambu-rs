@@ -102,6 +102,21 @@ bambu job start /cache/out.gcode.3mf --plate 1 --ams-map 0 \
 Full details (flags, AMS mapping, external spool, `--dry-run`) in
 [docs/slicing.md](docs/slicing.md).
 
+## Accessories: sequences and the pre-print hook
+
+A `.gcode` macro named in a printer's profile can be run on demand, or wired to
+fire **just before a print starts** — which is how a plate changer gets driven:
+
+```bash
+bambu gcode --sequence swap --wait --confirm    # --wait: return when the motion FINISHED
+```
+
+`--wait` is the load-bearing part. The last acknowledgement lands about a second
+in while the machine keeps moving for another minute, and a print start does not
+queue behind it — so without waiting, a print begins into a moving changer. See
+[docs/plate-changer.md](docs/plate-changer.md) for how completion is actually
+observed, and `sequences/` for a reference macro.
+
 ## Dashboard
 
 `bambu serve` runs a small local server. With the `dashboard` feature enabled, it serves the
