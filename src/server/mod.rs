@@ -18,6 +18,7 @@ pub mod emulate;
 pub mod files;
 #[cfg(feature = "relay")]
 pub mod ftpd;
+pub mod hook;
 pub mod live;
 #[cfg(feature = "relay")]
 pub mod relay;
@@ -42,6 +43,7 @@ pub use control::{Controller, FakeController, LiveController};
 #[cfg(feature = "relay")]
 use emulate::Upstream as _;
 pub use files::{FakeFiles, FileStore, LiveFiles};
+pub use hook::{LiveHook, NoHook, PrePrint, PrePrintHook};
 pub use live::LiveSource;
 pub use start::{FakeStarter, LiveStarter, Starter};
 
@@ -116,6 +118,10 @@ pub struct EmulateOpts {
 pub struct ServeTarget {
     pub name: String,
     pub target: ResolvedTarget,
+    /// This printer's `pre_print` sequence, already resolved from its profile.
+    /// Resolved by the caller because `hooks`/`sequences` live on `Profile`,
+    /// which nothing under `src/server/` sees.
+    pub hook: Option<PrePrint>,
 }
 
 /// Parse a `"first-last"` passive port range.
@@ -302,11 +308,21 @@ pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
                     )),
                     internal_camera: Arc::new(NoCamera),
                     timelapse: Default::default(),
+                    hook_running: Default::default(),
+                    hook: Arc::new(NoHook),
                 },
             );
         } else {
             eprintln!("connecting to the printer over LAN…");
-            for (i, ServeTarget { name, target: t }) in targets.into_iter().enumerate() {
+            for (
+                i,
+                ServeTarget {
+                    name,
+                    target: t,
+                    hook,
+                },
+            ) in targets.into_iter().enumerate()
+            {
                 let id = printer_id(&name);
                 if i == 0 {
                     default = id.clone();
@@ -338,8 +354,13 @@ pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
                         password: password.clone(),
                         start_lock: Arc::new(tokio::sync::Mutex::new(())),
                         external_cameras: Arc::new(std::sync::RwLock::new(cams)),
-                        internal_camera: Arc::new(LiveCamera::new(t)),
+                        internal_camera: Arc::new(LiveCamera::new(t.clone())),
                         timelapse: Default::default(),
+                        hook_running: Default::default(),
+                        hook: match hook {
+                            Some(spec) => Arc::new(LiveHook::new(t, spec)),
+                            None => Arc::new(NoHook),
+                        },
                     },
                 );
             }
