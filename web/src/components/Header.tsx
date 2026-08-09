@@ -8,10 +8,14 @@ import type { Theme } from "../useTheme";
 const ICON: Record<Theme, string> = { auto: "◐", dark: "●", light: "○" };
 
 /**
- * The printer picker — rendered only when this server has more than one.
+ * The printer picker — rendered when this server has more than one, or when the
+ * one it has is not the one the URL asks for.
  *
- * A single-printer server shows nothing at all: a select with one option is a
- * decision the user does not have, and the header is the same as it was.
+ * A single-printer server normally shows nothing at all: a select with one
+ * option is a decision the user does not have, and the header is the same as it
+ * was. The exception is a `?printer=` naming a machine that is gone — every
+ * request on the page is then going to a prefix that 404s, and hiding the
+ * picker would leave hand-editing the URL as the only way back.
  */
 function PrinterPicker() {
   const [printers, setPrinters] = useState<PrinterEntry[]>([]);
@@ -34,7 +38,6 @@ function PrinterPicker() {
       clearTimeout(timer);
     };
   }, []);
-  if (printers.length < 2) return null;
   const selected = selectedPrinter();
   const current = printers.find((p) => p.id === selected);
   const fallback = printers.find((p) => p.default);
@@ -42,7 +45,14 @@ function PrinterPicker() {
   // server does not serve. Showing the default as selected would hide that —
   // the select would already read "correct" and there would be nothing to pick
   // to recover. Say it instead, and let picking a real printer fix the URL.
-  const unknown = selected !== null && current === undefined;
+  //
+  // An empty list is the list request failing or not having answered yet, which
+  // says nothing about the selection — so it is not "unknown", and the picker
+  // stays away rather than flashing an error on every load.
+  const unknown = selected !== null && printers.length > 0 && current === undefined;
+  // Decided after `unknown`, not before: this is the one case where a
+  // one-option select is worth showing, because it is the way out.
+  if (printers.length < 2 && !unknown) return null;
   return (
     <select
       className={unknown ? "printer printer--unknown" : "printer"}

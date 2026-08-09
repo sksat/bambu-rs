@@ -184,6 +184,12 @@ div.lbl,
   justify-content: space-between;
   padding: 0.4rem 0 0.7rem;
   border-bottom: 1px solid var(--hair);
+  /* Printer names are the operator's, not ours — "Bambu Lab A1 mini (workshop)"
+     is an ordinary one, and on a phone the picker alone is wider than the space
+     left over. Wrapping to a second row is the only bound that holds for a
+     string we do not control; without it the whole page scrolls sideways. */
+  flex-wrap: wrap;
+  row-gap: 0.35rem;
 }
 .hdr__brand {
   font-family: var(--mono);
@@ -194,6 +200,9 @@ div.lbl,
   display: flex;
   align-items: center;
   gap: 0.6rem;
+  /* Shrink before wrapping, and only wrap when shrinking is not enough. */
+  flex: 0 1 auto;
+  min-width: 0;
 }
 /* Matches the theme button: the picker is a peer control, not a form field. */
 .printer {
@@ -206,6 +215,11 @@ div.lbl,
   padding: 0.2rem 0.5rem;
   cursor: pointer;
   max-width: 14rem;
+  /* A flex item will not go below its content width unless told to; without
+     this the long name pushes the row out instead of the select narrowing. */
+  min-width: 3rem;
+  flex: 0 1 auto;
+  text-overflow: ellipsis;
 }
 .printer:hover {
   border-color: var(--accent);
