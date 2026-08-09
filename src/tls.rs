@@ -156,11 +156,19 @@ pub fn emulated_printer_identity(
         }
         // `create_new` is the atomic part: it either creates the lock or tells
         // us someone else already did.
-        let won = std::fs::OpenOptions::new()
+        let won = match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&lock)
-            .is_ok();
+        {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+            // Anything else is this directory being unusable — no permission, a
+            // full disk — and reading that as "somebody is holding the lock"
+            // would send us round the stale path to a confident wrong answer
+            // about a process dying, instead of saying what actually failed.
+            Err(e) => return Err(e.into()),
+        };
         if won {
             // Holding the lock is not the same as nobody having written one.
             // The previous holder removes it when it finishes, so a starter
@@ -196,14 +204,16 @@ pub fn emulated_printer_identity(
         // rather than writing from here: the next round re-reads and re-locks,
         // so two starters that break the same stale lock still come away with
         // one identity between them.
-        takeovers += 1;
-        if takeovers > MAX_TAKEOVERS {
+        // Counted before the break, so the number in the message below is the
+        // number of locks actually broken rather than one more than that.
+        if takeovers >= MAX_TAKEOVERS {
             return Err(ServerTlsError::Io(std::io::Error::other(format!(
-                "gave up on {}: broken {takeovers} times and still held, which \
-                 means something is repeatedly dying while holding it",
+                "gave up on {}: broken {MAX_TAKEOVERS} times and still held, \
+                 which means something is repeatedly dying while holding it",
                 lock.display()
             ))));
         }
+        takeovers += 1;
         let _ = std::fs::remove_file(&lock);
     }
 }
@@ -211,13 +221,22 @@ pub fn emulated_printer_identity(
 /// Has the lock been sitting there longer than anyone could plausibly still be
 /// writing?
 ///
-/// A lock that has gone away counts as stale: the next round will find the pair
-/// or take the lock properly, and either is progress.
+/// Anything unreadable counts as stale, and so does anything the clock cannot
+/// make sense of. A lock that has gone away is obvious enough. A timestamp in
+/// the *future* — a clock stepped backwards, a file restored with a stamp from
+/// another machine — is the dangerous one: reading that as "not stale yet"
+/// makes it never stale, and a starter waits out a process that is already
+/// gone, polling for as long as it is left running. Erring towards stale costs
+/// at worst a broken lock, which the loop is built to survive; erring the other
+/// way is a hang.
 #[cfg(feature = "relay")]
 fn is_stale(lock: &std::path::Path) -> bool {
-    std::fs::metadata(lock)
-        .and_then(|m| m.modified())
-        .map(|written| written.elapsed().unwrap_or_default() >= STALE_AFTER)
+    let Ok(written) = std::fs::metadata(lock).and_then(|m| m.modified()) else {
+        return true;
+    };
+    written
+        .elapsed()
+        .map(|age| age >= STALE_AFTER)
         .unwrap_or(true)
 }
 
@@ -484,6 +503,71 @@ mod tests {
             "both broke the same stale lock and generated their own identity"
         );
         assert!(!lock.exists(), "the lock should not be left behind");
+    }
+
+    /// A lock stamped in the future must not be waited on forever.
+    ///
+    /// Age is measured with `SystemTime::elapsed`, which *fails* rather than
+    /// going negative when the stamp is ahead of the clock — a clock stepped
+    /// backwards, or a file restored with a timestamp from another machine.
+    /// Reading that failure as "no age yet" made the lock never stale, and a
+    /// starter would poll for a process that was already gone until somebody
+    /// killed it. A relay that never comes up and never says why.
+    #[cfg(feature = "relay")]
+    #[test]
+    fn a_lock_stamped_in_the_future_is_not_waited_on_forever() {
+        let dir = scratch("future-lock");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("0309FA123456789.lock");
+        let file = std::fs::File::create(&lock).unwrap();
+        file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(600))
+            .unwrap();
+        drop(file);
+
+        // On another thread with a deadline, because the failure this guards
+        // against is an *endless* wait: asserting on elapsed time afterwards
+        // would never get to run, and the regression would show up as a CI job
+        // that hangs until the runner kills it rather than a test that failed.
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(emulated_printer_identity("0309FA123456789", Some(&dir)));
+        });
+        let got = finished
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("still waiting after 2s, so it is waiting out the clock");
+        let (cert, _) = got.expect("a lock nobody holds should not stop a printer starting");
+        assert!(!cert.is_empty());
+    }
+
+    /// A directory that cannot be written says so, instead of blaming a peer.
+    ///
+    /// Taking the lock used to be `.is_ok()`, which reads every failure as
+    /// "somebody else has it" — so a permission problem went round the
+    /// stale-lock path and came back as a confident story about a process
+    /// repeatedly dying.
+    #[cfg(all(feature = "relay", unix))]
+    #[test]
+    fn an_unwritable_store_reports_itself() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch("unwritable");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // Root ignores the mode, and so do some container filesystems. Only
+        // assert where the thing under test can actually happen.
+        let enforced = std::fs::write(dir.join(".probe"), b"x").is_err();
+
+        let got = emulated_printer_identity("0309FA123456789", Some(&dir));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        if enforced {
+            let err = got.expect_err("an unwritable store cannot yield an identity");
+            let said = err.to_string();
+            assert!(
+                said.contains("ermission") || said.contains("denied"),
+                "it should name the real failure, not a peer: {said}"
+            );
+        }
     }
 
     #[cfg(feature = "relay")]
