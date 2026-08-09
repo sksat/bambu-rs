@@ -772,3 +772,35 @@ fn waiting_for_the_motion_is_not_offered_for_a_single_line() {
         .failure();
     let _ = std::fs::remove_dir_all(&cfg);
 }
+
+#[test]
+fn a_camera_interval_that_would_panic_or_spin_is_refused_up_front() {
+    // These reach `Duration::from_secs_f32` straight from the command line.
+    // NaN, infinity and negatives panic there outright; zero polls the camera
+    // as fast as it will answer. Clap rejects all four before any of that.
+    // Asserting only `.failure()` would prove nothing: this command also fails
+    // for want of a configured printer, whatever the interval says. The message
+    // has to name the flag.
+    let cfg = tmp_cfg("camera-interval");
+    // `=` rather than a separate argument: a bare `-1` is read as a flag, and
+    // the refusal then comes from clap's argument matching instead of from the
+    // check under test.
+    for bad in ["NaN", "inf", "-1", "0"] {
+        let out = bambu(&cfg)
+            .args([
+                "serve",
+                "--emulate",
+                "--emulate-camera",
+                "bed",
+                &format!("--emulate-camera-interval={bad}"),
+            ])
+            .assert()
+            .failure();
+        let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+        assert!(
+            stderr.contains("emulate-camera-interval"),
+            "{bad:?} should be refused by name, got:\n{stderr}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&cfg);
+}

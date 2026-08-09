@@ -177,8 +177,14 @@ pub fn is_jpeg(bytes: &[u8]) -> bool {
 /// Incremental by construction, like [`parse_auth`]: the bytes come off a
 /// socket, so "not yet" is the common answer rather than a failure.
 pub struct Multipart {
-    /// The delimiter as it appears on the wire, `--` included.
-    marker: Vec<u8>,
+    /// The delimiters this stream might use, longest first.
+    ///
+    /// Normally one: the parameter with `--` in front, as the standard says.
+    /// A camera that writes `boundary=--frame` gets two, because in practice
+    /// such a camera delimits with `--frame` and not the `----frame` the
+    /// standard would produce — and guessing wrong means never finding a frame
+    /// at all, which looks exactly like a camera that is switched off.
+    markers: Vec<Vec<u8>>,
 }
 
 impl Multipart {
@@ -197,9 +203,15 @@ impl Multipart {
         if value.is_empty() {
             return None;
         }
-        Some(Self {
-            marker: [b"--", value.as_bytes()].concat(),
-        })
+        let spec = [b"--".as_slice(), value.as_bytes()].concat();
+        let mut markers = vec![spec];
+        if let Some(bare) = value.strip_prefix("--") {
+            markers.push([b"--".as_slice(), bare.as_bytes()].concat());
+        }
+        // Longest first, so a buffer containing `----frame` is not matched as
+        // the shorter `--frame` two characters early.
+        markers.sort_by_key(|m| std::cmp::Reverse(m.len()));
+        Some(Self { markers })
     }
 
     /// The next frame in `buf`, and how much of `buf` it used up.
@@ -211,10 +223,10 @@ impl Multipart {
         &self,
         buf: &[u8],
     ) -> Result<Option<(std::ops::Range<usize>, usize)>, CameraError> {
-        let Some(start) = find(buf, &self.marker) else {
+        let Some((start, marker)) = self.find_marker(buf) else {
             return Ok(None);
         };
-        let after_marker = start + self.marker.len();
+        let after_marker = start + marker.len();
         // Headers end at a blank line; until then this part is incomplete.
         let Some(gap) = find(&buf[after_marker..], b"\r\n\r\n") else {
             return Ok(None);
@@ -230,7 +242,7 @@ impl Multipart {
             }
             return Ok(Some((body..body + len, body + len)));
         }
-        let Some(next) = find(&buf[body..], &self.marker) else {
+        let Some((next, _)) = self.find_marker(&buf[body..]) else {
             return Ok(None);
         };
         let mut end = body + next;
@@ -239,6 +251,16 @@ impl Multipart {
             end -= 2;
         }
         Ok(Some((body..end, end)))
+    }
+}
+
+impl Multipart {
+    /// The earliest delimiter in `buf`, and which one it was.
+    fn find_marker<'a>(&'a self, buf: &[u8]) -> Option<(usize, &'a [u8])> {
+        self.markers
+            .iter()
+            .filter_map(|m| find(buf, m).map(|at| (at, m.as_slice())))
+            .min_by_key(|(at, m)| (*at, std::cmp::Reverse(m.len())))
     }
 }
 
@@ -400,10 +422,24 @@ mod tests {
             "multipart/x-mixed-replace; boundary=frame; charset=binary",
         ] {
             let mp = Multipart::from_content_type(header).expect(header);
-            assert_eq!(mp.marker, b"--frame", "{header}");
+            assert_eq!(mp.markers, vec![b"--frame".to_vec()], "{header}");
         }
         assert!(Multipart::from_content_type("image/jpeg").is_none());
         assert!(Multipart::from_content_type("multipart/x-mixed-replace; boundary=").is_none());
+    }
+
+    #[test]
+    fn a_boundary_that_already_has_dashes_is_still_found() {
+        // Cameras that write `boundary=--frame` delimit with `--frame`, not the
+        // `----frame` the standard implies. Following the standard alone here
+        // finds no frames at all, which is indistinguishable from a camera that
+        // is switched off — so both spellings are tried.
+        let want = vec![jpeg(0x88), jpeg(0x99)];
+        let mp = Multipart::from_content_type("multipart/x-mixed-replace; boundary=--frame")
+            .expect("a boundary");
+        assert_eq!(drain(&mp, &multipart_body("frame", &want, true)), want);
+        // And the by-the-book spelling still works.
+        assert_eq!(drain(&mp, &multipart_body("--frame", &want, true)), want);
     }
 
     #[test]
