@@ -225,7 +225,11 @@ fn is_authored_project_capped<R: Read + Seek>(zip: R, cap: u64) -> Result<bool, 
         Ok(entry) => count_items(entry, cap),
         // No root model at all: nothing to re-arrange, and the slicer will
         // reject the file on its own terms.
-        Err(_) => BuildItems::Count(0),
+        Err(zip::result::ZipError::FileNotFound) => BuildItems::Count(0),
+        // Anything else — a corrupt entry, a bad header — means the model was
+        // not read. "Not read" is not "bare geometry"; answering that would
+        // re-arrange a layout nobody managed to look at.
+        Err(_) => BuildItems::Unknown,
     };
     Ok(match items {
         BuildItems::Count(n) => n > 1,
@@ -318,7 +322,16 @@ fn count_items<R: Read>(entry: R, cap: u64) -> BuildItems {
                     _ => {}
                 }
             }
-            (_, Event::End(e)) if e.local_name().as_ref() == b"build" => {
+            // Our `<build>`, in our namespace, and only once we are inside
+            // one: an extension element named `build` in some other namespace
+            // must not end the section — and neither must a stray closing tag
+            // before it started.
+            (ns, Event::End(e))
+                if in_build
+                    && e.local_name().as_ref() == b"build"
+                    && (matches!(ns, ResolveResult::Unbound)
+                        || matches!(ns, ResolveResult::Bound(n) if n.as_ref() == CORE_NS)) =>
+            {
                 return BuildItems::Count(if oriented { items.max(2) } else { items });
             }
             _ => {}
@@ -626,6 +639,44 @@ mod tests {
     }
 
     #[test]
+    fn a_foreign_build_end_tag_does_not_close_ours() {
+        // An extension element named `build` in another namespace must not end
+        // the 3MF one — the items after it would go uncounted and the assembly
+        // would read as bare geometry.
+        let mixed = make_3mf(&[(
+            "3D/3dmodel.model",
+            br#"<model xmlns:x="urn:other"><build>
+                  <x:build/></x:build>
+                  <item objectid="1"/><item objectid="2"/></build></model>"#,
+        )]);
+        assert!(is_authored_project(Cursor::new(&mixed)).unwrap());
+    }
+
+    #[test]
+    fn a_model_stream_that_will_not_decompress_is_not_bare_geometry() {
+        // The zip directory stays intact, so the entry OPENS and then fails to
+        // inflate — the model was never actually read. Answering "no build
+        // items" to that re-arranges a layout nobody managed to look at.
+        //
+        // (The sibling case, where `by_name` itself fails for a reason other
+        // than the entry being absent, takes the same `Unknown` route by
+        // construction. Reaching it needs a malformed local header, which is
+        // not worth hand-building a fixture for.)
+        let mut bad = make_3mf(&[(
+            "3D/3dmodel.model",
+            br#"<model><build><item objectid="1"/><item objectid="2"/></build></model>"#,
+        )]);
+        let n = bad.len();
+        for b in &mut bad[40..n.min(90)] {
+            *b ^= 0xff;
+        }
+        assert!(
+            is_authored_project(Cursor::new(&bad)).unwrap(),
+            "a model that would not decompress read as bare geometry"
+        );
+    }
+
+    #[test]
     fn an_undeclared_prefix_is_not_quietly_treated_as_bare_geometry() {
         // Invalid XML: `c:` is bound to nothing, so the element resolves to no
         // namespace at all. Answering "not 3MF, therefore bare" would slice a
@@ -721,11 +772,10 @@ mod tests {
 
     #[test]
     fn a_build_item_split_across_read_chunks_is_still_counted() {
-        // The scan reads in chunks and carries an overlap between them; without
-        // it a `<item` straddling a boundary vanishes and an assembly reads as
-        // bare geometry. Driven through a reader that hands over ONE byte per
-        // call, so every needle is split — a zip entry's `read` returns
-        // whatever size it likes, and a fixture cannot force the case.
+        // Driven through a reader that hands over ONE byte per call. The
+        // parser buffers for itself, so this is no longer about splitting a
+        // marker; it keeps a prefixed document going through the smallest
+        // reads anything could produce.
         struct Dribble<'a>(&'a [u8]);
         impl std::io::Read for Dribble<'_> {
             fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
