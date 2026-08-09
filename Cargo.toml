@@ -26,6 +26,11 @@ include = [
     "/README.md",
     "/LICENSE",
     "/about.toml",
+    # The prose the README links to, and the accessory macros it points at. Both
+    # are small, and a vendored copy of this crate that cannot follow its own
+    # links is a worse artifact than one carrying a few KiB of text.
+    "/docs",
+    "/sequences",
     "/src",
     # …but not the game. Publishing a crate is redistribution, and this one
     # would rather not carry DOOM into somebody else's dependency tree — the
