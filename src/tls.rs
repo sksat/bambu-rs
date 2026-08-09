@@ -137,55 +137,102 @@ pub fn emulated_printer_identity(
         return Ok(generate(serial)?.0);
     };
     std::fs::create_dir_all(dir)?;
-    if let Some(pair) = read_pair(dir, serial)? {
-        return Ok(pair);
-    }
+    let lock = dir.join(format!("{serial}.lock"));
 
+    // Rounds of: is there one? no — may I make it? no — wait a moment.
+    //
     // Two emulators for the same serial can start at the same moment — the
     // end-to-end test does exactly that, a relay in front of a synthetic
-    // printer — and the certificate and the key are separate files, so there is
-    // no way for both to appear at once. Without this, each process generates
-    // its own pair and writes over the other's, and whoever reads one file
-    // before the second write and the other after gets a certificate and a key
-    // from different pairs. rustls calls that `KeyMismatch` and the listener
-    // never binds.
-    //
-    // So exactly one process generates. `create_new` is the atomic part: it
-    // either creates the lock or tells us someone else already did.
-    let lock = dir.join(format!("{serial}.lock"));
-    let won = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock)
-        .is_ok();
-    if won {
-        let (pair, pem) = generate(serial)?;
-        let written = write_pair(dir, serial, &pair, &pem);
-        let _ = std::fs::remove_file(&lock);
-        written?;
-        return Ok(pair);
-    }
-
-    // Someone else is mid-write. Their files appear by rename, so each is
-    // complete the instant it is visible; waiting for both is enough.
-    for _ in 0..WAIT_FOR_PEER {
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    // printer — and the certificate and the key are separate files, so there
+    // is no way for both to appear at once. Without the lock, each starter
+    // generates its own pair and writes over the other's, and whoever reads one
+    // file before the second write and the other after gets a certificate and a
+    // key from different pairs. rustls calls that `KeyMismatch` and the
+    // listener never binds.
+    let mut takeovers = 0;
+    loop {
         if let Some(pair) = read_pair(dir, serial)? {
             return Ok(pair);
         }
+        // `create_new` is the atomic part: it either creates the lock or tells
+        // us someone else already did.
+        let won = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+            .is_ok();
+        if won {
+            // Holding the lock is not the same as nobody having written one.
+            // The previous holder removes it when it finishes, so a starter
+            // that found the directory empty a moment ago can take the lock
+            // straight after that removal and generate a *second* identity over
+            // a perfectly good first one — two starters, two certificates for
+            // one printer, and a client that pinned the first rejecting the
+            // second. Looking again here is what makes winning the lock mean
+            // what it reads like.
+            if let Some(pair) = read_pair(dir, serial)? {
+                let _ = std::fs::remove_file(&lock);
+                return Ok(pair);
+            }
+            let (pair, pem) = generate(serial)?;
+            let written = write_pair(dir, serial, &pair, &pem);
+            let _ = std::fs::remove_file(&lock);
+            written?;
+            return Ok(pair);
+        }
+        // Somebody else holds it. Whether to wait or to break it is a question
+        // about the *lock*, not about how long we personally have been here:
+        // two starters that began together also time out together, and one
+        // counting its own patience would break the lock the other had just
+        // taken — putting both back to generating at once, which is the thing
+        // the lock is for.
+        if !is_stale(&lock) {
+            // Mid-write. The files appear by rename, so each is complete the
+            // instant it is visible; waiting for both is enough.
+            std::thread::sleep(POLL);
+            continue;
+        }
+        // Old enough that whoever made it is gone. Break it and go round again
+        // rather than writing from here: the next round re-reads and re-locks,
+        // so two starters that break the same stale lock still come away with
+        // one identity between them.
+        takeovers += 1;
+        if takeovers > MAX_TAKEOVERS {
+            return Err(ServerTlsError::Io(std::io::Error::other(format!(
+                "gave up on {}: broken {takeovers} times and still held, which \
+                 means something is repeatedly dying while holding it",
+                lock.display()
+            ))));
+        }
+        let _ = std::fs::remove_file(&lock);
     }
-
-    // The lock is stale — a process died holding it. Take it over rather than
-    // run without an identity a client could have pinned.
-    let _ = std::fs::remove_file(&lock);
-    let (pair, pem) = generate(serial)?;
-    write_pair(dir, serial, &pair, &pem)?;
-    Ok(pair)
 }
 
-/// How long to wait for the process that won the lock (50 ms each).
+/// Has the lock been sitting there longer than anyone could plausibly still be
+/// writing?
+///
+/// A lock that has gone away counts as stale: the next round will find the pair
+/// or take the lock properly, and either is progress.
 #[cfg(feature = "relay")]
-const WAIT_FOR_PEER: u32 = 100;
+fn is_stale(lock: &std::path::Path) -> bool {
+    std::fs::metadata(lock)
+        .and_then(|m| m.modified())
+        .map(|written| written.elapsed().unwrap_or_default() >= STALE_AFTER)
+        .unwrap_or(true)
+}
+
+/// How many stale locks to break before giving up rather than spinning.
+#[cfg(feature = "relay")]
+const MAX_TAKEOVERS: u32 = 3;
+
+/// How long a lock may sit before it is treated as abandoned. Generating a key
+/// takes milliseconds, so this is only ever reached by a process that died.
+#[cfg(feature = "relay")]
+const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often to look while somebody else is writing.
+#[cfg(feature = "relay")]
+const POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// A self-signed certificate naming this serial, its key, and the certificate
 /// in PEM.
@@ -399,6 +446,44 @@ mod tests {
         let one = emulated_printer_identity("0309FAAAAAAAAAA", Some(&dir)).unwrap();
         let two = emulated_printer_identity("0309FBBBBBBBBBB", Some(&dir)).unwrap();
         assert_ne!(one.0, two.0);
+    }
+
+    #[cfg(feature = "relay")]
+    #[test]
+    fn a_lock_left_by_a_dead_process_still_yields_one_identity() {
+        // The racing test above is a race, so it only fails when the timing
+        // goes wrong — it passed sixty times here and failed on CI. This is the
+        // same defect made deterministic: with a lock nobody is holding, two
+        // starters used to wait it out, both decide it was theirs to break, and
+        // both generate. Two certificates for one printer, and a client that
+        // pinned the first rejects the second.
+        //
+        // Breaking a stale lock has to hand off, not just clear the way.
+        let dir = scratch("stale-lock");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("0309FA123456789.lock");
+        let file = std::fs::File::create(&lock).unwrap();
+        // Older than any writer could plausibly still be, so the wait is not
+        // what this test is measuring.
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(600))
+            .unwrap();
+        drop(file);
+
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    emulated_printer_identity("0309FA123456789", Some(&dir)).unwrap()
+                })
+            })
+            .collect();
+        let got: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(
+            (&got[0].0, &got[0].1),
+            (&got[1].0, &got[1].1),
+            "both broke the same stale lock and generated their own identity"
+        );
+        assert!(!lock.exists(), "the lock should not be left behind");
     }
 
     #[cfg(feature = "relay")]
