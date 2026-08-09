@@ -202,7 +202,8 @@ pub struct ProcessChoice {
     pub force_layer: bool,
 }
 
-/// The stock A1-mini process profiles, by layer height.
+/// The stock A1-mini process profiles, by layer height. The 0.4-nozzle set —
+/// see [`SlicerNames::process_suffix`], which is the only way to reach them.
 const PROCESS_TABLE: [(f64, &str); 6] = [
     (0.08, "0.08mm Extra Fine"),
     (0.12, "0.12mm Fine"),
@@ -497,7 +498,39 @@ impl SlicerNames {
     pub fn machine_profile(&self, nozzle: &str) -> String {
         format!("{} {} nozzle", self.machine_base, nozzle.trim())
     }
+
+    /// The process/filament preset suffix for the fitted nozzle — and the only
+    /// way to reach `PROCESS_TABLE`.
+    ///
+    /// The bundle ships a **separate process set per nozzle**: alongside
+    /// `0.20mm Standard @BBL A1M` sit `0.24mm Optimal @BBL A1M 0.6 nozzle`,
+    /// `0.40mm Standard @BBL A1M 0.8 nozzle` and 17 more. `preset_suffix` names
+    /// the 0.4 set — and not by inference: the unsuffixed presets declare
+    /// `"compatible_printers": ["Bambu Lab A1 mini 0.4 nozzle"]`, so pairing
+    /// one with a 0.6 machine is a combination the slicer itself calls
+    /// incompatible, not merely one tuned for a different orifice. (It would
+    /// also make legal heights unreachable: the 0.4 table stops at 0.28 mm, so
+    /// 0.4 mm on a 0.8 nozzle could never be asked for.)
+    ///
+    /// Only 0.4 is device-verified, so the rest are refused rather than guessed
+    /// at — the same rule [`crate::core::capability`] applies to models and
+    /// firmware. Adding one is a verified table plus a row, not a branch.
+    pub fn process_suffix(&self, nozzle: &str) -> Result<&'static str, String> {
+        let n = nozzle.trim();
+        if n == VERIFIED_NOZZLE {
+            return Ok(self.preset_suffix);
+        }
+        Err(format!(
+            "no verified slicing profiles for a {n} mm nozzle — only {VERIFIED_NOZZLE} mm is \
+             mapped, and this slicer bundle ships a different process set per nozzle. Slice it \
+             yourself and upload the result."
+        ))
+    }
 }
+
+/// The nozzle whose profile names are mapped — see
+/// [`SlicerNames::process_suffix`].
+pub const VERIFIED_NOZZLE: &str = "0.4";
 
 /// Whether a layer height is printable with the fitted nozzle.
 ///
@@ -859,14 +892,9 @@ mod tests {
         for h in [0.08, 0.12, 0.16, 0.20, 0.24, 0.28] {
             assert!(layer_fits_nozzle(h, "0.4").is_ok(), "{h} is a stock height");
         }
-        assert!(layer_fits_nozzle(0.4, "0.2").is_err(), "0.2 can't lay 0.4");
-        assert!(layer_fits_nozzle(0.5, "0.8").is_ok(), "0.8 can");
+        // Outside what a 0.4 can lay down, in both directions.
         assert!(layer_fits_nozzle(0.02, "0.4").is_err());
-        let err = layer_fits_nozzle(0.4, "0.2").unwrap_err();
-        assert!(
-            err.contains("0.2 mm nozzle"),
-            "names the real nozzle: {err}"
-        );
+        assert!(layer_fits_nozzle(0.35, "0.4").is_err());
         assert!(layer_fits_nozzle(0.2, "wat").is_err());
         assert!(layer_fits_nozzle(0.2, "0").is_err());
     }

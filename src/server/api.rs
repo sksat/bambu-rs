@@ -1208,6 +1208,17 @@ async fn job_start(State(st): State<PrinterState>, Json(b): Json<StartBody>) -> 
                 ));
             }
         }
+        // Length matters as much as range. This path slices ONE filament, and
+        // the mapping is expanded onto the project's filament indices — a
+        // mismatched length is left unexpanded, so the printer falls back to
+        // whatever the gcode baked in. That is how a plate got printed in the
+        // wrong material once already; it is a refusal now, not a surprise.
+        if b.ams_map.len() != 1 {
+            return bad_request(format!(
+                "ams_map has {} entries but this slice uses 1 filament — pass exactly one tray",
+                b.ams_map.len()
+            ));
+        }
     }
     // With an AMS mapping, inspecting is MANDATORY, not a nicety: the wire array
     // is keyed by each filament's index in the project, and only the plate's
@@ -3000,12 +3011,19 @@ async fn slice_start(
                 .to_string(),
         );
     }
-    if ![".stl", ".step", ".stp", ".3mf"]
+    // Exactly what the slicer reads. It rejects anything else before opening
+    // the file — "Unknown file format. Input file must have .stl, .obj,
+    // .amf(.xml) extension" — so accepting `.step` here would return 202 and
+    // then fail in the background, which is a worse answer than refusing.
+    // (Verified against the installed OrcaSlicer; `.3mf` gets past the format
+    // check on its own path.)
+    if ![".stl", ".obj", ".amf", ".3mf"]
         .iter()
         .any(|e| lower.ends_with(e))
     {
         return bad_request(format!(
-            "{name:?} is not a model file: expected .stl, .step, .stp or .3mf"
+            "{name:?} is not a model file this slicer reads: expected .stl, .obj, .amf or .3mf \
+             (STEP is not supported — convert it first)"
         ));
     }
 
@@ -3067,6 +3085,13 @@ async fn slice_start(
     if !crate::core::slice::is_safe_profile_name(&machine_profile) {
         return bad_request(format!("invalid nozzle {nozzle:?}"));
     }
+    // The process presets are per-nozzle, and only the 0.4 set is mapped. A
+    // 0.6 machine would otherwise slice with 0.4 speeds and flow: a success
+    // that is wrong, which is worse than this refusal.
+    let preset_suffix = match names.process_suffix(&nozzle) {
+        Ok(s) => s,
+        Err(why) => return bad_request(why),
+    };
     // Judged against the nozzle actually fitted, and only once that is known: a
     // fixed 0.04–0.4 window accepts 0.4 mm on a 0.2 nozzle and refuses legal
     // heights on a 0.6, while naming a nozzle the machine doesn't have.
@@ -3149,7 +3174,7 @@ async fn slice_start(
         out_dir: workdir.path().to_path_buf(),
         out_name: crate::core::slice::sanitize_output_name(&name),
         machine_profile,
-        preset_suffix: names.preset_suffix.to_string(),
+        preset_suffix: preset_suffix.to_string(),
         layer_mm: layer,
         filament,
         bed_type,
@@ -3321,6 +3346,17 @@ async fn slice_print(
                     "ams_map[{i}]={v} out of range (trays 0..3, or -1 external)"
                 ));
             }
+        }
+        // Length matters as much as range. This path slices ONE filament, and
+        // the mapping is expanded onto the project's filament indices — a
+        // mismatched length is left unexpanded, so the printer falls back to
+        // whatever the gcode baked in. That is how a plate got printed in the
+        // wrong material once already; it is a refusal now, not a surprise.
+        if b.ams_map.len() != 1 {
+            return bad_request(format!(
+                "ams_map has {} entries but this slice uses 1 filament — pass exactly one tray",
+                b.ams_map.len()
+            ));
         }
     }
     // The A1 mini prints from `/`; a start that reads an uploaded file out of
@@ -6132,6 +6168,79 @@ mod tests {
             // No slice has run, so this is the honest 404 rather than a 401.
             .await
             .assert_status(StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_nozzle_without_verified_profiles_is_refused_rather_than_sliced_at_0_4() {
+        // The bundle ships a process set per nozzle; only the 0.4 set is
+        // mapped. Slicing a 0.6 with 0.4 speeds and flow would succeed and be
+        // wrong — the failure mode this whole module is arranged against.
+        let app = fake_slice_app();
+        for n in ["0.2", "0.6", "0.8"] {
+            let res = app
+                .post(&format!(
+                    "/api/slice?{}",
+                    SLICE_Q.replace("nozzle=0.4", &format!("nozzle={n}"))
+                ))
+                .bytes(b"solid cube".to_vec().into())
+                .await;
+            res.assert_status(StatusCode::BAD_REQUEST);
+            assert!(
+                res.text().contains("no verified slicing profiles"),
+                "{n}: {}",
+                res.text()
+            );
+            assert!(res.text().contains(n), "names the nozzle: {}", res.text());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_format_the_slicer_cannot_read_is_refused_up_front() {
+        // The slicer rejects anything but .stl/.obj/.amf (and .3mf on its own
+        // path) before it opens the file. Accepting `.step` here would answer
+        // 202 and fail in the background — a worse answer than refusing.
+        let (app, _) = slice_app(
+            Arc::new(FakeSlicer),
+            Some(crate::core::model::Model::A1Mini),
+        );
+        for bad in ["part.step", "part.stp"] {
+            let res = app
+                .post(&format!("/api/slice?{}", SLICE_Q.replace("cube.stl", bad)))
+                .bytes(b"whatever".to_vec().into())
+                .await;
+            res.assert_status(StatusCode::BAD_REQUEST);
+            assert!(
+                res.text().contains("STEP is not supported"),
+                "{}",
+                res.text()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn printing_a_slice_needs_exactly_one_tray() {
+        // The slice uses one filament, and a mismatched map is left unexpanded
+        // — the printer then falls back to whatever the gcode baked in, which
+        // is how a plate got printed in the wrong material once already.
+        let app = fake_slice_app();
+        app.post(&format!("/api/slice?{SLICE_Q}"))
+            .bytes(b"solid cube".to_vec().into())
+            .await
+            .assert_status(StatusCode::ACCEPTED);
+        await_slice(&app).await;
+        for map in [json!([]), json!([0, 3])] {
+            let res = app
+                .post("/api/slice/print")
+                .json(&json!({ "use_ams": true, "ams_map": map, "dry_run": true }))
+                .await;
+            res.assert_status(StatusCode::BAD_REQUEST);
+            assert!(res.text().contains("exactly one tray"), "{}", res.text());
+        }
+        // One is fine.
+        app.post("/api/slice/print")
+            .json(&json!({ "use_ams": true, "ams_map": [0], "dry_run": true }))
+            .await
+            .assert_status_ok();
     }
 
     #[tokio::test]
