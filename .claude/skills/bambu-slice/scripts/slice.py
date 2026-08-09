@@ -40,7 +40,11 @@ def detect_slicer():
     """Prefer OrcaSlicer (the originally-verified path); fall back to Bambu Studio
     (`/opt/bambustudio-bin`), which ships the same BBL profiles + CLI flags but
     needs its bundled libs on LD_LIBRARY_PATH and LC_ALL=C (segfault workaround)."""
+    # Absolute: PATH may hold a relative entry (`.`, `./build/bin`), and the
+    # slicer runs from a scratch directory — a relative program name would be
+    # looked up there and vanish.
     orca = shutil.which("orca-slicer")
+    orca = os.path.abspath(orca) if orca else None
     orca_prof = "/opt/orca-slicer/resources/profiles/BBL"
     if orca and os.path.isdir(orca_prof):
         return [orca], orca_prof, dict(os.environ)
