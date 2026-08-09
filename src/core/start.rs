@@ -55,6 +55,46 @@ impl PrintStartParams {
 /// no-op rather than inventing a mapping.
 ///
 /// Called from [`build_command`], so every frontend gets the corrected array.
+/// Whether `used` can be expanded onto this plate's `filament_ids`.
+///
+/// The one rule, in one place, because the CLI and the server each had their
+/// own and they disagreed. [`expand_ams_map`] is keyed by **`filament_ids`** —
+/// each used filament's index in the project — and a map it cannot expand is
+/// passed through *unchanged*, so the printer falls back to whatever the gcode
+/// baked in and prints the wrong material. That has happened on this hardware.
+///
+/// The CLI checked the length against `filament_colors` instead. Those are
+/// normally the same length, but `filament_ids` is parsed all-or-nothing (a
+/// malformed entry would otherwise shift every later index), so a plate with a
+/// bad `filament_ids` keeps its colours and loses its ids — passing the check
+/// and then not expanding.
+///
+/// With no ids to expand onto, exactly one tray is still unambiguous: a single
+/// filament is index 0 whatever the metadata says. More than one is a guess
+/// about ordering, and is refused.
+pub fn ams_map_fits(used: &[i32], filament_ids: &[usize]) -> Result<(), String> {
+    if filament_ids.is_empty() {
+        if used.len() <= 1 {
+            return Ok(());
+        }
+        return Err(format!(
+            "this plate does not say which filaments it uses, so a {}-entry mapping cannot be \
+             resolved — pass a single tray, or re-slice the plate",
+            used.len()
+        ));
+    }
+    if used.len() != filament_ids.len() {
+        return Err(format!(
+            "{} entr{} for a plate that uses {} filament(s) — one tray per filament, in the \
+             plate's own order",
+            used.len(),
+            if used.len() == 1 { "y" } else { "ies" },
+            filament_ids.len()
+        ));
+    }
+    Ok(())
+}
+
 pub fn expand_ams_map(used: &[i32], filament_ids: &[usize]) -> Vec<i32> {
     if used.is_empty() || filament_ids.len() != used.len() {
         return used.to_vec();
@@ -103,6 +143,58 @@ pub fn build_command(params: &PrintStartParams, inspection: Option<&PlateInspect
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_mapping_is_judged_against_the_ids_it_will_be_expanded_onto() {
+        // The pairing that matters: whatever `ams_map_fits` accepts must be
+        // something `expand_ams_map` actually expands. Anything it passes
+        // through unchanged reaches the printer keyed wrongly.
+        for (used, ids) in [
+            (vec![0], vec![0]),
+            (vec![3, 1], vec![0, 2]),
+            (vec![1, 3], vec![2, 0]),
+        ] {
+            assert!(ams_map_fits(&used, &ids).is_ok(), "{used:?} / {ids:?}");
+            // Expanded means each filament's tray lands at that filament's own
+            // index — the property the wire array is read by. (For a single
+            // filament at index 0 that is the identity, which is why "the
+            // output differs from the input" is not the test.)
+            let out = expand_ams_map(&used, &ids);
+            assert_eq!(
+                out.len(),
+                ids.iter().max().unwrap() + 1,
+                "{used:?} / {ids:?}"
+            );
+            for (slot, &idx) in ids.iter().enumerate() {
+                assert_eq!(out[idx], used[slot], "{used:?} / {ids:?} at {idx}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_length_that_cannot_be_expanded_is_refused() {
+        // This is the wrong-material bug: `expand_ams_map` returns a
+        // mismatched-length map UNCHANGED, so it goes to the printer keyed by
+        // nothing and the gcode's baked-in choice wins.
+        let err = ams_map_fits(&[0], &[0, 1]).unwrap_err();
+        assert!(err.contains("2 filament"), "{err}");
+        assert_eq!(
+            expand_ams_map(&[0], &[0, 1]),
+            vec![0],
+            "unexpanded, as feared"
+        );
+        assert!(ams_map_fits(&[0, 1, 2], &[0, 1]).is_err());
+    }
+
+    #[test]
+    fn with_no_ids_one_tray_is_still_unambiguous_and_several_are_not() {
+        // `filament_ids` is parsed all-or-nothing, so a plate with a malformed
+        // one keeps its colours and loses its ids — which is exactly when the
+        // CLI's old check (against `filament_colors`) waved a bad map through.
+        assert!(ams_map_fits(&[2], &[]).is_ok(), "one filament is index 0");
+        let err = ams_map_fits(&[2, 3], &[]).unwrap_err();
+        assert!(err.contains("does not say which filaments"), "{err}");
+    }
     use super::*;
 
     #[test]

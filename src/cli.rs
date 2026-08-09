@@ -2655,7 +2655,7 @@ fn run_job(cli: &Cli, action: &JobAction) -> Result<(), CliError> {
                         // on --dry-run it's downgraded to a warning so the plan
                         // (which also flags it) still prints for the agent to fix.
                         if let Some(m) = &ams_mapping {
-                            match validate_ams_map(m, Some(insp.filament_colors.len())) {
+                            match validate_ams_map(m, Some(&insp.filament_ids)) {
                                 Ok(warns) => {
                                     for w in warns {
                                         eprintln!("warning: {w}");
@@ -2809,7 +2809,7 @@ fn run_job_start_upload(
         let insp = project::inspect_plate(&bytes, plate)
             .map_err(|e| CliError::new(exit::VALIDATION, format!("3mf inspection: {e}")))?;
         if let Some(m) = &parsed_ams {
-            for w in validate_ams_map(m, Some(insp.filament_colors.len()))? {
+            for w in validate_ams_map(m, Some(&insp.filament_ids))? {
                 eprintln!("warning: {w}");
             }
         }
@@ -2963,7 +2963,7 @@ fn parse_ams_map(map: &str) -> Result<Vec<i32>, CliError> {
 /// Returns warnings (non-fatal advisories) for the caller to surface.
 fn validate_ams_map(
     mapping: &[i32],
-    filament_count: Option<usize>,
+    filament_ids: Option<&[usize]>,
 ) -> Result<Vec<String>, CliError> {
     // Range: A1 AMS Lite has trays 0..=3; -1 = external spool.
     for (i, &v) in mapping.iter().enumerate() {
@@ -2977,17 +2977,18 @@ fn validate_ams_map(
             ));
         }
     }
-    if let Some(n) = filament_count
-        && mapping.len() != n
+    // Judged against `filament_ids`, which is what the mapping is expanded onto
+    // — NOT against `filament_colors`, which this used to use. They are usually
+    // the same length, but `filament_ids` is parsed all-or-nothing, so a plate
+    // with a malformed one keeps its colours and loses its ids: the old check
+    // passed and the map then went to the printer unexpanded, choosing the
+    // wrong material. Shared with the server so there is one rule, not two.
+    if let Some(ids) = filament_ids
+        && let Err(why) = crate::core::start::ams_map_fits(mapping, ids)
     {
         return Err(CliError::new(
             exit::VALIDATION,
-            format!(
-                "--ams-map has {} entr{} but the plate has {n} filament(s) — one tray per \
-                 filament, in order",
-                mapping.len(),
-                if mapping.len() == 1 { "y" } else { "ies" },
-            ),
+            format!("--ams-map has {why}"),
         ));
     }
     let mut warnings = Vec::new();
@@ -4727,21 +4728,36 @@ mod tests {
     }
 
     #[test]
-    fn ams_map_length_must_match_filament_count_when_known() {
-        // 2 filaments, 2 entries -> ok.
-        assert!(validate_ams_map(&[0, 1], Some(2)).is_ok());
-        // 2 entries but 3 filaments -> error.
-        assert!(validate_ams_map(&[0, 1], Some(3)).is_err());
+    fn ams_map_length_is_judged_against_the_plates_filament_ids() {
+        // Against `filament_ids` — what the map is expanded onto — and not
+        // `filament_colors`. A plate with a malformed `filament_ids` keeps its
+        // colours and loses its ids, so the old check passed a two-entry map
+        // and the printer then got it unexpanded, choosing the wrong material.
+        assert!(validate_ams_map(&[0, 1], Some(&[0, 1][..])).is_ok());
+        assert!(validate_ams_map(&[0, 1], Some(&[0, 1, 2][..])).is_err());
         // 1 entry, 2 filaments -> error (the classic footgun).
-        assert!(validate_ams_map(&[0], Some(2)).is_err());
+        assert!(validate_ams_map(&[0], Some(&[0, 1][..])).is_err());
+        // Ids the plate does not declare: one tray is still unambiguous (a
+        // single filament is index 0), several are a guess about ordering.
+        assert!(validate_ams_map(&[2], Some(&[][..])).is_ok());
+        let err = validate_ams_map(&[2, 3], Some(&[][..])).unwrap_err();
+        assert!(
+            err.message.contains("does not say which filaments"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]
     fn ams_map_warns_on_multiple_external_spools() {
-        let warns = validate_ams_map(&[-1, -1], Some(2)).unwrap();
+        let warns = validate_ams_map(&[-1, -1], Some(&[0, 1][..])).unwrap();
         assert!(warns.iter().any(|w| w.contains("external spool")));
         // A single -1 is fine, no warning.
-        assert!(validate_ams_map(&[0, -1], Some(2)).unwrap().is_empty());
+        assert!(
+            validate_ams_map(&[0, -1], Some(&[0, 1][..]))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
