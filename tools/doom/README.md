@@ -21,6 +21,16 @@ incapable of also being forwarded (`ControlPolicy::Intercept`).
 
 ## Build it
 
+Two halves, and the Rust one is **not in a default build**. `--emulate-doom`
+exists only with the `doom` feature, which is off because a printer CLI should
+not carry a game's plumbing — or the flag — unless somebody asked:
+
+```bash
+cargo build --features doom        # or: cargo run --features doom -- serve …
+```
+
+Then the engine:
+
 ```bash
 ./build.sh
 ```

@@ -424,7 +424,7 @@ enum Command {
         /// those commands is consumed and never forwarded, which is why this
         /// requires --fake: it only runs in front of a printer that cannot
         /// move. Needs an engine built by tools/doom/build.sh.
-        #[cfg(feature = "relay")]
+        #[cfg(feature = "doom")]
         #[arg(
             long,
             requires_all = ["emulate", "fake", "emulate_doom_engine"],
@@ -434,7 +434,7 @@ enum Command {
         /// The DOOM engine to run — the program built by tools/doom/build.sh.
         /// No default: it is something you built, and guessing where would turn
         /// "not built yet" into "the demo is broken".
-        #[cfg(feature = "relay")]
+        #[cfg(feature = "doom")]
         #[arg(long, value_name = "PATH", requires = "emulate_doom")]
         emulate_doom_engine: Option<std::path::PathBuf>,
         /// An argument for the engine, repeated once per argument — the WAD and
@@ -444,7 +444,7 @@ enum Command {
         // `allow_hyphen_values`, because every argument DOOM takes starts with
         // a hyphen and clap would otherwise read `-iwad` as a flag of ours and
         // refuse to start.
-        #[cfg(feature = "relay")]
+        #[cfg(feature = "doom")]
         #[arg(
             long,
             value_name = "ARG",
@@ -454,7 +454,7 @@ enum Command {
         emulate_doom_arg: Vec<String>,
         /// Port for the game's picture, which is served as the chamber camera.
         /// 6000 is where a client looks.
-        #[cfg(feature = "relay")]
+        #[cfg(feature = "doom")]
         #[arg(long, default_value_t = 6000, requires = "emulate_doom")]
         emulate_doom_port: u16,
     },
@@ -1042,13 +1042,13 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             emulate_camera_port,
             #[cfg(feature = "relay")]
             emulate_camera_interval,
-            #[cfg(feature = "relay")]
+            #[cfg(feature = "doom")]
             emulate_doom,
-            #[cfg(feature = "relay")]
+            #[cfg(feature = "doom")]
             emulate_doom_engine,
-            #[cfg(feature = "relay")]
+            #[cfg(feature = "doom")]
             emulate_doom_arg,
-            #[cfg(feature = "relay")]
+            #[cfg(feature = "doom")]
             emulate_doom_port,
         } => run_serve(
             cli,
@@ -1085,6 +1085,7 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
                 // `requires_all` on the flag makes the engine path present
                 // whenever DOOM is asked for, so this can only be None when
                 // DOOM was not asked for.
+                #[cfg(feature = "doom")]
                 doom: emulate_doom
                     .then(|| emulate_doom_engine.clone())
                     .flatten()

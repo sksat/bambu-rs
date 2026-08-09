@@ -24,4 +24,4 @@ from the environment and **never printed**).
 | `capture_get_version.py` | the `info.get_version` module inventory |
 | `capture_report_delta.py` | the snapshot **plus** every delta over a window — run it, then trigger a change (AMS load/unload, a setting) to observe its wire format |
 | `trust_relay_in_studio.sh` | **writes.** Adds a `serve --emulate` relay's certificate to Bambu Studio's printer CA bundle, without which Studio refuses the relay with a TLS `UnknownCA` before MQTT begins. Needs root; idempotent; keeps the original. `DRY_RUN=1` to look first. |
-| `doom/` | **not an observation script.** Builds the frame source for `serve --emulate-doom`, which shows DOOM in a client's chamber-camera liveview and plays it with the movement panel. Runs only against `--fake`. See `doom/README.md`. |
+| `doom/` | **not an observation script.** Builds the frame source for `serve --emulate-doom`, which shows DOOM in a client's chamber-camera liveview and plays it with the movement panel. Runs only against `--fake`, and only in a build with the default-off `doom` feature. See `doom/README.md`. |

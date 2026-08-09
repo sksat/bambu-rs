@@ -8,7 +8,7 @@ pub mod capability;
 pub mod command;
 #[cfg(feature = "relay")]
 pub mod detect;
-#[cfg(feature = "relay")]
+#[cfg(feature = "doom")]
 pub mod doom;
 #[cfg(feature = "relay")]
 pub mod emulate;

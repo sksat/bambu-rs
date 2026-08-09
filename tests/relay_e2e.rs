@@ -458,7 +458,7 @@ fn the_relay_refuses_a_client_with_the_wrong_access_code() {
 ///
 /// The "engine" here is a shell script, not DOOM: this is a test of the
 /// plumbing, and it should not need a WAD or a C compiler.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "doom"))]
 #[test]
 fn a_client_plays_a_game_through_the_printers_own_controls() {
     use std::os::unix::fs::PermissionsExt;

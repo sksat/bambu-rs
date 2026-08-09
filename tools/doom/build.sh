@@ -69,7 +69,9 @@ built $(pwd)/build/bambu-doom-engine
   see it on its own:
     ./build/bambu-doom-engine -raw -iwad ./build/doom1.wad -warp 1 1 | ffplay -f mjpeg -
 
-  play it through a printer that does not exist:
+  play it through a printer that does not exist — with a bambu built for it,
+  because --emulate-doom is behind a feature that is off by default:
+    cargo build --features doom
     bambu serve --fake --emulate --serial DOOM00000000001 --access-code 12345678 \\
       --emulate-doom \\
       --emulate-doom-engine $(pwd)/build/bambu-doom-engine \\

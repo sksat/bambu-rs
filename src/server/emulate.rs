@@ -140,7 +140,9 @@ pub trait Upstream: Send + Sync + 'static {
 /// Paired with [`crate::core::emulate::ControlPolicy::Intercept`], and only ever
 /// through [`Emulator::intercepting`] — the policy and the interceptor are set
 /// together so a relay cannot end up swallowing commands with nothing behind
-/// it. `serve --emulate-doom` puts [`crate::server::doom::DoomEngine`] here.
+/// it. With the `doom` feature, `serve --emulate-doom` puts a `DoomEngine`
+/// here; not linked as a doc reference, because that module is not in a build
+/// without it.
 ///
 /// Both directions are one trait because they are one thing: something that
 /// takes the buttons has state of its own, and the report on the way out is

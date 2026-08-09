@@ -97,6 +97,15 @@ server = [
 # because this uses it directly, but it arrives with `rumqttc` either way, so
 # turning the feature off does not shed it.
 relay = ["server", "dep:rcgen", "dep:tokio-rustls"]
+# `serve --emulate-doom`: the emulated printer's movement panel plays DOOM, and
+# its liveview is the screen. An easter egg, and **off by default** — a printer
+# CLI should not carry a game's plumbing, or the flag, unless it was asked for.
+#
+# Nothing extra is pulled in; the feature exists to keep the code and the
+# command line out of a build that did not want them. The engine itself is a
+# separate program built from `tools/doom/` and spawned, never linked, which is
+# also why enabling this does not make the crate GPL.
+doom = ["relay"]
 # The embedded web dashboard SPA, served by `bambu serve` when enabled. Builds on
 # the API server and embeds `web/dist/` via rust-embed.
 dashboard = ["server", "dep:rust-embed"]
