@@ -55,6 +55,18 @@ impl PrintStartParams {
 /// no-op rather than inventing a mapping.
 ///
 /// Called from [`build_command`], so every frontend gets the corrected array.
+pub fn expand_ams_map(used: &[i32], filament_ids: &[usize]) -> Vec<i32> {
+    if used.is_empty() || filament_ids.len() != used.len() {
+        return used.to_vec();
+    }
+    let len = filament_ids.iter().copied().max().unwrap_or(0) + 1;
+    let mut out = vec![used[0]; len];
+    for (slot, &idx) in filament_ids.iter().enumerate() {
+        out[idx] = used[slot];
+    }
+    out
+}
+
 /// Whether `used` can be expanded onto this plate's `filament_ids`.
 ///
 /// The one rule, in one place, because the CLI and the server each had their
@@ -72,20 +84,31 @@ impl PrintStartParams {
 /// With no ids to expand onto, exactly one tray is still unambiguous: a single
 /// filament is index 0 whatever the metadata says. More than one is a guess
 /// about ordering, and is refused.
+///
+/// The message is a clause, so a caller can name the thing it is about:
+/// `--ams-map {why}` / `ams_map {why}`.
 pub fn ams_map_fits(used: &[i32], filament_ids: &[usize]) -> Result<(), String> {
+    // No mapping supplied at all. Expansion is a no-op and the plate's own
+    // choice stands, so there is nothing here to be wrong — whether `use_ams`
+    // without a mapping makes sense is the caller's question, not this one's.
+    // Spelled out rather than folded into the `1` case below, which is about
+    // something else entirely.
+    if used.is_empty() {
+        return Ok(());
+    }
     if filament_ids.is_empty() {
-        if used.len() <= 1 {
+        if used.len() == 1 {
             return Ok(());
         }
         return Err(format!(
-            "this plate does not say which filaments it uses, so a {}-entry mapping cannot be \
-             resolved — pass a single tray, or re-slice the plate",
+            "has {} entries, but the plate does not say which filaments it uses, so they cannot \
+             be resolved — pass a single tray, or re-slice the plate",
             used.len()
         ));
     }
     if used.len() != filament_ids.len() {
         return Err(format!(
-            "{} entr{} for a plate that uses {} filament(s) — one tray per filament, in the \
+            "has {} entr{} but the plate uses {} filament(s) — one tray per filament, in the \
              plate's own order",
             used.len(),
             if used.len() == 1 { "y" } else { "ies" },
@@ -93,18 +116,6 @@ pub fn ams_map_fits(used: &[i32], filament_ids: &[usize]) -> Result<(), String> 
         ));
     }
     Ok(())
-}
-
-pub fn expand_ams_map(used: &[i32], filament_ids: &[usize]) -> Vec<i32> {
-    if used.is_empty() || filament_ids.len() != used.len() {
-        return used.to_vec();
-    }
-    let len = filament_ids.iter().copied().max().unwrap_or(0) + 1;
-    let mut out = vec![used[0]; len];
-    for (slot, &idx) in filament_ids.iter().enumerate() {
-        out[idx] = used[slot];
-    }
-    out
 }
 
 /// Render the print-start command: `project_file` for a `.3mf`, `gcode_file` for
@@ -184,6 +195,17 @@ mod tests {
             "unexpanded, as feared"
         );
         assert!(ams_map_fits(&[0, 1, 2], &[0, 1]).is_err());
+    }
+
+    #[test]
+    fn no_mapping_at_all_is_not_a_one_entry_mapping() {
+        // `used.is_empty()` means the caller supplied no mapping — expansion is
+        // a no-op and the plate's own choice stands. Folding that in with "one
+        // tray" (as `<= 1` did) would also let `use_ams` through with an empty
+        // wire array, which is a different thing entirely.
+        assert!(ams_map_fits(&[], &[]).is_ok());
+        assert!(ams_map_fits(&[], &[0, 1]).is_ok());
+        assert_eq!(expand_ams_map(&[], &[0, 1]), Vec::<i32>::new());
     }
 
     #[test]

@@ -2957,10 +2957,10 @@ fn parse_ams_map(map: &str) -> Result<Vec<i32>, CliError> {
 }
 
 /// Validate a parsed `--ams-map`. Tray range is **always** checked (needs only
-/// the mapping); the filament-count match is checked only when `filament_count`
-/// is known (we have to inspect the on-printer 3mf for that). A wrong mapping is
-/// the AMS footgun the plan calls out — refuse (exit 3) rather than mis-print.
-/// Returns warnings (non-fatal advisories) for the caller to surface.
+/// the mapping); the length is checked only when `filament_ids` is known, which
+/// means inspecting the on-printer 3mf first. A wrong mapping is the AMS
+/// footgun the plan calls out — refuse (exit 3) rather than mis-print. Returns
+/// warnings (non-fatal advisories) for the caller to surface.
 fn validate_ams_map(
     mapping: &[i32],
     filament_ids: Option<&[usize]>,
@@ -2986,10 +2986,7 @@ fn validate_ams_map(
     if let Some(ids) = filament_ids
         && let Err(why) = crate::core::start::ams_map_fits(mapping, ids)
     {
-        return Err(CliError::new(
-            exit::VALIDATION,
-            format!("--ams-map has {why}"),
-        ));
+        return Err(CliError::new(exit::VALIDATION, format!("--ams-map {why}")));
     }
     let mut warnings = Vec::new();
     if mapping.iter().filter(|&&v| v == -1).count() > 1 {

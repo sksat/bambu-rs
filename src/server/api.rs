@@ -1247,7 +1247,7 @@ async fn job_start(State(st): State<PrinterState>, Json(b): Json<StartBody>) -> 
     if let Some(insp) = inspection.as_ref()
         && let Err(why) = crate::core::start::ams_map_fits(&b.ams_map, &insp.filament_ids)
     {
-        return bad_request(format!("ams_map has {why}"));
+        return bad_request(format!("ams_map {why} ({} plate {})", b.file, b.plate));
     }
     let req = StartRequest {
         file: b.file.clone(),
