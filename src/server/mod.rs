@@ -608,6 +608,9 @@ async fn start_emulator(
     };
 
     let emulator = emulate::Emulator::new(printer, upstream);
+    if opts.camera.is_some() {
+        emulator.claim_camera();
+    }
     tokio::spawn(Arc::clone(&emulator).pump());
     tokio::spawn({
         let tls = Arc::clone(&tls);

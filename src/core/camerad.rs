@@ -22,6 +22,8 @@
 //! rather than from a capture, and why the pieces are shared: the production
 //! client is then a witness the server has to satisfy.
 
+use serde_json::Value;
+
 /// Where a real printer serves the camera stream.
 pub const CAMERA_PORT: u16 = 6000;
 
@@ -164,6 +166,48 @@ pub fn is_jpeg(bytes: &[u8]) -> bool {
         && bytes.starts_with(&[0xFF, 0xD8])
         && bytes.ends_with(&[0xFF, 0xD9])
 }
+
+/// Tell a client the printer has a camera, in a report about to be relayed.
+///
+/// Serving the camera port is not enough on its own. A client reads
+/// `print.ipcam.ipcam_dev` and, finding `"0"`, never opens a liveview at all —
+/// observed with Bambu Studio against this relay, which connected over MQTT and
+/// then made no attempt on the camera port. The A1 mini here reports `"0"`
+/// honestly, because its built-in camera is physically dead.
+///
+/// **This is the one place the relay contradicts the printer about the printer.**
+/// Elsewhere it only ever corrects claims about *itself* — the detect reply says
+/// `bind: free` because the relay is free, whatever the machine is doing. Here
+/// it says a camera exists where the machine says none does. What makes it
+/// defensible is that, from the client's side, it is true: there really is a
+/// camera on that port, and pictures really do come out of it. What makes it
+/// safe is that it only happens when a camera was named for substitution — an
+/// unsubstituted relay repeats the printer's `"0"` and no client goes looking.
+///
+/// Returns whether anything changed, so a caller can avoid re-encoding a
+/// message it did not touch.
+pub fn claim_camera(message: &mut Value) -> bool {
+    let Some(print) = message.get_mut("print").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    // Only in a report. An ACK wears the same envelope, and bolting device
+    // state onto a command's answer would put it somewhere no client looks.
+    if !print.contains_key("ipcam") {
+        return false;
+    }
+    let Some(ipcam) = print.get_mut("ipcam").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    if ipcam.get("ipcam_dev").and_then(Value::as_str) == Some(PRESENT) {
+        return false;
+    }
+    ipcam.insert("ipcam_dev".to_string(), Value::from(PRESENT));
+    true
+}
+
+/// What `ipcam_dev` says when a camera is there. A string, as the printer sends
+/// it — a client comparing against `"1"` would not recognise the number 1.
+const PRESENT: &str = "1";
 
 /// Splits an MJPEG `multipart/x-mixed-replace` body into single frames.
 ///
@@ -412,6 +456,45 @@ mod tests {
             at += used;
         }
         out
+    }
+
+    #[test]
+    fn a_relayed_report_can_say_the_camera_is_there() {
+        // The shape the A1 mini really sends, dead camera and all.
+        let mut report = serde_json::json!({"print": {
+            "command": "push_status", "msg": 0,
+            "ipcam": {
+                "ipcam_dev": "0", "ipcam_record": "enable", "mode_bits": 3,
+                "resolution": "1080p", "timelapse": "disable", "tutk_server": "disable",
+            },
+        }});
+        assert!(claim_camera(&mut report));
+        assert_eq!(report["print"]["ipcam"]["ipcam_dev"], "1");
+        // A string, not the number: a client comparing against "1" would not
+        // recognise 1.
+        assert!(report["print"]["ipcam"]["ipcam_dev"].is_string());
+        // Everything else is the printer's to say, and is left alone.
+        assert_eq!(report["print"]["ipcam"]["resolution"], "1080p");
+        assert_eq!(report["print"]["ipcam"]["tutk_server"], "disable");
+        assert_eq!(report["print"]["msg"], 0);
+        // Idempotent: a second pass has nothing to change.
+        assert!(!claim_camera(&mut report));
+    }
+
+    #[test]
+    fn nothing_that_is_not_a_camera_report_is_touched() {
+        // An ACK wears the same envelope as a report. Adding device state to a
+        // command's answer would put it where no client reads it, and would
+        // make the ACK a thing it is not.
+        let mut ack = serde_json::json!({"print": {"sequence_id": "1", "result": "success"}});
+        let before = ack.clone();
+        assert!(!claim_camera(&mut ack));
+        assert_eq!(ack, before);
+
+        // A report from a model whose camera the relay is not standing in for
+        // keeps whatever it said.
+        let mut other = serde_json::json!({"info": {"command": "get_version"}});
+        assert!(!claim_camera(&mut other));
     }
 
     #[test]
