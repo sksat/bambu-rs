@@ -877,6 +877,27 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_filament_ids_keeps_the_colours_and_that_asymmetry_matters() {
+        // The two fields are parsed independently, so a plate can end up with
+        // colours and no ids. Anything sizing an AMS map by `filament_colors`
+        // therefore sees "2 filaments" while `expand_ams_map` — which is keyed
+        // by `filament_ids` — has nothing to expand onto, passes the map
+        // through unchanged, and the printer uses the gcode's baked-in choice.
+        // That was the CLI's check, and this pins the asymmetry that made it
+        // wrong so nobody sizes anything by colours again.
+        let zip = make_3mf(&[
+            ("Metadata/plate_1.gcode", b"G28\n"),
+            (
+                "Metadata/plate_1.json",
+                br##"{"filament_colors":["#FF0000","#00FF00"],"filament_ids":[null,1]}"##,
+            ),
+        ]);
+        let insp = inspect_plate(&zip, 1).unwrap();
+        assert_eq!(insp.filament_colors.len(), 2, "colours survive");
+        assert!(insp.filament_ids.is_empty(), "ids do not");
+    }
+
+    #[test]
     fn a_malformed_filament_id_discards_the_whole_array() {
         // Compacting would turn [null, 1] into [1] and point the SECOND
         // filament's tray at the FIRST — a wrong-material print that looks

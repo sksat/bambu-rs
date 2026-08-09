@@ -1244,23 +1244,10 @@ async fn job_start(State(st): State<PrinterState>, Json(b): Json<StartBody>) -> 
     // uses whatever the gcode baked in. That is how a plate got printed in the
     // wrong material once already — device-verified — so a map that cannot be
     // expanded is refused here rather than sent and hoped over.
-    if let Some(insp) = inspection.as_ref() {
-        let want = insp.filament_ids.len();
-        if want == 0 {
-            return bad_request(format!(
-                "{} plate {} does not say which filaments it uses, so an AMS mapping cannot be \
-                 resolved — start without use_ams, or re-slice the plate",
-                b.file, b.plate
-            ));
-        }
-        if b.ams_map.len() != want {
-            return bad_request(format!(
-                "ams_map has {} entries but plate {} uses {want} filament(s) — pass one tray per \
-                 filament, in the plate's own order",
-                b.ams_map.len(),
-                b.plate
-            ));
-        }
+    if let Some(insp) = inspection.as_ref()
+        && let Err(why) = crate::core::start::ams_map_fits(&b.ams_map, &insp.filament_ids)
+    {
+        return bad_request(format!("ams_map {why} ({} plate {})", b.file, b.plate));
     }
     let req = StartRequest {
         file: b.file.clone(),
