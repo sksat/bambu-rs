@@ -76,11 +76,47 @@ impl VerifySession {
         }
     }
 
+    /// This message's ACK for our command, if it carries one: the echoed
+    /// `sequence_id` **and** a `result`, both in the same message.
+    ///
+    /// `Ok` is success; `Err` carries the reason. A verdict, not a string —
+    /// returning the reason for a failure and the result for a success makes
+    /// the two indistinguishable to the caller, and a printer answering
+    /// `{"result": "FAIL", "reason": "success"}` would then be read as success.
+    fn ack_in(&self, message: &Value) -> Option<Result<(), String>> {
+        let cat = self.cmd.category();
+        let obj = message.pointer(&format!("/{cat}"))?;
+        if obj.get("sequence_id").and_then(Value::as_str) != Some(self.seq.as_str()) {
+            return None;
+        }
+        let result = obj.get("result").and_then(Value::as_str)?;
+        if result.eq_ignore_ascii_case("success") {
+            return Some(Ok(()));
+        }
+        // `reason` when the printer gives one, the bare result otherwise.
+        Some(Err(obj
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or(result)
+            .to_string()))
+    }
+
     /// Feed one report message. Returns `Some(outcome)` once a verdict is
     /// reached; `None` means keep waiting (feed the next message, or call
     /// [`timed_out`](Self::timed_out) when the deadline passes).
     pub fn observe(&mut self, message: Value) -> Option<CommandOutcome> {
         let full = is_full_snapshot_message(&message);
+        // Phase 1 reads THIS message; phase 2 reads the merged state. An ACK is
+        // an event — it either is or isn't in the message that just arrived —
+        // while an effect is a level that persists across reports.
+        //
+        // Matching the ACK against the merged state works only while this
+        // session is the sole thing on the connection. Over a shared report
+        // feed it doesn't: another client's ACK leaves `result` sitting in the
+        // merged state, and the next `push_status` overwrites `sequence_id`
+        // with the printer's own counter (a different thing entirely, see the
+        // module docs) — a conjunction the command never produced.
+        let ack = self.ack_in(&message);
         self.state.apply(message);
 
         // Baseline print_error from the first full snapshot, so we react only to
@@ -93,35 +129,17 @@ impl VerifySession {
             );
         }
 
-        let cat = self.cmd.category();
-
         // Phase 1 — the ACK echoes our sequence_id and carries result/reason.
-        if !self.acked {
-            let echoed = self
-                .state
-                .pointer(&format!("/{cat}/sequence_id"))
-                .and_then(|v| v.as_str())
-                == Some(self.seq.as_str());
-            if let (true, Some(result)) = (
-                echoed,
-                self.state
-                    .pointer(&format!("/{cat}/result"))
-                    .and_then(|v| v.as_str()),
-            ) {
-                if !result.eq_ignore_ascii_case("success") {
-                    let reason = self
-                        .state
-                        .pointer(&format!("/{cat}/reason"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(result)
-                        .to_string();
-                    return Some(CommandOutcome::Rejected { reason });
-                }
-                self.acked = true;
-                // For commands with no readable effect, the ACK is the verdict.
-                if !verify::has_observable_effect(&self.cmd) {
-                    return Some(CommandOutcome::Verified);
-                }
+        if !self.acked
+            && let Some(verdict) = ack
+        {
+            if let Err(reason) = verdict {
+                return Some(CommandOutcome::Rejected { reason });
+            }
+            self.acked = true;
+            // For commands with no readable effect, the ACK is the verdict.
+            if !verify::has_observable_effect(&self.cmd) {
+                return Some(CommandOutcome::Verified);
             }
         }
 
@@ -165,6 +183,75 @@ mod tests {
 
     fn project() -> Command {
         Command::ProjectFile(ProjectFile::new("ftp:///model/x.gcode.3mf", 1, "x"))
+    }
+
+    /// Two report messages that carry an ACK's halves separately — another
+    /// client's verdict, then a status push whose `sequence_id` is the
+    /// printer's own counter and happens to be ours.
+    fn split_ack(cat: &str, seq: &str) -> Vec<Value> {
+        vec![
+            // Somebody else's command was rejected. Nothing here is ours.
+            serde_json::json!({ cat: { "sequence_id": "20000042", "result": "FAIL",
+                                       "reason": "not ours" } }),
+            // A status push. Its `sequence_id` is the printer's counter, a
+            // different thing from an echo (see the module docs) — and it
+            // carries no result.
+            serde_json::json!({ cat: { "command": "push_status", "msg": 1,
+                                       "sequence_id": seq } }),
+        ]
+    }
+
+    #[test]
+    fn another_clients_verdict_plus_our_number_is_not_our_ack() {
+        // Over a shared report feed the two halves arrive in different
+        // messages, and merging them invents a verdict the printer never gave.
+        // Matching per message is what makes one connection shareable.
+        let s = run(project(), "300000007", split_ack("print", "300000007"));
+        assert_eq!(
+            s,
+            CommandOutcome::Unverified {
+                stage: VerifyStage::Ack
+            },
+            "no message contained both our id and a result"
+        );
+    }
+
+    #[test]
+    fn a_failure_whose_reason_reads_like_success_is_still_a_failure() {
+        // The result is the verdict and the reason is prose. Collapsing them
+        // into one string — the reason for a failure, the result for a success
+        // — makes a printer answering {"result":"FAIL","reason":"success"}
+        // indistinguishable from one that succeeded.
+        let s = run(
+            Command::PrintSpeed(SpeedLevel::Silent),
+            "300000009",
+            vec![serde_json::json!({ "print": { "sequence_id": "300000009",
+                                                "result": "FAIL", "reason": "success" } })],
+        );
+        assert_eq!(
+            s,
+            CommandOutcome::Rejected {
+                reason: "success".to_string()
+            },
+            "FAIL is a rejection whatever the reason says"
+        );
+    }
+
+    #[test]
+    fn an_ack_in_one_message_still_concludes() {
+        // The halves together, as a real ACK has them.
+        let s = run(
+            Command::PrintSpeed(SpeedLevel::Silent),
+            "300000008",
+            vec![serde_json::json!({ "print": { "sequence_id": "300000008",
+                                                "result": "FAIL", "reason": "busy" } })],
+        );
+        assert_eq!(
+            s,
+            CommandOutcome::Rejected {
+                reason: "busy".to_string()
+            }
+        );
     }
 
     /// Feed a whole message sequence; return the first concluded outcome (or the
