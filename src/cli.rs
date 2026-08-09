@@ -379,6 +379,38 @@ enum Command {
             value_parser = parse_camera_interval
         )]
         emulate_camera_interval: Option<f32>,
+        /// Play DOOM through the printer's controls: the chamber camera shows
+        /// the game and the movement panel plays it. Jog Y walks, jog X turns,
+        /// jog Z strafes, home fires, the chamber light is the use key, and the
+        /// four print-speed levels are the four weapon slots. Every one of
+        /// those commands is consumed and never forwarded, which is why this
+        /// requires --fake: it only runs in front of a printer that cannot
+        /// move. Needs an engine built by tools/doom/build.sh.
+        #[cfg(feature = "relay")]
+        #[arg(
+            long,
+            requires_all = ["emulate", "fake", "emulate_doom_engine"],
+            conflicts_with_all = ["emulate_camera", "emulate_read_only"],
+        )]
+        emulate_doom: bool,
+        /// The DOOM engine to run — the program built by tools/doom/build.sh.
+        /// No default: it is something you built, and guessing where would turn
+        /// "not built yet" into "the demo is broken".
+        #[cfg(feature = "relay")]
+        #[arg(long, value_name = "PATH", requires = "emulate_doom")]
+        emulate_doom_engine: Option<std::path::PathBuf>,
+        /// An argument for the engine, repeated once per argument — the WAD and
+        /// the starting level are DOOM's business, not the relay's. Typically
+        /// `--emulate-doom-arg -iwad --emulate-doom-arg /path/to/doom1.wad
+        /// --emulate-doom-arg -warp --emulate-doom-arg 1 --emulate-doom-arg 1`.
+        #[cfg(feature = "relay")]
+        #[arg(long, value_name = "ARG", requires = "emulate_doom")]
+        emulate_doom_arg: Vec<String>,
+        /// Port for the game's picture, which is served as the chamber camera.
+        /// 6000 is where a client looks.
+        #[cfg(feature = "relay")]
+        #[arg(long, default_value_t = 6000, requires = "emulate_doom")]
+        emulate_doom_port: u16,
     },
 }
 
@@ -959,6 +991,14 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
             emulate_camera_port,
             #[cfg(feature = "relay")]
             emulate_camera_interval,
+            #[cfg(feature = "relay")]
+            emulate_doom,
+            #[cfg(feature = "relay")]
+            emulate_doom_engine,
+            #[cfg(feature = "relay")]
+            emulate_doom_arg,
+            #[cfg(feature = "relay")]
+            emulate_doom_port,
         } => run_serve(
             cli,
             host,
@@ -986,6 +1026,17 @@ fn dispatch(cli: &Cli) -> Result<(), CliError> {
                         poll: emulate_camera_interval.map(camera_interval),
                     }),
                 read_only: *emulate_read_only,
+                // `requires_all` on the flag makes the engine path present
+                // whenever DOOM is asked for, so this can only be None when
+                // DOOM was not asked for.
+                doom: emulate_doom
+                    .then(|| emulate_doom_engine.clone())
+                    .flatten()
+                    .map(|engine| crate::server::DoomOpts {
+                        engine,
+                        args: emulate_doom_arg.clone(),
+                        port: *emulate_doom_port,
+                    }),
             }),
         ),
     }

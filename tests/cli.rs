@@ -773,6 +773,85 @@ fn waiting_for_the_motion_is_not_offered_for_a_single_line() {
     let _ = std::fs::remove_dir_all(&cfg);
 }
 
+/// The demo's own guard rail, refused before anything is bound.
+///
+/// `--emulate-doom` turns a printer's movement panel into a game controller.
+/// The relay cannot forward an intercepted command by construction, but the
+/// flag must still be impossible to point at a machine by accident — so it is
+/// refused at the command line, by name, before `serve` starts anything.
+#[cfg(feature = "relay")]
+#[test]
+fn doom_is_refused_unless_the_printer_is_a_fake_one() {
+    let cfg = tmp_cfg("doom-gate");
+    // A profile for a machine that can move, so the run would otherwise have a
+    // perfectly good printer to talk to.
+    bambu(&cfg)
+        .args([
+            "--printer",
+            "a1",
+            "config",
+            "add",
+            "--ip",
+            "192.0.2.10",
+            "--serial",
+            "0309FA000000000",
+            "--access-code",
+            "12345678",
+            "--model",
+            "a1mini",
+        ])
+        .assert()
+        .success();
+
+    let engine = cfg.join("engine");
+    std::fs::write(&engine, "#!/bin/sh\n").unwrap();
+    let engine = engine.to_string_lossy().into_owned();
+
+    // Refusals that must each name what is wrong, because "serve failed" and
+    // "DOOM was quietly ignored" look the same from outside.
+    let cases: [(&str, Vec<&str>); 3] = [
+        // No --fake: a real printer is on the other end.
+        (
+            "fake",
+            vec![
+                "serve",
+                "--emulate",
+                "--emulate-doom",
+                "--emulate-doom-engine",
+                &engine,
+            ],
+        ),
+        // No engine: nothing to draw the frames.
+        (
+            "emulate-doom-engine",
+            vec!["serve", "--fake", "--emulate", "--emulate-doom"],
+        ),
+        // Both cameras want port 6000 and the liveview.
+        (
+            "emulate-camera",
+            vec![
+                "serve",
+                "--fake",
+                "--emulate",
+                "--emulate-camera",
+                "bed",
+                "--emulate-doom",
+                "--emulate-doom-engine",
+                &engine,
+            ],
+        ),
+    ];
+    for (names, args) in cases {
+        let out = bambu(&cfg).args(&args).assert().failure();
+        let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+        assert!(
+            stderr.contains(names),
+            "{args:?} should be refused by naming {names:?}, got:\n{stderr}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
 /// Only meaningful where the flag exists: without `relay` there is no
 /// `--emulate-camera-interval`, and clap's "unexpected argument" is a different
 /// refusal from the one under test.

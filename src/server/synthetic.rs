@@ -32,6 +32,18 @@ const DEPTH: usize = 64;
 pub struct SyntheticPrinter {
     reports: broadcast::Sender<Value>,
     progress: Mutex<Progress>,
+    job: Job,
+}
+
+/// What the synthetic printer is pretending to be doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Job {
+    /// A print in progress, which is what makes it worth watching.
+    Printing,
+    /// Sitting there. A client leaves the movement controls enabled for an idle
+    /// printer and greys them out for a busy one, so this is the state to be in
+    /// when the movement controls are the point — see `serve --emulate-doom`.
+    Idle,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -43,13 +55,29 @@ struct Progress {
 }
 
 impl SyntheticPrinter {
-    /// Start reporting. A snapshot goes out immediately — the relay's cache is
-    /// seeded from it, exactly as a real connection's opening `pushall` would —
-    /// and a delta follows every `interval`.
+    /// Start reporting a print in progress. A snapshot goes out immediately —
+    /// the relay's cache is seeded from it, exactly as a real connection's
+    /// opening `pushall` would — and a delta follows every `interval`.
     pub fn start(interval: Duration) -> Arc<Self> {
+        Self::spawn(interval, Job::Printing)
+    }
+
+    /// The same printer, idle: nothing running, and the deltas are the small
+    /// temperature drift a real machine reports while it sits there.
+    ///
+    /// It has to keep talking. The relay gives up on a printer that says
+    /// nothing for half a minute and disconnects its clients — correctly, since
+    /// on a real link that means the machine is gone — so an idle printer that
+    /// went quiet would take the whole demo down with it.
+    pub fn idle(interval: Duration) -> Arc<Self> {
+        Self::spawn(interval, Job::Idle)
+    }
+
+    fn spawn(interval: Duration, job: Job) -> Arc<Self> {
         let (reports, _) = broadcast::channel(DEPTH);
         let me = Arc::new(Self {
             reports,
+            job,
             progress: Mutex::new(Progress {
                 layer: 0,
                 percent: 0,
@@ -77,24 +105,27 @@ impl SyntheticPrinter {
     /// The current state as a full `push_status` (`msg: 0`).
     pub fn snapshot(&self) -> Value {
         let p = *self.progress.lock().expect("progress lock poisoned");
+        // An idle machine is not a printing one with the numbers zeroed: it has
+        // no job at all, and nothing is being held at temperature.
+        let idle = self.job == Job::Idle;
         json!({"print": {
             "command": "push_status",
             "msg": 0,
             "sequence_id": "1000",
-            "gcode_state": "RUNNING",
+            "gcode_state": if idle { "IDLE" } else { "RUNNING" },
             "print_error": 0,
-            "subtask_name": "synthetic.gcode.3mf",
-            "gcode_file": "synthetic.gcode.3mf",
-            "mc_percent": p.percent,
-            "layer_num": p.layer,
-            "total_layer_num": 100,
-            "mc_remaining_time": 100 - p.percent,
+            "subtask_name": if idle { "" } else { "synthetic.gcode.3mf" },
+            "gcode_file": if idle { "" } else { "synthetic.gcode.3mf" },
+            "mc_percent": if idle { 0 } else { p.percent },
+            "layer_num": if idle { 0 } else { p.layer },
+            "total_layer_num": if idle { 0 } else { 100 },
+            "mc_remaining_time": if idle { 0 } else { 100 - p.percent },
             "nozzle_temper": p.nozzle,
-            "nozzle_target_temper": 220.0,
+            "nozzle_target_temper": if idle { 0.0 } else { 220.0 },
             "bed_temper": p.bed,
-            "bed_target_temper": 60.0,
+            "bed_target_temper": if idle { 0.0 } else { 60.0 },
             "chamber_temper": 5,
-            "cooling_fan_speed": "100",
+            "cooling_fan_speed": if idle { "0" } else { "100" },
             "spd_lvl": 2,
             "stg_cur": 0,
             "home_flag": 0,
@@ -119,7 +150,26 @@ impl SyntheticPrinter {
 
     /// Advance one layer and describe only what changed — a delta, the way the
     /// A1 sends them.
+    ///
+    /// An idle printer has no layer to advance, but it still has to speak: the
+    /// relay treats half a minute of silence as a printer that has gone away.
+    /// So it reports what an idle machine really does — a nozzle drifting
+    /// around ambient.
     fn advance(&self) -> Value {
+        if self.job == Job::Idle {
+            let mut p = self.progress.lock().expect("progress lock poisoned");
+            p.nozzle = if p.nozzle >= 26.0 {
+                24.0
+            } else {
+                p.nozzle + 0.5
+            };
+            return json!({"print": {
+                "command": "push_status",
+                "msg": 1,
+                "sequence_id": "1001",
+                "nozzle_temper": p.nozzle,
+            }});
+        }
         let mut p = self.progress.lock().expect("progress lock poisoned");
         p.layer = (p.layer + 1) % 101;
         p.percent = p.layer;

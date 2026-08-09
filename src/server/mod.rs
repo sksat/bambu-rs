@@ -16,6 +16,8 @@ pub mod control;
 #[cfg(feature = "relay")]
 pub mod detect;
 #[cfg(feature = "relay")]
+pub mod doom;
+#[cfg(feature = "relay")]
 pub mod emulate;
 pub mod files;
 #[cfg(feature = "relay")]
@@ -112,6 +114,13 @@ pub struct EmulateOpts {
     /// that it has to be asked for by name; it never follows from an external
     /// camera merely being configured.
     pub camera: Option<EmulateCamera>,
+    /// Play DOOM through the printer's control surface instead of relaying it
+    /// — see [`doom`]. `None` = off, which is every case but the demo.
+    ///
+    /// Only ever set with `--fake`: [`serve`] refuses the pair, and the live
+    /// path does not pass it on. A printer that can move must never be behind
+    /// a relay whose buttons are a game.
+    pub doom: Option<DoomOpts>,
     /// The address to tell clients the printer is at.
     ///
     /// The printer's report carries its own LAN address, and a client believes
@@ -126,6 +135,25 @@ pub struct EmulateOpts {
     /// Serve reads but refuse anything that would move or heat the machine —
     /// and, on the FTP side, anything that writes.
     pub read_only: bool,
+}
+
+/// Where the DOOM engine is and how to start it.
+///
+/// No default for the engine path: it is a program the operator built
+/// themselves (`tools/doom/build.sh`), and guessing at a location would turn
+/// "you have not built it" into "the demo does not work".
+#[cfg(feature = "relay")]
+pub struct DoomOpts {
+    /// The frame-source program, speaking the protocol in [`doom`].
+    pub engine: std::path::PathBuf,
+    /// Arguments passed through untouched — `-iwad <path>`, `-warp 1 1`, and
+    /// whatever else that engine understands. Passed through rather than
+    /// composed here, because the WAD and the starting level are DOOM's
+    /// business and not the relay's.
+    pub args: Vec<String>,
+    /// Where the game is served as the chamber camera. `6000` is where a client
+    /// looks unless told otherwise.
+    pub port: u16,
 }
 
 /// Which camera stands in for the printer's own, and where it is served.
@@ -202,6 +230,9 @@ pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
     // it under. Without either, the relay would answer every read with an empty
     // snapshot, which looks to a client like a printer gone strange rather than
     // one that was never there.
+    // DOOM is only ever played in front of a printer that isn't there.
+    #[cfg(feature = "relay")]
+    doom_needs_a_synthetic_printer(emulate.as_ref().is_some_and(|e| e.doom.is_some()), fake)?;
     #[cfg(feature = "relay")]
     if emulate.is_some() && targets.is_empty() {
         anyhow::bail!(
@@ -297,7 +328,14 @@ pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
             #[cfg(feature = "relay")]
             let source: Arc<dyn PrinterSource> = match (&emulate, targets.first()) {
                 (Some(em), Some(ServeTarget { target: t, .. })) => {
-                    let printer = synthetic::SyntheticPrinter::start(tick);
+                    // Idle when the buttons are a game: a client leaves the
+                    // movement panel enabled for a printer that is not printing
+                    // — and a printer that is "printing" while someone plays
+                    // DOOM through it is a confusing thing to show.
+                    let printer = match em.doom {
+                        Some(_) => synthetic::SyntheticPrinter::idle(tick),
+                        None => synthetic::SyntheticPrinter::start(tick),
+                    };
                     let source = Arc::new(LiveSource::from_reports(printer.subscribe()));
                     start_emulator(
                         t,
@@ -318,6 +356,10 @@ pub fn serve(targets: Vec<ServeTarget>, opts: ServeOpts) -> anyhow::Result<()> {
                                 .to_string(),
                         }),
                         &cams,
+                        // The only call site that may pass a game. The live one
+                        // below passes `None`, so even with every check above
+                        // removed a machine cannot end up behind this.
+                        em.doom.as_ref(),
                     )
                     .await?;
                     source
@@ -447,6 +489,9 @@ async fn connect_source(
                 // about it, not ours to compose.
                 detect::ProxyDetect::new(&t.ip, t.detect_port),
                 cameras,
+                // Never, whatever the options say: this is the path with a real
+                // machine on the end of it.
+                None,
             )
             .await?;
             // The relay answers clients' `pushall`s from its cache rather than
@@ -489,6 +534,7 @@ async fn start_emulator(
     files: Arc<dyn ftpd::PrinterFiles>,
     detect_source: Arc<dyn detect::DetectSource>,
     cameras: &[ExternalCamera],
+    doom: Option<&DoomOpts>,
 ) -> anyhow::Result<()> {
     use crate::core::emulate::EmulatedPrinter;
 
@@ -497,6 +543,27 @@ async fn start_emulator(
         printer.read_only()
     } else {
         printer
+    };
+    // Started before anything is bound, because an engine that will not start
+    // (a WAD that isn't there) should stop the whole thing rather than leave a
+    // relay up with a camera port that never produces a picture.
+    let engine = match doom {
+        Some(d) => {
+            if opts.camera.is_some() {
+                anyhow::bail!(
+                    "--emulate-doom and --emulate-camera both want to be the chamber camera; \
+                     pick one"
+                );
+            }
+            if opts.read_only {
+                anyhow::bail!(
+                    "--emulate-read-only refuses control commands and --emulate-doom plays them; \
+                     pick one"
+                );
+            }
+            Some(doom::DoomEngine::spawn(&d.engine, &d.args)?)
+        }
+        None => None,
     };
     // Kept on disk, not made afresh: Bambu Studio verifies a printer against the
     // CAs it bundles, so a relay can only ever be trusted by being pinned — and a
@@ -513,7 +580,12 @@ async fn start_emulator(
 
     // Both listeners bound before either is served, so a port clash on FTP
     // fails at startup rather than after MQTT has come up looking healthy.
-    let ftp = match opts.ftp_port {
+    //
+    // Never in DOOM mode: a client could otherwise upload a sliced file and
+    // "start" a print that is silently consumed as a keypress, which is a
+    // stranger thing to present than no FTP at all. It also means the demo
+    // needs no privileged port.
+    let ftp = match opts.ftp_port.filter(|_| doom.is_none()) {
         Some(port) => Some(bind_ftp_relay(target, opts, port, files).await?),
         None => None,
     };
@@ -549,13 +621,27 @@ async fn start_emulator(
     // Bound with the others, before anything is served: a camera port already
     // taken should stop startup, not surface later as a client that finds a
     // printer with no picture.
-    let camera = match &opts.camera {
-        Some(want) => Some(bind_camera_relay(target, opts, want, cameras).await?),
-        None => None,
+    let camera = match (&opts.camera, &engine, doom) {
+        (Some(want), _, _) => Some(bind_camera_relay(target, opts, want, cameras).await?),
+        (None, Some(engine), Some(d)) => {
+            let addr = show_addr(&opts.host, d.port);
+            let listener = tokio::net::TcpListener::bind((opts.host.as_str(), d.port))
+                .await
+                .map_err(|e| anyhow::anyhow!("binding the DOOM camera on {addr}: {e}"))?;
+            let from = format!("DOOM ({})", d.engine.display());
+            let relay = camerad::CameraRelay::new(&target.access_code, engine.frames());
+            Some((relay, listener, addr, from))
+        }
+        _ => None,
     };
 
-    let emulator = emulate::Emulator::new(printer, upstream);
-    if opts.camera.is_some() {
+    let emulator = match engine {
+        // The policy and the sink together: control is taken by the game and
+        // cannot also be forwarded.
+        Some(engine) => emulate::Emulator::intercepting(printer, upstream, engine),
+        None => emulate::Emulator::new(printer, upstream),
+    };
+    if camera.is_some() {
         emulator.claim_camera();
     }
     emulator.advertise_at(advertised_address(opts)?);
@@ -579,6 +665,7 @@ async fn start_emulator(
         });
         eprintln!("emulate: FTP relay on ftps://{ftp_addr} (implicit TLS)");
     }
+    let serving_camera = camera.is_some();
     if let Some((relay, listener, addr, from)) = camera {
         tokio::spawn({
             let tls = Arc::clone(&tls);
@@ -600,10 +687,17 @@ async fn start_emulator(
         });
         eprintln!("emulate: device-detect ({kind}) on {addr}");
     }
-    if opts.camera.is_none() {
+    if !serving_camera {
         eprintln!(
             "emulate: no camera relay, so a client's liveview will stay empty (pass \
              --emulate-camera <label> to show one of the configured cameras instead)"
+        );
+    }
+    if doom.is_some() {
+        eprintln!(
+            "emulate: DOOM — this printer's controls are a game and reach nothing else. \
+             Jog Y walks, jog X turns, jog Z strafes, home fires, the chamber light is the \
+             use key, and the four speed levels are the four weapon slots."
         );
     }
     if opts.detect_port.is_none() && opts.detect_tls_port.is_none() {
@@ -646,6 +740,28 @@ async fn start_emulator(
             "emulate: reachable from the LAN. Anyone with the printer's access code can \
              drive it through this relay — the same people who could drive the printer \
              directly, and no others."
+        );
+    }
+    Ok(())
+}
+
+/// DOOM is only ever played in front of a printer that isn't there.
+///
+/// The relay's intercept policy already makes it impossible for a command that
+/// plays the game to *also* be forwarded — but "impossible to forward" is not
+/// the same as "safe to point at a machine that can move". Under `--fake` there
+/// is no machine at all: the upstream is [`synthetic::SyntheticPrinter`], which
+/// is a few hundred lines of JSON and has never opened a socket.
+///
+/// Its own function so the rule is one thing with one reason, rather than a
+/// condition buried in a startup path nothing can call in a test.
+#[cfg(feature = "relay")]
+fn doom_needs_a_synthetic_printer(doom: bool, fake: bool) -> anyhow::Result<()> {
+    if doom && !fake {
+        anyhow::bail!(
+            "--emulate-doom turns this printer's controls into a game controller, so it only \
+             runs against a printer that cannot move: add --fake (with --serial/--access-code \
+             for the identity clients connect with)"
         );
     }
     Ok(())
@@ -794,4 +910,25 @@ async fn bind_ftp_relay(
             }
         })?;
     Ok((relay, listener, addr))
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "relay")]
+    use super::*;
+
+    #[cfg(feature = "relay")]
+    #[test]
+    fn doom_only_runs_in_front_of_a_printer_that_cannot_move() {
+        // The command line refuses this pair too (tests/cli.rs), and the live
+        // startup path cannot express it at all. This is the rule itself: three
+        // places, because the cost of being wrong is a game controller wired to
+        // a machine with a 220°C nozzle on it.
+        let refused = doom_needs_a_synthetic_printer(true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("--fake"), "{refused}");
+        assert!(doom_needs_a_synthetic_printer(true, true).is_ok());
+        assert!(doom_needs_a_synthetic_printer(false, false).is_ok());
+    }
 }
