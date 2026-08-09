@@ -7,7 +7,9 @@
 //!
 //! Two halves, because the useful properties need different things:
 //!
-//! * [`the_row_matches_the_captured_bundle`] runs everywhere, including CI. It
+//! * [`the_row_matches_the_captured_bundle`] runs everywhere, including the
+//!   lib-only CI job — it touches nothing but `core`, so it is not feature
+//!   gated. It
 //!   checks the names the row produces against
 //!   `tests/fixtures/bbl-a1mini-manifest.json` — a provenance-recorded capture
 //!   of a real bundle's *names*. Nothing here needs a slicer installed.
@@ -20,8 +22,6 @@
 //! Bambu and ship with the slicer, and copying them into an MIT repository is
 //! not a decision to make in passing. The `#[ignore]`d test is what covers the
 //! content, on a machine that legitimately has it.
-
-#![cfg(feature = "server")]
 
 use bambu_rs::core::capability::default_registry;
 use bambu_rs::core::model::Model;
@@ -114,7 +114,7 @@ fn the_row_matches_the_captured_bundle() {
 /// Everything above is only as true as the manifest. This re-derives it from
 /// the bundle installed here and reports what has moved.
 ///
-/// `cargo test --features server -- --ignored`
+/// `cargo test -- --ignored`
 #[test]
 #[ignore = "needs a BBL profile bundle installed"]
 fn capability_row_matches_the_installed_bundle() {

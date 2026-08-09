@@ -3,7 +3,7 @@
     "Captured from a real BBL bundle so CI can check the core::capability row",
     "for the A1 mini against something other than a restatement of itself.",
     "Names only, no vendor profile content. Re-capture with:",
-    "  cargo test --features server -- --ignored capability_row_matches_the_installed_bundle",
+    "  cargo test -- --ignored capability_row_matches_the_installed_bundle",
     "which fails with the differences when this file has gone stale."
   ],
   "captured_from": {
