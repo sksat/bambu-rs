@@ -16,7 +16,12 @@ cd "$(dirname "$0")"
 # a file added upstream would silently drop out of the build.
 DOOMGENERIC_REPO="https://github.com/ozkl/doomgeneric.git"
 DOOMGENERIC_COMMIT="dcb7a8dbc7a16ce3dda29382ac9aae9d77d21284"
-STB_URL="https://raw.githubusercontent.com/nothings/stb/master/stb_image_write.h"
+# Pinned to a commit, not `master`, and checked. It was the one fetched from a
+# moving branch: the same build would quietly compile different C over time, and
+# whatever upstream became would be compiled into a program `bambu serve` runs.
+STB_COMMIT="1ee679ca2ef753a528db5ba6801e1067b40481b8"
+STB_URL="https://raw.githubusercontent.com/nothings/stb/${STB_COMMIT}/stb_image_write.h"
+STB_SHA256="cbd5f0ad7a9cf4468affb36354a1d2338034f2c12473cf1a8e32053cb6914a05"
 WAD_URL="https://github.com/Akbar30Bill/DOOM_wads/raw/master/doom1.wad"
 # The shareware DOOM 1.9 IWAD. Checked, because a mirror that answers an
 # HTML error page with a 200 is the normal failure here.
@@ -31,8 +36,15 @@ fi
 git -C build/doomgeneric checkout --quiet "$DOOMGENERIC_COMMIT"
 
 if [ ! -f build/stb_image_write.h ]; then
-  echo "fetching stb_image_write.h"
-  curl -sSLf -o build/stb_image_write.h "$STB_URL"
+  echo "fetching stb_image_write.h @ ${STB_COMMIT:0:12}"
+  curl -sSLf -o build/stb_image_write.h.part "$STB_URL"
+  got="$(sha256sum build/stb_image_write.h.part | cut -d' ' -f1)"
+  if [ "$got" != "$STB_SHA256" ]; then
+    rm -f build/stb_image_write.h.part
+    echo "stb_image_write.h does not match its pinned digest (sha256 $got)." >&2
+    exit 1
+  fi
+  mv build/stb_image_write.h.part build/stb_image_write.h
 fi
 
 if [ ! -f build/doom1.wad ]; then

@@ -558,16 +558,31 @@ mod tests {
     async fn a_real_child_process_is_wired_up_both_ways() {
         let dir = tempfile::tempdir().unwrap();
         let keys_seen = dir.path().join("keys");
-        // A "DOOM" that draws one frame and writes down what it is told. The
-        // frame is 1200 bytes of 0x41 between the JPEG markers, which is enough
-        // to pass the relay's own size floor.
+        // One frame, written from here as bytes rather than spelled out in the
+        // stub's own language. `printf '\xNN'` is a bashism: this ran on a
+        // machine whose /bin/sh is bash and failed on CI's dash, which has no
+        // `\x` and printed the four characters instead — the reader then saw a
+        // frame claiming 878868572 bytes, which is `\xb4` read as a length.
+        //
+        // The header is still written out by hand, digit by digit, because the
+        // point of this test is the wire format. Building it with our own
+        // `frame_header` would only prove the encoder agrees with the decoder.
+        let frame_file = dir.path().join("frame.bin");
+        let mut wire = vec![
+            0xb4, 0x04, 0x00, 0x00, // 1204, little-endian
+            0x00, 0x00, 0x00, 0x00, //
+            0x01, 0x00, 0x00, 0x00, //
+            0x00, 0x00, 0x00, 0x00, //
+        ];
+        wire.extend_from_slice(&[0xff, 0xd8]);
+        wire.extend_from_slice(&[b'A'; 1200]);
+        wire.extend_from_slice(&[0xff, 0xd9]);
+        std::fs::write(&frame_file, &wire).expect("the stub's frame should be writable");
+
+        // A "DOOM" that draws that one frame and writes down what it is told.
         let script = format!(
-            r#"printf '\xb4\x04\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00'
-printf '\xff\xd8'
-for i in $(seq 1 1200); do printf 'A'; done
-printf '\xff\xd9'
-cat > {}
-"#,
+            "cat '{}'\ncat > '{}'\n",
+            frame_file.display(),
             keys_seen.display()
         );
         let engine = DoomEngine::spawn(Path::new("/bin/sh"), &["-c".to_string(), script])

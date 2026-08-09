@@ -506,16 +506,33 @@ fn success_ack(request: &Value) -> Value {
 
 /// The printer's ACK shape, filled in.
 ///
-/// Echoes `sequence_id` and `param` and carries **no `command`**, because that
-/// is the ACK observed on the A1 mini (docs/protocol.md):
-/// `{sequence_id, param, result, reason}`. Under the intercept policy this is
-/// the *only* ACK a client will ever see, so a shape of our own invention would
-/// be the shape of the whole printer.
+/// Echoes `sequence_id` and `param`, and carries **no `command` under `print`** —
+/// that is the ACK observed on the A1 mini (docs/protocol.md):
+/// `{sequence_id, param, result, reason}`.
+///
+/// Outside `print` it says which command it answers. Generalising the observed
+/// `print` shape to every category was a guess, and a costly one: Bambu Studio
+/// sends `security.app_cert_install`, gets back a result with nothing naming
+/// the question, and asks again forever — an evening of "Retrieving printer
+/// information" that looked like a dozen other things first. The asymmetry is
+/// the printer's, not ours.
+///
+/// It matters most right here. Under the intercept policy this is the *only*
+/// ACK a client will ever see — the chamber light that opens a door in DOOM is
+/// `system.ledctrl`, not a `print` command — so a shape of our own invention
+/// would be the shape of the whole printer.
 fn ack(request: &Value, result: &str, reason: &str) -> Value {
     let category = category(request).unwrap_or("print");
     let mut ack = Map::new();
     if let Some(seq) = sequence_id(request) {
         ack.insert("sequence_id".to_string(), Value::String(seq.to_string()));
+    }
+    if category != "print"
+        && let Some(command) = request
+            .pointer(&format!("/{category}/command"))
+            .and_then(Value::as_str)
+    {
+        ack.insert("command".to_string(), Value::String(command.to_string()));
     }
     if let Some(param) = request.pointer(&format!("/{category}/param")) {
         ack.insert("param".to_string(), param.clone());
@@ -1594,6 +1611,43 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&p.payload).unwrap();
         assert_eq!(v["system"]["sequence_id"], "4");
         assert_eq!(v["system"]["result"], "success");
+        // And it says which command it answers. Outside `print` a client needs
+        // that: Bambu Studio, told only that *something* succeeded, asks its
+        // question again forever. Under interception this ACK is the only reply
+        // the client will ever get, so leaving it out strands the client at the
+        // first non-`print` command — which here is the door-opening key.
+        assert_eq!(
+            v["system"]["command"], "ledctrl",
+            "an ACK outside `print` must name its command: {v}"
+        );
+    }
+
+    /// …and `print` still does not, because that is what the machine does.
+    ///
+    /// Two rules that look like an inconsistency, so both are pinned: copying
+    /// the observed `print` shape to every category is exactly the guess that
+    /// cost an evening, and "fixing" the asymmetry by adding `command`
+    /// everywhere would be the same mistake mirrored.
+    #[test]
+    fn a_print_ack_still_carries_no_command() {
+        let mut s = connected();
+        let r = s.handle(
+            publish_request(
+                json!({"print": {"sequence_id": "5", "command": "gcode_line", "param": "G28"}}),
+                None,
+            ),
+            &printer().intercepted(),
+            &cache_with_snapshot(),
+        );
+        let [Packet::Publish(p)] = r.send.as_slice() else {
+            panic!("expected one ACK, got {:?}", r.send)
+        };
+        let v: serde_json::Value = serde_json::from_slice(&p.payload).unwrap();
+        assert_eq!(v["print"]["sequence_id"], "5");
+        assert!(
+            v["print"]["command"].is_null(),
+            "the A1's `print` ACK carries no command: {v}"
+        );
     }
 
     #[test]
