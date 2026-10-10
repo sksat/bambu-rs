@@ -15,7 +15,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # dtolnay/rust-toolchain publishes no minor.patch release tags (only the
       # moving `stable` branch), so pin to its commit SHA for reproducibility.
       # Toolchain version is pinned by rust-toolchain.toml (1.96.0); keep this in
@@ -71,7 +71,7 @@ jobs:
             features: "--features dashboard,ts-rs,doom"
     name: test (${{ matrix.name }})
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable, 2026-03-27
         with:
           toolchain: "1.96.0"
@@ -91,7 +91,7 @@ jobs:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable, 2026-03-27
         with:
           toolchain: "1.96.0"
@@ -131,7 +131,7 @@ jobs:
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Read MSRV from Cargo.toml
         id: msrv
         run: |
