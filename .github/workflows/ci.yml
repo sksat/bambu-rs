@@ -15,7 +15,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       # dtolnay/rust-toolchain publishes no minor.patch release tags (only the
       # moving `stable` branch), so pin to its commit SHA for reproducibility.
       # Toolchain version is pinned by rust-toolchain.toml (1.96.0); keep this in
@@ -24,7 +24,7 @@ jobs:
         with:
           toolchain: "1.96.0"
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Format
         run: cargo fmt --all -- --check
       # `dashboard,ts-rs,doom` is every feature EXCEPT `license-notice` (release-only:
@@ -71,11 +71,11 @@ jobs:
             features: "--features dashboard,ts-rs,doom"
     name: test (${{ matrix.name }})
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable, 2026-03-27
         with:
           toolchain: "1.96.0"
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: ${{ matrix.name }}
       - name: Test (${{ matrix.name }})
@@ -91,15 +91,15 @@ jobs:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable, 2026-03-27
         with:
           toolchain: "1.96.0"
-      - uses: Swatinem/rust-cache@v2.9.1
-      - uses: pnpm/action-setup@v6.0.9
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
           version: "11.6.0"
-      - uses: actions/setup-node@v6.4.0
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: "22"
           cache: pnpm
@@ -131,7 +131,7 @@ jobs:
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Read MSRV from Cargo.toml
         id: msrv
         run: |
@@ -142,7 +142,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable, 2026-03-27
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # RUSTUP_TOOLCHAIN overrides rust-toolchain.toml (which pins 1.96.0) so cargo
       # uses the MSRV; the guard then proves it actually did.
       - name: Guard — active rustc must be the declared MSRV
