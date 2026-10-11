@@ -38,7 +38,7 @@ jobs:
           pnpm -C web build
       - name: Assert the SPA built
         run: test -s web/dist/index.html
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: web-dist
           path: web/dist
@@ -152,7 +152,7 @@ jobs:
           "$hb  bambu-$TARGET.exe" | Out-File -Encoding ascii "dist/bambu-$TARGET.exe.sha256"
           Remove-Item -Recurse -Force "dist/$STAGE"
 
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-${{ matrix.target }}
           path: dist/*
